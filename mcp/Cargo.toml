@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "kyris-mcp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kyris stdio MCP wrapper: JSON-RPC interposition with AgentPact policy enforcement"
+
+[[bin]]
+name = "kyris-mcp"
+path = "src/main.rs"
+
+[dependencies]
+kyris-core = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "io-std", "net", "sync", "signal", "time"] }
+serde_json = { workspace = true }
+nix = { workspace = true }
+uuid = { workspace = true }

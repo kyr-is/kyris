@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "kyris-hook"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal UDS helper for shell hooks: JSON construction, AgentPact protocol, response parsing"
+
+[[bin]]
+name = "kyris-hook"
+path = "src/main.rs"
+
+# Intentionally minimal: stdlib UnixStream + serde + serde_json only.
+# No DuckDB, no Tokio. < 1MB, < 5ms cold start.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

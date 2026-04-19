@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "kyrisd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kyris daemon: LLM routing, HTTP MCP routing, relay sync"
+
+[[bin]]
+name = "kyrisd"
+path = "src/main.rs"
+
+[dependencies]
+kyris-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "signal", "macros", "io-util", "time"] }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true }
+duckdb = { workspace = true }
+aws-lc-rs = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arc-swap = { workspace = true }
+chrono = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-mini = { workspace = true }
+tray-icon = { workspace = true }
+notify-rust = { workspace = true }
+futures-util = { workspace = true }
+const-hex = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[build-dependencies]
+resvg = "0.47"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "adapter_overhead"
+harness = false
+
+[[bench]]
+name = "sse_parse"
+harness = false
+
+[[bench]]
+name = "token_accumulate"
+harness = false
+
+[[bench]]
+name = "project_config_resolve"
+harness = false
+
+[[bench]]
+name = "hmac_sign"
+harness = false
+
+[[bench]]
+name = "pending_store"
+harness = false
+
+[[bench]]
+name = "is_tools_call"
+harness = false

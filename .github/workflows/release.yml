@@ -1,0 +1,121 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Test + coverage
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          COVERAGE=$(cargo llvm-cov --all-features 2>&1 | grep '^TOTAL' | awk '{print $NF}')
+          echo "COVERAGE=$COVERAGE" >> "$GITHUB_ENV"
+
+      - name: Coverage badge
+        if: matrix.target == 'aarch64-apple-darwin'
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: coverage.json
+          label: coverage
+          message: "${{ env.COVERAGE }}"
+          valColorRange: ${{ env.COVERAGE }}
+          minColorRange: 50
+          maxColorRange: 100
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Sign binaries (macOS)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        if: env.APPLE_CERTIFICATE != ''
+        run: |
+          for bin in kyris kyrisd kyris-mcp kyris-hook; do
+            codesign --sign "Developer ID Application: Kyri So LLC" \
+              --options runtime --timestamp \
+              "target/${{ matrix.target }}/release/$bin"
+          done
+
+      - name: Notarize binaries (macOS)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        if: env.APPLE_ID != ''
+        run: |
+          for bin in kyris kyrisd kyris-mcp kyris-hook; do
+            zip -j "$bin.zip" "target/${{ matrix.target }}/release/$bin"
+            xcrun notarytool submit --wait \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              "$bin.zip"
+            xcrun stapler staple "target/${{ matrix.target }}/release/$bin"
+            rm "$bin.zip"
+          done
+
+      - name: Binary size check
+        run: |
+          for bin in kyris kyrisd kyris-mcp kyris-hook; do
+            SIZE=$(stat -f%z "target/${{ matrix.target }}/release/$bin")
+            echo "$bin: $((SIZE / 1024 / 1024))MB ($SIZE bytes)"
+          done
+          KYRISD_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyrisd")
+          if [ "$KYRISD_SIZE" -gt 15728640 ]; then echo "::error::kyrisd exceeds 15MB"; exit 1; fi
+          HOOK_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-hook")
+          if [ "$HOOK_SIZE" -gt 524288 ]; then echo "::error::kyris-hook exceeds 500KB"; exit 1; fi
+          MCP_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-mcp")
+          if [ "$MCP_SIZE" -gt 5242880 ]; then echo "::error::kyris-mcp exceeds 5MB"; exit 1; fi
+
+      - name: Generate checksums
+        run: |
+          cd target/${{ matrix.target }}/release
+          shasum -a 256 kyris kyrisd kyris-mcp kyris-hook > checksums-${{ matrix.target }}.sha256
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/${{ matrix.target }}/release/kyris
+            target/${{ matrix.target }}/release/kyrisd
+            target/${{ matrix.target }}/release/kyris-mcp
+            target/${{ matrix.target }}/release/kyris-hook
+            target/${{ matrix.target }}/release/checksums-${{ matrix.target }}.sha256
+
+  homebrew:
+    runs-on: macos-latest
+    needs: [build]
+    steps:
+      - name: Trigger homebrew-tap update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: kyr-is/homebrew-tap
+          event-type: release
+          client-payload: '{"tag": "${{ github.ref_name }}"}'
