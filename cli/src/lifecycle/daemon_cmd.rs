@@ -31,9 +31,10 @@ pub fn run(args: DaemonArgs) {
 }
 
 fn configured_listen() -> String {
-    load_config()
-        .map(|config| config.server.listen)
-        .unwrap_or_else(|_| "127.0.0.1:4710".to_string())
+    load_config().map_or_else(
+        |_| "127.0.0.1:4710".to_string(),
+        |config| config.server.listen,
+    )
 }
 
 fn start() {

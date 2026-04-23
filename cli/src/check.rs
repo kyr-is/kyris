@@ -27,7 +27,8 @@ pub fn run(args: CheckArgs) {
         "detail": args.command,
         "context": {
             "working_dir": cwd,
-        }
+        },
+        "preview": true,
     });
 
     let mut stream = match UnixStream::connect(&sock) {
@@ -38,7 +39,8 @@ pub fn run(args: CheckArgs) {
         }
     };
 
-    let payload = serde_json::to_vec(&request).expect("serialize request");
+    let mut payload = serde_json::to_vec(&request).expect("serialize request");
+    payload.push(b'\n');
     if let Err(e) = stream.write_all(&payload) {
         eprintln!("Failed to send request: {e}");
         std::process::exit(1);
@@ -53,6 +55,7 @@ pub fn run(args: CheckArgs) {
         eprintln!("Failed to read response: {e}");
         std::process::exit(1);
     }
+    trim_socket_message(&mut response_buf);
 
     let response: serde_json::Value = match serde_json::from_slice(&response_buf) {
         Ok(v) => v,
@@ -90,13 +93,25 @@ fn agentpact_socket() -> String {
     })
 }
 
+fn trim_socket_message(bytes: &mut Vec<u8>) {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+}
+
 fn parse_check_response(response: &serde_json::Value) -> (&str, Option<&str>, Option<&str>) {
     let decision = response
         .get("decision")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let rule = response.get("matched_rule").and_then(|v| v.as_str());
-    let reason = response.get("reason").and_then(|v| v.as_str());
+    let rule = response
+        .get("matched_rule")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("rule_id").and_then(|v| v.as_str()));
+    let reason = response
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("error").and_then(|v| v.as_str()));
     (decision, rule, reason)
 }
 
@@ -142,6 +157,30 @@ mod tests {
         assert_eq!(decision, "deny");
         assert_eq!(rule, None);
         assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn testParseCheckResponseFallsBackToRuleId() {
+        let resp = serde_json::json!({
+            "decision": "auto",
+            "rule_id": "cmd:git.status"
+        });
+        let (decision, rule, reason) = parse_check_response(&resp);
+        assert_eq!(decision, "auto");
+        assert_eq!(rule, Some("cmd:git.status"));
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn testParseCheckResponseFallsBackToError() {
+        let resp = serde_json::json!({
+            "code": "PACT_POLICY_ERROR",
+            "error": "working_dir not allowed"
+        });
+        let (decision, rule, reason) = parse_check_response(&resp);
+        assert_eq!(decision, "unknown");
+        assert_eq!(rule, None);
+        assert_eq!(reason, Some("working_dir not allowed"));
     }
 
     #[test]

@@ -15,7 +15,6 @@ use crate::state::{
 };
 
 const HOOKS_COMPONENT: &str = "hooks";
-const AGENTPACTD_COMPONENT: &str = "agentpactd";
 const KYRISD_COMPONENT: &str = "kyrisd";
 const KYRIS_MCP_COMPONENT: &str = "kyris-mcp";
 const KYRIS_HOOK_COMPONENT: &str = "kyris-hook";
@@ -23,16 +22,16 @@ const CLAUDE_COMPONENT: &str = "claude-code";
 const CODEX_COMPONENT: &str = "codex-cli";
 const GEMINI_COMPONENT: &str = "gemini-cli";
 const CLINE_COMPONENT: &str = "cline";
-const ZSH_HOOK_SOURCE: &str = include_str!("../../hooks/zsh_hook.sh");
-const ZSHENV_HOOK_SOURCE: &str = include_str!("../../hooks/zshenv_hook.sh");
-const BASH_HOOK_SOURCE: &str = include_str!("../../hooks/bash_hook.sh");
-const BASH_ENV_SOURCE: &str = include_str!("../../hooks/bash_env.sh");
+const ZSH_HOOK_SOURCE: &str = include_str!("../../../hooks/zsh_hook.sh");
+const ZSHENV_HOOK_SOURCE: &str = include_str!("../../../hooks/zshenv_hook.sh");
+const BASH_HOOK_SOURCE: &str = include_str!("../../../hooks/bash_hook.sh");
+const BASH_ENV_SOURCE: &str = include_str!("../../../hooks/bash_env.sh");
 const CLAUDE_PRETOOL_SOURCE: &str =
-    include_str!("../../integrations/live-hooks/claude-code/pretooluse.sh");
+    include_str!("../../../integrations/live-hooks/claude-code/pretooluse.sh");
 const CODEX_PRETOOL_SOURCE: &str =
-    include_str!("../../integrations/live-hooks/codex-cli/pretooluse.sh");
+    include_str!("../../../integrations/live-hooks/codex-cli/pretooluse.sh");
 const GEMINI_BEFORETOOL_SOURCE: &str =
-    include_str!("../../integrations/live-hooks/gemini-cli/beforetool.sh");
+    include_str!("../../../integrations/live-hooks/gemini-cli/beforetool.sh");
 
 #[derive(Args)]
 pub struct InstallArgs {
@@ -54,6 +53,14 @@ pub fn run(args: InstallArgs) {
         std::process::exit(1);
     }
 
+    if !check_agentpactd_available() {
+        eprintln!(
+            "agentpactd not found. Kyris requires AgentPact — install it first via AgentPact's \
+             own installer, then re-run `kyris install`."
+        );
+        std::process::exit(1);
+    }
+
     println!("Kyris Installer");
     println!("===============");
 
@@ -63,7 +70,6 @@ pub fn run(args: InstallArgs) {
             HOOKS_COMPONENT,
             install_shell_hooks as fn() -> Result<Vec<String>, String>,
         ),
-        (AGENTPACTD_COMPONENT, install_agentpactd_binary),
         (KYRISD_COMPONENT, install_kyrisd_binary),
         (KYRIS_MCP_COMPONENT, install_kyris_mcp_binary),
         (KYRIS_HOOK_COMPONENT, install_kyris_hook_binary),
@@ -101,30 +107,30 @@ pub fn run(args: InstallArgs) {
     }
 
     println!("Component status:");
-    let agentpactd_ok = check_binary("agentpactd");
     let kyrisd_ok = check_binary("kyrisd");
     let kyris_mcp_ok = check_binary("kyris-mcp");
     let kyris_hook_ok = check_binary("kyris-hook");
     let shell_hook_ok = check_shell_hooks();
+    let agentpactd_ok = check_binary("agentpactd");
 
-    if agentpactd_ok && kyrisd_ok && kyris_mcp_ok && kyris_hook_ok && shell_hook_ok {
+    if kyrisd_ok && kyris_mcp_ok && kyris_hook_ok && shell_hook_ok && agentpactd_ok {
         println!("All known components detected.");
     } else {
         println!("Missing components:");
-        if !agentpactd_ok {
-            println!("  agentpactd - Install via: curl -fsSL https://get.kyri.so | sh");
-        }
         if !kyrisd_ok {
-            println!("  kyrisd     - Install via: curl -fsSL https://get.kyri.so | sh");
+            println!("  kyrisd     - Install via: curl -fsSL https://kyr.is/install | sh");
         }
         if !kyris_mcp_ok {
-            println!("  kyris-mcp  - Install via: curl -fsSL https://get.kyri.so | sh");
+            println!("  kyris-mcp  - Install via: curl -fsSL https://kyr.is/install | sh");
         }
         if !kyris_hook_ok {
-            println!("  kyris-hook - Install via: curl -fsSL https://get.kyri.so | sh");
+            println!("  kyris-hook - Install via: curl -fsSL https://kyr.is/install | sh");
         }
         if !shell_hook_ok {
             println!("  shell hook - Run `kyris install --components hooks`.");
+        }
+        if !agentpactd_ok {
+            println!("  agentpactd - Install separately via AgentPact's own installer.");
         }
     }
 }
@@ -147,7 +153,6 @@ fn validate_components(requested: &[String]) -> Result<(), String> {
             !matches!(
                 *component,
                 HOOKS_COMPONENT
-                    | AGENTPACTD_COMPONENT
                     | KYRISD_COMPONENT
                     | KYRIS_MCP_COMPONENT
                     | KYRIS_HOOK_COMPONENT
@@ -165,7 +170,7 @@ fn validate_components(requested: &[String]) -> Result<(), String> {
 
     Err(format!(
         "Unsupported install components: {}. Currently supported: {HOOKS_COMPONENT}, \
-         {AGENTPACTD_COMPONENT}, {KYRISD_COMPONENT}, {KYRIS_MCP_COMPONENT}, \
+         {KYRISD_COMPONENT}, {KYRIS_MCP_COMPONENT}, \
          {KYRIS_HOOK_COMPONENT}, {CLAUDE_COMPONENT}, {CODEX_COMPONENT}, \
          {GEMINI_COMPONENT}, {CLINE_COMPONENT}.",
         unsupported.join(", ")
@@ -175,7 +180,6 @@ fn validate_components(requested: &[String]) -> Result<(), String> {
 fn detected_components() -> Vec<String> {
     let mut components = vec![
         HOOKS_COMPONENT.to_string(),
-        AGENTPACTD_COMPONENT.to_string(),
         KYRISD_COMPONENT.to_string(),
         KYRIS_MCP_COMPONENT.to_string(),
         KYRIS_HOOK_COMPONENT.to_string(),
@@ -245,16 +249,6 @@ fn install_shell_hooks() -> Result<Vec<String>, String> {
     }
 
     Ok(changes)
-}
-
-fn install_agentpactd_binary() -> Result<Vec<String>, String> {
-    install_release_binary(
-        "kyr-is",
-        "agentpact",
-        "agentpact",
-        "agentpactd",
-        Some(ServiceKind::Agentpactd),
-    )
 }
 
 fn install_kyrisd_binary() -> Result<Vec<String>, String> {
@@ -343,14 +337,9 @@ fn install_launchd_service(
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{}.plist", launchd_label(kind)));
-    let log_path = match kind {
-        ServiceKind::Kyrisd => PathBuf::from(&home)
-            .join(".kyris")
-            .join("kyrisd.stderr.log"),
-        ServiceKind::Agentpactd => PathBuf::from(&home)
-            .join(".agentpact")
-            .join("agentpactd.log"),
-    };
+    let log_path = PathBuf::from(&home)
+        .join(".kyris")
+        .join("kyrisd.stderr.log");
 
     let mut changes = Vec::new();
     ensure_parent(&log_path)?;
@@ -361,7 +350,7 @@ fn install_launchd_service(
 
     if !state.launchd_loaded {
         start_service(kind)?;
-        changes.push(format!("started {:?}", kind));
+        changes.push(format!("started {kind:?}"));
     }
 
     Ok(changes)
@@ -395,11 +384,8 @@ fn launchd_plist(label: &str, binary_path: &std::path::Path, log_path: &std::pat
     )
 }
 
-fn launchd_label(kind: ServiceKind) -> &'static str {
-    match kind {
-        ServiceKind::Kyrisd => "so.kyri.kyrisd",
-        ServiceKind::Agentpactd => "so.kyri.agentpactd",
-    }
+fn launchd_label(_kind: ServiceKind) -> &'static str {
+    "is.kyr.kyrisd"
 }
 
 fn install_claude_adapter() -> Result<Vec<String>, String> {
@@ -549,9 +535,6 @@ fn cline_extension_installed(home: &str) -> bool {
 }
 
 fn brew_formula_installed(formula: &str) -> bool {
-    if env_flag("KYRIS_TEST_DISABLE_HOMEBREW_DETECTION") {
-        return false;
-    }
     std::process::Command::new("brew")
         .args(["list", formula])
         .output()
@@ -563,13 +546,6 @@ fn which_exists(cmd: &str) -> bool {
         .arg(cmd)
         .output()
         .is_ok_and(|output| output.status.success())
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-    })
 }
 
 #[derive(serde::Deserialize)]
@@ -658,7 +634,7 @@ async fn download_and_extract(asset: &GitHubAsset) -> Result<PathBuf, String> {
 
 fn release_target() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") | ("macos", "arm64") => Ok("darwin-aarch64"),
+        ("macos", "aarch64" | "arm64") => Ok("darwin-aarch64"),
         ("macos", "x86_64") => Ok("darwin-x86_64"),
         ("linux", "x86_64") => Ok("linux-x86_64"),
         ("linux", "aarch64") => Ok("linux-aarch64"),
@@ -671,10 +647,13 @@ fn user_agent() -> String {
 }
 
 fn github_releases_base_url() -> String {
-    std::env::var("KYRIS_TEST_GITHUB_RELEASES_BASE_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_string())
-        .trim_end_matches('/')
-        .to_string()
+    "https://api.github.com".to_string()
+}
+
+fn check_agentpactd_available() -> bool {
+    which_exists("agentpactd")
+        || bin_dir().is_ok_and(|dir| dir.join("agentpactd").exists())
+        || brew_formula_installed("agentpact")
 }
 
 fn check_binary(name: &str) -> bool {

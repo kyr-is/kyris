@@ -32,6 +32,7 @@ struct PendingEntry {
     state: PendingState,
     created: Instant,
     resolver: Option<oneshot::Sender<Resolution>>,
+    timeout_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,12 @@ pub struct Resolution {
 
 pub struct PendingStore {
     entries: Mutex<HashMap<String, PendingEntry>>,
+}
+
+impl Default for PendingStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PendingStore {
@@ -65,19 +72,41 @@ impl PendingStore {
             state: PendingState::Held,
             created: Instant::now(),
             resolver: Some(tx),
+            timeout_handle: None,
         };
-        self.entries.lock().expect("lock pending").insert(id, entry);
+        let mut entries = self.entries.lock().expect("lock pending");
+        if let Some(old) = entries.remove(&id)
+            && let Some(handle) = old.timeout_handle
+        {
+            handle.abort();
+        }
+        entries.insert(id, entry);
         rx
+    }
+
+    pub fn set_timeout_handle(&self, id: &str, handle: tokio::task::JoinHandle<()>) {
+        let mut entries = self.entries.lock().expect("lock pending");
+        if let Some(entry) = entries.get_mut(id) {
+            entry.timeout_handle = Some(handle);
+        }
     }
 
     pub fn claim(&self, id: &str) -> Result<Claim, ResolveError> {
         let mut entries = self.entries.lock().expect("lock pending");
         let entry = entries.get_mut(id).ok_or(ResolveError::NotFound)?;
         if entry.state != PendingState::Held {
-            return Err(ResolveError::AlreadyResolved(entry.state));
+            return match entry.state {
+                PendingState::TimedOut | PendingState::Cancelled => {
+                    Err(ResolveError::NoLongerResolvable(entry.state))
+                }
+                _ => Err(ResolveError::AlreadyResolved(entry.state)),
+            };
         }
         if entry.resolver.is_none() {
             return Err(ResolveError::AlreadyResolved(PendingState::Held));
+        }
+        if let Some(handle) = entry.timeout_handle.take() {
+            handle.abort();
         }
         let token = entry.approval_token.clone();
         let resolver = entry.resolver.take();
@@ -85,27 +114,35 @@ impl PendingStore {
             id: id.to_string(),
             approval_token: token,
             resolver,
+            completed: false,
         })
     }
 
-    pub fn complete_claim(&self, claim: Claim, approved: bool) {
-        if let Some(tx) = claim.resolver {
+    pub fn complete_claim(&self, mut claim: Claim, approved: bool) {
+        claim.completed = true;
+        if let Some(tx) = claim.resolver.take() {
             let _ = tx.send(Resolution { approved });
         }
         let mut entries = self.entries.lock().expect("lock pending");
-        if let Some(entry) = entries.get_mut(&claim.id) {
+        if let Some(entry) = entries.get_mut(&claim.id)
+            && matches!(entry.state, PendingState::Held)
+        {
             entry.state = if approved {
                 PendingState::Approved
             } else {
                 PendingState::Denied
             };
+            if let Some(handle) = entry.timeout_handle.take() {
+                handle.abort();
+            }
         }
     }
 
-    pub fn abandon_claim(&self, claim: Claim) {
+    pub fn abandon_claim(&self, mut claim: Claim) {
+        claim.completed = true;
         let mut entries = self.entries.lock().expect("lock pending");
         if let Some(entry) = entries.get_mut(&claim.id) {
-            entry.resolver = claim.resolver;
+            entry.resolver = claim.resolver.take();
         }
     }
 
@@ -116,16 +153,24 @@ impl PendingStore {
         {
             entry.state = PendingState::TimedOut;
             drop(entry.resolver.take());
+            drop(entry.timeout_handle.take());
         }
     }
 
-    pub fn cancel(&self, id: &str) {
+    pub fn cancel(&self, id: &str) -> Option<String> {
         let mut entries = self.entries.lock().expect("lock pending");
         if let Some(entry) = entries.get_mut(id)
             && entry.state == PendingState::Held
         {
+            let token = entry.approval_token.clone();
             entry.state = PendingState::Cancelled;
             drop(entry.resolver.take());
+            if let Some(handle) = entry.timeout_handle.take() {
+                handle.abort();
+            }
+            Some(token)
+        } else {
+            None
         }
     }
 
@@ -141,6 +186,14 @@ impl PendingStore {
                 held_since_ms: entry.created.elapsed().as_millis() as u64,
             })
             .collect()
+    }
+
+    pub fn get_state(&self, id: &str) -> Option<PendingState> {
+        self.entries
+            .lock()
+            .expect("lock pending")
+            .get(id)
+            .map(|e| e.state)
     }
 
     pub fn list_held(&self) -> Vec<PendingInfo> {
@@ -160,12 +213,24 @@ pub struct Claim {
     id: String,
     pub approval_token: String,
     resolver: Option<oneshot::Sender<Resolution>>,
+    completed: bool,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Some(tx) = self.resolver.take()
+        {
+            let _ = tx.send(Resolution { approved: false });
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum ResolveError {
     NotFound,
     AlreadyResolved(PendingState),
+    NoLongerResolvable(PendingState),
 }
 
 #[cfg(test)]
@@ -264,7 +329,7 @@ mod tests {
         store.timeout("req-1");
         assert!(matches!(
             store.claim("req-1"),
-            Err(ResolveError::AlreadyResolved(PendingState::TimedOut))
+            Err(ResolveError::NoLongerResolvable(PendingState::TimedOut))
         ));
     }
 
@@ -320,5 +385,59 @@ mod tests {
 
         store.cancel("req-1");
         assert!(rx.await.is_err());
+    }
+
+    #[test]
+    fn testGetStateReturnsHeldThenApproved() {
+        let store = PendingStore::new();
+        assert!(store.get_state("req-1").is_none());
+
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        assert_eq!(store.get_state("req-1"), Some(PendingState::Held));
+
+        let claim = store.claim("req-1").unwrap();
+        store.complete_claim(claim, true);
+        assert_eq!(store.get_state("req-1"), Some(PendingState::Approved));
+    }
+
+    #[test]
+    fn testGetStateReturnsDenied() {
+        let store = PendingStore::new();
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+
+        let claim = store.claim("req-1").unwrap();
+        store.complete_claim(claim, false);
+        assert_eq!(store.get_state("req-1"), Some(PendingState::Denied));
+    }
+
+    #[test]
+    fn testCompleteClaimRefusesToOverwriteTerminalState() {
+        let store = PendingStore::new();
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+
+        store.timeout("req-1");
+        assert_eq!(store.get_state("req-1"), Some(PendingState::TimedOut));
+
+        let (tx, _rx2) = oneshot::channel();
+        let claim = Claim {
+            id: "req-1".into(),
+            approval_token: "tok-1".into(),
+            resolver: Some(tx),
+            completed: false,
+        };
+        store.complete_claim(claim, true);
+        assert_eq!(store.get_state("req-1"), Some(PendingState::TimedOut));
+    }
+
+    #[test]
+    fn testHoldDuplicateIdReplacesEntry() {
+        let store = PendingStore::new();
+        let _rx1 = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx2 = store.hold("req-1".into(), "tok-2".into(), "gitlab".into(), None);
+
+        assert_eq!(store.list().len(), 1);
+        let claim = store.claim("req-1").unwrap();
+        assert_eq!(claim.approval_token, "tok-2");
+        store.complete_claim(claim, true);
     }
 }

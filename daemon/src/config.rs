@@ -147,31 +147,6 @@ fn save_config(path: &PathBuf, config: &KyrisdConfig) {
     });
 }
 
-pub fn resolve_effective_config(
-    global: &KyrisdConfig,
-    working_dir: Option<&str>,
-) -> KyrisdConfig {
-    let Some(dir) = working_dir else {
-        return global.clone();
-    };
-    let path = Path::new(dir);
-    let Some(project_path) = kyris_core::config::discover_project_config(path) else {
-        return global.clone();
-    };
-    let Ok(contents) = std::fs::read_to_string(&project_path) else {
-        tracing::warn!(path = %project_path.display(), "failed to read per-project config");
-        return global.clone();
-    };
-    let Ok(project) = serde_saphyr::from_str::<kyris_core::config::ProjectConfig>(&contents) else {
-        tracing::warn!(path = %project_path.display(), "failed to parse per-project config");
-        return global.clone();
-    };
-    let mut effective = global.clone();
-    project.merge_into(&mut effective);
-    tracing::debug!(path = %project_path.display(), "applied per-project config");
-    effective
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,46 +188,5 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         assert!(validate_permissions(&path).is_err());
-    }
-
-    #[test]
-    fn testResolveEffectiveConfigAppliesProjectOverrides() {
-        let global: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        assert_eq!(global.circuit_breaker.max_tokens, 200_000);
-
-        let dir = tempfile::tempdir().unwrap();
-        let project_dir = dir.path().join("project").join("deep");
-        std::fs::create_dir_all(&project_dir).unwrap();
-        std::fs::write(
-            dir.path().join("project").join(".kyris.yaml"),
-            "circuit_breaker:\n  max_tokens: 50000\n",
-        )
-        .unwrap();
-
-        let effective =
-            resolve_effective_config(&global, Some(project_dir.to_str().unwrap()));
-        assert_eq!(effective.circuit_breaker.max_tokens, 50_000);
-    }
-
-    #[test]
-    fn testResolveEffectiveConfigFallsBackWithoutWorkingDir() {
-        let global: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        let effective = resolve_effective_config(&global, None);
-        assert_eq!(
-            effective.circuit_breaker.max_tokens,
-            global.circuit_breaker.max_tokens
-        );
-    }
-
-    #[test]
-    fn testResolveEffectiveConfigFallsBackWhenNoProjectFile() {
-        let global: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let effective =
-            resolve_effective_config(&global, Some(dir.path().to_str().unwrap()));
-        assert_eq!(
-            effective.circuit_breaker.max_tokens,
-            global.circuit_breaker.max_tokens
-        );
     }
 }

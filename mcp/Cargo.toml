@@ -14,7 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 kyris-core = { workspace = true }
+kyris-agentpact-client = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "io-std", "net", "sync", "signal", "time"] }
 serde_json = { workspace = true }
 nix = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "blocking"] }
+
+[dev-dependencies]
+tempfile = "3"

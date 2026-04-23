@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(
-    dead_code,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
@@ -12,24 +11,7 @@
 )]
 #![cfg_attr(test, allow(non_snake_case))]
 
-mod adapter;
-mod auth;
-mod circuit_breaker;
-mod config;
-mod cost;
-mod mcp_routing;
-mod metering;
-mod notify;
-mod pending;
-mod platform;
-mod pricing_fetch;
-mod server;
-mod storage;
-mod streaming;
-mod sync;
-mod trace_attach;
-mod tray;
-
+use kyrisd::{config, server, tray};
 use tracing_subscriber::EnvFilter;
 
 fn main() {

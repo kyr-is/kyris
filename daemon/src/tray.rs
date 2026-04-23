@@ -20,6 +20,7 @@ impl std::fmt::Display for TrayState {
 }
 
 impl TrayState {
+    #[cfg(test)]
     fn label(self) -> &'static str {
         match self {
             Self::Normal => "Kyris ●",
@@ -84,9 +85,9 @@ fn degraded_icon_rgba() -> Vec<u8> {
         if pixel[3] == 0 {
             continue;
         }
-        pixel[0] = (((pixel[0] as u16) * 2) / 5 + (255_u16 * 3) / 5) as u8;
-        pixel[1] = (((pixel[1] as u16) * 2) / 5 + (191_u16 * 3) / 5) as u8;
-        pixel[2] = ((pixel[2] as u16) / 3) as u8;
+        pixel[0] = ((u16::from(pixel[0]) * 2) / 5 + (255_u16 * 3) / 5) as u8;
+        pixel[1] = ((u16::from(pixel[1]) * 2) / 5 + (191_u16 * 3) / 5) as u8;
+        pixel[2] = (u16::from(pixel[2]) / 3) as u8;
     }
     rgba
 }

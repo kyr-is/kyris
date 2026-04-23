@@ -19,14 +19,15 @@ fn bench_hold(c: &mut Criterion) {
     });
 }
 
-fn bench_resolve(c: &mut Criterion) {
-    c.bench_function("pending_hold_resolve", |b| {
+fn bench_claim_complete(c: &mut Criterion) {
+    c.bench_function("pending_hold_claim_complete", |b| {
         let store = PendingStore::new();
         let mut i = 0u64;
         b.iter(|| {
             let id = format!("req-{i}");
             let _rx = store.hold(id.clone(), format!("tok-{i}"), "github".into(), None);
-            store.resolve(black_box(&id), true).unwrap();
+            let claim = store.claim(black_box(&id)).unwrap();
+            store.complete_claim(claim, true);
             i += 1;
         });
     });
@@ -41,7 +42,8 @@ fn bench_prune(c: &mut Criterion) {
                 for j in 0..100u64 {
                     let id = format!("req-{j}");
                     let _rx = store.hold(id.clone(), format!("tok-{j}"), "github".into(), None);
-                    store.resolve(&id, true).unwrap();
+                    let claim = store.claim(&id).unwrap();
+                    store.complete_claim(claim, true);
                 }
                 let start = std::time::Instant::now();
                 store.prune_resolved();
@@ -67,7 +69,8 @@ fn bench_list_held(c: &mut Criterion) {
     for i in 50..100u64 {
         let id = format!("req-{i}");
         let _rx = store.hold(id.clone(), format!("tok-{i}"), "github".into(), None);
-        store.resolve(&id, true).unwrap();
+        let claim = store.claim(&id).unwrap();
+        store.complete_claim(claim, true);
     }
 
     c.bench_function("pending_list_held_100_entries", |b| {
@@ -75,5 +78,11 @@ fn bench_list_held(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_hold, bench_resolve, bench_prune, bench_list_held);
+criterion_group!(
+    benches,
+    bench_hold,
+    bench_claim_complete,
+    bench_prune,
+    bench_list_held
+);
 criterion_main!(benches);

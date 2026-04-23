@@ -15,6 +15,10 @@ __kyris_preexec() {
 
     if [[ ! -S "$sock" ]]; then
         __kyris_restart_daemon "$sock" || {
+            if __kyris_daemon_state_allows "$sock"; then
+                logger -t agentpact "fail-open: $cmd"
+                return 0
+            fi
             __kyris_write_sentinel "$sentinel"
             printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
             return 1
@@ -23,23 +27,25 @@ __kyris_preexec() {
 
     (( $+commands[kyris-hook] )) || return 0
 
-    local output exit_code
-    output=$(kyris-hook check "$cmd" --cwd "$PWD" --socket "$sock")
-    exit_code=$?
-
-    if [[ $exit_code -eq 10 ]]; then
-        __kyris_restart_daemon "$sock" || {
-            __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
-            return 1
-        }
+    local output exit_code attempt=0
+    while (( attempt < 2 )); do
         output=$(kyris-hook check "$cmd" --cwd "$PWD" --socket "$sock")
         exit_code=$?
-        if [[ $exit_code -eq 10 ]]; then
-            __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
-            return 1
+        [[ $exit_code -ne 10 ]] && break
+        (( attempt++ ))
+        if (( attempt == 1 )); then
+            __kyris_restart_daemon "$sock" || break
         fi
+    done
+
+    if [[ $exit_code -eq 10 ]]; then
+        if __kyris_daemon_state_allows "$sock"; then
+            logger -t agentpact "fail-open: $cmd"
+            return 0
+        fi
+        __kyris_write_sentinel "$sentinel"
+        printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+        return 1
     fi
 
     case $exit_code in
@@ -59,7 +65,10 @@ __kyris_preexec() {
             __kyris_circuit_breaker_prompt "$cmd" "$sock" "$req_id" "$token" "$count"
             return $?
             ;;
-        *) return 0 ;;
+        *)
+            printf '\033[31m[agentpact]\033[0m unexpected kyris-hook exit code: %s\n' "$exit_code" >&2
+            return 1
+            ;;
     esac
 }
 
@@ -104,9 +113,19 @@ __kyris_prompt_user() {
             fi
             ;;
         *)
+            kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response denied 2>/dev/null
             return 1
             ;;
     esac
+}
+
+__kyris_daemon_state_allows() {
+    local sock="$1"
+    local state_file="${sock%/*}/daemon.state"
+    [[ -f "$state_file" ]] || return 1
+    local content
+    content=$(<"$state_file" 2>/dev/null) || return 1
+    [[ "$content" == *'"on_daemon_unavailable":"allow"'* || "$content" == *'"on_daemon_unavailable": "allow"'* ]]
 }
 
 __kyris_sentinel_active() {
@@ -125,7 +144,7 @@ __kyris_write_sentinel() {
 
 __kyris_restart_daemon() {
     local sock="$1"
-    launchctl kickstart -k gui/$(id -u)/so.kyri.agentpactd 2>/dev/null || return 1
+    launchctl kickstart -k gui/$(id -u)/is.kyr.agentpactd 2>/dev/null || return 1
     local delay
     for delay in 0.05 0.1 0.25; do
         sleep "$delay"

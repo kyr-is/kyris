@@ -2,29 +2,27 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
-#![allow(clippy::needless_pass_by_value)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate
+)]
 #![cfg_attr(test, allow(non_snake_case))]
 
 mod check;
 mod compile_policy;
 mod continue_cmd;
-mod daemon_cmd;
-mod enroll;
-mod history;
-mod install;
 mod integration;
+mod lifecycle;
 mod mcp_cmd;
 mod pending;
-mod replay;
+mod query;
 mod scan;
 mod service;
 mod setup;
 mod state;
-mod stats;
 mod status;
-mod timeline;
-mod uninstall;
-mod update;
 mod version;
 
 use clap::{Parser, Subcommand};
@@ -38,22 +36,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Timeline(timeline::TimelineArgs),
-    Replay(replay::ReplayArgs),
-    Stats(stats::StatsArgs),
-    History(history::HistoryArgs),
+    Timeline(query::timeline::TimelineArgs),
+    Replay(query::replay::ReplayArgs),
+    Stats(query::stats::StatsArgs),
+    History(query::history::HistoryArgs),
     Check(check::CheckArgs),
     CompilePolicy(compile_policy::CompilePolicyArgs),
     Pending(pending::PendingArgs),
     Continue(continue_cmd::ContinueArgs),
     Scan(scan::ScanArgs),
-    Install(install::InstallArgs),
-    Enroll(enroll::EnrollArgs),
+    Install(lifecycle::install::InstallArgs),
+    Enroll(lifecycle::enroll::EnrollArgs),
     Setup(setup::SetupArgs),
-    Update(update::UpdateArgs),
-    Daemon(daemon_cmd::DaemonArgs),
+    Update(lifecycle::update::UpdateArgs),
+    Daemon(lifecycle::daemon_cmd::DaemonArgs),
     Mcp(mcp_cmd::McpArgs),
-    Uninstall(uninstall::UninstallArgs),
+    Uninstall(lifecycle::uninstall::UninstallArgs),
     Status(status::StatusArgs),
     Version(version::VersionArgs),
 }
@@ -62,22 +60,22 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Timeline(args) => timeline::run(args),
-        Command::Replay(args) => replay::run(args),
-        Command::Stats(args) => stats::run(args),
-        Command::History(args) => history::run(args),
+        Command::Timeline(args) => query::timeline::run(args),
+        Command::Replay(args) => query::replay::run(args),
+        Command::Stats(args) => query::stats::run(args),
+        Command::History(args) => query::history::run(args),
         Command::Check(args) => check::run(args),
         Command::CompilePolicy(args) => compile_policy::run(args),
         Command::Pending(args) => pending::run(args),
         Command::Continue(args) => continue_cmd::run(args),
         Command::Scan(args) => scan::run(args),
-        Command::Install(args) => install::run(args),
-        Command::Enroll(args) => enroll::run(args),
+        Command::Install(args) => lifecycle::install::run(args),
+        Command::Enroll(args) => lifecycle::enroll::run(args),
         Command::Setup(args) => setup::run(args),
-        Command::Update(args) => update::run(args),
-        Command::Daemon(args) => daemon_cmd::run(args),
+        Command::Update(args) => lifecycle::update::run(args),
+        Command::Daemon(args) => lifecycle::daemon_cmd::run(args),
         Command::Mcp(args) => mcp_cmd::run(args),
-        Command::Uninstall(args) => uninstall::run(args),
+        Command::Uninstall(args) => lifecycle::uninstall::run(args),
         Command::Status(args) => status::run(args),
         Command::Version(args) => version::run(args),
     }
@@ -109,7 +107,7 @@ mod tests {
 
     #[test]
     fn testParseContinue() {
-        assert!(try_parse(&["continue"]).is_ok());
+        assert!(try_parse(&["continue"]).is_err());
     }
 
     #[test]

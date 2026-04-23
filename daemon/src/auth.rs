@@ -11,9 +11,15 @@ use axum::{
 };
 use kyris_core::config::KyrisdConfig;
 
-pub fn validate_key(headers: &HeaderMap, expected: &str) -> bool {
+pub enum AuthResult {
+    Ok,
+    Rejected,
+    Misconfigured,
+}
+
+pub fn validate_key(headers: &HeaderMap, expected: &str) -> AuthResult {
     if expected.is_empty() {
-        return true;
+        return AuthResult::Misconfigured;
     }
 
     let provided = headers
@@ -23,8 +29,8 @@ pub fn validate_key(headers: &HeaderMap, expected: &str) -> bool {
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()));
 
     match provided {
-        Some(key) => constant_time_eq(key.as_bytes(), expected.as_bytes()),
-        None => false,
+        Some(key) if constant_time_eq(key.as_bytes(), expected.as_bytes()) => AuthResult::Ok,
+        _ => AuthResult::Rejected,
     }
 }
 
@@ -40,11 +46,11 @@ pub async fn inbound_auth_middleware(
     let loaded = config.load();
     let inbound_key = &loaded.server.inbound_key;
 
-    if !validate_key(request.headers(), inbound_key) {
-        return Err(StatusCode::UNAUTHORIZED);
+    match validate_key(request.headers(), inbound_key) {
+        AuthResult::Ok => Ok(next.run(request).await),
+        AuthResult::Rejected => Err(StatusCode::UNAUTHORIZED),
+        AuthResult::Misconfigured => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
-
-    Ok(next.run(request).await)
 }
 
 pub async fn operator_auth_middleware(
@@ -55,11 +61,11 @@ pub async fn operator_auth_middleware(
     let loaded = config.load();
     let operator_key = &loaded.server.operator_key;
 
-    if !validate_key(request.headers(), operator_key) {
-        return Err(StatusCode::UNAUTHORIZED);
+    match validate_key(request.headers(), operator_key) {
+        AuthResult::Ok => Ok(next.run(request).await),
+        AuthResult::Rejected => Err(StatusCode::UNAUTHORIZED),
+        AuthResult::Misconfigured => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
-
-    Ok(next.run(request).await)
 }
 
 #[cfg(test)]
@@ -74,14 +80,20 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer sk-kyris-test"),
         );
-        assert!(validate_key(&headers, "sk-kyris-test"));
+        assert!(matches!(
+            validate_key(&headers, "sk-kyris-test"),
+            AuthResult::Ok
+        ));
     }
 
     #[test]
     fn testValidateXApiKey() {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("sk-kyris-test"));
-        assert!(validate_key(&headers, "sk-kyris-test"));
+        assert!(matches!(
+            validate_key(&headers, "sk-kyris-test"),
+            AuthResult::Ok
+        ));
     }
 
     #[test]
@@ -91,19 +103,38 @@ mod tests {
             "authorization",
             HeaderValue::from_static("Bearer wrong-key"),
         );
-        assert!(!validate_key(&headers, "sk-kyris-test"));
+        assert!(matches!(
+            validate_key(&headers, "sk-kyris-test"),
+            AuthResult::Rejected
+        ));
     }
 
     #[test]
     fn testValidateNoHeader() {
         let headers = HeaderMap::new();
-        assert!(!validate_key(&headers, "sk-kyris-test"));
+        assert!(matches!(
+            validate_key(&headers, "sk-kyris-test"),
+            AuthResult::Rejected
+        ));
     }
 
     #[test]
-    fn testValidateEmptyExpected() {
+    fn testValidateEmptyExpectedIsMisconfigured() {
         let headers = HeaderMap::new();
-        assert!(validate_key(&headers, ""));
+        assert!(matches!(
+            validate_key(&headers, ""),
+            AuthResult::Misconfigured
+        ));
+    }
+
+    #[test]
+    fn testValidateEmptyExpectedMisconfiguredEvenWithKey() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer some-key"));
+        assert!(matches!(
+            validate_key(&headers, ""),
+            AuthResult::Misconfigured
+        ));
     }
 
     #[test]
@@ -130,6 +161,9 @@ mod tests {
     fn testValidateBearerWithoutPrefix() {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", HeaderValue::from_static("sk-kyris-test"));
-        assert!(!validate_key(&headers, "sk-kyris-test"));
+        assert!(matches!(
+            validate_key(&headers, "sk-kyris-test"),
+            AuthResult::Rejected
+        ));
     }
 }

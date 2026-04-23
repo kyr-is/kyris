@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde_json::{Map, Value, json};
 
+#[must_use]
 pub fn generate() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -61,7 +62,7 @@ fn server_config() -> Value {
             "max_request_body_bytes": {
                 "type": "integer",
                 "minimum": 0,
-                "default": 10485760,
+                "default": 10_485_760,
                 "description": "Maximum request body size in bytes"
             },
             "drain_timeout_seconds": {
@@ -195,7 +196,7 @@ fn circuit_breaker_config() -> Value {
             "max_tokens": {
                 "type": "integer",
                 "minimum": 0,
-                "default": 200000,
+                "default": 200_000,
                 "description": "Maximum tokens per session before the circuit breaker trips"
             },
             "session_idle_minutes": {

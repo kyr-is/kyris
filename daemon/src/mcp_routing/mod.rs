@@ -26,12 +26,7 @@ async fn handle_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
-    let global_config = state.config.load();
-    let working_dir = headers
-        .get("x-working-dir")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-    let config = crate::config::resolve_effective_config(&global_config, working_dir.as_deref());
+    let config = state.config.load();
 
     if !config.mcp.enabled {
         return Err(StatusCode::NOT_FOUND);
@@ -44,9 +39,32 @@ async fn handle_mcp(
         .find(|s| s.name == server_name)
         .ok_or(StatusCode::NOT_FOUND)?;
 
+    let working_dir = headers
+        .get("x-working-dir")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if policy::is_tools_call_request(&path, &body) && working_dir.is_none() {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": "X-Working-Dir header required for tools/call"})
+                    .to_string(),
+            ))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     let tool_name = policy::extract_tool_name(&path, &body);
     let socket_timeout = Duration::from_millis(config.mcp.socket_timeout_ms);
-    let decision = policy::check_permission(&server_name, &path, &body, socket_timeout).await;
+    let decision = policy::check_permission(
+        &server_name,
+        &path,
+        &body,
+        working_dir.as_deref(),
+        socket_timeout,
+    )
+    .await;
 
     match decision {
         policy::PolicyDecision::Deny(reason) => {
@@ -183,6 +201,7 @@ mod tests {
     static MCP_ROUTE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn testMcpRouteAllowsAndForwardsToolsCall() {
         let _guard = lock_mcp_route_tests();
         let upstream_recorded = Arc::new(Mutex::new(None));
@@ -198,8 +217,7 @@ mod tests {
             &sock_path,
             serde_json::json!({"code": "PACT_OK"}),
             daemon_recorded.clone(),
-        )
-        .await;
+        );
         policy::set_test_agentpact_socket(Some(sock_path.clone()));
 
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
@@ -224,6 +242,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/mcp/remote/tools/call"))
             .header("content-type", "application/json")
+            .header("x-working-dir", "/tmp/project")
             .body(request_body.to_string())
             .send()
             .await
@@ -236,7 +255,9 @@ mod tests {
         let policy_request = daemon_recorded.lock().unwrap().clone().unwrap();
         assert_eq!(policy_request["method"], "permission.request");
         assert_eq!(policy_request["action"], "call");
-        assert_eq!(policy_request["detail"], "remote/read_file");
+        assert_eq!(policy_request["detail"], "read_file");
+        assert_eq!(policy_request["context"]["mcp_server"], "remote");
+        assert_eq!(policy_request["context"]["working_dir"], "/tmp/project");
 
         let upstream_request = upstream_recorded.lock().unwrap().clone().unwrap();
         let forwarded: serde_json::Value = serde_json::from_slice(&upstream_request.body).unwrap();
@@ -252,6 +273,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn testMcpRouteReturnsForbiddenWhenPolicyDenies() {
         let _guard = lock_mcp_route_tests();
         let sock_dir = tempfile::tempdir().unwrap();
@@ -261,8 +283,7 @@ mod tests {
             &sock_path,
             serde_json::json!({"code": "PACT_DENIED", "reason": "blocked by policy"}),
             daemon_recorded.clone(),
-        )
-        .await;
+        );
         policy::set_test_agentpact_socket(Some(sock_path.clone()));
 
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
@@ -287,6 +308,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/mcp/remote/tools/call"))
             .header("content-type", "application/json")
+            .header("x-working-dir", "/tmp/project")
             .body(request_body.to_string())
             .send()
             .await
@@ -297,7 +319,8 @@ mod tests {
         assert_eq!(response_json["error"], "blocked by policy");
 
         let policy_request = daemon_recorded.lock().unwrap().clone().unwrap();
-        assert_eq!(policy_request["detail"], "remote/read_file");
+        assert_eq!(policy_request["detail"], "read_file");
+        assert_eq!(policy_request["context"]["mcp_server"], "remote");
 
         policy::set_test_agentpact_socket(None);
         let _ = router_shutdown.send(());
@@ -336,6 +359,7 @@ mod tests {
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
+            agentpact_socket: None,
         })
     }
 
@@ -356,7 +380,7 @@ mod tests {
         (address, shutdown_tx, handle)
     }
 
-    async fn spawn_agentpact_stub(
+    fn spawn_agentpact_stub(
         sock_path: &std::path::Path,
         response: serde_json::Value,
         recorded: Arc<Mutex<Option<serde_json::Value>>>,
@@ -376,6 +400,123 @@ mod tests {
     }
 
     fn lock_mcp_route_tests() -> MutexGuard<'static, ()> {
-        MCP_ROUTE_TEST_LOCK.lock().unwrap()
+        MCP_ROUTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteReturnsNotFoundWhenDisabled() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = false;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote/tools/call"))
+            .header("content-type", "application/json")
+            .body(r#"{"method":"tools/call","params":{"name":"read_file"}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = response.bytes().await.unwrap();
+
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteReturnsNotFoundForUnknownServer() {
+        let _guard = lock_mcp_route_tests();
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("agentpact.sock");
+        policy::set_test_agentpact_socket(Some(sock_path.clone()));
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "known".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/unknown-server/tools/call"))
+            .header("content-type", "application/json")
+            .body(r#"{"method":"tools/call","params":{"name":"read_file"}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = response.bytes().await.unwrap();
+
+        policy::set_test_agentpact_socket(None);
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteAskTimesOutAndReturns408() {
+        let _guard = lock_mcp_route_tests();
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("agentpact.sock");
+        let daemon_recorded = Arc::new(Mutex::new(None));
+        let daemon_handle = spawn_agentpact_stub(
+            &sock_path,
+            serde_json::json!({"code": "PACT_ASK", "approval_id": "req-timeout", "approval_token": "apt-timeout"}),
+            daemon_recorded,
+        );
+        policy::set_test_agentpact_socket(Some(sock_path.clone()));
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.pending_timeout_seconds = 1;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote/tools/call"))
+            .header("content-type", "application/json")
+            .header("x-working-dir", "/tmp/project")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"dangerous_tool"}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"], "request timed out");
+
+        policy::set_test_agentpact_socket(None);
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+        daemon_handle.await.unwrap();
     }
 }

@@ -50,16 +50,16 @@ async fn handle_messages(
 
     let trace_id = uuid::Uuid::now_v7().to_string();
     let session_id = super::extract_session_id(&headers);
+    let trace_token = super::extract_trace_token(&headers);
 
-    if let Some(ref sid) = session_id
-        && state.circuit_breaker.is_tripped(sid)
+    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
-        let count = state.circuit_breaker.get_token_count(sid);
+        let count = state.circuit_breaker.get_token_count(&session_id);
         crate::notify::circuit_breaker_toast(count);
         if is_stream {
-            return Ok(circuit_breaker_sse_error(&trace_id));
+            return Ok(circuit_breaker_sse_error(&trace_id, count));
         }
-        return Ok(circuit_breaker_error(&trace_id).into_response());
+        return Ok(circuit_breaker_error(&trace_id, count).into_response());
     }
 
     let config = state.config.load();
@@ -114,6 +114,7 @@ async fn handle_messages(
             trace_id,
             model,
             session_id,
+            trace_token,
             start,
         );
     }
@@ -122,9 +123,16 @@ async fn handle_messages(
         .bytes()
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let tokens = extract_tokens_from_body(&resp_body);
-    let cache_creation = extract_cache_creation_tokens(&resp_body);
-    let cache_read = extract_cache_read_tokens(&resp_body);
+    let usage = extract_usage_from_body(&resp_body);
+    let metering = if usage.is_some() {
+        kyris_core::record::Metering::Available
+    } else {
+        kyris_core::record::Metering::Unavailable
+    };
+    let (tokens, cache_creation, cache_read) = match usage {
+        Some(u) => (u.tokens, u.cache_create, u.cache_read),
+        None => (TokenCounts::default(), 0, 0),
+    };
     let latency_ms = start.elapsed().as_millis() as i64;
 
     let cost = state.cost_calculator.calculate(
@@ -143,11 +151,18 @@ async fn handle_messages(
         },
     );
 
-    if let Some(ref sid) = session_id {
-        let total = tokens.input + tokens.output;
-        let max = state.config.load().circuit_breaker.max_tokens as i64;
-        state.circuit_breaker.record_tokens(sid, total, max);
+    {
+        let config = state.config.load();
+        if config.circuit_breaker.enabled {
+            let total = tokens.input + tokens.output;
+            let max = config.circuit_breaker.max_tokens as i64;
+            state.circuit_breaker.record_tokens(&session_id, total, max);
+        }
     }
+
+    let working_dir = trace_token
+        .as_deref()
+        .and_then(|token| super::relay_trace_attach(&state, token, &trace_id));
 
     let _ = state.stats_tx.try_send(StatsEvent {
         trace_id: trace_id.clone(),
@@ -163,12 +178,12 @@ async fn handle_messages(
         } else {
             "error".to_string()
         },
-        session_id: session_id.clone(),
+        session_id: Some(session_id.clone()),
         mcp_server: None,
         mcp_tool: None,
+        metering,
+        working_dir,
     });
-
-    crate::trace_attach::spawn_trace_attach(trace_id.clone(), model);
 
     let mut builder = Response::builder().status(status);
     for (key, value) in &resp_headers {
@@ -189,7 +204,8 @@ fn relay_sse_stream(
     resp_headers: HeaderMap,
     trace_id: String,
     model: String,
-    session_id: Option<String>,
+    session_id: String,
+    trace_token: Option<String>,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(StreamTokenCounts::default()));
@@ -202,10 +218,10 @@ fn relay_sse_stream(
         let line_buf = line_buf.clone();
         let breaker_tripped = breaker_tripped.clone();
         let state = state.clone();
-        let session_id = session_id.clone();
 
-        response.bytes_stream().map(move |chunk_result| {
-            match chunk_result {
+        response
+            .bytes_stream()
+            .map(move |chunk_result| match chunk_result {
                 Ok(chunk) => {
                     if let Ok(text) = std::str::from_utf8(&chunk) {
                         let mut buf = line_buf.lock().expect("lock line buffer");
@@ -225,8 +241,7 @@ fn relay_sse_stream(
                         *buf = remainder.to_string();
                     }
 
-                    // Check circuit breaker mid-stream
-                    if let Some(ref _sid) = session_id {
+                    {
                         let acc = accumulated.lock().expect("lock accumulated");
                         let total = acc.tokens.input + acc.tokens.output;
                         let max = state.config.load().circuit_breaker.max_tokens as i64;
@@ -237,7 +252,7 @@ fn relay_sse_stream(
                                 "type": "error",
                                 "error": {
                                     "type": "circuit_breaker",
-                                    "message": "Circuit breaker: token limit exceeded."
+                                    "message": circuit_breaker_message(total),
                                 }
                             });
                             let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
@@ -250,8 +265,7 @@ fn relay_sse_stream(
                     Ok(chunk)
                 }
                 Err(e) => Err(e),
-            }
-        })
+            })
     };
 
     let mut relay = Box::pin(relay);
@@ -306,31 +320,44 @@ fn relay_sse_stream(
 
             let mut breaker_chunk = None;
             let mut status = "success";
-            if let Some(ref sid) = session_id {
-                let total = tokens.input + tokens.output;
-                let max = state.config.load().circuit_breaker.max_tokens as i64;
-                if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                    state.circuit_breaker.record_tokens(sid, total, max);
-                    status = "error";
-                } else if total > max {
-                    state.circuit_breaker.record_tokens(sid, total, max);
-                    breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                    status = "error";
-                    if emit_breaker_chunk {
-                        let payload = serde_json::json!({
-                            "type": "error",
-                            "error": {
-                                "type": "circuit_breaker",
-                                "message": "Circuit breaker: token limit exceeded."
-                            }
-                        });
-                        let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
-                        breaker_chunk = Some(Bytes::from(err_chunk));
+            {
+                let config = state.config.load();
+                if config.circuit_breaker.enabled {
+                    let total = tokens.input + tokens.output;
+                    let max = config.circuit_breaker.max_tokens as i64;
+                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
+                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                        status = "error";
+                    } else if total > max {
+                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        status = "error";
+                        if emit_breaker_chunk {
+                            let payload = serde_json::json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "circuit_breaker",
+                                    "message": circuit_breaker_message(total),
+                                }
+                            });
+                            let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
+                            breaker_chunk = Some(Bytes::from(err_chunk));
+                        }
+                    } else {
+                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
-                } else {
-                    state.circuit_breaker.record_tokens(sid, total, max);
                 }
             }
+
+            let stream_metering = if tokens.input == 0 && tokens.output == 0 {
+                kyris_core::record::Metering::Unavailable
+            } else {
+                kyris_core::record::Metering::Available
+            };
+
+            let working_dir = trace_token
+                .as_deref()
+                .and_then(|token| super::relay_trace_attach(&state, token, &trace_id_for_stream));
 
             let _ = state.stats_tx.try_send(StatsEvent {
                 trace_id: trace_id_for_stream.clone(),
@@ -342,15 +369,12 @@ fn relay_sse_stream(
                 cost,
                 latency_ms,
                 status: status.to_string(),
-                session_id: session_id_for_stream.clone(),
+                session_id: Some(session_id_for_stream.clone()),
                 mcp_server: None,
                 mcp_tool: None,
+                metering: stream_metering,
+                working_dir,
             });
-
-            crate::trace_attach::spawn_trace_attach(
-                trace_id_for_stream.clone(),
-                model_for_stream.clone(),
-            );
 
             breaker_chunk
         };
@@ -460,31 +484,26 @@ async fn handle_count_tokens(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-fn extract_tokens_from_body(body: &[u8]) -> TokenCounts {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return TokenCounts::default();
-    };
-    let usage = &v["usage"];
-    TokenCounts {
-        input: usage["input_tokens"].as_i64().unwrap_or(0),
-        output: usage["output_tokens"].as_i64().unwrap_or(0),
+struct BodyUsage {
+    tokens: TokenCounts,
+    cache_create: i64,
+    cache_read: i64,
+}
+
+fn extract_usage_from_body(body: &[u8]) -> Option<BodyUsage> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = v.get("usage")?;
+    if usage.is_null() {
+        return None;
     }
-}
-
-fn extract_cache_creation_tokens(body: &[u8]) -> i64 {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return 0;
-    };
-    v["usage"]["cache_creation_input_tokens"]
-        .as_i64()
-        .unwrap_or(0)
-}
-
-fn extract_cache_read_tokens(body: &[u8]) -> i64 {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return 0;
-    };
-    v["usage"]["cache_read_input_tokens"].as_i64().unwrap_or(0)
+    Some(BodyUsage {
+        tokens: TokenCounts {
+            input: usage["input_tokens"].as_i64().unwrap_or(0),
+            output: usage["output_tokens"].as_i64().unwrap_or(0),
+        },
+        cache_create: usage["cache_creation_input_tokens"].as_i64().unwrap_or(0),
+        cache_read: usage["cache_read_input_tokens"].as_i64().unwrap_or(0),
+    })
 }
 
 /// Extract token information from a single SSE data JSON payload (Anthropic format).
@@ -517,23 +536,29 @@ pub fn extract_tokens_from_sse_json(json: &str) -> Option<StreamTokenCounts> {
     }
 }
 
-fn circuit_breaker_error(trace_id: &str) -> axum::Json<serde_json::Value> {
+fn circuit_breaker_message(token_count: i64) -> String {
+    format!(
+        "Circuit breaker: {token_count} tokens consumed in this session without human input. Run 'kyris continue' to resume."
+    )
+}
+
+fn circuit_breaker_error(trace_id: &str, token_count: i64) -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
         "type": "error",
         "error": {
             "type": "circuit_breaker",
-            "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume."
+            "message": circuit_breaker_message(token_count),
         },
         "x-kyris-trace-id": trace_id,
     }))
 }
 
-fn circuit_breaker_sse_error(trace_id: &str) -> Response {
+fn circuit_breaker_sse_error(trace_id: &str, token_count: i64) -> Response {
     let payload = serde_json::json!({
         "type": "error",
         "error": {
             "type": "circuit_breaker",
-            "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume."
+            "message": circuit_breaker_message(token_count),
         },
         "x-kyris-trace-id": trace_id,
     });
@@ -566,43 +591,52 @@ mod tests {
     };
 
     #[test]
-    fn testExtractTokensFromBody() {
-        let body = br#"{"usage":{"input_tokens":100,"output_tokens":50}}"#;
-        let tokens = extract_tokens_from_body(body);
-        assert_eq!(tokens.input, 100);
-        assert_eq!(tokens.output, 50);
+    fn testExtractUsageFromBody() {
+        let body = br#"{"usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":20,"cache_read_input_tokens":10}}"#;
+        let usage = extract_usage_from_body(body).unwrap();
+        assert_eq!(usage.tokens.input, 100);
+        assert_eq!(usage.tokens.output, 50);
+        assert_eq!(usage.cache_create, 20);
+        assert_eq!(usage.cache_read, 10);
     }
 
     #[test]
-    fn testExtractTokensFromInvalidBody() {
+    fn testExtractUsageFromInvalidBody() {
         let body = b"not json";
-        let tokens = extract_tokens_from_body(body);
-        assert_eq!(tokens.input, 0);
-        assert_eq!(tokens.output, 0);
+        assert!(extract_usage_from_body(body).is_none());
     }
 
     #[test]
-    fn testExtractTokensFromEmptyUsage() {
+    fn testExtractUsageFromMissingUsage() {
+        let body = br#"{"id":"msg_123"}"#;
+        assert!(extract_usage_from_body(body).is_none());
+    }
+
+    #[test]
+    fn testExtractUsageFromNullUsage() {
+        let body = br#"{"usage":null}"#;
+        assert!(extract_usage_from_body(body).is_none());
+    }
+
+    #[test]
+    fn testExtractUsageFromEmptyUsage() {
         let body = br#"{"usage":{}}"#;
-        let tokens = extract_tokens_from_body(body);
-        assert_eq!(tokens.input, 0);
-        assert_eq!(tokens.output, 0);
+        let usage = extract_usage_from_body(body).unwrap();
+        assert_eq!(usage.tokens.input, 0);
+        assert_eq!(usage.tokens.output, 0);
     }
 
     #[test]
     fn testExtractSessionId() {
         let mut headers = HeaderMap::new();
         headers.insert("x-kyris-session-id", "sess-123".parse().unwrap());
-        assert_eq!(
-            super::super::extract_session_id(&headers),
-            Some("sess-123".to_string())
-        );
+        assert_eq!(super::super::extract_session_id(&headers), "sess-123");
     }
 
     #[test]
-    fn testExtractSessionIdMissing() {
+    fn testExtractSessionIdMissingFallsBackToDefault() {
         let headers = HeaderMap::new();
-        assert_eq!(super::super::extract_session_id(&headers), None);
+        assert_eq!(super::super::extract_session_id(&headers), "__default");
     }
 
     #[test]
@@ -627,25 +661,6 @@ mod tests {
     fn testExtractTokensFromSSEContentDelta() {
         let json = r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}"#;
         assert!(extract_tokens_from_sse_json(json).is_none());
-    }
-
-    #[test]
-    fn testExtractCacheCreationTokens() {
-        let body = br#"{"usage":{"cache_creation_input_tokens":200}}"#;
-        assert_eq!(extract_cache_creation_tokens(body), 200);
-    }
-
-    #[test]
-    fn testExtractCacheReadTokens() {
-        let body = br#"{"usage":{"cache_read_input_tokens":100}}"#;
-        assert_eq!(extract_cache_read_tokens(body), 100);
-    }
-
-    #[test]
-    fn testExtractCacheTokensMissing() {
-        let body = br#"{"usage":{"input_tokens":10}}"#;
-        assert_eq!(extract_cache_creation_tokens(body), 0);
-        assert_eq!(extract_cache_read_tokens(body), 0);
     }
 
     #[test]
@@ -1076,6 +1091,7 @@ mod tests {
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
+            agentpact_socket: None,
         });
         (state, stats_rx)
     }

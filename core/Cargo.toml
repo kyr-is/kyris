@@ -6,13 +6,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared types for the Kyris workspace: events, records, sync protocol, config schema, pricing"
+description = "Shared library for the Kyris workspace: re-exports kyris-types, adds I/O helpers (config loading, env overrides, AgentPact protocol, project config discovery)"
 
 [dependencies]
+kyris-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 serde-saphyr = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

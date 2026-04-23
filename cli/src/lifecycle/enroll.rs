@@ -51,7 +51,7 @@ fn enroll(args: EnrollArgs) -> Result<(), String> {
     let relay_url = resolve_relay_url(&args, &config)?;
     let existing_credentials = load_credentials()?;
     if config.sync.relay_url != relay_url {
-        config.sync.relay_url = relay_url.clone();
+        config.sync.relay_url.clone_from(&relay_url);
     }
 
     let github_client_id = std::env::var("GITHUB_CLIENT_ID")
@@ -226,10 +226,10 @@ fn machine_metadata() -> EnrollmentRequest {
 }
 
 fn hostname() -> String {
-    if let Ok(value) = std::env::var("HOSTNAME") {
-        if !value.trim().is_empty() {
-            return value;
-        }
+    if let Ok(value) = std::env::var("HOSTNAME")
+        && !value.trim().is_empty()
+    {
+        return value;
     }
 
     std::process::Command::new("hostname")
@@ -336,7 +336,6 @@ fn resolve_relay_url(
         .relay_url
         .clone()
         .or_else(|| std::env::var("KYRIS_RELAY_URL").ok())
-        .or_else(|| std::env::var("KYRISO_SYNC_RELAY_URL").ok())
         .unwrap_or_else(|| config.sync.relay_url.clone())
         .trim()
         .trim_end_matches('/')

@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use notify_debouncer_mini::new_debouncer;
+
 use kyris_core::sync::SyncCursor;
 
 use super::event_sync::{EventSyncer, send_batch};
@@ -63,22 +65,56 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
     let scope = config.sync.scope.clone();
     let log_dir = agentpact_log_dir();
 
-    let mut syncer = EventSyncer::new(cursor, scope, log_dir);
+    let mut syncer = EventSyncer::new(cursor, scope, log_dir.clone());
     let client = reqwest::Client::new();
 
-    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let debounce_duration = Duration::from_secs(1);
+
+    if log_dir.exists() {
+        let fs_tx_clone = fs_tx.clone();
+        match new_debouncer(debounce_duration, move |_res| {
+            let _ = fs_tx_clone.try_send(());
+        }) {
+            Ok(mut debouncer) => {
+                if let Err(e) = debouncer
+                    .watcher()
+                    .watch(&log_dir, notify::RecursiveMode::NonRecursive)
+                {
+                    tracing::warn!(error = %e, "failed to watch log dir, falling back to poll");
+                } else {
+                    // Leak the debouncer so it lives for the process lifetime.
+                    // The sync loop runs for the entire daemon lifetime, so this is intentional.
+                    std::mem::forget(debouncer);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create file watcher, falling back to poll");
+            }
+        }
+    }
+
+    let flush_interval = Duration::from_mins(1);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = fs_rx.recv() => {}
+            () = tokio::time::sleep(flush_interval) => {}
+        }
 
         syncer.check_rotation();
-        let events = syncer.read_new_events();
+        let (events, new_offset) = syncer.read_new_events();
+        let kyrisd_records = filter_records_in_scope(&syncer, fetch_unsynced_records(&state));
+        let synced_record_ids = kyrisd_records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
 
-        if events.is_empty() {
+        if events.is_empty() && kyrisd_records.is_empty() {
+            syncer.commit_read(new_offset);
             continue;
         }
 
-        let kyrisd_records = fetch_unsynced_records(&state);
         let batch = syncer.build_batch(events, &credentials.machine_id, kyrisd_records);
 
         match send_batch(
@@ -91,6 +127,7 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
         .await
         {
             Ok(()) => {
+                syncer.commit_read(new_offset);
                 let cursor = syncer.cursor();
                 if let Err(e) = state
                     .db
@@ -98,14 +135,18 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
                 {
                     tracing::warn!(error = %e, "failed to persist sync cursor");
                 }
+                if let Err(e) = state.db.mark_records_synced(&synced_record_ids) {
+                    tracing::warn!(error = %e, "failed to mark synced kyrisd records");
+                }
                 tracing::debug!(
                     batch_id = %batch.batch_id,
                     events = batch.events.len(),
+                    kyrisd_records = synced_record_ids.len(),
                     "sync batch sent"
                 );
             }
             Err(e) => {
-                tracing::warn!(error = %e, "relay sync failed");
+                tracing::warn!(error = %e, "relay sync failed — will retry from same offset");
                 crate::notify::relay_sync_error_toast(&e);
                 crate::tray::set_state(crate::tray::TrayState::RelayDisconnected);
             }
@@ -119,8 +160,9 @@ fn fetch_unsynced_records(state: &AppState) -> Vec<kyris_core::record::GatewayRe
             .prepare(
                 "SELECT id, trace_id, timestamp, provider, model, \
                  tokens_in, tokens_out, tokens_cache_create, tokens_cache_read, \
-                 cost_usd, latency_ms, status, session_id, cached, mcp_server, mcp_tool \
-                 FROM gateway_records WHERE cached = false ORDER BY timestamp LIMIT 500",
+                 cost_usd, latency_ms, status, session_id, synced, mcp_server, mcp_tool, \
+                 working_dir, metering \
+                 FROM gateway_records WHERE synced = false AND working_dir IS NOT NULL ORDER BY timestamp LIMIT 500",
             )
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "prepare unsynced records query failed");
@@ -133,6 +175,11 @@ fn fetch_unsynced_records(state: &AppState) -> Vec<kyris_core::record::GatewayRe
                 let status = status_str
                     .parse::<kyris_core::record::RecordStatus>()
                     .unwrap_or(kyris_core::record::RecordStatus::Success);
+                let metering_str: String = row.get(17)?;
+                let metering = match metering_str.as_str() {
+                    "unavailable" => kyris_core::record::Metering::Unavailable,
+                    _ => kyris_core::record::Metering::Available,
+                };
                 Ok(kyris_core::record::GatewayRecord {
                     id: row.get(0)?,
                     trace_id: row.get(1)?,
@@ -147,11 +194,11 @@ fn fetch_unsynced_records(state: &AppState) -> Vec<kyris_core::record::GatewayRe
                     latency_ms: row.get(10)?,
                     status,
                     session_id: row.get(12)?,
-                    cached: row.get(13)?,
+                    synced: row.get(13)?,
                     mcp_server: row.get(14)?,
                     mcp_tool: row.get(15)?,
-                    metering: kyris_core::record::Metering::default(),
-                    working_dir: None,
+                    metering,
+                    working_dir: row.get(16)?,
                 })
             })
             .ok();
@@ -163,13 +210,131 @@ fn fetch_unsynced_records(state: &AppState) -> Vec<kyris_core::record::GatewayRe
     })
 }
 
+fn filter_records_in_scope(
+    syncer: &EventSyncer,
+    records: Vec<kyris_core::record::GatewayRecord>,
+) -> Vec<kyris_core::record::GatewayRecord> {
+    records
+        .into_iter()
+        .filter(|record| syncer.is_in_scope(record.working_dir.as_deref()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kyris_core::record::{GatewayRecord, Metering, RecordStatus};
+    use std::io::Write;
+
+    fn sample_gateway_record(id: &str, working_dir: Option<&str>) -> GatewayRecord {
+        GatewayRecord {
+            id: id.to_string(),
+            trace_id: format!("trace-{id}"),
+            timestamp: "2026-04-20T00:00:00Z".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-4-opus".to_string(),
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            tokens_cache_create: None,
+            tokens_cache_read: None,
+            cost_usd: Some(0.01),
+            latency_ms: 250,
+            status: RecordStatus::Success,
+            session_id: None,
+            synced: false,
+            mcp_server: None,
+            mcp_tool: None,
+            metering: Metering::Available,
+            working_dir: working_dir.map(str::to_string),
+        }
+    }
 
     #[test]
     fn testAgentpactLogDir() {
         let dir = agentpact_log_dir();
         assert!(dir.to_string_lossy().ends_with(".agentpact/log"));
+    }
+
+    #[test]
+    fn testLoadCredentialsValidFile() {
+        let dir = tempfile::tempdir().unwrap();
+        let kyris_dir = dir.path().join(".kyris");
+        std::fs::create_dir_all(&kyris_dir).unwrap();
+        let cred_path = kyris_dir.join("credentials.json");
+        let mut f = std::fs::File::create(&cred_path).unwrap();
+        writeln!(f, r#"{{"machine_id":"m-123","machine_token":"tok-abc"}}"#).unwrap();
+
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        let creds = load_credentials().unwrap();
+        assert_eq!(creds.machine_id, "m-123");
+        assert_eq!(creds.machine_token, "tok-abc");
+    }
+
+    #[test]
+    fn testLoadCredentialsMissingMachineId() {
+        let dir = tempfile::tempdir().unwrap();
+        let kyris_dir = dir.path().join(".kyris");
+        std::fs::create_dir_all(&kyris_dir).unwrap();
+        let cred_path = kyris_dir.join("credentials.json");
+        std::fs::write(&cred_path, r#"{"machine_token":"tok-abc"}"#).unwrap();
+
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        assert!(load_credentials().is_none());
+    }
+
+    #[test]
+    fn testLoadCredentialsMissingFile() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        assert!(load_credentials().is_none());
+    }
+
+    #[test]
+    fn testLoadCredentialsInvalidJson() {
+        let dir = tempfile::tempdir().unwrap();
+        let kyris_dir = dir.path().join(".kyris");
+        std::fs::create_dir_all(&kyris_dir).unwrap();
+        let cred_path = kyris_dir.join("credentials.json");
+        std::fs::write(&cred_path, "not valid json {{{").unwrap();
+
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        assert!(load_credentials().is_none());
+    }
+
+    #[test]
+    fn testLoadCredentialsNonStringValues() {
+        let dir = tempfile::tempdir().unwrap();
+        let kyris_dir = dir.path().join(".kyris");
+        std::fs::create_dir_all(&kyris_dir).unwrap();
+        let cred_path = kyris_dir.join("credentials.json");
+        std::fs::write(&cred_path, r#"{"machine_id":123,"machine_token":"tok"}"#).unwrap();
+
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        assert!(load_credentials().is_none());
+    }
+
+    #[test]
+    fn testFilterRecordsInScope() {
+        let dir = tempfile::tempdir().unwrap();
+        let syncer = EventSyncer::new(
+            SyncCursor {
+                filename: "events.jsonl".to_string(),
+                byte_offset: 0,
+            },
+            vec!["/work/*".to_string()],
+            dir.path().to_path_buf(),
+        );
+
+        let filtered = filter_records_in_scope(
+            &syncer,
+            vec![
+                sample_gateway_record("a", Some("/work/project")),
+                sample_gateway_record("b", Some("/personal/project")),
+                sample_gateway_record("c", None),
+            ],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "a");
     }
 }

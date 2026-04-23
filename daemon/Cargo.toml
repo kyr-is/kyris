@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 kyris-core = { workspace = true }
+kyris-agentpact-client = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "signal", "macros", "io-util", "time"] }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -57,10 +58,6 @@ harness = false
 
 [[bench]]
 name = "token_accumulate"
-harness = false
-
-[[bench]]
-name = "project_config_resolve"
 harness = false
 
 [[bench]]

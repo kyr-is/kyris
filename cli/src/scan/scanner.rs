@@ -20,9 +20,9 @@ pub enum FindingCategory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 pub enum Severity {
     Info = 0,
+    #[allow(dead_code)]
     Low = 2,
     Medium = 4,
     High = 7,

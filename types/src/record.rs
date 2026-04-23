@@ -17,7 +17,7 @@ pub struct GatewayRecord {
     pub status: RecordStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    pub cached: bool,
+    pub synced: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,9 +85,11 @@ CREATE TABLE IF NOT EXISTS gateway_records (
     latency_ms  INTEGER NOT NULL,
     status      VARCHAR NOT NULL,
     session_id  VARCHAR,
-    cached      BOOLEAN NOT NULL DEFAULT FALSE,
+    synced      BOOLEAN NOT NULL DEFAULT FALSE,
     mcp_server  VARCHAR,
-    mcp_tool    VARCHAR
+    mcp_tool    VARCHAR,
+    working_dir VARCHAR,
+    metering    VARCHAR NOT NULL DEFAULT 'available'
 )";
 
 pub const CREATE_SESSION_TOKENS: &str = "\
@@ -141,7 +143,7 @@ mod tests {
             latency_ms: 250,
             status: RecordStatus::Success,
             session_id: Some("sess-1".to_string()),
-            cached: false,
+            synced: false,
             mcp_server: None,
             mcp_tool: None,
             metering: Metering::Available,
@@ -170,7 +172,7 @@ mod tests {
             latency_ms: 100,
             status: RecordStatus::Error,
             session_id: None,
-            cached: false,
+            synced: false,
             mcp_server: None,
             mcp_tool: None,
             metering: Metering::Unavailable,

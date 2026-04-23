@@ -15,9 +15,6 @@ pub struct ServiceState {
 }
 
 pub fn start_service(kind: ServiceKind) -> Result<(), String> {
-    if service_management_disabled() {
-        return Ok(());
-    }
     if let Some(prefix) = homebrew_prefix_for(kind) {
         run_command(
             "brew",
@@ -39,9 +36,6 @@ pub fn start_service(kind: ServiceKind) -> Result<(), String> {
 }
 
 pub fn stop_service(kind: ServiceKind) -> Result<(), String> {
-    if service_management_disabled() {
-        return Ok(());
-    }
     if let Some(prefix) = homebrew_prefix_for(kind) {
         run_command(
             "brew",
@@ -55,9 +49,6 @@ pub fn stop_service(kind: ServiceKind) -> Result<(), String> {
 }
 
 pub fn restart_service(kind: ServiceKind) -> Result<(), String> {
-    if service_management_disabled() {
-        return Ok(());
-    }
     if let Some(prefix) = homebrew_prefix_for(kind) {
         run_command(
             "brew",
@@ -71,9 +62,6 @@ pub fn restart_service(kind: ServiceKind) -> Result<(), String> {
 }
 
 pub fn service_state(kind: ServiceKind) -> ServiceState {
-    if service_management_disabled() {
-        return ServiceState::default();
-    }
     let homebrew_status = brew_service_status(kind);
     let launchd_loaded = std::process::Command::new("launchctl")
         .args(["print", &format!("gui/{}/{}", uid(), kind.launchd_label())])
@@ -85,17 +73,6 @@ pub fn service_state(kind: ServiceKind) -> ServiceState {
         homebrew_status,
         launchd_loaded,
     }
-}
-
-fn service_management_disabled() -> bool {
-    env_flag("KYRIS_TEST_DISABLE_SERVICE_MANAGEMENT")
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-    })
 }
 
 pub fn candidate_log_paths(kind: ServiceKind) -> Vec<PathBuf> {
@@ -215,8 +192,8 @@ impl ServiceKind {
 
     fn launchd_label(self) -> &'static str {
         match self {
-            Self::Kyrisd => "so.kyri.kyrisd",
-            Self::Agentpactd => "so.kyri.agentpactd",
+            Self::Kyrisd => "is.kyr.kyrisd",
+            Self::Agentpactd => "is.kyr.agentpactd",
         }
     }
 

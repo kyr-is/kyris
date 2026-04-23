@@ -55,10 +55,10 @@ set -eu
 printf '%s\n' "$*" >> "${KYRIS_TEST_LAUNCHCTL_LOG:?}"
 if [ "${1-}" = "print" ]; then
   case "${2-}" in
-    *so.kyri.kyrisd)
+    *is.kyr.kyrisd)
       [ "${KYRIS_TEST_LAUNCHCTL_PRINT_KYRISD:-0}" = "1" ] && exit 0 || exit 1
       ;;
-    *so.kyri.agentpactd)
+    *is.kyr.agentpactd)
       [ "${KYRIS_TEST_LAUNCHCTL_PRINT_AGENTPACTD:-0}" = "1" ] && exit 0 || exit 1
       ;;
   esac
@@ -118,6 +118,9 @@ fn test_install_skips_local_kyrisd_when_homebrew_managed() {
     fs::write(&which_log, "").expect("write which log");
     fs::write(temp_home.path().join(".zshrc"), "# zsh\n").expect("write .zshrc");
     fs::write(temp_home.path().join(".bashrc"), "# bash\n").expect("write .bashrc");
+    let kyris_bin = temp_home.path().join(".kyris").join("bin");
+    fs::create_dir_all(&kyris_bin).expect("create .kyris/bin");
+    fs::write(kyris_bin.join("agentpactd"), "").expect("write fake agentpactd");
     write_fake_brew(shim_bin.path());
     write_fake_launchctl(shim_bin.path());
     write_fake_which(shim_bin.path());
@@ -256,7 +259,7 @@ fn test_daemon_stop_uses_launchctl_for_launchd_managed_kyrisd() {
         "{launchctl_log_contents}"
     );
     assert!(
-        launchctl_log_contents.contains("so.kyri.kyrisd"),
+        launchctl_log_contents.contains("is.kyr.kyrisd"),
         "{launchctl_log_contents}"
     );
 }

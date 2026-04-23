@@ -51,7 +51,6 @@ fn run_enroll(home: &Path, fake_bin_dir: &Path, base_url: &str) -> std::process:
             format!("{base_url}/login/oauth/access_token"),
         )
         .env("KYRIS_TEST_DISABLE_BROWSER_OPEN", "1")
-        .env("KYRIS_TEST_DISABLE_SERVICE_MANAGEMENT", "1")
         .arg("enroll")
         .arg("--force")
         .arg("--relay-url")
@@ -79,6 +78,7 @@ fn spawn_mock_server() -> (
         while served < 3 {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).expect("set stream blocking");
                     served += 1;
                     let request = read_request(&mut stream);
                     let response_body = match request.path.as_str() {

@@ -5,9 +5,11 @@ use std::path::{Path, PathBuf};
 use kyris_core::event::Event;
 use kyris_core::sync::{EventBatch, SyncCursor};
 
+use super::scope::SyncScope;
+
 pub struct EventSyncer {
     cursor: SyncCursor,
-    scope: Vec<String>,
+    scope: SyncScope,
     log_dir: PathBuf,
 }
 
@@ -15,7 +17,7 @@ impl EventSyncer {
     pub fn new(cursor: SyncCursor, scope: Vec<String>, log_dir: PathBuf) -> Self {
         Self {
             cursor,
-            scope,
+            scope: SyncScope::new(scope),
             log_dir,
         }
     }
@@ -30,18 +32,10 @@ impl EventSyncer {
     }
 
     pub fn is_in_scope(&self, working_dir: Option<&str>) -> bool {
-        let Some(dir) = working_dir else {
-            return false;
-        };
-        if self.scope.is_empty() {
-            return false;
-        }
-        self.scope
-            .iter()
-            .any(|pattern| super::scope::matches_scope(pattern, dir))
+        self.scope.is_in_scope(working_dir)
     }
 
-    pub fn read_new_events(&mut self) -> Vec<Event> {
+    pub fn read_new_events(&mut self) -> (Vec<Event>, u64) {
         let file_path = self.log_dir.join(&self.cursor.filename);
         let mut events = Vec::new();
 
@@ -50,13 +44,13 @@ impl EventSyncer {
                 self.cursor.filename = oldest;
                 self.cursor.byte_offset = 0;
             } else {
-                return events;
+                return (events, self.cursor.byte_offset);
             }
         }
 
         let file_path = self.log_dir.join(&self.cursor.filename);
         let Ok(file) = std::fs::File::open(&file_path) else {
-            return events;
+            return (events, self.cursor.byte_offset);
         };
 
         let mut reader = std::io::BufReader::new(file);
@@ -64,7 +58,7 @@ impl EventSyncer {
             .seek(SeekFrom::Start(self.cursor.byte_offset))
             .is_err()
         {
-            return events;
+            return (events, self.cursor.byte_offset);
         }
 
         let mut line = String::new();
@@ -87,8 +81,11 @@ impl EventSyncer {
         }
 
         let new_offset = reader.stream_position().unwrap_or(self.cursor.byte_offset);
-        self.cursor.byte_offset = new_offset;
-        events
+        (events, new_offset)
+    }
+
+    pub fn commit_read(&mut self, byte_offset: u64) {
+        self.cursor.byte_offset = byte_offset;
     }
 
     pub fn check_rotation(&mut self) -> bool {
@@ -98,12 +95,12 @@ impl EventSyncer {
             // Active file was rotated out from under us — it no longer exists but a
             // new active file has been created (or will be shortly). Find the oldest
             // dated file to continue reading from, or stay put if nothing rotated.
-            if !active.exists() {
-                if let Some(oldest) = find_oldest_log_file(&self.log_dir) {
-                    self.cursor.filename = oldest;
-                    self.cursor.byte_offset = 0;
-                    return true;
-                }
+            if !active.exists()
+                && let Some(oldest) = find_oldest_log_file(&self.log_dir)
+            {
+                self.cursor.filename = oldest;
+                self.cursor.byte_offset = 0;
+                return true;
             }
             return false;
         }
@@ -136,7 +133,10 @@ impl EventSyncer {
 }
 
 fn is_log_file(name: &str) -> bool {
-    name.ends_with(".jsonl") || name.ends_with(".jsonl.gz")
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        || name.ends_with(".jsonl.gz")
 }
 
 fn find_oldest_log_file(dir: &Path) -> Option<String> {
@@ -145,11 +145,7 @@ fn find_oldest_log_file(dir: &Path) -> Option<String> {
         .filter_map(std::result::Result::ok)
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if is_log_file(&name) {
-                Some(name)
-            } else {
-                None
-            }
+            if is_log_file(&name) { Some(name) } else { None }
         })
         .collect();
     log_files.sort();
@@ -252,10 +248,12 @@ mod tests {
         std::fs::write(&log_path, format!("{event_json}\n")).unwrap();
 
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
-        let events = syncer.read_new_events();
+        let (events, new_offset) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "evt-1");
-        assert!(syncer.cursor().byte_offset > 0);
+        assert!(new_offset > 0);
+        syncer.commit_read(new_offset);
+        assert_eq!(syncer.cursor().byte_offset, new_offset);
     }
 
     #[test]
@@ -284,7 +282,7 @@ mod tests {
         std::fs::write(&log_path, format!("{in_scope}\n{out_of_scope}\n")).unwrap();
 
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
-        let events = syncer.read_new_events();
+        let (events, _) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "evt-1");
     }
@@ -316,8 +314,9 @@ mod tests {
         std::fs::write(&log_path, format!("{evt1}\n{evt2}\n")).unwrap();
 
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
-        let events = syncer.read_new_events();
+        let (events, offset) = syncer.read_new_events();
         assert_eq!(events.len(), 2);
+        syncer.commit_read(offset);
 
         let evt3 = serde_json::json!({
             "id": "evt-3",
@@ -334,7 +333,7 @@ mod tests {
             .unwrap();
         writeln!(f, "{evt3}").unwrap();
 
-        let events = syncer.read_new_events();
+        let (events, _) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "evt-3");
     }
@@ -356,7 +355,7 @@ mod tests {
         std::fs::write(&log_path, format!("not json\n{valid}\n")).unwrap();
 
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
-        let events = syncer.read_new_events();
+        let (events, _) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
     }
 
@@ -364,7 +363,7 @@ mod tests {
     fn testReadNewEventsMissingFile() {
         let dir = tempfile::tempdir().unwrap();
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
-        let events = syncer.read_new_events();
+        let (events, _) = syncer.read_new_events();
         assert!(events.is_empty());
     }
 
@@ -487,6 +486,37 @@ mod tests {
         assert!(!is_log_file("events.json"));
     }
 
+    #[test]
+    fn testUncommittedReadRetriesSameEvents() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+
+        let evt = serde_json::json!({
+            "id": "evt-retry",
+            "timestamp": "2026-04-12T00:00:00Z",
+            "agent": "test",
+            "action": "execute",
+            "detail": "cmd",
+            "decision": "auto",
+            "working_dir": "/work/a"
+        });
+        std::fs::write(&log_path, format!("{evt}\n")).unwrap();
+
+        let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
+        let (events, _new_offset) = syncer.read_new_events();
+        assert_eq!(events.len(), 1);
+
+        // Simulate relay failure: don't call commit_read
+        let (events_retry, offset) = syncer.read_new_events();
+        assert_eq!(events_retry.len(), 1, "same events returned on retry");
+        assert_eq!(events_retry[0].id, "evt-retry");
+
+        // Now commit and verify no more events
+        syncer.commit_read(offset);
+        let (events_after, _) = syncer.read_new_events();
+        assert!(events_after.is_empty());
+    }
+
     #[tokio::test]
     async fn testSyncerBuildsAndPostsSignedBatchToMockRelay() {
         let dir = tempfile::tempdir().unwrap();
@@ -513,7 +543,8 @@ mod tests {
         std::fs::write(&log_path, format!("{in_scope}\n{out_of_scope}\n")).unwrap();
 
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
-        let events = syncer.read_new_events();
+        let (events, offset) = syncer.read_new_events();
+        syncer.commit_read(offset);
         assert_eq!(events.len(), 1);
         let batch = syncer.build_batch(events, "machine-1", vec![]);
 
@@ -657,7 +688,6 @@ mod tests {
 
     fn write_response(stream: &mut TcpStream, status_code: u16, body: &[u8]) {
         let status_text = match status_code {
-            200 => "OK",
             503 => "Service Unavailable",
             _ => "OK",
         };

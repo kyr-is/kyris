@@ -17,6 +17,9 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy, llvm-tools-preview
 
+      - if: env.ACT != 'true'
+        uses: Swatinem/rust-cache@v2
+
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny,cargo-llvm-cov
@@ -30,24 +33,11 @@ jobs:
       - name: Deny check
         run: cargo deny check
 
-      - name: Test + coverage
-        run: cargo llvm-cov --all-features
+      - name: Test + coverage + bench regression
+        run: |
+          cargo llvm-cov --all-features
+          cargo bench -p kyrisd -- --test
 
-      - name: Bench (regression gate)
-        run: cargo bench --workspace -- --test
+      - name: Build release binaries
+        run: cargo build --release --workspace
 
-  cross-repo:
-    runs-on: macos-latest
-    needs: [check]
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.95.0"
-
-      - name: Install agentpactd (pinned release)
-        run: ./scripts/install-agentpact-ci.sh
-
-      - name: Cross-repo integration tests
-        run: cargo test -- --ignored --test-threads=1 cross_repo

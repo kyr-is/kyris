@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use kyris_core::record::Metering;
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenCounts {
@@ -20,6 +21,8 @@ pub struct StatsEvent {
     pub session_id: Option<String>,
     pub mcp_server: Option<String>,
     pub mcp_tool: Option<String>,
+    pub metering: Metering,
+    pub working_dir: Option<String>,
 }
 
 #[cfg(test)]

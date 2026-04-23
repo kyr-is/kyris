@@ -78,10 +78,7 @@ fn test_status_reports_degraded_cline_policy() {
     fs::create_dir_all(&policy_dir).expect("create policy dir");
     fs::write(
         policy_dir.join("pact.yaml"),
-        r#"- action: execute
-  pattern: "rm -rf *"
-  decision: ask
-"#,
+        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"rm.-rf.*\": ask\n",
     )
     .expect("write pact policy");
 

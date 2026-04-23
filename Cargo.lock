@@ -2253,14 +2253,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kyris-agentpact-client"
+version = "0.1.0"
+dependencies = [
+ "kyris-core",
+ "serde_json",
+]
+
+[[package]]
 name = "kyris-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "kyris-types",
  "serde",
  "serde-saphyr",
  "serde_json",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2269,17 +2279,31 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
 name = "kyris-mcp"
 version = "0.1.0"
 dependencies = [
+ "kyris-agentpact-client",
  "kyris-core",
  "nix",
+ "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "kyris-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
 ]
 
 [[package]]
@@ -2295,6 +2319,7 @@ dependencies = [
  "criterion",
  "duckdb",
  "futures-util",
+ "kyris-agentpact-client",
  "kyris-core",
  "nix",
  "notify",
@@ -3610,9 +3635,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.12"
+version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8279bb85272c9f10811ae6a6c547ff594d6a7f3c6c6b02ee9726d1d0dcfcdd06"
+checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
  "ring",
  "rustls-pki-types",

@@ -1,19 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 use clap::Args;
 
-use crate::state::load_or_init_config;
-
 #[derive(Args)]
 pub struct ContinueArgs {
-    pub session: Option<String>,
+    pub session: String,
 }
 
 pub fn run(args: ContinueArgs) {
-    let config = load_or_init_config().unwrap_or_else(|error| {
-        eprintln!("{error}");
+    let conn = kyris_core::config::load_kyrisd_connection().unwrap_or_else(|| {
+        eprintln!("kyrisd not configured — run `kyris enroll` first");
         std::process::exit(1);
     });
-    let base_url = format!("http://{}", config.server.listen);
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -23,12 +20,9 @@ pub fn run(args: ContinueArgs) {
     rt.block_on(async {
         let client = reqwest::Client::new();
         let resp = client
-            .post(format!("{base_url}/api/circuit-breaker/reset"))
-            .header(
-                "authorization",
-                format!("Bearer {}", config.server.operator_key),
-            )
-            .json(&serde_json::json!({ "session_id": args.session }))
+            .post(format!("{}/api/circuit-breaker/reset", conn.base_url))
+            .header("authorization", format!("Bearer {}", conn.operator_key))
+            .json(&serde_json::json!({ "session_id": &args.session }))
             .send()
             .await;
 
@@ -37,7 +31,9 @@ pub fn run(args: ContinueArgs) {
                 println!("Circuit breaker reset. Session resumed.");
             }
             Ok(r) => {
-                eprintln!("Reset failed: {}", r.status());
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                eprintln!("Reset failed ({status}): {body}");
                 std::process::exit(1);
             }
             Err(e) => {

@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>so.kyri.kyrisd</string>
+    <string>is.kyr.kyrisd</string>
     <key>ProgramArguments</key>
     <array>
         <string>{{BINARY_PATH}}</string>

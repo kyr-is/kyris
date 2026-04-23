@@ -10,13 +10,11 @@ pub struct UninstallArgs {}
 pub fn run(_args: UninstallArgs) {
     println!("Reversing all install actions...");
 
-    for service in [ServiceKind::Kyrisd, ServiceKind::Agentpactd] {
-        let state = service_state(service);
-        if state.managed_by_homebrew || state.launchd_loaded {
-            match stop_service(service) {
-                Ok(()) => println!("Stopped {:?}", service),
-                Err(error) => eprintln!("Could not stop {:?}: {error}", service),
-            }
+    let state = service_state(ServiceKind::Kyrisd);
+    if state.managed_by_homebrew || state.launchd_loaded {
+        match stop_service(ServiceKind::Kyrisd) {
+            Ok(()) => println!("Stopped Kyrisd"),
+            Err(error) => eprintln!("Could not stop Kyrisd: {error}"),
         }
     }
 

@@ -10,7 +10,9 @@ fn bench_validate_key(c: &mut Criterion) {
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
-        HeaderValue::from_static("Bearer sk-kyris-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+        HeaderValue::from_static(
+            "Bearer sk-kyris-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ),
     );
     let expected = "sk-kyris-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

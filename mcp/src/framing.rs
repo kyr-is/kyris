@@ -17,4 +17,33 @@ mod tests {
         assert!(!is_tools_call(br#"{"method":"ping"}"#));
         assert!(!is_tools_call(b"not json"));
     }
+
+    #[test]
+    fn testIsToolsCallWithExtraFields() {
+        let msg = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"ls"}}}"#;
+        assert!(is_tools_call(msg));
+    }
+
+    #[test]
+    fn testIsToolsCallEmptyInput() {
+        assert!(!is_tools_call(b""));
+    }
+
+    #[test]
+    fn testIsToolsCallPartialMethodMatch() {
+        assert!(!is_tools_call(br#"{"method":"tools/call_result"}"#));
+        assert!(!is_tools_call(br#"{"method":"tools/list"}"#));
+    }
+
+    #[test]
+    fn testIsToolsCallNotificationWithoutId() {
+        let msg = br#"{"method":"tools/call","params":{"name":"test"}}"#;
+        assert!(is_tools_call(msg));
+    }
+
+    #[test]
+    fn testIsToolsCallMethodNotString() {
+        assert!(!is_tools_call(br#"{"method":42}"#));
+        assert!(!is_tools_call(br#"{"method":null}"#));
+    }
 }

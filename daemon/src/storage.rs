@@ -19,20 +19,26 @@ pub struct DuckDbWriter {
 }
 
 impl DuckDbWriter {
-    pub fn open(path: &Path) -> Self {
+    pub fn try_open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect("create database directory");
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create database directory {}: {e}", parent.display()))?;
         }
-        let conn = Connection::open(path).expect("open duckdb");
+        let conn =
+            Connection::open(path).map_err(|e| format!("open duckdb {}: {e}", path.display()))?;
         conn.execute_batch(kyris_core::record::CREATE_GATEWAY_RECORDS)
-            .expect("create gateway_records table");
+            .map_err(|e| format!("create gateway_records table: {e}"))?;
         conn.execute_batch(kyris_core::record::CREATE_SESSION_TOKENS)
-            .expect("create session_tokens table");
+            .map_err(|e| format!("create session_tokens table: {e}"))?;
         conn.execute_batch(kyris_core::record::CREATE_SYNC_CURSOR)
-            .expect("create sync_cursor table");
-        Self {
+            .map_err(|e| format!("create sync_cursor table: {e}"))?;
+        Ok(Self {
             conn: std::sync::Mutex::new(conn),
-        }
+        })
+    }
+
+    pub fn open(path: &Path) -> Self {
+        Self::try_open(path).unwrap_or_else(|e| panic!("{e}"))
     }
 
     pub fn insert_batch(&self, events: &[StatsEvent]) -> duckdb::Result<()> {
@@ -41,28 +47,44 @@ impl DuckDbWriter {
             "INSERT INTO gateway_records (
                 id, trace_id, timestamp, provider, model,
                 tokens_in, tokens_out, tokens_cache_create, tokens_cache_read,
-                cost_usd, latency_ms, status, session_id, cached, mcp_server, mcp_tool
-            ) VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?)",
+                cost_usd, latency_ms, status, session_id, synced, mcp_server, mcp_tool,
+                working_dir, metering
+            ) VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?, ?, ?)",
         )?;
         for event in events {
             let id = uuid::Uuid::now_v7().to_string();
-            let cache_create: Option<i64> = if event.cache_create > 0 {
-                Some(event.cache_create)
-            } else {
+            let unavailable = event.metering == kyris_core::record::Metering::Unavailable;
+            let tokens_in: Option<i64> = if unavailable {
                 None
+            } else {
+                Some(event.tokens.input)
             };
-            let cache_read: Option<i64> = if event.cache_read > 0 {
-                Some(event.cache_read)
-            } else {
+            let tokens_out: Option<i64> = if unavailable {
                 None
+            } else {
+                Some(event.tokens.output)
+            };
+            let cache_create: Option<i64> = if unavailable || event.cache_create == 0 {
+                None
+            } else {
+                Some(event.cache_create)
+            };
+            let cache_read: Option<i64> = if unavailable || event.cache_read == 0 {
+                None
+            } else {
+                Some(event.cache_read)
+            };
+            let metering_str = match event.metering {
+                kyris_core::record::Metering::Available => "available",
+                kyris_core::record::Metering::Unavailable => "unavailable",
             };
             stmt.execute(duckdb::params![
                 id,
                 event.trace_id,
                 event.provider,
                 event.model,
-                event.tokens.input,
-                event.tokens.output,
+                tokens_in,
+                tokens_out,
                 cache_create,
                 cache_read,
                 event.cost,
@@ -71,6 +93,8 @@ impl DuckDbWriter {
                 event.session_id,
                 event.mcp_server,
                 event.mcp_tool,
+                event.working_dir,
+                metering_str,
             ])?;
         }
         Ok(())
@@ -79,11 +103,9 @@ impl DuckDbWriter {
     pub fn prune(&self, retention_days: u64) -> duckdb::Result<usize> {
         let conn = self.conn.lock().expect("lock db");
         conn.execute(
-            &format!(
-                "DELETE FROM gateway_records \
-                 WHERE timestamp < now()::TIMESTAMP - INTERVAL '{retention_days} days'"
-            ),
-            [],
+            "DELETE FROM gateway_records \
+             WHERE timestamp < now()::TIMESTAMP - (INTERVAL '1 day' * ?::INTEGER)",
+            duckdb::params![retention_days as i32],
         )
     }
 
@@ -102,14 +124,23 @@ impl DuckDbWriter {
         )
     }
 
-    pub fn load_session_tokens(&self) -> Vec<(String, i64)> {
+    pub fn load_session_tokens(&self) -> Vec<(String, i64, std::time::Duration)> {
         let conn = self.conn.lock().expect("lock db");
         let mut stmt = conn
-            .prepare("SELECT session_id, total_tokens FROM session_tokens")
+            .prepare(
+                "SELECT session_id, total_tokens, \
+                 EXTRACT(EPOCH FROM (now()::TIMESTAMP - last_activity))::BIGINT as elapsed_secs \
+                 FROM session_tokens",
+            )
             .expect("prepare session_tokens query");
         let rows = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                let elapsed_secs: i64 = row.get(2)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    std::time::Duration::from_secs(elapsed_secs.max(0) as u64),
+                ))
             })
             .expect("query session_tokens");
         rows.filter_map(std::result::Result::ok).collect()
@@ -118,11 +149,9 @@ impl DuckDbWriter {
     pub fn prune_session_tokens(&self, idle_timeout_minutes: u64) -> duckdb::Result<usize> {
         let conn = self.conn.lock().expect("lock db");
         conn.execute(
-            &format!(
-                "DELETE FROM session_tokens \
-                 WHERE last_activity < now()::TIMESTAMP - INTERVAL '{idle_timeout_minutes} minutes'"
-            ),
-            [],
+            "DELETE FROM session_tokens \
+             WHERE last_activity < now()::TIMESTAMP - (INTERVAL '1 minute' * ?::INTEGER)",
+            duckdb::params![idle_timeout_minutes as i32],
         )
     }
 
@@ -149,6 +178,28 @@ impl DuckDbWriter {
         .ok()
     }
 
+    pub fn mark_records_synced(&self, record_ids: &[String]) -> duckdb::Result<()> {
+        if record_ids.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().expect("lock db");
+        let mut stmt = conn.prepare("UPDATE gateway_records SET synced = true WHERE id = ?")?;
+        for record_id in record_ids {
+            stmt.execute(duckdb::params![record_id])?;
+        }
+        Ok(())
+    }
+
+    pub fn probe_writable(&self) -> bool {
+        let conn = self.conn.lock().expect("lock db");
+        conn.execute_batch(
+            "CREATE TEMPORARY TABLE IF NOT EXISTS _health_probe (v INT); \
+             DROP TABLE IF EXISTS _health_probe",
+        )
+        .is_ok()
+    }
+
     pub fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Connection) -> R,
@@ -159,14 +210,20 @@ impl DuckDbWriter {
 }
 
 pub fn open_db() -> DuckDbWriter {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME").unwrap_or_else(|_| {
+        tracing::error!("HOME not set — cannot locate database directory");
+        std::process::exit(1);
+    });
     let path = PathBuf::from(format!("{home}/.kyris/kyrisd.duckdb"));
-    DuckDbWriter::open(&path)
+    DuckDbWriter::try_open(&path).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to open database");
+        std::process::exit(1);
+    })
 }
 
 pub async fn stats_writer(
     mut rx: mpsc::Receiver<StatsEvent>,
-    writer: DuckDbWriter,
+    writer: Arc<DuckDbWriter>,
     circuit_breaker: Arc<crate::circuit_breaker::CircuitBreaker>,
     stats_config: kyris_core::config::StatsConfig,
     session_idle_minutes: u64,
@@ -174,29 +231,26 @@ pub async fn stats_writer(
     let batch_size = stats_config.flush_batch_size;
     let retention_days = stats_config.retention_days;
     let mut batch: Vec<StatsEvent> = Vec::with_capacity(batch_size);
-    let mut flush_interval = tokio::time::interval(
-        std::time::Duration::from_millis(stats_config.flush_interval_ms),
-    );
+    let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(
+        stats_config.flush_interval_ms,
+    ));
     let mut prune_interval = tokio::time::interval(std::time::Duration::from_hours(1));
 
     loop {
         tokio::select! {
             recv = rx.recv() => {
-                match recv {
-                    Some(event) => {
-                        batch.push(event);
-                        if batch.len() >= batch_size {
-                            flush_batch(&writer, &mut batch);
-                            persist_session_tokens(&writer, &circuit_breaker);
-                        }
-                    }
-                    None => {
-                        if !batch.is_empty() {
-                            flush_batch(&writer, &mut batch);
-                        }
+                if let Some(event) = recv {
+                    batch.push(event);
+                    if batch.len() >= batch_size {
+                        flush_batch(&writer, &mut batch);
                         persist_session_tokens(&writer, &circuit_breaker);
-                        return;
                     }
+                } else {
+                    if !batch.is_empty() {
+                        flush_batch(&writer, &mut batch);
+                    }
+                    persist_session_tokens(&writer, &circuit_breaker);
+                    return;
                 }
             }
             _ = flush_interval.tick() => {
@@ -212,6 +266,7 @@ pub async fn stats_writer(
                 if let Err(e) = writer.prune_session_tokens(session_idle_minutes) {
                     tracing::warn!(error = %e, "prune session_tokens failed");
                 }
+                circuit_breaker.prune_idle(std::time::Duration::from_secs(session_idle_minutes * 60));
             }
         }
     }
@@ -259,6 +314,8 @@ mod tests {
             session_id: None,
             mcp_server: None,
             mcp_tool: None,
+            metering: kyris_core::record::Metering::Available,
+            working_dir: None,
         }
     }
 
@@ -310,7 +367,7 @@ mod tests {
             .upsert_session_tokens("sess-1", 200_000)
             .expect("upsert update");
         let sessions = writer.load_session_tokens();
-        let sess1 = sessions.iter().find(|(id, _)| id == "sess-1").unwrap();
+        let sess1 = sessions.iter().find(|(id, _, _)| id == "sess-1").unwrap();
         assert_eq!(sess1.1, 200_000);
     }
 
@@ -337,7 +394,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO gateway_records (
                     id, trace_id, timestamp, provider, model,
-                    tokens_in, tokens_out, cost_usd, latency_ms, status, cached
+                    tokens_in, tokens_out, cost_usd, latency_ms, status, synced
                 ) VALUES ('old-1', 'old-1', '2020-01-01 00:00:00', 'test', 'test',
                     0, 0, NULL, 100, 'success', false)",
                 [],
@@ -396,6 +453,51 @@ mod tests {
     }
 
     #[test]
+    fn testMarkRecordsSynced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.duckdb");
+        let writer = DuckDbWriter::open(&db_path);
+
+        writer
+            .insert_batch(&[sample_event("trace-sync-a"), sample_event("trace-sync-b")])
+            .expect("insert batch");
+
+        let record_ids: Vec<String> = writer.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT id FROM gateway_records ORDER BY trace_id")
+                .expect("prepare record query");
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .expect("query record ids");
+            rows.filter_map(std::result::Result::ok).collect()
+        });
+
+        writer
+            .mark_records_synced(&record_ids[..1])
+            .expect("mark synced");
+
+        let synced_rows: Vec<(String, bool)> = writer.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT trace_id, synced FROM gateway_records ORDER BY trace_id")
+                .expect("prepare synced query");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })
+                .expect("query synced rows");
+            rows.filter_map(std::result::Result::ok).collect()
+        });
+
+        assert_eq!(
+            synced_rows,
+            vec![
+                ("trace-sync-a".to_string(), true),
+                ("trace-sync-b".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
     fn testInsertBatchWithSessionAndMcpFields() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("test.duckdb");
@@ -417,6 +519,8 @@ mod tests {
             session_id: Some("sess-42".to_string()),
             mcp_server: Some("github".to_string()),
             mcp_tool: Some("read_file".to_string()),
+            metering: kyris_core::record::Metering::Available,
+            working_dir: Some("/tmp/project".to_string()),
         };
 
         writer
@@ -458,5 +562,64 @@ mod tests {
         });
 
         assert!(has_nulls);
+    }
+
+    #[test]
+    fn testInsertBatchPersistsWorkingDirAndMetering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.duckdb");
+        let writer = DuckDbWriter::open(&db_path);
+
+        let mut event = sample_event("trace-wd");
+        event.working_dir = Some("/home/user/project".to_string());
+        writer.insert_batch(&[event]).expect("insert");
+
+        let (working_dir, metering): (String, String) = writer.with_conn(|conn| {
+            conn.query_row(
+                "SELECT working_dir, metering FROM gateway_records WHERE trace_id = 'trace-wd'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query working_dir and metering")
+        });
+        assert_eq!(working_dir, "/home/user/project");
+        assert_eq!(metering, "available");
+    }
+
+    #[test]
+    fn testInsertBatchUnavailableMeteringNullsTokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.duckdb");
+        let writer = DuckDbWriter::open(&db_path);
+
+        let event = StatsEvent {
+            trace_id: "trace-unavail".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-4-opus".to_string(),
+            tokens: TokenCounts::default(),
+            cache_create: 0,
+            cache_read: 0,
+            cost: None,
+            latency_ms: 100,
+            status: "error".to_string(),
+            session_id: None,
+            mcp_server: None,
+            mcp_tool: None,
+            metering: kyris_core::record::Metering::Unavailable,
+            working_dir: None,
+        };
+        writer.insert_batch(&[event]).expect("insert");
+
+        let (tokens_null, metering): (bool, String) = writer.with_conn(|conn| {
+            conn.query_row(
+                "SELECT tokens_in IS NULL AND tokens_out IS NULL, metering \
+                 FROM gateway_records WHERE trace_id = 'trace-unavail'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query unavailable record")
+        });
+        assert!(tokens_null);
+        assert_eq!(metering, "unavailable");
     }
 }

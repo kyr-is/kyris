@@ -2,10 +2,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
-const RETRY_BACKOFFS: &[u64] = &[50, 100, 250];
+use kyris_agentpact_client as agentpact;
 
 #[cfg(test)]
 static TEST_AGENTPACT_SOCKET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -46,22 +43,21 @@ pub async fn check_permission(
     server_name: &str,
     path: &str,
     body: &[u8],
+    working_dir: Option<&str>,
     socket_timeout: Duration,
 ) -> PolicyDecision {
-    let tool_name = extract_tool_name(path, body);
-
-    if tool_name.is_none() {
+    if !is_tools_call_request(path, body) {
         return PolicyDecision::Allow;
     }
 
-    let tool = tool_name.as_deref().unwrap_or("unknown");
+    let tool = extract_tool_name(path, body).unwrap_or_else(|| "unknown".to_string());
     tracing::debug!(server = %server_name, tool = %tool, "mcp policy check: tools/call detected");
 
     let sock = agentpact_socket();
-    match send_permission_request(&sock, server_name, tool, socket_timeout).await {
+    match request_permission(&sock, server_name, &tool, working_dir, socket_timeout).await {
         Ok(decision) => decision,
         Err(e) => {
-            if allow_on_daemon_unavailable() {
+            if agentpact::allow_on_daemon_unavailable() {
                 tracing::warn!(error = %e, "agentpactd unavailable, allowing due to policy");
                 PolicyDecision::Allow
             } else {
@@ -72,89 +68,55 @@ pub async fn check_permission(
     }
 }
 
-async fn send_permission_request(
+async fn request_permission(
     sock: &Path,
     server_name: &str,
     tool: &str,
+    working_dir: Option<&str>,
     socket_timeout: Duration,
-) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>> {
-    let mut attempts = RETRY_BACKOFFS.iter().copied().peekable();
-    loop {
-        match send_permission_request_once(sock, server_name, tool, socket_timeout).await {
-            Ok(decision) => return Ok(decision),
-            Err(error) => {
-                let Some(backoff_ms) = attempts.next() else {
-                    return Err(error);
-                };
-                let _ = crate::platform::launchd::restart_agentpactd();
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            }
-        }
-    }
-}
-
-async fn send_permission_request_once(
-    sock: &Path,
-    server_name: &str,
-    tool: &str,
-    socket_timeout: Duration,
-) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>> {
-    let result = tokio::time::timeout(socket_timeout, async {
-        let mut stream = UnixStream::connect(sock).await?;
-
-        let request = serde_json::json!({
-            "id": format!("kyris-{}", uuid::Uuid::now_v7()),
-            "method": "permission.request",
-            "action": "call",
-            "detail": format!("{server_name}/{tool}"),
-        });
-
-        let payload = serde_json::to_vec(&request)?;
-        stream.write_all(&payload).await?;
-        stream.shutdown().await?;
-
-        let mut buf = Vec::with_capacity(1024);
-        stream.read_to_end(&mut buf).await?;
-
-        let response: serde_json::Value = serde_json::from_slice(&buf)?;
-        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(parse_permission_response(&response))
+) -> Result<PolicyDecision, String> {
+    let socket = sock.to_string_lossy().to_string();
+    let server = server_name.to_string();
+    let tool = tool.to_string();
+    let working_dir = working_dir.map(str::to_owned);
+    tokio::task::spawn_blocking(move || {
+        agentpact::request_mcp_tool_permission(
+            &socket,
+            "kyris",
+            &server,
+            &tool,
+            working_dir.as_deref(),
+            socket_timeout,
+        )
+        .map(map_permission_decision)
     })
-    .await;
+    .await
+    .map_err(|e| format!("permission.request task failed: {e}"))?
+}
 
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err("permission.request timed out".into()),
+fn map_permission_decision(decision: agentpact::McpPermissionDecision) -> PolicyDecision {
+    match decision {
+        agentpact::McpPermissionDecision::Allow => PolicyDecision::Allow,
+        agentpact::McpPermissionDecision::Deny(reason) => PolicyDecision::Deny(reason),
+        agentpact::McpPermissionDecision::Ask {
+            approval_id,
+            approval_token,
+        } => PolicyDecision::Ask {
+            approval_id,
+            approval_token,
+        },
     }
 }
 
-fn parse_permission_response(response: &serde_json::Value) -> PolicyDecision {
-    let code = response["code"].as_str().unwrap_or("");
-    match code {
-        "PACT_OK" => PolicyDecision::Allow,
-        "PACT_DENIED" => {
-            let reason = response["reason"]
-                .as_str()
-                .unwrap_or("denied by policy")
-                .to_string();
-            PolicyDecision::Deny(reason)
-        }
-        "PACT_ASK" => {
-            let approval_id = response["approval_id"].as_str().unwrap_or("").to_string();
-            let approval_token = response["approval_token"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            if approval_id.is_empty() || approval_token.is_empty() {
-                PolicyDecision::Deny("invalid approval response from agentpactd".to_string())
-            } else {
-                PolicyDecision::Ask {
-                    approval_id,
-                    approval_token,
-                }
-            }
-        }
-        _ => PolicyDecision::Deny("invalid response from agentpactd".to_string()),
-    }
+pub fn is_tools_call_request(path: &str, body: &[u8]) -> bool {
+    let is_tools_call_path = path.contains("tools/call");
+
+    let is_tools_call_body = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("method")?.as_str().map(String::from))
+        .is_some_and(|m| m == "tools/call");
+
+    is_tools_call_path || is_tools_call_body
 }
 
 pub fn extract_tool_name(path: &str, body: &[u8]) -> Option<String> {
@@ -178,29 +140,6 @@ pub fn extract_tool_name(path: &str, body: &[u8]) -> Option<String> {
         .map(String::from)
 }
 
-fn allow_on_daemon_unavailable() -> bool {
-    policy_candidates().iter().any(|path| {
-        std::fs::read_to_string(path).is_ok_and(|contents| {
-            contents
-                .lines()
-                .any(|line| line.trim() == "on_daemon_unavailable: allow")
-        })
-    })
-}
-
-fn policy_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(path) = std::env::var("AGENTPACT_POLICY_FILE") {
-        candidates.push(PathBuf::from(path));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        candidates.push(home.join(".agentpact").join("policy").join("pact.yaml"));
-        candidates.push(home.join(".agentpact").join("policy").join("caps.yaml"));
-    }
-    candidates
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,9 +147,14 @@ mod tests {
     #[tokio::test]
     async fn testNonToolsCallAllowed() {
         let body = br#"{"method":"ping"}"#;
-        let decision =
-            check_permission("test-server", "/mcp/test/ping", body, Duration::from_millis(50))
-                .await;
+        let decision = check_permission(
+            "test-server",
+            "/mcp/test/ping",
+            body,
+            None,
+            Duration::from_millis(50),
+        )
+        .await;
         assert_eq!(decision, PolicyDecision::Allow);
     }
 
@@ -242,16 +186,47 @@ mod tests {
     }
 
     #[test]
+    fn testIsToolsCallRequestFromPath() {
+        assert!(is_tools_call_request("tools/call", br#"{"params":{}}"#));
+    }
+
+    #[test]
+    fn testIsToolsCallRequestFromBody() {
+        assert!(is_tools_call_request(
+            "/other",
+            br#"{"method":"tools/call"}"#
+        ));
+    }
+
+    #[test]
+    fn testIsToolsCallRequestNonToolsCall() {
+        assert!(!is_tools_call_request("/other", br#"{"method":"ping"}"#));
+    }
+
+    #[test]
+    fn testIsToolsCallRequestInvalidJson() {
+        assert!(!is_tools_call_request("/other", b"not json"));
+    }
+
+    #[test]
+    fn testIsToolsCallRequestInvalidJsonOnToolsCallPath() {
+        assert!(is_tools_call_request("tools/call", b"not json"));
+    }
+
+    #[test]
     fn testParsePermissionResponseOk() {
         let resp = serde_json::json!({"code": "PACT_OK", "decision": "auto"});
-        assert_eq!(parse_permission_response(&resp), PolicyDecision::Allow);
+        assert_eq!(
+            map_permission_decision(agentpact::parse_mcp_permission_response(&resp)),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]
     fn testParsePermissionResponseDenied() {
         let resp = serde_json::json!({"code": "PACT_DENIED", "reason": "blocked by policy"});
         assert_eq!(
-            parse_permission_response(&resp),
+            map_permission_decision(agentpact::parse_mcp_permission_response(&resp)),
             PolicyDecision::Deny("blocked by policy".to_string())
         );
     }
@@ -264,7 +239,7 @@ mod tests {
             "approval_token": "tok-abc"
         });
         assert_eq!(
-            parse_permission_response(&resp),
+            map_permission_decision(agentpact::parse_mcp_permission_response(&resp)),
             PolicyDecision::Ask {
                 approval_id: "req-42".to_string(),
                 approval_token: "tok-abc".to_string(),
@@ -276,7 +251,7 @@ mod tests {
     fn testParsePermissionResponseUnknownCode() {
         let resp = serde_json::json!({"code": "SOMETHING_NEW"});
         assert_eq!(
-            parse_permission_response(&resp),
+            map_permission_decision(agentpact::parse_mcp_permission_response(&resp)),
             PolicyDecision::Deny("invalid response from agentpactd".to_string())
         );
     }

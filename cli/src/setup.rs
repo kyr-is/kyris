@@ -305,7 +305,7 @@ fn rewrite_codex_mcp_servers(config: &mut toml::Value, listen: &str, inbound_key
             let mut wrapped_args = vec![
                 toml::Value::String("wrap".to_string()),
                 toml::Value::String("--server".to_string()),
-                toml::Value::String(name.to_string()),
+                toml::Value::String(name.clone()),
                 toml::Value::String(command.to_string()),
             ];
             wrapped_args.extend(original_args);

@@ -9,10 +9,9 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Json;
+use kyris_agentpact_client as agentpact;
 use kyris_core::config::{KyrisdConfig, ProviderConfig};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -34,6 +33,7 @@ pub struct AppState {
     pub db: Arc<storage::DuckDbWriter>,
     pub provider_clients: ArcSwap<HashMap<String, reqwest::Client>>,
     pub pending: Arc<PendingStore>,
+    pub agentpact_socket: Option<std::path::PathBuf>,
 }
 
 pub fn build_provider_client(_provider: &ProviderConfig) -> reqwest::Client {
@@ -54,6 +54,13 @@ pub fn build_provider_clients(config: &KyrisdConfig) -> HashMap<String, reqwest:
 }
 
 pub async fn run(config: KyrisdConfig) {
+    if config.tls.enabled {
+        tracing::error!(
+            "TLS is configured but not yet implemented — refusing to start without encryption guarantee"
+        );
+        std::process::exit(1);
+    }
+
     let listen_addr = config.server.listen.clone();
     let max_body = config.server.max_request_body_bytes;
     let drain_timeout = config.server.drain_timeout_seconds;
@@ -71,9 +78,10 @@ pub async fn run(config: KyrisdConfig) {
         "rebuilt circuit breaker from DuckDB"
     );
 
+    let agentpact_socket = probe_agentpact_socket();
+
     check_crash_recovery();
     write_pid_file();
-    remove_daemon_unreachable_sentinel();
 
     let stats_config = config.stats.clone();
     let session_idle_minutes = config.circuit_breaker.session_idle_minutes;
@@ -86,11 +94,12 @@ pub async fn run(config: KyrisdConfig) {
         db: db.clone(),
         provider_clients: ArcSwap::from_pointee(clients),
         pending: Arc::new(PendingStore::new()),
+        agentpact_socket,
     });
 
     let stats_writer_handle = tokio::spawn(storage::stats_writer(
         stats_rx,
-        storage::open_db(),
+        db.clone(),
         circuit_breaker,
         stats_config,
         session_idle_minutes,
@@ -179,11 +188,32 @@ async fn drain_and_flush_stats(
 }
 
 async fn run_pending_prune(pending: Arc<PendingStore>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut interval = tokio::time::interval(Duration::from_mins(1));
     interval.tick().await; // skip immediate first tick
     loop {
         interval.tick().await;
         pending.prune_resolved();
+    }
+}
+
+impl AppState {
+    pub fn resolve_agentpact_socket(&self) -> Option<std::path::PathBuf> {
+        if let Some(ref path) = self.agentpact_socket {
+            return Some(path.clone());
+        }
+        let socket = agentpact::default_socket_path();
+        if socket.exists() { Some(socket) } else { None }
+    }
+}
+
+fn probe_agentpact_socket() -> Option<std::path::PathBuf> {
+    let socket = agentpact::default_socket_path();
+    if socket.exists() {
+        tracing::info!(path = %socket.display(), "agentpactd socket found");
+        Some(socket)
+    } else {
+        tracing::info!("agentpactd socket not found — trace relay disabled");
+        None
     }
 }
 
@@ -204,20 +234,18 @@ fn check_crash_recovery() {
         let alive = signal::kill(Pid::from_raw(old_pid), None).is_ok();
         if !alive {
             tracing::warn!(old_pid, "detected stale PID file — previous daemon crashed");
-            let modified = std::fs::metadata(&pid_path)
-                .and_then(|m| m.modified())
-                .ok();
-            let duration = modified
-                .and_then(|m| m.elapsed().ok())
-                .map(|d| {
+            let modified = std::fs::metadata(&pid_path).and_then(|m| m.modified()).ok();
+            let duration = modified.and_then(|m| m.elapsed().ok()).map_or_else(
+                || "unknown".to_string(),
+                |d| {
                     let secs = d.as_secs();
                     if secs < 60 {
                         format!("{secs}s")
                     } else {
                         format!("{}m", secs / 60)
                     }
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+                },
+            );
             crate::notify::daemon_recovery_toast(&duration);
         }
     }
@@ -244,17 +272,9 @@ fn remove_pid_file() {
     let _ = std::fs::remove_file(pid_path);
 }
 
-fn remove_daemon_unreachable_sentinel() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let sentinel = format!("{home}/.kyris/.daemon-unreachable");
-    if std::fs::remove_file(&sentinel).is_ok() {
-        tracing::info!("removed daemon-unreachable sentinel");
-    }
-}
-
 /// Routes that require auth: circuit-breaker reset, pending requests.
 fn authed_operational_routes(state: Arc<AppState>) -> Router {
-    use axum::routing::{get, post};
+    use axum::routing::{delete, get, post};
 
     Router::new()
         .route(
@@ -264,7 +284,19 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
         .route("/api/pending", get(list_pending).with_state(state.clone()))
         .route(
             "/api/pending/{id}/resolve",
-            post(resolve_pending).with_state(state),
+            post(resolve_pending).with_state(state.clone()),
+        )
+        .route(
+            "/api/pending/hold",
+            post(hold_pending).with_state(state.clone()),
+        )
+        .route(
+            "/api/pending/{id}/cancel",
+            delete(cancel_pending).with_state(state.clone()),
+        )
+        .route(
+            "/api/pending/{id}/status",
+            get(pending_status).with_state(state),
         )
 }
 
@@ -286,9 +318,13 @@ async fn circuit_breaker_reset(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CircuitBreakerResetRequest>,
 ) -> axum::http::StatusCode {
-    state.circuit_breaker.reset(&body.session_id);
-    tracing::info!(session_id = %body.session_id, "circuit breaker reset");
-    axum::http::StatusCode::OK
+    if state.circuit_breaker.reset(&body.session_id) {
+        tracing::info!(session_id = %body.session_id, "circuit breaker reset");
+        axum::http::StatusCode::OK
+    } else {
+        tracing::warn!(session_id = %body.session_id, "circuit breaker reset: unknown session");
+        axum::http::StatusCode::NOT_FOUND
+    }
 }
 
 async fn list_pending(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -309,11 +345,11 @@ enum ResolveDecision {
 }
 
 impl ResolveDecision {
-    fn as_agentpact_response(self) -> &'static str {
+    fn as_approval_response(self) -> agentpact::ApprovalResponse {
         match self {
-            Self::Approved => "approved",
-            Self::Denied => "denied",
-            Self::Always => "always",
+            Self::Approved => agentpact::ApprovalResponse::Approved,
+            Self::Denied => agentpact::ApprovalResponse::Denied,
+            Self::Always => agentpact::ApprovalResponse::Always,
         }
     }
 
@@ -332,57 +368,27 @@ fn parse_resolve_decision(value: &str) -> Option<ResolveDecision> {
 }
 
 fn agentpact_socket_path() -> String {
-    std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.agentpact/agentpact.sock")
-    })
+    agentpact::default_socket_path().display().to_string()
 }
 
 async fn send_permission_response(
     approval_token: &str,
     decision: ResolveDecision,
 ) -> Result<(), String> {
-    let mut stream = UnixStream::connect(agentpact_socket_path())
-        .await
-        .map_err(|e| format!("failed to connect to agentpactd: {e}"))?;
-    let request = serde_json::json!({
-        "id": format!("kyrisd-resolve-{}", uuid::Uuid::now_v7()),
-        "method": "permission.respond",
-        "approval_token": approval_token,
-        "response": decision.as_agentpact_response(),
-    });
-    let payload =
-        serde_json::to_vec(&request).map_err(|e| format!("failed to serialize response: {e}"))?;
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|e| format!("failed to send response to agentpactd: {e}"))?;
-    stream
-        .shutdown()
-        .await
-        .map_err(|e| format!("failed to close response body: {e}"))?;
-
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .await
-        .map_err(|e| format!("failed to read agentpactd response: {e}"))?;
-    let response: serde_json::Value =
-        serde_json::from_slice(&buf).map_err(|e| format!("invalid agentpactd response: {e}"))?;
-
-    match response.get("code").and_then(|code| code.as_str()) {
-        Some("PACT_OK") => Ok(()),
-        Some("PACT_DENIED") if decision == ResolveDecision::Denied => Ok(()),
-        Some(code) => {
-            let reason = response
-                .get("reason")
-                .or_else(|| response.get("error"))
-                .and_then(|value| value.as_str())
-                .unwrap_or(code);
-            Err(format!("agentpactd rejected resolution: {reason}"))
-        }
-        None => Err("agentpactd returned a malformed approval response".to_string()),
-    }
+    let socket = agentpact_socket_path();
+    let token = approval_token.to_string();
+    tokio::task::spawn_blocking(move || {
+        agentpact::send_permission_response(
+            &socket,
+            "kyrisd-resolve",
+            &token,
+            decision.as_approval_response(),
+            None,
+        )
+        .map_err(|reason| reason.replace("approval response", "resolution"))
+    })
+    .await
+    .map_err(|e| format!("permission.respond task failed: {e}"))?
 }
 
 async fn resolve_pending(
@@ -396,7 +402,9 @@ async fn resolve_pending(
 
     let claim = match state.pending.claim(&id) {
         Ok(claim) => claim,
-        Err(ResolveError::NotFound) => return StatusCode::GONE,
+        Err(ResolveError::NotFound | ResolveError::NoLongerResolvable(_)) => {
+            return StatusCode::GONE;
+        }
         Err(ResolveError::AlreadyResolved(_)) => return StatusCode::CONFLICT,
     };
 
@@ -406,8 +414,56 @@ async fn resolve_pending(
         return StatusCode::BAD_GATEWAY;
     }
 
-    state.pending.complete_claim(claim, decision.allows_execution());
+    state
+        .pending
+        .complete_claim(claim, decision.allows_execution());
     StatusCode::OK
+}
+
+#[derive(Deserialize)]
+struct HoldRequest {
+    id: String,
+    approval_token: String,
+    server: String,
+    tool: Option<String>,
+}
+
+async fn hold_pending(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<HoldRequest>,
+) -> StatusCode {
+    let pending_timeout = state.config.load().mcp.pending_timeout_seconds;
+    let pending = state.pending.clone();
+    let timeout_id = body.id.clone();
+    let _rx = state
+        .pending
+        .hold(body.id.clone(), body.approval_token, body.server, body.tool);
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(pending_timeout)).await;
+        pending.timeout(&timeout_id);
+    });
+    state.pending.set_timeout_handle(&body.id, handle);
+    StatusCode::OK
+}
+
+async fn cancel_pending(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+    if let Some(token) = state.pending.cancel(&id) {
+        let _ = send_permission_response(&token, ResolveDecision::Denied).await;
+    }
+    StatusCode::OK
+}
+
+async fn pending_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.pending.get_state(&id) {
+        Some(s) => (StatusCode::OK, Json(serde_json::json!({ "state": s }))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        ),
+    }
 }
 
 #[derive(Serialize)]
@@ -415,6 +471,7 @@ struct ReadyzResponse {
     ready: bool,
     providers: usize,
     dropped_events: u64,
+    db_writable: bool,
 }
 
 async fn readyz(
@@ -423,7 +480,8 @@ async fn readyz(
     let config = state.config.load();
     let dropped = storage::dropped_count();
     let providers = config.providers.len();
-    let ready = providers > 0 && dropped == 0;
+    let db_writable = state.db.probe_writable();
+    let ready = providers > 0 && dropped == 0 && db_writable;
     let status = if ready {
         axum::http::StatusCode::OK
     } else {
@@ -435,6 +493,7 @@ async fn readyz(
             ready,
             providers,
             dropped_events: dropped,
+            db_writable,
         }),
     )
 }
@@ -593,6 +652,8 @@ mod tests {
             session_id: session_id.map(str::to_string),
             mcp_server: None,
             mcp_tool: None,
+            metering: kyris_core::record::Metering::Available,
+            working_dir: None,
         }
     }
 
@@ -619,6 +680,7 @@ mod tests {
             )),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
+            agentpact_socket: None,
         })
     }
 
@@ -688,7 +750,7 @@ mod tests {
         let (stats_tx, stats_rx) = mpsc::channel(8);
         let writer_handle = tokio::spawn(storage::stats_writer(
             stats_rx,
-            storage::DuckDbWriter::open(&db_path),
+            Arc::new(storage::DuckDbWriter::open(&db_path)),
             circuit_breaker,
             kyris_core::config::StatsConfig::default(),
             30,
@@ -708,10 +770,10 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(row_count, 1);
-        assert_eq!(
-            writer.load_session_tokens(),
-            vec![("sess-drain".to_string(), 150)]
-        );
+        let sessions = writer.load_session_tokens();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "sess-drain");
+        assert_eq!(sessions[0].1, 150);
     }
 
     #[tokio::test]
@@ -810,5 +872,319 @@ mod tests {
         let clients = state.provider_clients.load();
         assert_eq!(clients.len(), 1);
         assert!(clients.contains_key("google"));
+    }
+
+    #[tokio::test]
+    async fn testHealthzReturnsOk() {
+        let app = Router::new().route("/healthz", axum::routing::get(healthz));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/healthz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testReadyzWithProviders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![make_provider("openai", "key", "http://localhost")];
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route("/readyz", axum::routing::get(readyz).with_state(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/readyz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["providers"], 1);
+        assert_eq!(body["db_writable"], true);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testReadyzWithoutProvidersReturnsUnavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route("/readyz", axum::routing::get(readyz).with_state(state));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/readyz"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["ready"], false);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testCircuitBreakerResetEndpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        state
+            .circuit_breaker
+            .record_tokens("sess-reset", 999_999, 200_000);
+        assert!(state.circuit_breaker.is_tripped("sess-reset"));
+
+        let app = Router::new().route(
+            "/api/circuit-breaker/reset",
+            axum::routing::post(circuit_breaker_reset).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("{addr}/api/circuit-breaker/reset"))
+            .json(&serde_json::json!({"session_id": "sess-reset"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(!state.circuit_breaker.is_tripped("sess-reset"));
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testResolvePendingNotFoundReturnsGone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route(
+            "/api/pending/{id}/resolve",
+            axum::routing::post(resolve_pending).with_state(state),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("{addr}/api/pending/nonexistent/resolve"))
+            .json(&serde_json::json!({"decision": "approved"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 410);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testResolvePendingBadDecisionReturnsBadRequest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        let _rx = state.pending.hold(
+            "req-1".into(),
+            "tok-1".into(),
+            "github".into(),
+            Some("read_file".into()),
+        );
+
+        let app = Router::new().route(
+            "/api/pending/{id}/resolve",
+            axum::routing::post(resolve_pending).with_state(state),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("{addr}/api/pending/req-1/resolve"))
+            .json(&serde_json::json!({"decision": "invalid_value"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn testParseResolveDecision() {
+        assert_eq!(
+            parse_resolve_decision("approved"),
+            Some(ResolveDecision::Approved)
+        );
+        assert_eq!(
+            parse_resolve_decision("denied"),
+            Some(ResolveDecision::Denied)
+        );
+        assert_eq!(
+            parse_resolve_decision("always"),
+            Some(ResolveDecision::Always)
+        );
+        assert_eq!(parse_resolve_decision("garbage"), None);
+    }
+
+    #[tokio::test]
+    async fn testHoldPendingEndpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route(
+            "/api/pending/hold",
+            axum::routing::post(hold_pending).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("{addr}/api/pending/hold"))
+            .json(&serde_json::json!({
+                "id": "req-ext-1",
+                "approval_token": "apt-ext-1",
+                "server": "github",
+                "tool": "read_file"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(state.pending.list_held().len(), 1);
+        assert_eq!(state.pending.list_held()[0].id, "req-ext-1");
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testPendingStatusEndpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        let _rx = state.pending.hold(
+            "req-s-1".into(),
+            "tok-s-1".into(),
+            "github".into(),
+            Some("read_file".into()),
+        );
+
+        let app = Router::new().route(
+            "/api/pending/{id}/status",
+            axum::routing::get(pending_status).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/api/pending/req-s-1/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["state"], "held");
+
+        let resp_missing = reqwest::Client::new()
+            .get(format!("{addr}/api/pending/nonexistent/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp_missing.status(), 404);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
     }
 }

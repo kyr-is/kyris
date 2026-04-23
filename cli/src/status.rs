@@ -37,13 +37,12 @@ fn check_agentpactd() {
 }
 
 fn check_kyrisd() {
-    let listen = load_config()
-        .map(|config| config.server.listen)
-        .unwrap_or_else(|_| "127.0.0.1:4710".to_string());
+    let listen = load_config().map_or_else(
+        |_| "127.0.0.1:4710".to_string(),
+        |config| config.server.listen,
+    );
     let state = service_state(ServiceKind::Kyrisd);
-    let healthy = health_status(&listen)
-        .map(|status| status.is_success())
-        .unwrap_or(false);
+    let healthy = health_status(&listen).is_ok_and(|status| status.is_success());
     let service = if state.managed_by_homebrew {
         format!(
             "homebrew/{}",
@@ -85,12 +84,11 @@ fn check_native_integrations() {
     let claude_hook = claude_settings_path()
         .ok()
         .and_then(|path| read_json_value(&path).ok())
-        .map(|settings| {
+        .is_some_and(|settings| {
             settings["hooks"]["PreToolUse"]
                 .as_array()
                 .is_some_and(|hooks| !hooks.is_empty())
-        })
-        .unwrap_or(false);
+        });
     println!("  [{}] claude-code live hook", status_marker(claude_hook));
 
     let codex_hook = codex_hooks_path().ok().is_some_and(|path| path.exists());
@@ -99,12 +97,11 @@ fn check_native_integrations() {
     let gemini_hook = gemini_settings_path()
         .ok()
         .and_then(|path| read_json_value(&path).ok())
-        .map(|settings| {
+        .is_some_and(|settings| {
             settings["hooks"]["BeforeTool"]
                 .as_array()
                 .is_some_and(|hooks| !hooks.is_empty())
-        })
-        .unwrap_or(false);
+        });
     println!("  [{}] gemini-cli live hook", status_marker(gemini_hook));
 
     let cline_permissions_path = env_dir().ok().map(|dir| dir.join("cline.sh"));

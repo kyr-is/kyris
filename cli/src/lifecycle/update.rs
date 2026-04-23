@@ -243,7 +243,7 @@ fn which_path(binary: &str) -> Option<PathBuf> {
 
 fn release_target() -> Result<&'static str, String> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") | ("macos", "arm64") => Ok("darwin-aarch64"),
+        ("macos", "aarch64" | "arm64") => Ok("darwin-aarch64"),
         ("macos", "x86_64") => Ok("darwin-x86_64"),
         ("linux", "x86_64") => Ok("linux-x86_64"),
         ("linux", "aarch64") => Ok("linux-aarch64"),
@@ -291,9 +291,6 @@ fn user_agent() -> String {
 }
 
 fn brew_formula_installed(formula: &str) -> bool {
-    if env_flag("KYRIS_TEST_DISABLE_HOMEBREW_DETECTION") {
-        return false;
-    }
     std::process::Command::new("brew")
         .args(["list", formula])
         .output()
@@ -301,17 +298,7 @@ fn brew_formula_installed(formula: &str) -> bool {
 }
 
 fn github_releases_base_url() -> String {
-    std::env::var("KYRIS_TEST_GITHUB_RELEASES_BASE_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        let normalized = value.trim().to_ascii_lowercase();
-        matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-    })
+    "https://api.github.com".to_string()
 }
 
 #[cfg(test)]

@@ -10,7 +10,6 @@ fn run_kyris(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kyris"))
         .current_dir(home)
         .env("HOME", home)
-        .env("KYRIS_TEST_DISABLE_SERVICE_MANAGEMENT", "1")
         .args(args)
         .output()
         .expect("run kyris")
@@ -20,6 +19,10 @@ fn run_kyris(home: &Path, args: &[&str]) -> std::process::Output {
 fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
+
+    let kyris_bin = home.join(".kyris").join("bin");
+    fs::create_dir_all(&kyris_bin).expect("create .kyris/bin");
+    fs::write(kyris_bin.join("agentpactd"), "").expect("write fake agentpactd");
 
     let zshrc = "# zsh baseline\n";
     let zshenv = "# zshenv baseline\n";
@@ -35,13 +38,7 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     fs::create_dir_all(home.join(".agentpact").join("policy")).expect("create policy dir");
     fs::write(
         home.join(".agentpact").join("policy").join("pact.yaml"),
-        r#"- action: execute
-  pattern: "ls *"
-  decision: auto
-- action: execute
-  pattern: "rm -rf *"
-  decision: ask
-"#,
+        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"ls.*\": auto\n    \"rm.-rf.*\": ask\n",
     )
     .expect("write policy");
 
@@ -140,5 +137,7 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
             .join("agentpact_pretooluse.sh")
             .exists()
     );
-    assert!(!home.join(".kyris").exists());
+    assert!(!home.join(".kyris").join("hooks").exists());
+    assert!(!home.join(".kyris").join("env").exists());
+    assert!(!home.join(".kyris").join("manifest.json").exists());
 }

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(non_snake_case))]
 
 mod framing;
+mod policy;
 mod relay;
 
 use std::process::ExitCode;
@@ -42,7 +43,9 @@ fn main() -> ExitCode {
 
     let has_tty = check_tty();
     if !has_tty {
-        eprintln!("[kyris-mcp] no controlling terminal — ask actions will be denied");
+        eprintln!(
+            "[kyris-mcp] no controlling terminal — ask actions will delegate to kyrisd, or deny if kyrisd is unreachable"
+        );
     }
 
     let mcp_config = kyris_core::config::load_mcp_config();

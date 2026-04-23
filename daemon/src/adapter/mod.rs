@@ -10,11 +10,37 @@ use axum::http::HeaderMap;
 
 use crate::server::AppState;
 
-pub fn extract_session_id(headers: &HeaderMap) -> Option<String> {
+pub fn extract_session_id(headers: &HeaderMap) -> String {
     headers
         .get("x-kyris-session-id")
         .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| "__default".to_string(), String::from)
+}
+
+pub fn extract_trace_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-kyris-trace-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+pub fn relay_trace_attach(state: &AppState, trace_token: &str, trace_id: &str) -> Option<String> {
+    let socket_path = state.resolve_agentpact_socket()?;
+    let socket = socket_path.display().to_string();
+    match kyris_agentpact_client::send_trace_attach(
+        &socket,
+        trace_token,
+        trace_id,
+        Some(std::time::Duration::from_secs(2)),
+    ) {
+        Ok(working_dir) => working_dir,
+        Err(e) => {
+            tracing::debug!(error = %e, "trace.attach relay failed");
+            None
+        }
+    }
 }
 
 pub fn routes(state: Arc<AppState>) -> Router {
@@ -65,22 +91,45 @@ mod tests {
             "x-kyris-session-id",
             HeaderValue::from_static("sess-abc-123"),
         );
+        assert_eq!(extract_session_id(&headers), "sess-abc-123");
+    }
+
+    #[test]
+    fn testExtractSessionIdMissingFallsBackToDefault() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_session_id(&headers), "__default");
+    }
+
+    #[test]
+    fn testExtractSessionIdEmptyFallsBackToDefault() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-kyris-session-id", HeaderValue::from_static(""));
+        assert_eq!(extract_session_id(&headers), "__default");
+    }
+
+    #[test]
+    fn testExtractTraceTokenPresent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-kyris-trace-token",
+            HeaderValue::from_static("tok-abc-123"),
+        );
         assert_eq!(
-            extract_session_id(&headers),
-            Some("sess-abc-123".to_string())
+            extract_trace_token(&headers),
+            Some("tok-abc-123".to_string())
         );
     }
 
     #[test]
-    fn testExtractSessionIdMissing() {
+    fn testExtractTraceTokenMissing() {
         let headers = HeaderMap::new();
-        assert_eq!(extract_session_id(&headers), None);
+        assert_eq!(extract_trace_token(&headers), None);
     }
 
     #[test]
-    fn testExtractSessionIdEmpty() {
+    fn testExtractTraceTokenEmpty() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-kyris-session-id", HeaderValue::from_static(""));
-        assert_eq!(extract_session_id(&headers), Some(String::new()));
+        headers.insert("x-kyris-trace-token", HeaderValue::from_static(""));
+        assert_eq!(extract_trace_token(&headers), None);
     }
 }
