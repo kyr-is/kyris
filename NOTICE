@@ -1,0 +1,24 @@
+Kyris
+Copyright 2026 Kyris
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+---
+
+This product includes design patterns informed by TensorZero (Apache 2.0).
+Provider adapter patterns (request forwarding, SSE streaming relay, token
+counting logic, error handling) draw from TensorZero's approach. Because
+kyrisd uses native-format passthrough rather than TensorZero's normalization
+approach, the code is structurally different — not a direct port.
+
+TensorZero: https://github.com/tensorzero/tensorzero

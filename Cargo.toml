@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: Apache-2.0
+[workspace]
+members = [
+    "types",
+    "core",
+    "agentpact-client",
+    "daemon",
+    "cli",
+    "mcp",
+    "hooks/helper",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/kyr-is/kyris"
+
+[workspace.dependencies]
+kyris-types = { path = "types" }
+kyris-core = { path = "core" }
+kyris-agentpact-client = { path = "agentpact-client" }
+agentpact = { git = "https://github.com/kyr-is/agentpact.git", version = ">=0.1.0" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tokio = { version = ">=1.44.2" }
+tracing = "0.1"
+tracing-subscriber = { version = ">=0.3.20", features = ["json", "env-filter"] }
+arc-swap = { version = ">=1.1.0" }
+uuid = { version = "1.16", features = ["v7"] }
+bytes = { version = ">=1.11.1" }
+reqwest = { version = "0.12", default-features = false }
+rustls = { version = ">=0.23.18", default-features = false, features = ["aws-lc-rs"] }
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "limit", "cors"] }
+serde-saphyr = "0.0.23"
+toml = "0.8"
+duckdb = { version = "1.10501.0", features = ["bundled"] }
+aws-lc-rs = "1.16"
+const-hex = "1.18"
+notify = "8.2"
+notify-debouncer-mini = "0.6"
+nix = { version = ">=0.23.0", features = ["process", "socket", "signal", "fs", "user"] }
+tray-icon = "0.22"
+notify-rust = "4.14"
+clap = { version = "4.6", features = ["derive"] }
+regex = { version = ">=1.5.5" }
+open = "5.3"
+dialoguer = "0.12"
+console = "0.16"
+futures-util = "0.3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

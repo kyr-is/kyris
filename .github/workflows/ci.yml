@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure git auth for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.KYRIS_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - if: env.ACT != 'true'
+        uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-llvm-cov
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Deny check
+        run: cargo deny check
+
+      - name: Test + coverage + bench regression
+        run: |
+          cargo llvm-cov --all-features
+          cargo bench -p kyrisd -- --test
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+

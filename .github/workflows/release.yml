@@ -1,0 +1,130 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  COVERAGE_GIST_ID: 2a8a7c5f533e65aa92dc3c0478aac964
+
+jobs:
+  build:
+    runs-on: macos-latest
+    outputs:
+      sha256: ${{ steps.checksums.outputs.sha256 }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure git auth for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.KYRIS_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Test with coverage
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: |
+          cargo llvm-cov report --color never | tee coverage-report.txt
+          grep -oE '[0-9]+\.[0-9]+%' coverage-report.txt | tail -1 > coverage-pct.txt
+
+      - name: Update coverage gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          COVERAGE=$(cat coverage-pct.txt)
+          echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"$COVERAGE\",\"color\":\"brightgreen\"}" > coverage.json
+          gh gist edit $COVERAGE_GIST_ID -f coverage.json coverage.json
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Sign binaries (macOS)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        if: env.APPLE_CERTIFICATE != ''
+        run: |
+          for bin in kyris kyrisd kyris-mcp kyris-hook; do
+            codesign --sign "Developer ID Application: Kyri So LLC" \
+              --options runtime --timestamp \
+              "target/${{ matrix.target }}/release/$bin"
+          done
+
+      - name: Notarize binaries (macOS)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        if: env.APPLE_ID != ''
+        run: |
+          for bin in kyris kyrisd kyris-mcp kyris-hook; do
+            zip -j "$bin.zip" "target/${{ matrix.target }}/release/$bin"
+            xcrun notarytool submit --wait \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              "$bin.zip"
+            xcrun stapler staple "target/${{ matrix.target }}/release/$bin"
+            rm "$bin.zip"
+          done
+
+      - name: Binary size check
+        run: |
+          for bin in kyris kyrisd kyris-mcp kyris-hook; do
+            SIZE=$(stat -f%z "target/${{ matrix.target }}/release/$bin")
+            echo "$bin: $((SIZE / 1024 / 1024))MB ($SIZE bytes)"
+          done
+          KYRISD_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyrisd")
+          if [ "$KYRISD_SIZE" -gt 15728640 ]; then echo "::error::kyrisd exceeds 15MB"; exit 1; fi
+          HOOK_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-hook")
+          if [ "$HOOK_SIZE" -gt 524288 ]; then echo "::error::kyris-hook exceeds 500KB"; exit 1; fi
+          MCP_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-mcp")
+          if [ "$MCP_SIZE" -gt 5242880 ]; then echo "::error::kyris-mcp exceeds 5MB"; exit 1; fi
+
+      - name: Create tarball
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf kyris-darwin-aarch64.tar.gz kyris kyrisd kyris-mcp kyris-hook
+
+      - name: Generate checksums
+        id: checksums
+        run: |
+          cd target/${{ matrix.target }}/release
+          shasum -a 256 kyris-darwin-aarch64.tar.gz > kyris-darwin-aarch64.tar.gz.sha256
+          echo "sha256=$(awk '{print $1}' kyris-darwin-aarch64.tar.gz.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz
+            target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz.sha256
+
+  homebrew:
+    runs-on: macos-latest
+    needs: [build]
+    steps:
+      - name: Trigger homebrew-tap update
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.KYRIS_TOKEN }}
+          repository: kyr-is/homebrew-tap
+          event-type: update-formula
+          client-payload: '{"tool": "kyris", "version": "${{ github.ref_name }}", "shas": {"darwin-aarch64": "${{ needs.build.outputs.sha256 }}"}}'
