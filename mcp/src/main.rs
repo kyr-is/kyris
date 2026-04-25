@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Stdio MCP wrapper (`kyris-mcp`). Sits between an AI agent and an MCP
+//! server, intercepting JSON-RPC `tools/call` requests over stdin/stdout.
+//! Each tool invocation is checked against `AgentPact` policy via UDS before
+//! being forwarded to the wrapped server process.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]

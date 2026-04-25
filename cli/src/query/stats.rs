@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use clap::Args;
+use kyris_core::coverage;
 
 #[derive(Args)]
 pub struct StatsArgs {
@@ -29,6 +30,7 @@ pub fn run(args: StatsArgs) {
     let interval = parse_interval(&args.since);
 
     print_action_stats(&db, &interval);
+    print_coverage_stats(&db, &interval);
 
     if has_gw {
         print_token_stats(&db, &interval);
@@ -58,6 +60,29 @@ fn print_action_stats(db: &duckdb::Connection, interval: &str) {
         let decision: String = row.get(1).unwrap_or_default();
         let count: i64 = row.get(2).unwrap_or(0);
         println!("  {action:<10} {decision:<8} {count}");
+    }
+}
+
+fn print_coverage_stats(db: &duckdb::Connection, interval: &str) {
+    let cov = coverage::sql_expr();
+    println!("\nCoverage breakdown:");
+    let query = format!(
+        "SELECT {cov} as coverage, COUNT(*) as cnt \
+         FROM events \
+         WHERE timestamp >= now() - INTERVAL '{interval}' \
+         GROUP BY coverage \
+         ORDER BY cnt DESC"
+    );
+    let Ok(mut stmt) = db.prepare(&query) else {
+        return;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return;
+    };
+    while let Some(row) = rows.next().expect("read row") {
+        let coverage: String = row.get(0).unwrap_or_default();
+        let count: i64 = row.get(1).unwrap_or(0);
+        println!("  {coverage:<16} {count}");
     }
 }
 

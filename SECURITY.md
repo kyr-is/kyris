@@ -1,16 +1,21 @@
 # Security Policy
 
+## Supported Versions
+
+Only the latest release is supported with security fixes. Pin to a specific release and watch the
+repository for advisories.
+
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Kyris, please report it responsibly.
+Use the **Security** tab > **Report a vulnerability** to file a private advisory. Include reproduction
+steps and the output of `kyrisd --version`.
 
-Email: security@kyr.is
-
-Do not open a public issue for security vulnerabilities.
+We aim to acknowledge reports within 48 hours and provide a fix or mitigation within 14 days.
 
 ## Scope
 
-Security concerns include:
+Kyris is a local routing proxy and governance layer for AI agent LLM traffic. Security concerns include:
+
 - Provider credential exposure
 - Policy bypass
 - LLM request interception or tampering

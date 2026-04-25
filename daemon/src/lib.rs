@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Kyris daemon (`kyrisd`). Reverse-proxy for LLM provider APIs with
+//! token metering, cost tracking, circuit breaking, and streaming relay.
+//! Also routes MCP tool calls through policy and syncs events to the
+//! relay. `DuckDB`-backed local storage; config hot-reloaded via `ArcSwap`.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]

@@ -231,18 +231,11 @@ async fn resolve_ask_via_kyrisd(
         "[kyris-mcp] {server_name}/{tool_name} held for approval — resolve with 'kyris pending'"
     );
 
-    let mut cancel_guard = CancelGuard {
-        base_url: conn.base_url.clone(),
-        operator_key: conn.operator_key.clone(),
-        pending_id: approval_id.to_string(),
-        armed: true,
-    };
-
     let deadline = tokio::time::Instant::now() + KYRISD_POLL_TIMEOUT;
     loop {
         tokio::time::sleep(KYRISD_POLL_INTERVAL).await;
         if tokio::time::Instant::now() >= deadline {
-            cancel_guard.armed = false;
+            cancel_held_request(&client, &conn.base_url, &conn.operator_key, approval_id).await;
             return deny_ask_immediately(approval_token, sock_path, socket_timeout).await;
         }
 
@@ -264,44 +257,28 @@ async fn resolve_ask_via_kyrisd(
 
         match body.get("state").and_then(|s| s.as_str()) {
             Some("held") => {}
-            Some("approved") => {
-                cancel_guard.armed = false;
-                return PactDecision::Allow;
-            }
-            Some("denied") => {
-                cancel_guard.armed = false;
-                return PactDecision::Deny(no_tty_message());
-            }
+            Some("approved") => return PactDecision::Allow,
+            Some("denied") => return PactDecision::Deny(no_tty_message()),
             _ => {
-                cancel_guard.armed = false;
+                cancel_held_request(&client, &conn.base_url, &conn.operator_key, approval_id).await;
                 return deny_ask_immediately(approval_token, sock_path, socket_timeout).await;
             }
         }
     }
 }
 
-struct CancelGuard {
-    base_url: String,
-    operator_key: String,
-    pending_id: String,
-    armed: bool,
-}
-
-impl Drop for CancelGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let url = format!("{}/api/pending/{}/cancel", self.base_url, self.pending_id);
-        let key = self.operator_key.clone();
-        std::thread::spawn(move || {
-            let client = reqwest::blocking::Client::new();
-            let _ = client
-                .delete(&url)
-                .header("authorization", format!("Bearer {key}"))
-                .send();
-        });
-    }
+async fn cancel_held_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    operator_key: &str,
+    pending_id: &str,
+) {
+    let url = format!("{base_url}/api/pending/{pending_id}/cancel");
+    let _ = client
+        .delete(&url)
+        .header("authorization", format!("Bearer {operator_key}"))
+        .send()
+        .await;
 }
 
 async fn deny_ask_immediately(

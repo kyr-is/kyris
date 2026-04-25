@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Minimal shell hook helper (`kyris-hook`). Translates agent hook events
+//! (check, respond, send) into `AgentPact` UDS protocol calls. Intentionally
+//! tiny — stdlib + serde only, no Tokio, no `DuckDB` — to keep cold start
+//! under 5ms and binary under 1MB.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]

@@ -133,10 +133,7 @@ fn build_event_query(args: &HistoryArgs) -> (String, Vec<String>) {
         params.push(until.clone());
     }
     if let Some(ref dir) = args.dir {
-        clauses.push(format!(
-            "json_extract_string(context, '$.working_dir') = ${}",
-            params.len() + 1
-        ));
+        clauses.push(format!("working_dir = ${}", params.len() + 1));
         params.push(dir.clone());
     }
 
@@ -276,7 +273,7 @@ mod tests {
             ..empty_args()
         };
         let (query, params) = build_event_query(&args);
-        assert!(query.contains("json_extract_string(context, '$.working_dir')"));
+        assert!(query.contains("working_dir = $1"));
         assert_eq!(params[0], "/home/user/project");
     }
 

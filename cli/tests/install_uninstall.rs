@@ -38,7 +38,7 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     fs::create_dir_all(home.join(".agentpact").join("policy")).expect("create policy dir");
     fs::write(
         home.join(".agentpact").join("policy").join("pact.yaml"),
-        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"ls.*\": auto\n    \"rm.-rf.*\": ask\n",
+        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"ls·*\": auto\n    \"rm·-rf·*\": ask\n",
     )
     .expect("write policy");
 

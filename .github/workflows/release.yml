@@ -5,16 +5,26 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: write
+
+env:
+  COVERAGE_GIST_ID: 2a8a7c5f533e65aa92dc3c0478aac964
+
 jobs:
   build:
     runs-on: macos-latest
+    outputs:
+      sha256: ${{ steps.checksums.outputs.sha256 }}
     strategy:
       matrix:
         include:
           - target: aarch64-apple-darwin
-          - target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v5
+
+      - name: Configure git auth for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.KYRIS_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -26,26 +36,21 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Test + coverage
-        if: matrix.target == 'aarch64-apple-darwin'
-        run: |
-          COVERAGE=$(cargo llvm-cov --all-features 2>&1 | grep '^TOTAL' | awk '{print $NF}')
-          echo "COVERAGE=$COVERAGE" >> "$GITHUB_ENV"
+      - name: Test with coverage
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
 
-      - name: Coverage badge
-        if: matrix.target == 'aarch64-apple-darwin'
-        uses: schneegans/dynamic-badges-action@v1.7.0
+      - name: Coverage summary
+        run: |
+          cargo llvm-cov report --color never | tee coverage-report.txt
+          grep -oE '[0-9]+\.[0-9]+%' coverage-report.txt | tail -1 > coverage-pct.txt
+
+      - name: Update coverage gist
         env:
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-        with:
-          auth: ${{ secrets.GIST_TOKEN }}
-          gistID: ${{ vars.COVERAGE_GIST_ID }}
-          filename: coverage.json
-          label: coverage
-          message: "${{ env.COVERAGE }}"
-          valColorRange: ${{ env.COVERAGE }}
-          minColorRange: 50
-          maxColorRange: 100
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: |
+          COVERAGE=$(cat coverage-pct.txt)
+          echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"$COVERAGE\",\"color\":\"brightgreen\"}" > coverage.json
+          gh gist edit $COVERAGE_GIST_ID -f coverage.json coverage.json
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
@@ -93,29 +98,33 @@ jobs:
           MCP_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-mcp")
           if [ "$MCP_SIZE" -gt 5242880 ]; then echo "::error::kyris-mcp exceeds 5MB"; exit 1; fi
 
-      - name: Generate checksums
+      - name: Create tarball
         run: |
           cd target/${{ matrix.target }}/release
-          shasum -a 256 kyris kyrisd kyris-mcp kyris-hook > checksums-${{ matrix.target }}.sha256
+          tar czf kyris-darwin-aarch64.tar.gz kyris kyrisd kyris-mcp kyris-hook
+
+      - name: Generate checksums
+        id: checksums
+        run: |
+          cd target/${{ matrix.target }}/release
+          shasum -a 256 kyris-darwin-aarch64.tar.gz > kyris-darwin-aarch64.tar.gz.sha256
+          echo "sha256=$(awk '{print $1}' kyris-darwin-aarch64.tar.gz.sha256)" >> "$GITHUB_OUTPUT"
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
-            target/${{ matrix.target }}/release/kyris
-            target/${{ matrix.target }}/release/kyrisd
-            target/${{ matrix.target }}/release/kyris-mcp
-            target/${{ matrix.target }}/release/kyris-hook
-            target/${{ matrix.target }}/release/checksums-${{ matrix.target }}.sha256
+            target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz
+            target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz.sha256
 
   homebrew:
     runs-on: macos-latest
     needs: [build]
     steps:
       - name: Trigger homebrew-tap update
-        uses: peter-evans/repository-dispatch@v3
+        uses: peter-evans/repository-dispatch@v4
         with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ secrets.KYRIS_TOKEN }}
           repository: kyr-is/homebrew-tap
-          event-type: release
-          client-payload: '{"tag": "${{ github.ref_name }}"}'
+          event-type: update-formula
+          client-payload: '{"tool": "kyris", "version": "${{ github.ref_name }}", "shas": {"darwin-aarch64": "${{ needs.build.outputs.sha256 }}"}}'

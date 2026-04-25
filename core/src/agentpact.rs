@@ -36,7 +36,7 @@ impl ApprovalResponse {
 
 #[must_use]
 pub fn daemon_unavailable_message() -> String {
-    "AgentPact daemon is unreachable. MCP governance cannot be evaluated.".to_string()
+    "AgentPact daemon is unreachable.".to_string()
 }
 
 #[must_use]

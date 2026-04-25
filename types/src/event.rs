@@ -20,11 +20,17 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_trace_id: Option<String>,
     #[serde(default)]
-    pub attribution: Attribution,
+    pub binary: String,
+    #[serde(default)]
+    pub attribution_method: AttributionMethod,
     #[serde(default)]
     pub sync_state: SyncState,
     #[serde(default)]
     pub coverage_state: CoverageState,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub event_kind: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,16 +73,6 @@ impl std::fmt::Display for Decision {
             Self::Deny => f.write_str("deny"),
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Attribution {
-    #[serde(default)]
-    pub agent: String,
-    #[serde(default)]
-    pub binary: String,
-    #[serde(default)]
-    pub method: AttributionMethod,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -197,18 +193,16 @@ mod tests {
             "detail": "git status",
             "decision": "auto",
             "working_dir": "/tmp/project",
-            "attribution": {
-                "agent": "claude-code",
-                "binary": "claude",
-                "method": "lineage"
-            }
+            "binary": "claude",
+            "attribution_method": "lineage"
         }"#;
         let event: Event = serde_json::from_str(json).unwrap();
         assert_eq!(event.id, "evt-1");
         assert_eq!(event.agent, "claude-code");
         assert_eq!(event.action, Action::Execute);
         assert_eq!(event.decision, Decision::Auto);
-        assert_eq!(event.attribution.method, AttributionMethod::Lineage);
+        assert_eq!(event.binary, "claude");
+        assert_eq!(event.attribution_method, AttributionMethod::Lineage);
         assert_eq!(event.sync_state, SyncState::LocalOnly);
         assert_eq!(event.coverage_state, CoverageState::Unknown);
     }
@@ -226,7 +220,7 @@ mod tests {
         let event: Event = serde_json::from_str(json).unwrap();
         assert!(event.working_dir.is_none());
         assert!(event.routing_trace_id.is_none());
-        assert_eq!(event.attribution.method, AttributionMethod::Unknown);
+        assert_eq!(event.attribution_method, AttributionMethod::Unknown);
     }
 
     #[test]
@@ -285,9 +279,12 @@ mod tests {
             reason: None,
             working_dir: None,
             routing_trace_id: None,
-            attribution: Attribution::default(),
+            binary: String::new(),
+            attribution_method: AttributionMethod::default(),
             sync_state: SyncState::default(),
             coverage_state: CoverageState::default(),
+            mode: String::new(),
+            event_kind: String::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("rule_kind"));

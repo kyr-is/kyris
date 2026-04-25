@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Security scanning. Discovers running AI agents, exposed API keys, MCP
+//! server configurations, and network traffic patterns. Outputs reports
+//! in terminal, JSON, or HTML format.
 pub mod agents;
 pub mod keys;
 pub mod mcp;

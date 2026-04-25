@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Kyris CLI (`kyris`). Developer-facing tool for agent governance:
+//! event timeline/replay queries, security scanning, daemon lifecycle
+//! management, agent setup, and `AgentPact` policy compilation.
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]

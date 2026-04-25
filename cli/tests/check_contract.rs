@@ -83,7 +83,7 @@ fn test_check_command_contract_with_agentpact_socket() {
             "id": "resp-1",
             "code": "PACT_OK",
             "decision": "auto",
-            "matched_rule": "git.status",
+            "matched_rule": "git·status",
             "reason": "allowed by test policy"
         })],
     );
@@ -98,7 +98,7 @@ fn test_check_command_contract_with_agentpact_socket() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Decision: auto"), "{stdout}");
-    assert!(stdout.contains("Matched rule: git.status"), "{stdout}");
+    assert!(stdout.contains("Matched rule: git status"), "{stdout}");
     assert!(
         stdout.contains("Reason: allowed by test policy"),
         "{stdout}"

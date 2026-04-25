@@ -11,3 +11,4 @@ description = "AgentPact daemon UDS client: socket I/O, retry, daemon-state fall
 [dependencies]
 kyris-core = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }

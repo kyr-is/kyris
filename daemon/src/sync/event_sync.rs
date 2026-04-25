@@ -71,9 +71,10 @@ impl EventSyncer {
                     if trimmed.is_empty() {
                         continue;
                     }
-                    if let Ok(event) = serde_json::from_str::<Event>(trimmed)
+                    if let Ok(mut event) = serde_json::from_str::<Event>(trimmed)
                         && self.is_in_scope(event.working_dir.as_deref())
                     {
+                        kyris_core::coverage::derive_for_event(&mut event);
                         events.push(event);
                     }
                 }

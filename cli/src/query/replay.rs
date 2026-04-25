@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::fmt::Write as _;
 
+use agentpact::catalog::commands::id_to_shell;
 use clap::Args;
+use kyris_core::coverage;
 
 #[derive(Args)]
 pub struct ReplayArgs {
@@ -31,13 +33,17 @@ pub fn run(args: ReplayArgs) {
         false
     };
 
-    let event_query = "SELECT timestamp, agent, action, decision, detail, \
-                        mode, rule_kind, rule_id, rule_display, working_dir \
-                       FROM events \
-                       WHERE session_id = ? OR session = ? \
-                       ORDER BY timestamp ASC";
+    let cov = coverage::sql_expr();
+    let event_query = format!(
+        "SELECT timestamp, agent, action, decision, detail, \
+                mode, rule_kind, rule_id, rule_display, working_dir, \
+                {cov} as coverage \
+         FROM events \
+         WHERE session_id = ? OR session = ? \
+         ORDER BY timestamp ASC"
+    );
 
-    let mut stmt = db.prepare(event_query).unwrap_or_else(|e| {
+    let mut stmt = db.prepare(&event_query).unwrap_or_else(|e| {
         eprintln!("Failed to prepare query: {e}");
         std::process::exit(1);
     });
@@ -59,15 +65,17 @@ pub fn run(args: ReplayArgs) {
         let rule_kind: Option<String> = row.get(6).ok();
         let rule_id: Option<String> = row.get(7).ok();
         let rule_display: Option<String> = row.get(8).ok();
+        let coverage: String = row.get(10).unwrap_or_default();
 
-        let mut line = format!("{timestamp}  {agent:<15} {action:<10} {decision:<8} {detail}");
+        let mut line =
+            format!("{timestamp}  {agent:<15} {action:<10} {decision:<8} [{coverage:<8}] {detail}");
         if !mode.is_empty() {
             let _ = write!(line, "  mode={mode}");
         }
         if let Some(ref kind) = rule_kind {
             let _ = write!(line, "  rule={kind}");
             if let Some(ref id) = rule_id {
-                let _ = write!(line, ":{id}");
+                let _ = write!(line, ":{}", id_to_shell(id));
             }
         }
         if let Some(ref display) = rule_display {

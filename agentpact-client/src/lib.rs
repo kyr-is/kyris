@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+//! UDS client for the `AgentPact` daemon. Sends permission requests and
+//! trace-attach calls over a Unix domain socket with retry backoff
+//! ([50, 100, 250]ms). Falls back to a daemon-unavailable state when
+//! `agentpactd` is unreachable.
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -50,7 +54,7 @@ pub fn send_trace_attach(
     socket_timeout: Option<Duration>,
 ) -> Result<Option<String>, String> {
     let request = serde_json::json!({
-        "id": "kyrisd-trace",
+        "id": format!("kyrisd-trace-{}", uuid::Uuid::now_v7()),
         "method": "trace.attach",
         "trace_token": trace_token,
         "trace_id": trace_id,

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use agentpact::catalog::commands::id_to_shell;
 use clap::Args;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -69,7 +70,7 @@ pub fn run(args: CheckArgs) {
 
     println!("Decision: {decision}");
     if let Some(r) = rule {
-        println!("Matched rule: {r}");
+        println!("Matched rule: {}", id_to_shell(r));
     }
     if let Some(r) = reason {
         println!("Reason: {r}");
@@ -163,11 +164,11 @@ mod tests {
     fn testParseCheckResponseFallsBackToRuleId() {
         let resp = serde_json::json!({
             "decision": "auto",
-            "rule_id": "cmd:git.status"
+            "rule_id": "cmd:git·status"
         });
         let (decision, rule, reason) = parse_check_response(&resp);
         assert_eq!(decision, "auto");
-        assert_eq!(rule, Some("cmd:git.status"));
+        assert_eq!(rule, Some("cmd:git·status"));
         assert_eq!(reason, None);
     }
 

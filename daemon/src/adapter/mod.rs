@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+//! Pluggable LLM provider adapters. Each adapter translates between `kyrisd`'s
+//! internal routing and a provider's API (Anthropic, Google, `OpenAI`), handling
+//! auth header forwarding, streaming SSE relay, and session extraction.
 pub mod anthropic;
 pub mod google;
 pub mod openai;
@@ -26,7 +29,11 @@ pub fn extract_trace_token(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-pub fn relay_trace_attach(state: &AppState, trace_token: &str, trace_id: &str) -> Option<String> {
+pub fn relay_trace_attach_sync(
+    state: &AppState,
+    trace_token: &str,
+    trace_id: &str,
+) -> Option<String> {
     let socket_path = state.resolve_agentpact_socket()?;
     let socket = socket_path.display().to_string();
     match kyris_agentpact_client::send_trace_attach(
@@ -38,6 +45,37 @@ pub fn relay_trace_attach(state: &AppState, trace_token: &str, trace_id: &str) -
         Ok(working_dir) => working_dir,
         Err(e) => {
             tracing::debug!(error = %e, "trace.attach relay failed");
+            None
+        }
+    }
+}
+
+pub async fn relay_trace_attach(
+    state: &AppState,
+    trace_token: &str,
+    trace_id: &str,
+) -> Option<String> {
+    let socket_path = state.resolve_agentpact_socket()?;
+    let socket = socket_path.display().to_string();
+    let token = trace_token.to_string();
+    let id = trace_id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        kyris_agentpact_client::send_trace_attach(
+            &socket,
+            &token,
+            &id,
+            Some(std::time::Duration::from_secs(2)),
+        )
+    })
+    .await
+    {
+        Ok(Ok(working_dir)) => working_dir,
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "trace.attach relay failed");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "trace.attach spawn_blocking failed");
             None
         }
     }

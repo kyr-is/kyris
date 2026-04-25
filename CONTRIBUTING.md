@@ -1,20 +1,25 @@
 # Contributing to Kyris
 
-Thank you for your interest in contributing to Kyris.
+## Contributor License Agreement
+
+All contributors must sign the [Kyris CLA](CLA.md). The CLA bot will prompt you on your first pull request.
 
 ## Development
+
+MSRV is 1.95. The toolchain is pinned in `rust-toolchain.toml`.
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo audit
 cargo deny check
 ```
 
+See [AGENTS.md](AGENTS.md) for workspace layout, crate descriptions, and architecture details.
+
 ## Pull Requests
 
-All PRs must pass CI checks: `fmt`, `clippy`, `test`, `audit`, `deny`.
+All PRs must pass CI checks: `fmt`, `clippy`, `test`, `deny`.
 
 ## License
 

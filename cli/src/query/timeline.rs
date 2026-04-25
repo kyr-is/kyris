@@ -2,6 +2,7 @@
 use std::fmt::Write as _;
 
 use clap::Args;
+use kyris_core::coverage;
 
 #[derive(Args)]
 pub struct TimelineArgs {
@@ -32,6 +33,7 @@ pub fn run(args: TimelineArgs) {
         false
     };
 
+    let cov = coverage::sql_expr();
     let query = if has_gw {
         format!(
             "SELECT * FROM (\
@@ -46,7 +48,8 @@ pub fn run(args: TimelineArgs) {
                  NULL as tokens_out, \
                  NULL as cost_usd, \
                  NULL as sync_state, \
-                 'event' as source \
+                 'event' as source, \
+                 {cov} as coverage \
                FROM events e \
                UNION ALL \
                SELECT \
@@ -64,7 +67,8 @@ pub fn run(args: TimelineArgs) {
                    WHEN g.working_dir IS NOT NULL THEN 'pending' \
                    ELSE 'local' \
                  END, \
-                 'gw' as source \
+                 'gw' as source, \
+                 CASE WHEN g.status = 'circuit_breaker' THEN 'enforced' ELSE 'observed' END as coverage \
                FROM gw.gateway_records g \
                WHERE g.trace_id NOT IN (SELECT e.routing_trace_id FROM events e WHERE e.routing_trace_id IS NOT NULL) \
              ) \
@@ -75,7 +79,7 @@ pub fn run(args: TimelineArgs) {
     } else {
         format!(
             "SELECT e.timestamp, e.agent, e.action, e.decision, e.detail, \
-               NULL, NULL, NULL, NULL, NULL, 'event' \
+               NULL, NULL, NULL, NULL, NULL, 'event', {cov} as coverage \
              FROM events e \
              ORDER BY e.timestamp DESC \
              LIMIT {}",
@@ -97,8 +101,10 @@ pub fn run(args: TimelineArgs) {
         let cost_usd: Option<f64> = row.get(8).ok();
         let sync_state: Option<String> = row.get(9).ok();
         let source: String = row.get(10).unwrap_or_default();
+        let coverage: String = row.get(11).unwrap_or_default();
 
-        let mut line = format!("{timestamp}  {agent:<15} {action:<10} {decision:<8} {detail}");
+        let mut line =
+            format!("{timestamp}  {agent:<15} {action:<10} {decision:<8} [{coverage:<8}] {detail}");
 
         if source == "gw" {
             if let (Some(ti), Some(to)) = (tokens_in, tokens_out) {

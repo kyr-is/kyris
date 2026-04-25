@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
+//! HTTP MCP routing. Proxies `POST /mcp/{server}/{path}` to configured
+//! upstream MCP servers, applying policy checks before forwarding. Server
+//! names and upstream URLs are resolved from the daemon config.
 pub mod policy;
 
 use std::sync::Arc;

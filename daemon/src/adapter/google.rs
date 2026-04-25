@@ -129,9 +129,10 @@ async fn handle_generate_content(
         }
     }
 
-    let working_dir = trace_token
-        .as_deref()
-        .and_then(|token| super::relay_trace_attach(&state, token, &trace_id));
+    let working_dir = match trace_token.as_deref() {
+        Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
+        None => None,
+    };
 
     let _ = state.stats_tx.try_send(StatsEvent {
         trace_id: trace_id.clone(),
@@ -348,11 +349,11 @@ fn relay_ndjson_stream(
                     let max = config.circuit_breaker.max_tokens as i64;
                     if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
                         state.circuit_breaker.record_tokens(&session_id, total, max);
-                        status = "error";
+                        status = "circuit_breaker";
                     } else if total > max {
                         state.circuit_breaker.record_tokens(&session_id, total, max);
                         breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "error";
+                        status = "circuit_breaker";
                         if emit_breaker_chunk {
                             let payload = serde_json::json!({
                                 "error": {
@@ -375,9 +376,9 @@ fn relay_ndjson_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = trace_token
-                .as_deref()
-                .and_then(|token| super::relay_trace_attach(&state, token, &trace_id_for_stream));
+            let working_dir = trace_token.as_deref().and_then(|token| {
+                super::relay_trace_attach_sync(&state, token, &trace_id_for_stream)
+            });
 
             let _ = state.stats_tx.try_send(StatsEvent {
                 trace_id: trace_id_for_stream.clone(),
