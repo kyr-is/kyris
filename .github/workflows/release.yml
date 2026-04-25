@@ -8,9 +8,6 @@ on:
 permissions:
   contents: write
 
-env:
-  COVERAGE_GIST_ID: 2a8a7c5f533e65aa92dc3c0478aac964
-
 jobs:
   build:
     runs-on: macos-latest
@@ -30,48 +27,32 @@ jobs:
         with:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
-          components: llvm-tools-preview
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-llvm-cov
-
-      - name: Test with coverage
-        run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-
-      - name: Coverage summary
-        run: |
-          cargo llvm-cov report --color never | tee coverage-report.txt
-          grep -oE '[0-9]+\.[0-9]+%' coverage-report.txt | tail -1 > coverage-pct.txt
-
-      - name: Update coverage gist
-        env:
-          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
-        run: |
-          COVERAGE=$(cat coverage-pct.txt)
-          echo "{\"schemaVersion\":1,\"label\":\"coverage\",\"message\":\"$COVERAGE\",\"color\":\"brightgreen\"}" > coverage.json
-          gh gist edit $COVERAGE_GIST_ID -f coverage.json coverage.json
 
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Sign binaries (macOS)
+      - name: Codesign
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_IDENTITY: ${{ secrets.APPLE_IDENTITY }}
         if: env.APPLE_CERTIFICATE != ''
         run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
+          security create-keychain -p "" build.keychain
+          security import cert.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+          security list-keychains -d user -s build.keychain login.keychain
           for bin in kyris kyrisd kyris-mcp kyris-hook; do
-            codesign --sign "Developer ID Application: Kyri So LLC" \
-              --options runtime --timestamp \
+            codesign --sign "$APPLE_IDENTITY" --options runtime --timestamp \
               "target/${{ matrix.target }}/release/$bin"
           done
 
-      - name: Notarize binaries (macOS)
+      - name: Notarize
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         if: env.APPLE_ID != ''
         run: |
           for bin in kyris kyrisd kyris-mcp kyris-hook; do
@@ -79,7 +60,7 @@ jobs:
             xcrun notarytool submit --wait \
               --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --password "$APPLE_APP_PASSWORD" \
               "$bin.zip"
             xcrun stapler staple "target/${{ matrix.target }}/release/$bin"
             rm "$bin.zip"
@@ -118,8 +99,8 @@ jobs:
             target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz.sha256
 
   homebrew:
-    runs-on: macos-latest
-    needs: [build]
+    needs: build
+    runs-on: ubuntu-latest
     steps:
       - name: Trigger homebrew-tap update
         uses: peter-evans/repository-dispatch@v4
