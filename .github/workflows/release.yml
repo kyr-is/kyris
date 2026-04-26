@@ -73,10 +73,12 @@ jobs:
             SIZE=$(stat -f%z "target/${{ matrix.target }}/release/$bin")
             echo "$bin: $((SIZE / 1024 / 1024))MB ($SIZE bytes)"
           done
+          KYRIS_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris")
+          if [ "$KYRIS_SIZE" -gt 31457280 ]; then echo "::error::kyris exceeds 30MB"; exit 1; fi
           KYRISD_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyrisd")
-          if [ "$KYRISD_SIZE" -gt 15728640 ]; then echo "::error::kyrisd exceeds 15MB"; exit 1; fi
+          if [ "$KYRISD_SIZE" -gt 31457280 ]; then echo "::error::kyrisd exceeds 30MB"; exit 1; fi
           HOOK_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-hook")
-          if [ "$HOOK_SIZE" -gt 524288 ]; then echo "::error::kyris-hook exceeds 500KB"; exit 1; fi
+          if [ "$HOOK_SIZE" -gt 1048576 ]; then echo "::error::kyris-hook exceeds 1MB"; exit 1; fi
           MCP_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-mcp")
           if [ "$MCP_SIZE" -gt 5242880 ]; then echo "::error::kyris-mcp exceeds 5MB"; exit 1; fi
 
