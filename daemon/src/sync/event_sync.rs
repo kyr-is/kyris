@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -35,22 +36,22 @@ impl EventSyncer {
         self.scope.is_in_scope(working_dir)
     }
 
-    pub fn read_new_events(&mut self) -> (Vec<Event>, u64) {
+    pub fn read_new_events(&mut self) -> (Vec<Box<serde_json::value::RawValue>>, u64) {
         let file_path = self.log_dir.join(&self.cursor.filename);
-        let mut events = Vec::new();
+        let mut raw_events = Vec::new();
 
         if !file_path.exists() {
             if let Some(oldest) = find_oldest_log_file(&self.log_dir) {
                 self.cursor.filename = oldest;
                 self.cursor.byte_offset = 0;
             } else {
-                return (events, self.cursor.byte_offset);
+                return (raw_events, self.cursor.byte_offset);
             }
         }
 
         let file_path = self.log_dir.join(&self.cursor.filename);
         let Ok(file) = std::fs::File::open(&file_path) else {
-            return (events, self.cursor.byte_offset);
+            return (raw_events, self.cursor.byte_offset);
         };
 
         let mut reader = std::io::BufReader::new(file);
@@ -58,7 +59,7 @@ impl EventSyncer {
             .seek(SeekFrom::Start(self.cursor.byte_offset))
             .is_err()
         {
-            return (events, self.cursor.byte_offset);
+            return (raw_events, self.cursor.byte_offset);
         }
 
         let mut line = String::new();
@@ -75,14 +76,15 @@ impl EventSyncer {
                         && self.is_in_scope(event.working_dir.as_deref())
                     {
                         kyris_core::coverage::derive_for_event(&mut event);
-                        events.push(event);
+                        let raw = patch_coverage_state(trimmed, event.coverage_state);
+                        raw_events.push(raw);
                     }
                 }
             }
         }
 
         let new_offset = reader.stream_position().unwrap_or(self.cursor.byte_offset);
-        (events, new_offset)
+        (raw_events, new_offset)
     }
 
     pub fn commit_read(&mut self, byte_offset: u64) {
@@ -119,7 +121,7 @@ impl EventSyncer {
 
     pub fn build_batch(
         &self,
-        events: Vec<Event>,
+        events: Vec<Box<serde_json::value::RawValue>>,
         machine_id: &str,
         kyrisd_records: Vec<kyris_core::record::GatewayRecord>,
     ) -> EventBatch {
@@ -131,6 +133,23 @@ impl EventSyncer {
             cursor: self.cursor.clone(),
         }
     }
+}
+
+fn patch_coverage_state(
+    raw_line: &str,
+    coverage_state: kyris_core::event::CoverageState,
+) -> Box<serde_json::value::RawValue> {
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(raw_line).unwrap_or_default();
+    map.insert(
+        "coverage_state".to_string(),
+        serde_json::Value::String(coverage_state.to_string()),
+    );
+    serde_json::value::RawValue::from_string(serde_json::to_string(&map).unwrap_or_default())
+        .unwrap_or_else(|_| {
+            serde_json::value::RawValue::from_string(raw_line.to_string())
+                .expect("original line was valid JSON")
+        })
 }
 
 fn is_log_file(name: &str) -> bool {
@@ -198,6 +217,48 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    fn parse_event(raw: &serde_json::value::RawValue) -> Event {
+        serde_json::from_str(raw.get()).unwrap()
+    }
+
+    #[test]
+    fn testPatchCoverageStatePreservesFieldsAndOrder() {
+        use kyris_core::event::CoverageState;
+        let raw =
+            r#"{"id":"evt-1","agent":"claude","unknown_field":"kept","coverage_state":"unknown"}"#;
+        let patched = patch_coverage_state(raw, CoverageState::Enforced);
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(patched.get()).unwrap();
+        assert_eq!(
+            map.get("coverage_state").and_then(|v| v.as_str()),
+            Some("enforced")
+        );
+        assert_eq!(
+            map.get("unknown_field").and_then(|v| v.as_str()),
+            Some("kept")
+        );
+        let keys: Vec<&String> = map.keys().collect();
+        assert_eq!(keys[0], "id");
+        assert_eq!(keys[1], "agent");
+        assert_eq!(keys[2], "unknown_field");
+    }
+
+    #[test]
+    fn testReadNewEventsPreservesUnknownFields() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let json = r#"{"id":"evt-1","timestamp":"2026-04-12T00:00:00Z","agent":"test","action":"execute","detail":"cmd","decision":"auto","working_dir":"/work/a","future_field":"hello"}"#;
+        std::fs::write(&log_path, format!("{json}\n")).unwrap();
+        let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
+        let (events, _) = syncer.read_new_events();
+        assert_eq!(events.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(events[0].get()).unwrap();
+        assert_eq!(
+            v.get("future_field").and_then(|v| v.as_str()),
+            Some("hello")
+        );
+    }
+
     fn make_syncer(scope: Vec<String>, log_dir: &Path) -> EventSyncer {
         EventSyncer::new(
             SyncCursor {
@@ -251,7 +312,7 @@ mod tests {
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
         let (events, new_offset) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "evt-1");
+        assert_eq!(parse_event(&events[0]).id, "evt-1");
         assert!(new_offset > 0);
         syncer.commit_read(new_offset);
         assert_eq!(syncer.cursor().byte_offset, new_offset);
@@ -285,7 +346,7 @@ mod tests {
         let mut syncer = make_syncer(vec!["/work/*".to_string()], dir.path());
         let (events, _) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "evt-1");
+        assert_eq!(parse_event(&events[0]).id, "evt-1");
     }
 
     #[test]
@@ -336,7 +397,7 @@ mod tests {
 
         let (events, _) = syncer.read_new_events();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "evt-3");
+        assert_eq!(parse_event(&events[0]).id, "evt-3");
     }
 
     #[test]
@@ -510,7 +571,7 @@ mod tests {
         // Simulate relay failure: don't call commit_read
         let (events_retry, offset) = syncer.read_new_events();
         assert_eq!(events_retry.len(), 1, "same events returned on retry");
-        assert_eq!(events_retry[0].id, "evt-retry");
+        assert_eq!(parse_event(&events_retry[0]).id, "evt-retry");
 
         // Now commit and verify no more events
         syncer.commit_read(offset);
@@ -584,7 +645,7 @@ mod tests {
         let parsed: EventBatch = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(parsed.machine_id, "machine-1");
         assert_eq!(parsed.events.len(), 1);
-        assert_eq!(parsed.events[0].id, "evt-1");
+        assert_eq!(parse_event(&parsed.events[0]).id, "evt-1");
         assert_eq!(parsed.cursor.filename, "events.jsonl");
         assert!(parsed.cursor.byte_offset > 0);
     }

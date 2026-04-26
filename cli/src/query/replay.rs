@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use std::fmt::Write as _;
 

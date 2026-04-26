@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 

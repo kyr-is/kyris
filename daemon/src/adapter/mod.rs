@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Pluggable LLM provider adapters. Each adapter translates between `kyrisd`'s
 //! internal routing and a provider's API (Anthropic, Google, `OpenAI`), handling

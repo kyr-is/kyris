@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Kyris CLI (`kyris`). Developer-facing tool for agent governance:
 //! event timeline/replay queries, security scanning, daemon lifecycle

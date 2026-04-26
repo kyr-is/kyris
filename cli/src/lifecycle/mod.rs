@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Daemon and system lifecycle management: install/uninstall binaries and
 //! launchd services, enroll with the relay, check for updates, and

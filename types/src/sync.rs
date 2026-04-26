@@ -1,14 +1,14 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 
-use crate::event::Event;
 use crate::record::GatewayRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventBatch {
     pub machine_id: String,
     pub batch_id: String,
-    pub events: Vec<Event>,
+    pub events: Vec<Box<serde_json::value::RawValue>>,
     #[serde(default)]
     pub kyrisd_records: Vec<GatewayRecord>,
     pub cursor: SyncCursor,
@@ -28,6 +28,7 @@ pub struct PolicyBundle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EnrollmentResponse {
     pub machine_token: String,
     pub machine_id: String,

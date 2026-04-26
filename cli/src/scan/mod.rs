@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Security scanning. Discovers running AI agents, exposed API keys, MCP
 //! server configurations, and network traffic patterns. Outputs reports

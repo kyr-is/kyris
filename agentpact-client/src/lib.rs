@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! UDS client for the `AgentPact` daemon. Sends permission requests and
 //! trace-attach calls over a Unix domain socket with retry backoff

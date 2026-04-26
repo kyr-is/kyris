@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]

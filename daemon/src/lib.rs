@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Kyris daemon (`kyrisd`). Reverse-proxy for LLM provider APIs with
 //! token metering, cost tracking, circuit breaking, and streaming relay.
