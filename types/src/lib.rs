@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Pure schema and serialization types shared across the kyris workspace.
 //! No I/O, no runtime, no filesystem — just structs, enums, and serde

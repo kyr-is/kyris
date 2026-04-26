@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Relay synchronization. Pushes local events and gateway records to the
 //! remote relay in batches, using a cursor to track progress. Daemon state

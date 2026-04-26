@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Stdio MCP wrapper (`kyris-mcp`). Sits between an AI agent and an MCP
 //! server, intercepting JSON-RPC `tools/call` requests over stdin/stdout.

@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
 members = [
@@ -23,7 +24,7 @@ kyris-core = { path = "core" }
 kyris-agentpact-client = { path = "agentpact-client" }
 agentpact = { git = "https://github.com/kyr-is/agentpact.git", version = ">=0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value", "preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tokio = { version = ">=1.44.2" }
 tracing = "0.1"

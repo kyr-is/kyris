@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Minimal shell hook helper (`kyris-hook`). Translates agent hook events
 //! (check, respond, send) into `AgentPact` UDS protocol calls. Intentionally

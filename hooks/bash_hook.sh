@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
 # Kyris Bash hook: extdebug + DEBUG trap. Requires kyris-hook on PATH.
 # Compatible with macOS system Bash (3.2) and modern Bash (5.x).

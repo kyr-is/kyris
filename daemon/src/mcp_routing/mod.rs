@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! HTTP MCP routing. Proxies `POST /mcp/{server}/{path}` to configured
 //! upstream MCP servers, applying policy checks before forwarding. Server

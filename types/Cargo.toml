@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "kyris-types"
@@ -8,8 +9,12 @@ license.workspace = true
 repository.workspace = true
 description = "Pure schema and serialization types for the Kyris workspace. No I/O, no runtime, no filesystem."
 
+[features]
+openapi = ["utoipa"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 serde-saphyr = { workspace = true }
+utoipa = { version = "5.4", optional = true }

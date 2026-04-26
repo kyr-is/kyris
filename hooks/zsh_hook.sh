@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
 # Kyris Zsh hook: preexec via add-zsh-hook. Requires kyris-hook on PATH.
 # Compatible with macOS system Zsh (5.8+) and modern Zsh (5.9+).

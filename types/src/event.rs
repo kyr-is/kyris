@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,28 @@ pub struct Event {
     pub working_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_remote_origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     #[serde(default)]
     pub binary: String,
     #[serde(default)]
@@ -279,6 +302,17 @@ mod tests {
             reason: None,
             working_dir: None,
             routing_trace_id: None,
+            git_remote_origin: None,
+            mcp_server: None,
+            mcp_operation: None,
+            approval_id: None,
+            tier: None,
+            plan_status: None,
+            response: None,
+            success: None,
+            exit_code: None,
+            result_summary: None,
+            session: None,
             binary: String::new(),
             attribution_method: AttributionMethod::default(),
             sync_state: SyncState::default(),

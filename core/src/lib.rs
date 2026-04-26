@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! Shared library layer. Re-exports `kyris-types` and adds I/O helpers:
 //! config loading with environment variable overrides, `AgentPact` protocol
