@@ -1,11 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
+
+use kyris_core::agentpact::ToolAnnotations;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::RwLock;
 
 use crate::framing;
 use crate::policy::{self, PactDecision};
+
+type AnnotationCache = Arc<RwLock<HashMap<String, ToolAnnotations>>>;
 
 const CHILD_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -30,6 +37,7 @@ pub async fn run_wrapper(
 
     let stdin = tokio::io::stdin();
     let stdout: SharedStdout = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+    let annotation_cache: AnnotationCache = Arc::new(RwLock::new(HashMap::new()));
 
     let server_name_owned = server_name.to_string();
 
@@ -40,9 +48,14 @@ pub async fn run_wrapper(
         server_name_owned.clone(),
         has_tty,
         socket_timeout,
+        annotation_cache.clone(),
     ));
 
-    let server_to_agent = tokio::spawn(relay_server_to_agent(child_stdout, stdout));
+    let server_to_agent = tokio::spawn(relay_server_to_agent(
+        child_stdout,
+        stdout,
+        annotation_cache,
+    ));
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("register SIGTERM");
@@ -116,6 +129,7 @@ async fn relay_agent_to_server(
     server_name: String,
     has_tty: bool,
     socket_timeout: std::time::Duration,
+    annotation_cache: AnnotationCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let reader = BufReader::new(stdin);
     let mut lines = reader.lines();
@@ -126,8 +140,22 @@ async fn relay_agent_to_server(
             let tool_name = extract_tool_name(bytes).unwrap_or_else(|| "unknown".to_string());
             let original_id = extract_request_id(bytes).unwrap_or(serde_json::Value::Null);
 
-            let decision =
-                policy::check_permission(&server_name, &tool_name, has_tty, socket_timeout).await;
+            let annotations = annotation_cache
+                .read()
+                .await
+                .get(&tool_name)
+                .cloned()
+                .unwrap_or_default();
+
+            let decision = policy::check_permission(
+                &server_name,
+                &tool_name,
+                has_tty,
+                Some("tools/call"),
+                &annotations,
+                socket_timeout,
+            )
+            .await;
 
             match decision {
                 PactDecision::Allow => {
@@ -154,17 +182,28 @@ async fn relay_agent_to_server(
 }
 
 async fn relay_server_to_agent(
-    mut child_stdout: tokio::process::ChildStdout,
+    child_stdout: tokio::process::ChildStdout,
     stdout: SharedStdout,
+    annotation_cache: AnnotationCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = tokio::io::AsyncReadExt::read(&mut child_stdout, &mut buf).await?;
-        if n == 0 {
-            break;
+    let reader = BufReader::new(child_stdout);
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await? {
+        let bytes = line.as_bytes();
+        if framing::is_tools_list_response(bytes) {
+            let annotations = framing::extract_tool_annotations(bytes);
+            if !annotations.is_empty() {
+                let mut cache = annotation_cache.write().await;
+                for (name, ann) in annotations {
+                    cache.insert(name, ann);
+                }
+            }
+        } else if framing::is_tools_list_changed(bytes) {
+            annotation_cache.write().await.clear();
         }
         let mut out = stdout.lock().await;
-        out.write_all(&buf[..n]).await?;
+        out.write_all(bytes).await?;
+        out.write_all(b"\n").await?;
         out.flush().await?;
     }
     Ok(())

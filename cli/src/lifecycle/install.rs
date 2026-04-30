@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use crate::compile_policy;
 use crate::integration::{
-    claude_hooks_dir, claude_settings_path, codex_config_exists, codex_config_path, codex_dir,
-    codex_hooks_path, ensure_json_command_hook, ensure_toml_bool_path, gemini_settings_path,
-    read_json_value, read_toml_value, write_json_value, write_toml_value,
+    claude_hooks_dir, claude_settings_path, codex_config_path, codex_dir, codex_hooks_path,
+    ensure_json_command_hook, ensure_toml_bool_path, gemini_settings_path, read_json_value,
+    read_toml_value, write_json_value, write_toml_value,
 };
 use crate::service::{ServiceKind, service_state, start_service};
 use crate::state::{
@@ -185,21 +185,11 @@ fn detected_components() -> Vec<String> {
         KYRIS_MCP_COMPONENT.to_string(),
         KYRIS_HOOK_COMPONENT.to_string(),
     ];
-    let home = std::env::var("HOME").unwrap_or_default();
 
-    if claude_settings_path().is_ok_and(|path| path.exists())
-        || PathBuf::from(&home).join(".claude").is_dir()
-    {
-        components.push(CLAUDE_COMPONENT.to_string());
-    }
-    if codex_config_exists() {
-        components.push(CODEX_COMPONENT.to_string());
-    }
-    if which_exists("gemini") || gemini_settings_path().is_ok_and(|path| path.exists()) {
-        components.push(GEMINI_COMPONENT.to_string());
-    }
-    if cline_extension_installed(&home) {
-        components.push(CLINE_COMPONENT.to_string());
+    for agent in crate::agents::registry::all_agents() {
+        if agent.is_installed() {
+            components.push(agent.id().to_string());
+        }
     }
 
     components
@@ -520,19 +510,6 @@ fn install_cline_permissions() -> Result<Vec<String>, String> {
 
 fn shell_command(path: &std::path::Path) -> String {
     format!("bash \"{}\"", path.display())
-}
-
-fn cline_extension_installed(home: &str) -> bool {
-    let ext_dir = PathBuf::from(home).join(".vscode").join("extensions");
-    ext_dir.is_dir()
-        && std::fs::read_dir(ext_dir).is_ok_and(|entries| {
-            entries.filter_map(Result::ok).any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("saoudrizwan.claude-dev")
-            })
-        })
 }
 
 fn brew_formula_installed(formula: &str) -> bool {

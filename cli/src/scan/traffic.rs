@@ -14,19 +14,19 @@ const CHECKS: &[TrafficCheck] = &[
         agent: "Claude Code / Anthropic",
         env_var: "ANTHROPIC_BASE_URL",
         expected_prefix: "http://127.0.0.1:4710",
-        setup_cmd: "kyris setup claude-code",
+        setup_cmd: "kyris agents setup claude-code",
     },
     TrafficCheck {
         agent: "Codex CLI / OpenAI",
         env_var: "OPENAI_BASE_URL",
         expected_prefix: "http://127.0.0.1:4710",
-        setup_cmd: "kyris setup codex-cli",
+        setup_cmd: "kyris agents setup codex-cli",
     },
     TrafficCheck {
         agent: "Gemini CLI / Google",
         env_var: "GOOGLE_GEMINI_BASE_URL",
         expected_prefix: "http://127.0.0.1:4710",
-        setup_cmd: "kyris setup gemini-cli",
+        setup_cmd: "kyris agents setup gemini-cli",
     },
 ];
 
@@ -100,7 +100,7 @@ mod tests {
             agent: "Test Agent",
             env_var: "TEST_BASE_URL",
             expected_prefix: "http://127.0.0.1:4710",
-            setup_cmd: "kyris setup test",
+            setup_cmd: "kyris agents setup test",
         }
     }
 

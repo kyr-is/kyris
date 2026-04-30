@@ -5,6 +5,7 @@
 //! names and upstream URLs are resolved from the daemon config.
 pub mod policy;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +18,63 @@ use axum::{
     routing::post,
 };
 use bytes::Bytes;
+use kyris_core::agentpact::ToolAnnotations;
 
 use crate::server::AppState;
+
+#[derive(Default, Clone)]
+pub struct AnnotationCache(Arc<std::sync::RwLock<HashMap<(String, String), ToolAnnotations>>>);
+
+impl AnnotationCache {
+    pub fn lookup(&self, server: &str, tool: &str) -> ToolAnnotations {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(server.to_string(), tool.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn update_from_response(&self, server: &str, body: &[u8]) {
+        let Ok(tools) = serde_json::from_slice::<serde_json::Value>(body) else {
+            return;
+        };
+        let Some(tool_array) = tools
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+        else {
+            return;
+        };
+        let mut cache = self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tool in tool_array {
+            if let Some(name) = tool.get("name").and_then(|n| n.as_str()) {
+                let annotations = tool.get("annotations").cloned().unwrap_or_default();
+                cache.insert(
+                    (server.to_string(), name.to_string()),
+                    ToolAnnotations {
+                        read_only_hint: annotations
+                            .get("readOnlyHint")
+                            .and_then(serde_json::Value::as_bool),
+                        destructive_hint: annotations
+                            .get("destructiveHint")
+                            .and_then(serde_json::Value::as_bool),
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn clear_server(&self, server: &str) {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(s, _), _| s != server);
+    }
+}
 
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new().route("/mcp/{server}/{*path}", post(handle_mcp).with_state(state))
@@ -60,12 +116,19 @@ async fn handle_mcp(
     }
 
     let tool_name = policy::extract_tool_name(&path, &body);
+    let mcp_operation = extract_json_rpc_method(&body);
+    let annotations = tool_name
+        .as_deref()
+        .map(|t| state.mcp_annotation_cache.lookup(&server_name, t))
+        .unwrap_or_default();
     let socket_timeout = Duration::from_millis(config.mcp.socket_timeout_ms);
     let decision = policy::check_permission(
         &server_name,
         &path,
         &body,
         working_dir.as_deref(),
+        mcp_operation.as_deref(),
+        &annotations,
         socket_timeout,
     )
     .await;
@@ -176,11 +239,27 @@ async fn handle_mcp(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
+    if is_tools_list_path(&path) {
+        state
+            .mcp_annotation_cache
+            .update_from_response(&server_name, &resp_body);
+    }
+
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(resp_body))
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn extract_json_rpc_method(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("method")?.as_str().map(String::from))
+}
+
+fn is_tools_list_path(path: &str) -> bool {
+    path.contains("tools/list")
 }
 
 #[cfg(test)]
@@ -262,6 +341,7 @@ mod tests {
         assert_eq!(policy_request["detail"], "read_file");
         assert_eq!(policy_request["context"]["mcp_server"], "remote");
         assert_eq!(policy_request["context"]["working_dir"], "/tmp/project");
+        assert_eq!(policy_request["context"]["mcp_operation"], "tools/call");
 
         let upstream_request = upstream_recorded.lock().unwrap().clone().unwrap();
         let forwarded: serde_json::Value = serde_json::from_slice(&upstream_request.body).unwrap();
@@ -364,6 +444,7 @@ mod tests {
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
+            mcp_annotation_cache: AnnotationCache::default(),
         })
     }
 

@@ -31,7 +31,7 @@ pub fn run(args: StatsArgs) {
     let interval = parse_interval(&args.since);
 
     print_action_stats(&db, &interval);
-    print_coverage_stats(&db, &interval);
+    print_coverage_stats(&db, &interval, has_gw);
 
     if has_gw {
         print_token_stats(&db, &interval);
@@ -64,16 +64,37 @@ fn print_action_stats(db: &duckdb::Connection, interval: &str) {
     }
 }
 
-fn print_coverage_stats(db: &duckdb::Connection, interval: &str) {
+fn print_coverage_stats(db: &duckdb::Connection, interval: &str, has_gw: bool) {
     let cov = coverage::sql_expr();
     println!("\nCoverage breakdown:");
-    let query = format!(
-        "SELECT {cov} as coverage, COUNT(*) as cnt \
-         FROM events \
-         WHERE timestamp >= now() - INTERVAL '{interval}' \
-         GROUP BY coverage \
-         ORDER BY cnt DESC"
-    );
+    let query = if has_gw {
+        format!(
+            "SELECT coverage, SUM(cnt) as cnt FROM (\
+               SELECT {cov} as coverage, COUNT(*) as cnt \
+               FROM events \
+               WHERE timestamp >= now() - INTERVAL '{interval}' \
+               GROUP BY coverage \
+               UNION ALL \
+               SELECT \
+                 CASE WHEN g.status = 'circuit_breaker' THEN 'enforced' ELSE 'observed' END as coverage, \
+                 COUNT(*) as cnt \
+               FROM gw.gateway_records g \
+               WHERE g.timestamp >= now() - INTERVAL '{interval}' \
+                 AND g.trace_id NOT IN (SELECT e.routing_trace_id FROM events e WHERE e.routing_trace_id IS NOT NULL) \
+               GROUP BY coverage \
+             ) \
+             GROUP BY coverage \
+             ORDER BY cnt DESC"
+        )
+    } else {
+        format!(
+            "SELECT {cov} as coverage, COUNT(*) as cnt \
+             FROM events \
+             WHERE timestamp >= now() - INTERVAL '{interval}' \
+             GROUP BY coverage \
+             ORDER BY cnt DESC"
+        )
+    };
     let Ok(mut stmt) = db.prepare(&query) else {
         return;
     };

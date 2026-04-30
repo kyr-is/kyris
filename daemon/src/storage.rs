@@ -33,6 +33,8 @@ impl DuckDbWriter {
             .map_err(|e| format!("create session_tokens table: {e}"))?;
         conn.execute_batch(kyris_core::record::CREATE_SYNC_CURSOR)
             .map_err(|e| format!("create sync_cursor table: {e}"))?;
+        conn.execute_batch(kyris_core::record::CREATE_SYNC_METADATA)
+            .map_err(|e| format!("create sync_metadata table: {e}"))?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
         })
@@ -177,6 +179,16 @@ impl DuckDbWriter {
             },
         )
         .ok()
+    }
+
+    pub fn save_sync_metadata(&self, scope: &[String], synced_at: &str) -> duckdb::Result<usize> {
+        let conn = self.conn.lock().expect("lock db");
+        let scope_json = serde_json::to_string(scope).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "INSERT INTO sync_metadata (id, scope_json, last_synced_at) VALUES (1, ?, ?) \
+             ON CONFLICT (id) DO UPDATE SET scope_json = excluded.scope_json, last_synced_at = excluded.last_synced_at",
+            duckdb::params![scope_json, synced_at],
+        )
     }
 
     pub fn mark_records_synced(&self, record_ids: &[String]) -> duckdb::Result<()> {
@@ -622,5 +634,60 @@ mod tests {
         });
         assert!(tokens_null);
         assert_eq!(metering, "unavailable");
+    }
+
+    #[test]
+    fn testSyncMetadataSaveAndLoad() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.duckdb");
+        let writer = DuckDbWriter::open(&db_path);
+
+        writer
+            .save_sync_metadata(
+                &["/work/*".to_string(), "/corp/*".to_string()],
+                "2026-04-29T12:00:00Z",
+            )
+            .expect("save metadata");
+
+        let (scope_json, last_synced_at): (String, String) = writer.with_conn(|conn| {
+            conn.query_row(
+                "SELECT scope_json, last_synced_at FROM sync_metadata WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query sync_metadata")
+        });
+        let scope: Vec<String> = serde_json::from_str(&scope_json).expect("parse scope_json");
+        assert_eq!(scope, vec!["/work/*", "/corp/*"]);
+        assert_eq!(last_synced_at, "2026-04-29T12:00:00Z");
+    }
+
+    #[test]
+    fn testSyncMetadataUpsert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test.duckdb");
+        let writer = DuckDbWriter::open(&db_path);
+
+        writer
+            .save_sync_metadata(&["/work/*".to_string()], "2026-04-29T12:00:00Z")
+            .expect("first save");
+        writer
+            .save_sync_metadata(
+                &["/work/*".to_string(), "/new/*".to_string()],
+                "2026-04-29T13:00:00Z",
+            )
+            .expect("second save");
+
+        let (scope_json, last_synced_at): (String, String) = writer.with_conn(|conn| {
+            conn.query_row(
+                "SELECT scope_json, last_synced_at FROM sync_metadata WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("query sync_metadata")
+        });
+        let scope: Vec<String> = serde_json::from_str(&scope_json).expect("parse scope_json");
+        assert_eq!(scope, vec!["/work/*", "/new/*"]);
+        assert_eq!(last_synced_at, "2026-04-29T13:00:00Z");
     }
 }

@@ -36,7 +36,7 @@ The script downloads the latest release, verifies its SHA-256 checksum, installs
 
 ```sh
 kyris install
-kyris setup --list
+kyris agents
 kyris status
 ```
 
@@ -142,20 +142,18 @@ The normal workflow is simple. Exact output depends on what is installed and wha
      agentpactd - Install separately via AgentPact's own installer.
    ```
 
-3. Run `kyris setup <agent>` for the agents you use, or `kyris setup --list` to see what Kyris detected.
+3. Run `kyris agents setup <agent>` for the agents you use, or `kyris agents` to see what Kyris detected.
 
    Example response:
 
    ```text
-   $ kyris setup --list
-   Supported agents:
-     claude-code     (installed)
-     gemini-cli      (not found)
-     codex-cli       (installed)
-     opencode        (not found)
-     cline           (installed)
+   $ kyris agents
+   Agent         Execution        Tool             Burn-Control     Status
+   claude-code   adapted(hook)    adapted(hook)    none             ok
+   codex-cli     none             none             none             ok
+   cline         none             none             none             ok
 
-   $ kyris setup claude-code
+   $ kyris agents setup claude-code
    Applied setup for claude-code:
      wrote /Users/alex/.kyris/env/load.sh
      wrote /Users/alex/.kyris/env/claude-code.sh
@@ -281,7 +279,7 @@ Coverage terms describe what Kyris actually saw and controlled. If Kyris does no
 | --- | --- | --- |
 | **`enforced`** | Kyris intercepted the action and applied policy before execution | Shell command stopped by hooks, MCP call checked before execution |
 | **`observed`** | Kyris saw the action or its direct side effects, but not as a guaranteed preventive gate | Routed LLM request recorded by `kyrisd` without a stronger pre-execution claim on downstream effects |
-| **`vendor-reported`** | Kyris learned about the action from a vendor feed rather than a local preventive path | Vendor audit or analytics feed |
+| **`vendor_reported`** | Kyris learned about the action from a vendor feed rather than a local preventive path | Vendor audit or analytics feed |
 | **`unknown`** | Kyris had no trustworthy visibility into the path | Ungoverned traffic that bypassed Kyris entirely |
 
 ```mermaid
@@ -294,7 +292,7 @@ flowchart TD
 
   enforced[enforced]
   observed[observed]
-  vendorReported[vendor-reported]
+  vendorReported[vendor_reported]
   unknown[unknown]
 
   agentAction --> governedPath --> enforced
@@ -442,7 +440,7 @@ Several decisions are intentional enough that contributors should treat them as 
 - **No per-project Kyris config.** Project-specific policy belongs in AgentPact's directory walk-up tree. `kyrisd.yaml` is machine-wide.
 - **No provider normalization layer.** `kyrisd` uses native-format passthrough for provider adapters. Shared infra is metering, circuit breaking, auth, and storage, not request translation.
 - **Shell scripts stay thin.** `kyris-hook` owns the shell-to-daemon protocol boundary so the scripts remain transport glue rather than miniature JSON implementations.
-- **Coverage claims are path-based.** If Kyris is not on the path, the right answer is `observed`, `vendor-reported`, or `unknown`, not wishful thinking.
+- **Coverage claims are path-based.** If Kyris is not on the path, the right answer is `observed`, `vendor_reported`, or `unknown`, not wishful thinking.
 - **`kyris-types` is a stability boundary.** Pure shared types stay separate so local crates and future hosted systems can share a contract without dragging in runtime dependencies.
 - **`kyris-mcp` stays intentionally minimal.** Stdout is reserved for JSON-RPC, so the wrapper avoids database, web stack, and heavy observability dependencies on purpose.
 

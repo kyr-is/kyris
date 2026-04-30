@@ -51,6 +51,11 @@ fn main() -> ExitCode {
 fn cmd_check(args: &[String]) -> ExitCode {
     let (command, cwd, socket_path) = parse_check_args(args);
 
+    if let Err(msg) = check_protocol_version(&socket_path) {
+        eprintln!("[agentpact] {msg}");
+        return ExitCode::from(10);
+    }
+
     let exec_token = std::env::var("AGENTPACT_EXEC_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
@@ -70,7 +75,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     let Ok(response) = send_request(&socket_path, &request) else {
         if daemon_state_allows(&socket_path) {
-            return ExitCode::from(0);
+            write_fail_open_event("execute", &command, &cwd);
+            return ExitCode::from(11);
         }
         return ExitCode::from(10);
     };
@@ -254,6 +260,11 @@ fn cmd_check_hook(args: &[String]) -> ExitCode {
         }
     }
 
+    if let Err(msg) = check_protocol_version(&socket_path) {
+        print_hook_response(&agent, "error", &msg);
+        return ExitCode::from(1);
+    }
+
     let mut payload = String::new();
     std::io::stdin().read_to_string(&mut payload).unwrap_or(0);
 
@@ -278,6 +289,7 @@ fn cmd_check_hook(args: &[String]) -> ExitCode {
 
     let Ok(response) = send_request(&socket_path, &request) else {
         if daemon_state_allows(&socket_path) {
+            write_fail_open_event(&action, &detail, cwd.as_deref().unwrap_or(""));
             print_hook_response(&agent, "auto", "");
             return ExitCode::from(0);
         }
@@ -294,14 +306,23 @@ fn cmd_check_hook(args: &[String]) -> ExitCode {
             print_hook_response(&agent, "deny", reason.as_deref().unwrap_or(""));
             ExitCode::from(1)
         }
-        CheckResponse::Ask { approval_token, .. } => {
-            send_deny_quiet(&socket_path, &approval_token);
+        CheckResponse::Ask {
+            approval_token,
+            approval_id,
+            breaker_count,
+        } => {
+            send_void(&socket_path, &approval_token);
             let reason = response
-                .get("error")
-                .or_else(|| response.get("reason"))
+                .get("reason")
                 .and_then(|v| v.as_str())
-                .unwrap_or("denied by policy");
-            print_hook_response(&agent, "deny", reason);
+                .unwrap_or("requires approval");
+            let detail = match breaker_count {
+                Some(count) => format!(
+                    "{reason} ({count} commands without human input) [approval_id={approval_id}]"
+                ),
+                None => format!("{reason} [approval_id={approval_id}]"),
+            };
+            print_hook_ask_response(&agent, &detail);
             ExitCode::from(1)
         }
         CheckResponse::Invalid(_) => {
@@ -373,12 +394,12 @@ fn parse_check_args(args: &[String]) -> (String, String, String) {
     (command, cwd, socket)
 }
 
-fn send_deny_quiet(socket_path: &str, approval_token: &str) {
+fn send_void(socket_path: &str, approval_token: &str) {
     let request = serde_json::json!({
         "id": generate_id(),
         "method": "permission.respond",
         "approval_token": approval_token,
-        "response": "denied",
+        "response": "voided",
     });
     let _ = send_request(socket_path, &request);
 }
@@ -414,19 +435,103 @@ fn send_request(
     ))
 }
 
-fn daemon_state_allows(socket_path: &str) -> bool {
-    let state_path = std::path::Path::new(socket_path)
+fn write_fail_open_event(action: &str, detail: &str, working_dir: &str) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.kyris/fail-open.jsonl");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = ts.as_secs();
+    let line = serde_json::json!({
+        "id": format!("kyris-{}", ts.as_nanos()),
+        "timestamp": format_utc_timestamp(secs),
+        "agent": "unknown",
+        "action": action,
+        "detail": detail,
+        "decision": "auto",
+        "working_dir": working_dir,
+        "attribution_method": "unknown",
+        "mode": "log",
+        "event_kind": "action",
+        "coverage_state": "unknown",
+        "source": "fail-open",
+    });
+    let _ = writeln!(file, "{line}");
+}
+
+fn format_utc_timestamp(epoch_secs: u64) -> String {
+    let secs_per_day: u64 = 86400;
+    let days = epoch_secs / secs_per_day;
+    let day_secs = epoch_secs % secs_per_day;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+
+    let (year, month, day) = days_to_ymd(days + 719_468);
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_ymd(day_count: u64) -> (u64, u64, u64) {
+    let era = day_count / 146_097;
+    let doe = day_count - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+const PROTOCOL_VERSION: u64 = 1;
+
+fn read_daemon_state(socket_path: &str) -> Option<serde_json::Value> {
+    let path = std::path::Path::new(socket_path)
         .parent()
-        .map(|dir| dir.join("daemon.state"));
-    let Some(path) = state_path else {
-        return false;
+        .map(|dir| dir.join("daemon.state"))?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn daemon_state_allows(socket_path: &str) -> bool {
+    read_daemon_state(socket_path)
+        .as_ref()
+        .and_then(|v| v.get("on_daemon_unavailable"))
+        .and_then(|val| val.as_str())
+        == Some("allow")
+}
+
+fn check_protocol_version(socket_path: &str) -> Result<(), String> {
+    let Some(state) = read_daemon_state(socket_path) else {
+        return Ok(());
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return false;
+    let Some(version) = state
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Ok(());
     };
-    match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(v) => v.get("on_daemon_unavailable").and_then(|val| val.as_str()) == Some("allow"),
-        Err(_) => false,
+    if version == PROTOCOL_VERSION {
+        return Ok(());
+    }
+    if version > PROTOCOL_VERSION {
+        Err(format!(
+            "agentpactd protocol version {version} is newer than kyris-hook expects ({PROTOCOL_VERSION}). \
+             Upgrade kyris: brew upgrade kyris"
+        ))
+    } else {
+        Err(format!(
+            "agentpactd protocol version {version} is older than kyris-hook expects ({PROTOCOL_VERSION}). \
+             Upgrade agentpact: brew upgrade agentpact"
+        ))
     }
 }
 
@@ -496,6 +601,16 @@ fn map_agent_payload(agent: &str, input: &serde_json::Value) -> (String, String)
             let detail = input["detail"].as_str().unwrap_or("");
             (method.to_string(), detail.to_string())
         }
+    }
+}
+
+fn print_hook_ask_response(agent: &str, reason: &str) {
+    if agent == "claude-code" {
+        let result = serde_json::json!({"decision": "deny", "reason": reason});
+        println!("{}", serde_json::to_string(&result).unwrap_or_default());
+    } else {
+        eprintln!("[agentpact] {reason}");
+        println!("deny");
     }
 }
 
@@ -792,7 +907,7 @@ mod tests {
         let state_path = dir.path().join("daemon.state");
         std::fs::write(
             &state_path,
-            r#"{"on_daemon_unavailable":"allow","on_log_broken":"continue"}"#,
+            r#"{"protocol_version":1,"on_daemon_unavailable":"allow","on_log_broken":"continue"}"#,
         )
         .unwrap();
         let socket_path = dir.path().join("agentpact.sock");
@@ -805,7 +920,7 @@ mod tests {
         let state_path = dir.path().join("daemon.state");
         std::fs::write(
             &state_path,
-            r#"{"on_daemon_unavailable":"block","on_log_broken":"continue"}"#,
+            r#"{"protocol_version":1,"on_daemon_unavailable":"block","on_log_broken":"continue"}"#,
         )
         .unwrap();
         let socket_path = dir.path().join("agentpact.sock");
@@ -825,11 +940,39 @@ mod tests {
         let state_path = dir.path().join("daemon.state");
         std::fs::write(
             &state_path,
-            r#"{"on_daemon_unavailable": "allow", "on_log_broken": "continue"}"#,
+            r#"{"protocol_version": 1, "on_daemon_unavailable": "allow", "on_log_broken": "continue"}"#,
         )
         .unwrap();
         let socket_path = dir.path().join("agentpact.sock");
         assert!(daemon_state_allows(socket_path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn testWriteFailOpenEvent() {
+        let dir = tempfile::tempdir().unwrap();
+        let kyris_dir = dir.path().join(".kyris");
+        std::fs::create_dir_all(&kyris_dir).unwrap();
+        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+
+        write_fail_open_event("execute", "rm -rf /", "/home/user/project");
+
+        let path = kyris_dir.join("fail-open.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed["action"], "execute");
+        assert_eq!(parsed["detail"], "rm -rf /");
+        assert_eq!(parsed["working_dir"], "/home/user/project");
+        assert_eq!(parsed["source"], "fail-open");
+        assert_eq!(parsed["coverage_state"], "unknown");
+    }
+
+    #[test]
+    fn testFormatUtcTimestamp() {
+        // 2026-01-01T00:00:00Z
+        assert_eq!(format_utc_timestamp(1_767_225_600), "2026-01-01T00:00:00Z");
+        // 2026-04-27T12:30:45Z
+        assert_eq!(format_utc_timestamp(1_777_293_045), "2026-04-27T12:30:45Z");
     }
 
     #[test]
@@ -845,5 +988,64 @@ mod tests {
         unsafe { std::env::remove_var("AGENTPACT_SOCK") };
         let sock = default_socket();
         assert!(sock.ends_with(".agentpact/agentpact.sock"));
+    }
+
+    #[test]
+    fn testCheckProtocolVersionMatchingVersion() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("daemon.state");
+        std::fs::write(
+            &state_path,
+            r#"{"protocol_version":1,"on_daemon_unavailable":"block"}"#,
+        )
+        .unwrap();
+        let socket_path = dir.path().join("agentpact.sock");
+        assert!(check_protocol_version(socket_path.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn testCheckProtocolVersionNewerDaemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("daemon.state");
+        std::fs::write(
+            &state_path,
+            r#"{"protocol_version":99,"on_daemon_unavailable":"block"}"#,
+        )
+        .unwrap();
+        let socket_path = dir.path().join("agentpact.sock");
+        let result = check_protocol_version(socket_path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Upgrade kyris"));
+    }
+
+    #[test]
+    fn testCheckProtocolVersionOlderDaemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("daemon.state");
+        std::fs::write(
+            &state_path,
+            r#"{"protocol_version":0,"on_daemon_unavailable":"block"}"#,
+        )
+        .unwrap();
+        let socket_path = dir.path().join("agentpact.sock");
+        let result = check_protocol_version(socket_path.to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Upgrade agentpact"));
+    }
+
+    #[test]
+    fn testCheckProtocolVersionMissingState() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("agentpact.sock");
+        assert!(check_protocol_version(socket_path.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn testCheckProtocolVersionMissingField() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("daemon.state");
+        std::fs::write(&state_path, r#"{"on_daemon_unavailable":"block"}"#).unwrap();
+        let socket_path = dir.path().join("agentpact.sock");
+        assert!(check_protocol_version(socket_path.to_str().unwrap()).is_ok());
     }
 }

@@ -12,6 +12,19 @@ pub enum McpPermissionDecision {
     },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ToolAnnotations {
+    pub read_only_hint: Option<bool>,
+    pub destructive_hint: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct McpContext {
+    pub working_dir: Option<String>,
+    pub mcp_operation: Option<String>,
+    pub annotations: ToolAnnotations,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalResponse {
     Approved,
@@ -54,17 +67,23 @@ pub fn build_mcp_permission_request(
     request_id_prefix: &str,
     server_name: &str,
     tool_name: &str,
-    working_dir: Option<&str>,
+    mcp_ctx: &McpContext,
 ) -> serde_json::Value {
-    let context = match working_dir {
-        Some(dir) => serde_json::json!({
-            "working_dir": dir,
-            "mcp_server": server_name,
-        }),
-        None => serde_json::json!({
-            "mcp_server": server_name,
-        }),
-    };
+    let mut context = serde_json::json!({
+        "mcp_server": server_name,
+    });
+    if let Some(ref dir) = mcp_ctx.working_dir {
+        context["working_dir"] = serde_json::json!(dir);
+    }
+    if let Some(ref op) = mcp_ctx.mcp_operation {
+        context["mcp_operation"] = serde_json::json!(op);
+    }
+    if let Some(ro) = mcp_ctx.annotations.read_only_hint {
+        context["read_only_hint"] = serde_json::json!(ro);
+    }
+    if let Some(d) = mcp_ctx.annotations.destructive_hint {
+        context["destructive_hint"] = serde_json::json!(d);
+    }
     serde_json::json!({
         "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
         "method": "permission.request",
@@ -143,13 +162,27 @@ mod tests {
 
     #[test]
     fn testBuildMcpPermissionRequest() {
-        let request =
-            build_mcp_permission_request("kyris-mcp", "github", "read_file", Some("/tmp/repo"));
+        let request = build_mcp_permission_request(
+            "kyris-mcp",
+            "github",
+            "read_file",
+            &McpContext {
+                working_dir: Some("/tmp/repo".to_string()),
+                mcp_operation: Some("tools/call".to_string()),
+                annotations: ToolAnnotations {
+                    read_only_hint: Some(true),
+                    destructive_hint: None,
+                },
+            },
+        );
         assert_eq!(request["method"], "permission.request");
         assert_eq!(request["action"], "call");
         assert_eq!(request["detail"], "read_file");
         assert_eq!(request["context"]["mcp_server"], "github");
         assert_eq!(request["context"]["working_dir"], "/tmp/repo");
+        assert_eq!(request["context"]["mcp_operation"], "tools/call");
+        assert_eq!(request["context"]["read_only_hint"], true);
+        assert!(request["context"]["destructive_hint"].is_null());
         assert!(
             request["id"]
                 .as_str()

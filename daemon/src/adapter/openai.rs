@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
@@ -26,6 +27,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
 
 async fn handle_completions(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
@@ -107,6 +109,7 @@ async fn handle_completions(
             model,
             session_id,
             trace_token,
+            peer_addr,
             start,
         );
     }
@@ -139,7 +142,7 @@ async fn handle_completions(
 
     let working_dir = match trace_token.as_deref() {
         Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
-        None => None,
+        None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
     let _ = state.stats_tx.try_send(StatsEvent {
@@ -184,6 +187,7 @@ fn relay_sse_stream(
     model: String,
     session_id: String,
     trace_token: Option<String>,
+    peer_addr: SocketAddr,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
@@ -326,9 +330,10 @@ fn relay_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = trace_token.as_deref().and_then(|token| {
-                super::relay_trace_attach_sync(&state, token, &trace_id_for_stream)
-            });
+            let working_dir = match trace_token.as_deref() {
+                Some(token) => super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
+                None => super::resolve_peer_working_dir_sync(peer_addr),
+            };
 
             let _ = state.stats_tx.try_send(StatsEvent {
                 trace_id: trace_id_for_stream.clone(),
@@ -868,6 +873,7 @@ mod tests {
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
+            mcp_annotation_cache: crate::mcp_routing::AnnotationCache::default(),
         });
         (state, stats_rx)
     }
@@ -879,12 +885,15 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
         });
         (address, shutdown_tx, handle)
     }

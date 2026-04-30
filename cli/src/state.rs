@@ -38,6 +38,33 @@ pub fn credentials_path() -> Result<PathBuf, String> {
     Ok(kyris_home()?.join("credentials.json"))
 }
 
+pub fn agents_dir() -> Result<PathBuf, String> {
+    Ok(kyris_home()?.join("agents"))
+}
+
+pub fn load_agent_profile(
+    agent_id: &str,
+) -> Result<Option<crate::agents::profile::AgentProfile>, String> {
+    let path = agents_dir()?.join(format!("{agent_id}.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let profile = serde_json::from_str(&contents)
+        .map_err(|e| format!("Cannot parse {}: {e}", path.display()))?;
+    Ok(Some(profile))
+}
+
+pub fn save_agent_profile(profile: &crate::agents::profile::AgentProfile) -> Result<(), String> {
+    let dir = agents_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{}.json", profile.agent_id));
+    let contents = serde_json::to_string_pretty(profile)
+        .map_err(|e| format!("Cannot serialize agent profile: {e}"))?;
+    write_secure_file(&path, &contents)
+}
+
 fn backups_dir() -> Result<PathBuf, String> {
     Ok(kyris_home()?.join("backups"))
 }

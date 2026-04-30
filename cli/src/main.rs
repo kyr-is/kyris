@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Kyris CLI (`kyris`). Developer-facing tool for agent governance:
 //! event timeline/replay queries, security scanning, daemon lifecycle
-//! management, agent setup, and `AgentPact` policy compilation.
+//! management, agent integration, and `AgentPact` policy compilation.
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -14,6 +14,7 @@
 )]
 #![cfg_attr(test, allow(non_snake_case))]
 
+mod agents;
 mod check;
 mod compile_policy;
 mod continue_cmd;
@@ -24,7 +25,6 @@ mod pending;
 mod query;
 mod scan;
 mod service;
-mod setup;
 mod state;
 mod status;
 mod version;
@@ -40,6 +40,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Agents(agents::AgentsArgs),
     Timeline(query::timeline::TimelineArgs),
     Replay(query::replay::ReplayArgs),
     Stats(query::stats::StatsArgs),
@@ -51,7 +52,6 @@ enum Command {
     Scan(scan::ScanArgs),
     Install(lifecycle::install::InstallArgs),
     Enroll(lifecycle::enroll::EnrollArgs),
-    Setup(setup::SetupArgs),
     Update(lifecycle::update::UpdateArgs),
     Daemon(lifecycle::daemon_cmd::DaemonArgs),
     Mcp(mcp_cmd::McpArgs),
@@ -64,6 +64,7 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Agents(args) => agents::run(args),
         Command::Timeline(args) => query::timeline::run(args),
         Command::Replay(args) => query::replay::run(args),
         Command::Stats(args) => query::stats::run(args),
@@ -75,7 +76,6 @@ fn main() {
         Command::Scan(args) => scan::run(args),
         Command::Install(args) => lifecycle::install::run(args),
         Command::Enroll(args) => lifecycle::enroll::run(args),
-        Command::Setup(args) => setup::run(args),
         Command::Update(args) => lifecycle::update::run(args),
         Command::Daemon(args) => lifecycle::daemon_cmd::run(args),
         Command::Mcp(args) => mcp_cmd::run(args),
@@ -125,13 +125,18 @@ mod tests {
     }
 
     #[test]
-    fn testParseSetup() {
-        assert!(try_parse(&["setup", "claude-code"]).is_ok());
+    fn testParseAgents() {
+        assert!(try_parse(&["agents"]).is_ok());
     }
 
     #[test]
-    fn testParseSetupList() {
-        assert!(try_parse(&["setup", "--list"]).is_ok());
+    fn testParseAgentsSetup() {
+        assert!(try_parse(&["agents", "setup", "claude-code"]).is_ok());
+    }
+
+    #[test]
+    fn testParseAgentsReconcile() {
+        assert!(try_parse(&["agents", "reconcile"]).is_ok());
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub mod anthropic;
 pub mod google;
 pub mod openai;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -80,6 +81,17 @@ pub async fn relay_trace_attach(
             None
         }
     }
+}
+
+pub async fn resolve_peer_working_dir(peer_addr: SocketAddr) -> Option<String> {
+    tokio::task::spawn_blocking(move || kyris_peer_cwd::resolve(peer_addr))
+        .await
+        .ok()
+        .flatten()
+}
+
+pub fn resolve_peer_working_dir_sync(peer_addr: SocketAddr) -> Option<String> {
+    kyris_peer_cwd::resolve(peer_addr)
 }
 
 pub fn routes(state: Arc<AppState>) -> Router {

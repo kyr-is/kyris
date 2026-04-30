@@ -17,3 +17,4 @@ pub use kyris_types::sync;
 pub mod agentpact;
 pub mod config;
 pub mod coverage;
+pub mod fail_open_log;

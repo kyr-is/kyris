@@ -9,6 +9,8 @@ members = [
     "cli",
     "mcp",
     "hooks/helper",
+    "peer-cwd",
+    "xtask",
 ]
 resolver = "3"
 
@@ -22,6 +24,7 @@ repository = "https://github.com/kyr-is/kyris"
 kyris-types = { path = "types" }
 kyris-core = { path = "core" }
 kyris-agentpact-client = { path = "agentpact-client" }
+kyris-peer-cwd = { path = "peer-cwd" }
 agentpact = { git = "https://github.com/kyr-is/agentpact.git", version = ">=0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value", "preserve_order"] }
@@ -45,6 +48,7 @@ const-hex = "1.18"
 notify = "8.2"
 notify-debouncer-mini = "0.6"
 nix = { version = ">=0.23.0", features = ["process", "socket", "signal", "fs", "user"] }
+libproc = "0.14"
 tray-icon = "0.22"
 notify-rust = "4.14"
 clap = { version = "4.6", features = ["derive"] }
@@ -54,6 +58,7 @@ dialoguer = "0.12"
 console = "0.16"
 futures-util = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
+schemars = "0.8"
 
 [profile.release]
 opt-level = "z"

@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use kyris_agentpact_client as agentpact;
+use kyris_agentpact_client::{McpContext, ToolAnnotations};
+
+use crate::fail_open_log;
 
 #[cfg(test)]
 static TEST_AGENTPACT_SOCKET: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
@@ -45,21 +48,38 @@ pub async fn check_permission(
     path: &str,
     body: &[u8],
     working_dir: Option<&str>,
+    mcp_operation: Option<&str>,
+    annotations: &ToolAnnotations,
     socket_timeout: Duration,
 ) -> PolicyDecision {
     if !is_tools_call_request(path, body) {
         return PolicyDecision::Allow;
     }
 
+    if let Err(msg) = agentpact::check_protocol_compatibility() {
+        return PolicyDecision::Deny(msg);
+    }
+
     let tool = extract_tool_name(path, body).unwrap_or_else(|| "unknown".to_string());
     tracing::debug!(server = %server_name, tool = %tool, "mcp policy check: tools/call detected");
 
     let sock = agentpact_socket();
-    match request_permission(&sock, server_name, &tool, working_dir, socket_timeout).await {
+    match request_permission(
+        &sock,
+        server_name,
+        &tool,
+        working_dir,
+        mcp_operation,
+        annotations,
+        socket_timeout,
+    )
+    .await
+    {
         Ok(decision) => decision,
         Err(e) => {
             if agentpact::allow_on_daemon_unavailable() {
                 tracing::warn!(error = %e, "agentpactd unavailable, allowing due to policy");
+                fail_open_log::record("call", &tool, server_name, working_dir);
                 PolicyDecision::Allow
             } else {
                 tracing::warn!(error = %e, "agentpactd permission.request failed, blocking");
@@ -74,19 +94,25 @@ async fn request_permission(
     server_name: &str,
     tool: &str,
     working_dir: Option<&str>,
+    mcp_operation: Option<&str>,
+    annotations: &ToolAnnotations,
     socket_timeout: Duration,
 ) -> Result<PolicyDecision, String> {
     let socket = sock.to_string_lossy().to_string();
     let server = server_name.to_string();
     let tool = tool.to_string();
-    let working_dir = working_dir.map(str::to_owned);
+    let mcp_ctx = McpContext {
+        working_dir: working_dir.map(str::to_owned),
+        mcp_operation: mcp_operation.map(str::to_owned),
+        annotations: annotations.clone(),
+    };
     tokio::task::spawn_blocking(move || {
         agentpact::request_mcp_tool_permission(
             &socket,
             "kyris",
             &server,
             &tool,
-            working_dir.as_deref(),
+            &mcp_ctx,
             socket_timeout,
         )
         .map(map_permission_decision)
@@ -153,6 +179,8 @@ mod tests {
             "/mcp/test/ping",
             body,
             None,
+            None,
+            &ToolAnnotations::default(),
             Duration::from_millis(50),
         )
         .await;

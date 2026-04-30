@@ -6,6 +6,8 @@ use agentpact::catalog::commands::id_to_shell;
 use clap::Args;
 use kyris_core::coverage;
 
+use super::sync_state::{build_event_sync_expr, load_sync_metadata};
+
 #[derive(Args)]
 pub struct ReplayArgs {
     pub session: String,
@@ -34,11 +36,19 @@ pub fn run(args: ReplayArgs) {
         false
     };
 
+    let sync_meta = if has_gw {
+        load_sync_metadata(&db)
+    } else {
+        None
+    };
+    let event_sync_expr = build_event_sync_expr(sync_meta.as_ref());
+
     let cov = coverage::sql_expr();
     let event_query = format!(
         "SELECT timestamp, agent, action, decision, detail, \
                 mode, rule_kind, rule_id, rule_display, working_dir, \
-                {cov} as coverage \
+                {cov} as coverage, \
+                {event_sync_expr} as sync_state \
          FROM events \
          WHERE session_id = ? OR session = ? \
          ORDER BY timestamp ASC"
@@ -67,6 +77,7 @@ pub fn run(args: ReplayArgs) {
         let rule_id: Option<String> = row.get(7).ok();
         let rule_display: Option<String> = row.get(8).ok();
         let coverage: String = row.get(10).unwrap_or_default();
+        let sync_state: Option<String> = row.get(11).ok();
 
         let mut line =
             format!("{timestamp}  {agent:<15} {action:<10} {decision:<8} [{coverage:<8}] {detail}");
@@ -82,6 +93,11 @@ pub fn run(args: ReplayArgs) {
         if let Some(ref display) = rule_display {
             let _ = write!(line, "  ({display})");
         }
+        if let Some(ref state) = sync_state
+            && state != "local"
+        {
+            let _ = write!(line, "  [{state}]");
+        }
 
         println!("{line}");
         count += 1;
@@ -89,7 +105,12 @@ pub fn run(args: ReplayArgs) {
 
     if has_gw {
         let gw_query = "SELECT timestamp, provider, model, tokens_in, tokens_out, \
-                    cost_usd, latency_ms, status, metering, mcp_server, mcp_tool \
+                    cost_usd, latency_ms, status, metering, mcp_server, mcp_tool, \
+                    CASE \
+                      WHEN synced THEN 'synced' \
+                      WHEN working_dir IS NOT NULL THEN 'pending' \
+                      ELSE 'local' \
+                    END as sync_state \
              FROM gw.gateway_records \
              WHERE session_id = ? \
              ORDER BY timestamp ASC";
@@ -116,6 +137,7 @@ pub fn run(args: ReplayArgs) {
             let metering: String = row.get(8).unwrap_or_default();
             let mcp_server: Option<String> = row.get(9).ok();
             let mcp_tool: Option<String> = row.get(10).ok();
+            let sync_state: String = row.get(11).unwrap_or_default();
 
             let mut line =
                 format!("  {timestamp}  {provider:<12} {model:<30} {status:<8} {latency_ms:>5}ms");
@@ -132,6 +154,9 @@ pub fn run(args: ReplayArgs) {
                 if let Some(ref tool) = mcp_tool {
                     let _ = write!(line, "/{tool}");
                 }
+            }
+            if sync_state != "local" {
+                let _ = write!(line, "  [{sync_state}]");
             }
             println!("{line}");
             gw_count += 1;

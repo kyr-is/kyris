@@ -20,6 +20,7 @@ __kyris_preexec() {
         __kyris_restart_daemon "$sock" || {
             if __kyris_daemon_state_allows "$sock"; then
                 logger -t agentpact "fail-open: $cmd"
+                __kyris_record_fail_open "$cmd"
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
@@ -28,7 +29,16 @@ __kyris_preexec() {
         }
     fi
 
-    command -v kyris-hook >/dev/null 2>&1 || return 0
+    if ! __kyris_protocol_ok "$sock"; then
+        printf '\033[31m[agentpact]\033[0m %s\n' "$__kyris_protocol_error" >&2
+        return 1
+    fi
+
+    if ! command -v kyris-hook >/dev/null 2>&1; then
+        logger -t agentpact "fail-open (kyris-hook not on PATH): $cmd"
+        __kyris_record_fail_open "$cmd"
+        return 0
+    fi
 
     local output exit_code
     output=$(kyris-hook check "$cmd" --cwd "$PWD" --socket "$sock")
@@ -38,6 +48,7 @@ __kyris_preexec() {
         __kyris_restart_daemon "$sock" || {
             if __kyris_daemon_state_allows "$sock"; then
                 logger -t agentpact "fail-open: $cmd"
+                __kyris_record_fail_open "$cmd"
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
@@ -49,6 +60,7 @@ __kyris_preexec() {
         if [ $exit_code -eq 10 ]; then
             if __kyris_daemon_state_allows "$sock"; then
                 logger -t agentpact "fail-open: $cmd"
+                __kyris_record_fail_open "$cmd"
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
@@ -58,7 +70,7 @@ __kyris_preexec() {
     fi
 
     case $exit_code in
-        0) return 0 ;;
+        0|11) return 0 ;;
         1) return 1 ;;
         2)
             local req_id token
@@ -127,6 +139,23 @@ __kyris_prompt_user() {
     esac
 }
 
+__kyris_record_fail_open() {
+    local cmd="$1"
+    local log="$HOME/.kyris/fail-open.jsonl"
+    local id ts esc_cmd esc_pwd
+    id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || return
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    esc_cmd="${cmd//\\/\\\\}"
+    esc_cmd="${esc_cmd//\"/\\\"}"
+    esc_cmd="${esc_cmd//$'\n'/\\n}"
+    esc_cmd="${esc_cmd//$'\t'/\\t}"
+    esc_cmd="${esc_cmd//$'\r'/\\r}"
+    esc_pwd="${PWD//\\/\\\\}"
+    esc_pwd="${esc_pwd//\"/\\\"}"
+    printf '{"id":"%s","timestamp":"%s","agent":"unknown","action":"execute","detail":"%s","decision":"auto","working_dir":"%s","attribution_method":"unknown","mode":"log","event_kind":"action","coverage_state":"unknown","source":"fail-open"}\n' \
+        "$id" "$ts" "$esc_cmd" "$esc_pwd" >> "$log" 2>/dev/null
+}
+
 __kyris_daemon_state_allows() {
     local sock="$1"
     local state_file="${sock%/*}/daemon.state"
@@ -153,13 +182,47 @@ __kyris_write_sentinel() {
     printf '' > "$1" 2>/dev/null
 }
 
+__kyris_protocol_ok() {
+    local sock="$1"
+    local state_file="${sock%/*}/daemon.state"
+    [ -f "$state_file" ] || return 0
+    local content
+    content=$(cat "$state_file" 2>/dev/null) || return 0
+    local version
+    version="${content##*\"protocol_version\":}"
+    version="${version%%[,\}]*}"
+    version="$(printf '%s' "$version" | tr -d ' ')"
+    [ -z "$version" ] && return 0
+    [ "$version" = "$content" ] && return 0
+    if [ "$version" != "1" ]; then
+        if [ "$version" -gt 1 ] 2>/dev/null; then
+            __kyris_protocol_error="agentpactd protocol version ${version} is newer than kyris expects (1). Upgrade kyris: brew upgrade kyris"
+        else
+            __kyris_protocol_error="agentpactd protocol version ${version} is older than kyris expects (1). Upgrade agentpact: brew upgrade agentpact"
+        fi
+        return 1
+    fi
+    return 0
+}
+
 __kyris_restart_daemon() {
     local sock="$1"
-    launchctl kickstart -k "gui/$(id -u)/is.kyr.agentpactd" 2>/dev/null || return 1
     local delay
-    for delay in 0.05 0.1 0.25; do
-        sleep "$delay"
+
+    # The daemon is likely already starting (launchd RunAtLoad after reboot).
+    # Wait for it before attempting a kickstart.
+    for delay in 0.05 0.1 0.15 0.2 0.25 0.25; do
         [ -S "$sock" ] && return 0
+        sleep "$delay"
+    done
+
+    # Socket absent after 1s — ask launchd to start the service.
+    # No -k: don't kill a potentially mid-startup instance.
+    launchctl kickstart "gui/$(id -u)/is.kyr.agentpactd" 2>/dev/null
+
+    for delay in 0.1 0.2 0.3 0.4; do
+        [ -S "$sock" ] && return 0
+        sleep "$delay"
     done
     return 1
 }
