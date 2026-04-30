@@ -5,4 +5,5 @@
 pub mod history;
 pub mod replay;
 pub mod stats;
+mod sync_state;
 pub mod timeline;

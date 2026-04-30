@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 kyris-core = { workspace = true }
+kyris-agentpact-client = { workspace = true }
 agentpact = { workspace = true }
 clap = { workspace = true }
 duckdb = { workspace = true }

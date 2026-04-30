@@ -8,6 +8,8 @@
 #![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(non_snake_case))]
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod config;
 pub mod event;
 pub mod pricing;

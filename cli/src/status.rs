@@ -5,12 +5,8 @@ use regex::Regex;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use crate::compile_policy;
-use crate::integration::{
-    claude_settings_path, codex_hooks_path, gemini_settings_path, read_json_value,
-};
 use crate::service::{ServiceKind, service_state};
-use crate::state::{bin_dir, credentials_path, env_dir, load_config};
+use crate::state::{bin_dir, credentials_path, load_config};
 
 #[derive(Args)]
 pub struct StatusArgs {}
@@ -35,6 +31,9 @@ fn check_agentpactd() {
         status_marker(reachable),
         socket_path
     );
+    if let Err(msg) = kyris_agentpact_client::check_protocol_compatibility() {
+        println!("  [!] {msg}");
+    }
 }
 
 fn check_kyrisd() {
@@ -82,48 +81,30 @@ fn check_hooks() {
 }
 
 fn check_native_integrations() {
-    let claude_hook = claude_settings_path()
-        .ok()
-        .and_then(|path| read_json_value(&path).ok())
-        .is_some_and(|settings| {
-            settings["hooks"]["PreToolUse"]
-                .as_array()
-                .is_some_and(|hooks| !hooks.is_empty())
-        });
-    println!("  [{}] claude-code live hook", status_marker(claude_hook));
-
-    let codex_hook = codex_hooks_path().ok().is_some_and(|path| path.exists());
-    println!("  [{}] codex-cli live hook", status_marker(codex_hook));
-
-    let gemini_hook = gemini_settings_path()
-        .ok()
-        .and_then(|path| read_json_value(&path).ok())
-        .is_some_and(|settings| {
-            settings["hooks"]["BeforeTool"]
-                .as_array()
-                .is_some_and(|hooks| !hooks.is_empty())
-        });
-    println!("  [{}] gemini-cli live hook", status_marker(gemini_hook));
-
-    let cline_permissions_path = env_dir().ok().map(|dir| dir.join("cline.sh"));
-    let cline_permissions = cline_permissions_path
-        .as_ref()
-        .is_some_and(|path| path.exists());
-    if !cline_permissions {
-        println!("  [-] cline compiled policy");
-        return;
+    for agent in crate::agents::registry::all_agents() {
+        let probe = agent.probe();
+        if !probe.detected {
+            continue;
+        }
+        let exec_ok = probe.execution.level != crate::agents::profile::CapLevel::None;
+        let burn_ok = probe.burn_control.level != crate::agents::profile::CapLevel::None;
+        let any_ok = exec_ok || burn_ok;
+        println!(
+            "  [{}] {} agent integration",
+            status_marker(any_ok),
+            agent.id()
+        );
     }
 
-    match cline_policy_status() {
-        ClinePolicyStatus::Enforced => println!("  [+] cline compiled policy"),
-        ClinePolicyStatus::Degraded { ask_rules_dropped } => {
-            println!(
-                "  [!] cline compiled policy degraded ({ask_rules_dropped} ask rules dropped)"
-            );
+    check_cline_policy();
+}
+
+fn check_cline_policy() {
+    match crate::compile_policy::compile_cline_permissions(None) {
+        Ok((_, ask_dropped)) if ask_dropped > 0 => {
+            println!("  [!] cline compiled policy degraded ({ask_dropped} ask rules dropped)");
         }
-        ClinePolicyStatus::Unknown(error) => {
-            println!("  [!] cline compiled policy (cannot evaluate active policy: {error})");
-        }
+        Ok(_) | Err(_) => {}
     }
 }
 
@@ -214,20 +195,6 @@ fn component_binary_path(name: &str) -> Option<PathBuf> {
 fn extract_version(output: &str) -> Option<String> {
     let regex = Regex::new(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.\-]+)?").ok()?;
     regex.find(output).map(|match_| match_.as_str().to_string())
-}
-
-fn cline_policy_status() -> ClinePolicyStatus {
-    match compile_policy::compile_cline_permissions(None) {
-        Ok((_compiled, 0)) => ClinePolicyStatus::Enforced,
-        Ok((_compiled, ask_rules_dropped)) => ClinePolicyStatus::Degraded { ask_rules_dropped },
-        Err(error) => ClinePolicyStatus::Unknown(error),
-    }
-}
-
-enum ClinePolicyStatus {
-    Enforced,
-    Degraded { ask_rules_dropped: u32 },
-    Unknown(String),
 }
 
 fn health_status(listen: &str) -> Result<reqwest::StatusCode, String> {

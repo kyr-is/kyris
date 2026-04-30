@@ -5,6 +5,8 @@ use std::fmt::Write as _;
 use clap::Args;
 use kyris_core::coverage;
 
+use super::sync_state::{build_event_sync_expr, load_sync_metadata};
+
 #[derive(Args)]
 pub struct TimelineArgs {
     #[arg(long, default_value = "20")]
@@ -34,6 +36,13 @@ pub fn run(args: TimelineArgs) {
         false
     };
 
+    let sync_meta = if has_gw {
+        load_sync_metadata(&db)
+    } else {
+        None
+    };
+    let event_sync_expr = build_event_sync_expr(sync_meta.as_ref());
+
     let cov = coverage::sql_expr();
     let query = if has_gw {
         format!(
@@ -48,7 +57,7 @@ pub fn run(args: TimelineArgs) {
                  NULL as tokens_in, \
                  NULL as tokens_out, \
                  NULL as cost_usd, \
-                 NULL as sync_state, \
+                 {event_sync_expr} as sync_state, \
                  'event' as source, \
                  {cov} as coverage \
                FROM events e \
@@ -114,9 +123,12 @@ pub fn run(args: TimelineArgs) {
             if let Some(cost) = cost_usd {
                 let _ = write!(line, "  ${cost:.4}");
             }
-            if let Some(ref state) = sync_state {
-                let _ = write!(line, "  [{state}]");
-            }
+        }
+
+        if let Some(ref state) = sync_state
+            && state != "local"
+        {
+            let _ = write!(line, "  [{state}]");
         }
 
         println!("{line}");

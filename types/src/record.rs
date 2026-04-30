@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct GatewayRecord {
     pub id: String,
     pub trace_id: String,
@@ -30,6 +31,7 @@ pub struct GatewayRecord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RecordStatus {
     Success,
@@ -64,6 +66,7 @@ impl std::str::FromStr for RecordStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Metering {
     #[default]
@@ -106,6 +109,21 @@ CREATE TABLE IF NOT EXISTS sync_cursor (
     filename    VARCHAR NOT NULL,
     byte_offset BIGINT NOT NULL
 )";
+
+pub const CREATE_SYNC_METADATA: &str = "\
+CREATE TABLE IF NOT EXISTS sync_metadata (
+    id              INTEGER PRIMARY KEY DEFAULT 1,
+    scope_json      VARCHAR NOT NULL DEFAULT '[]',
+    last_synced_at  VARCHAR
+)";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionTokenRow {
+    pub session_id: String,
+    pub total_tokens: i64,
+    pub last_activity: String,
+}
 
 #[cfg(test)]
 mod tests {
@@ -189,6 +207,7 @@ mod tests {
         assert!(CREATE_GATEWAY_RECORDS.contains("gateway_records"));
         assert!(CREATE_SESSION_TOKENS.contains("session_tokens"));
         assert!(CREATE_SYNC_CURSOR.contains("sync_cursor"));
+        assert!(CREATE_SYNC_METADATA.contains("sync_metadata"));
     }
 
     #[test]

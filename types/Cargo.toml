@@ -11,6 +11,7 @@ description = "Pure schema and serialization types for the Kyris workspace. No I
 
 [features]
 openapi = ["utoipa"]
+schema = ["schemars"]
 
 [dependencies]
 serde = { workspace = true }
@@ -18,3 +19,4 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 serde-saphyr = { workspace = true }
 utoipa = { version = "5.4", optional = true }
+schemars = { version = "0.8", optional = true }

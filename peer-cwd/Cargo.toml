@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "kyris-peer-cwd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resolve the CWD of the process owning a localhost TCP connection"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = { workspace = true }

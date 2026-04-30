@@ -13,9 +13,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use kyris_core::agentpact::{
-    ApprovalResponse, McpPermissionDecision, build_mcp_permission_request,
-    build_permission_respond_request, daemon_unavailable_message, default_socket_path,
-    parse_mcp_permission_response,
+    ApprovalResponse, McpContext, McpPermissionDecision, ToolAnnotations,
+    build_mcp_permission_request, build_permission_respond_request, daemon_unavailable_message,
+    default_socket_path, parse_mcp_permission_response,
 };
 
 const RETRY_BACKOFFS: &[u64] = &[50, 100, 250];
@@ -31,11 +31,10 @@ pub fn request_mcp_tool_permission(
     request_id_prefix: &str,
     server_name: &str,
     tool_name: &str,
-    working_dir: Option<&str>,
+    mcp_ctx: &McpContext,
     socket_timeout: Duration,
 ) -> Result<McpPermissionDecision, String> {
-    let request =
-        build_mcp_permission_request(request_id_prefix, server_name, tool_name, working_dir);
+    let request = build_mcp_permission_request(request_id_prefix, server_name, tool_name, mcp_ctx);
     send_daemon_request_with_retry(socket_path, &request, socket_timeout)
         .map(|response| parse_mcp_permission_response(&response))
 }
@@ -108,19 +107,64 @@ pub fn send_permission_response(
     }
 }
 
+pub const PROTOCOL_VERSION: u64 = 1;
+
 #[must_use]
 pub fn allow_on_daemon_unavailable() -> bool {
-    let state_path = daemon_state_path();
-    let Some(path) = state_path else {
-        return false;
+    let state = read_daemon_state();
+    state
+        .as_ref()
+        .and_then(|v| v.get("on_daemon_unavailable"))
+        .and_then(|val| val.as_str())
+        == Some("allow")
+}
+
+/// Reads `daemon.state` and checks that `protocol_version` matches
+/// `PROTOCOL_VERSION`. Missing state file or missing field = Ok (pass-through).
+///
+/// # Errors
+///
+/// Returns a human-readable upgrade instruction when versions diverge.
+pub fn check_protocol_compatibility() -> Result<(), String> {
+    let Some(state) = read_daemon_state() else {
+        return Ok(());
     };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return false;
+    check_daemon_protocol_version(&state)
+}
+
+/// Pure protocol version check against a parsed `daemon.state` value.
+/// Missing `protocol_version` field = Ok.
+///
+/// # Errors
+///
+/// Returns a human-readable upgrade instruction when versions diverge.
+pub fn check_daemon_protocol_version(state: &serde_json::Value) -> Result<(), String> {
+    let Some(version) = state
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return Ok(());
     };
-    match serde_json::from_str::<serde_json::Value>(&contents) {
-        Ok(v) => v.get("on_daemon_unavailable").and_then(|val| val.as_str()) == Some("allow"),
-        Err(_) => false,
+    if version == PROTOCOL_VERSION {
+        return Ok(());
     }
+    if version > PROTOCOL_VERSION {
+        Err(format!(
+            "agentpactd protocol version {version} is newer than kyris expects ({PROTOCOL_VERSION}). \
+             Upgrade kyris: brew upgrade kyris"
+        ))
+    } else {
+        Err(format!(
+            "agentpactd protocol version {version} is older than kyris expects ({PROTOCOL_VERSION}). \
+             Upgrade agentpact: brew upgrade agentpact"
+        ))
+    }
+}
+
+fn read_daemon_state() -> Option<serde_json::Value> {
+    let path = daemon_state_path()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&contents).ok()
 }
 
 fn daemon_state_path() -> Option<PathBuf> {
@@ -240,14 +284,62 @@ mod tests {
 
     #[test]
     fn testBuildAndParseMcpPermissionRoundTrip() {
-        let request = build_mcp_permission_request("test", "srv", "tool", Some("/tmp"));
+        let request = build_mcp_permission_request(
+            "test",
+            "srv",
+            "tool",
+            &McpContext {
+                working_dir: Some("/tmp".to_string()),
+                mcp_operation: Some("tools/call".to_string()),
+                ..McpContext::default()
+            },
+        );
         assert_eq!(request["action"], "call");
         assert_eq!(request["detail"], "tool");
+        assert_eq!(request["context"]["mcp_operation"], "tools/call");
 
         let ok_resp = serde_json::json!({"code": "PACT_OK"});
         assert_eq!(
             parse_mcp_permission_response(&ok_resp),
             McpPermissionDecision::Allow
         );
+    }
+
+    #[test]
+    fn testProtocolVersionMatchingIsOk() {
+        let state = serde_json::json!({"protocol_version": 1});
+        assert!(check_daemon_protocol_version(&state).is_ok());
+    }
+
+    #[test]
+    fn testProtocolVersionNewerDaemonSuggestsUpgradeKyris() {
+        let state = serde_json::json!({"protocol_version": 99});
+        let err = check_daemon_protocol_version(&state).unwrap_err();
+        assert!(err.contains("Upgrade kyris"), "{err}");
+        assert!(err.contains("99"), "{err}");
+    }
+
+    #[test]
+    fn testProtocolVersionOlderDaemonSuggestsUpgradeAgentpact() {
+        let state = serde_json::json!({"protocol_version": 0});
+        let err = check_daemon_protocol_version(&state).unwrap_err();
+        assert!(err.contains("Upgrade agentpact"), "{err}");
+    }
+
+    #[test]
+    fn testProtocolVersionMissingFieldIsOk() {
+        let state = serde_json::json!({"on_daemon_unavailable": "block"});
+        assert!(check_daemon_protocol_version(&state).is_ok());
+    }
+
+    #[test]
+    fn testProtocolVersionNullFieldIsOk() {
+        let state = serde_json::json!({"protocol_version": null});
+        assert!(check_daemon_protocol_version(&state).is_ok());
+    }
+
+    #[test]
+    fn testCheckProtocolCompatibilityMissingStateFileIsOk() {
+        let _ = check_protocol_compatibility();
     }
 }

@@ -161,8 +161,8 @@ main() {
   info "  Service:  ${PLIST_LABEL} (launchd)"
   info ""
   info "Next steps:"
-  info "  kyris setup --list       # show detected agents"
-  info "  kyris setup claude-code  # configure an agent"
+  info "  kyris agents              # show detected agents"
+  info "  kyris agents setup claude-code  # configure an agent"
 }
 
 main "$@"

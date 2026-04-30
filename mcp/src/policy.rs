@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 
-use kyris_agentpact_client::{self as agentpact, ApprovalResponse as UserApprovalResponse};
+use kyris_agentpact_client::{
+    self as agentpact, ApprovalResponse as UserApprovalResponse, McpContext, ToolAnnotations,
+};
 
 #[derive(Debug, PartialEq)]
 pub enum PactDecision {
@@ -38,15 +40,21 @@ fn send_permission_request_with_socket(
     sock_path: &str,
     server_name: &str,
     tool_name: &str,
+    mcp_operation: Option<&str>,
+    annotations: &ToolAnnotations,
     socket_timeout: std::time::Duration,
 ) -> Result<PermissionRequestOutcome, String> {
-    let working_dir = current_working_dir();
+    let mcp_ctx = McpContext {
+        working_dir: current_working_dir(),
+        mcp_operation: mcp_operation.map(str::to_owned),
+        annotations: annotations.clone(),
+    };
     agentpact::request_mcp_tool_permission(
         sock_path,
         "kyris-mcp",
         server_name,
         tool_name,
-        working_dir.as_deref(),
+        &mcp_ctx,
         socket_timeout,
     )
 }
@@ -101,32 +109,68 @@ pub async fn check_permission(
     server_name: &str,
     tool_name: &str,
     has_tty: bool,
+    mcp_operation: Option<&str>,
+    annotations: &ToolAnnotations,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
     let sock_path = agentpact_socket_path();
-    check_permission_with_socket(server_name, tool_name, has_tty, &sock_path, socket_timeout).await
+    check_permission_with_socket(
+        server_name,
+        tool_name,
+        has_tty,
+        mcp_operation,
+        annotations,
+        &sock_path,
+        socket_timeout,
+    )
+    .await
 }
 
 pub async fn check_permission_with_socket(
     server_name: &str,
     tool_name: &str,
     has_tty: bool,
+    mcp_operation: Option<&str>,
+    annotations: &ToolAnnotations,
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
+    if let Err(msg) = agentpact::check_protocol_compatibility() {
+        return PactDecision::Deny(msg);
+    }
+
     let tool = tool_name.to_string();
     let server = server_name.to_string();
     let tty = has_tty;
     let socket = sock_path.to_string();
     let timeout = socket_timeout;
+    let operation = mcp_operation.map(str::to_owned);
+    let ann = annotations.clone();
 
     let outcome = tokio::task::spawn_blocking(move || {
-        send_permission_request_with_socket(&socket, &server, &tool, timeout)
+        send_permission_request_with_socket(
+            &socket,
+            &server,
+            &tool,
+            operation.as_deref(),
+            &ann,
+            timeout,
+        )
     })
     .await;
 
     let Ok(outcome) = outcome else {
         if allow_on_daemon_unavailable() {
+            let working_dir = current_working_dir();
+            eprintln!(
+                "[kyris-mcp] agentpactd unavailable, allowing {server_name}/{tool_name} due to policy"
+            );
+            kyris_core::fail_open_log::record(
+                "call",
+                tool_name,
+                server_name,
+                working_dir.as_deref(),
+            );
             return PactDecision::Allow;
         }
         return PactDecision::Deny(daemon_unavailable_message());
@@ -162,7 +206,19 @@ pub async fn check_permission_with_socket(
                 .await
             }
         }
-        Err(_) if allow_on_daemon_unavailable() => PactDecision::Allow,
+        Err(_) if allow_on_daemon_unavailable() => {
+            let working_dir = current_working_dir();
+            eprintln!(
+                "[kyris-mcp] agentpactd unavailable, allowing {server_name}/{tool_name} due to policy"
+            );
+            kyris_core::fail_open_log::record(
+                "call",
+                tool_name,
+                server_name,
+                working_dir.as_deref(),
+            );
+            PactDecision::Allow
+        }
         Err(reason) => PactDecision::Deny(reason),
     }
 }
@@ -322,13 +378,22 @@ mod tests {
             "kyris-mcp",
             "github",
             "read_file",
-            Some("/tmp/repo"),
+            &agentpact::McpContext {
+                working_dir: Some("/tmp/repo".to_string()),
+                mcp_operation: Some("tools/call".to_string()),
+                annotations: ToolAnnotations {
+                    read_only_hint: Some(true),
+                    destructive_hint: None,
+                },
+            },
         );
         assert_eq!(req["method"], "permission.request");
         assert_eq!(req["action"], "call");
         assert_eq!(req["detail"], "read_file");
         assert_eq!(req["context"]["mcp_server"], "github");
         assert_eq!(req["context"]["working_dir"], "/tmp/repo");
+        assert_eq!(req["context"]["mcp_operation"], "tools/call");
+        assert_eq!(req["context"]["read_only_hint"], true);
         let id = req["id"].as_str().unwrap();
         assert!(id.starts_with("kyris-mcp-"));
     }
@@ -441,6 +506,8 @@ mod tests {
             "test-server",
             "read_file",
             false,
+            Some("tools/call"),
+            &ToolAnnotations::default(),
             &socket_path_string(&socket_path),
             std::time::Duration::from_millis(500),
         )
@@ -519,6 +586,8 @@ mod tests {
             "test-server",
             "dangerous_tool",
             true,
+            Some("tools/call"),
+            &ToolAnnotations::default(),
             "/nonexistent/path.sock",
             std::time::Duration::from_millis(100),
         )
@@ -545,6 +614,8 @@ mod tests {
             "test-server",
             "read_file",
             false,
+            Some("tools/call"),
+            &ToolAnnotations::default(),
             &socket_path_string(&socket_path),
             std::time::Duration::from_millis(500),
         )
@@ -573,6 +644,8 @@ mod tests {
             "test-server",
             "write_file",
             true,
+            Some("tools/call"),
+            &ToolAnnotations::default(),
             &socket_path_string(&socket_path),
             std::time::Duration::from_millis(500),
         )

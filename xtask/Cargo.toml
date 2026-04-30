@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "xtask"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Development tasks for the Kyris workspace."
+publish = false
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+kyris-types = { path = "../types", features = ["schema"] }
+schemars = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true }

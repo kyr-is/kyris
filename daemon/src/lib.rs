@@ -24,6 +24,7 @@ pub mod auth;
 pub mod circuit_breaker;
 pub mod config;
 pub mod cost;
+pub mod fail_open_log;
 pub mod mcp_routing;
 pub mod metering;
 pub mod notify;

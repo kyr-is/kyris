@@ -25,6 +25,7 @@ pub enum Severity {
     Info = 0,
     #[allow(dead_code)]
     Low = 2,
+    #[allow(dead_code)]
     Medium = 4,
     High = 7,
     Critical = 10,

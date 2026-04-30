@@ -8,7 +8,7 @@ pub fn generate() -> Value {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://kyr-is.github.io/kyris/config.json",
         "title": "kyrisd configuration",
-        "description": "Schema for kyrisd.yaml and .kyris.yaml configuration files",
+        "description": "Schema for kyrisd.yaml configuration",
         "type": "object",
         "additionalProperties": false,
         "properties": {

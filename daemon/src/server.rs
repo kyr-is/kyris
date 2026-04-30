@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ pub struct AppState {
     pub provider_clients: ArcSwap<HashMap<String, reqwest::Client>>,
     pub pending: Arc<PendingStore>,
     pub agentpact_socket: Option<std::path::PathBuf>,
+    pub mcp_annotation_cache: mcp_routing::AnnotationCache,
 }
 
 pub fn build_provider_client(_provider: &ProviderConfig) -> reqwest::Client {
@@ -96,6 +98,7 @@ pub async fn run(config: KyrisdConfig) {
         provider_clients: ArcSwap::from_pointee(clients),
         pending: Arc::new(PendingStore::new()),
         agentpact_socket,
+        mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
     });
 
     let stats_writer_handle = tokio::spawn(storage::stats_writer(
@@ -164,9 +167,12 @@ async fn serve_with_graceful_shutdown<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
 }
 
 async fn drain_and_flush_stats(
@@ -682,6 +688,7 @@ mod tests {
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
+            mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
         })
     }
 

@@ -82,6 +82,9 @@ jobs:
           MCP_SIZE=$(stat -f%z "target/${{ matrix.target }}/release/kyris-mcp")
           if [ "$MCP_SIZE" -gt 5242880 ]; then echo "::error::kyris-mcp exceeds 5MB"; exit 1; fi
 
+      - name: Generate contract schemas
+        run: cargo run -p xtask -- schemas
+
       - name: Create tarball
         run: |
           cd target/${{ matrix.target }}/release
@@ -100,6 +103,8 @@ jobs:
           files: |
             target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz
             target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz.sha256
+            target/schemas/*.yaml
+            target/schemas/*.json
 
   homebrew:
     needs: build

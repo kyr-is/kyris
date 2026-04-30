@@ -20,10 +20,11 @@ fn run_setup(home: &Path, cwd: &Path, agent: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kyris"))
         .current_dir(cwd)
         .env("HOME", home)
+        .arg("agents")
         .arg("setup")
         .arg(agent)
         .output()
-        .expect("run kyris setup")
+        .expect("run kyris agents setup")
 }
 
 #[test]
@@ -39,7 +40,7 @@ fn test_claude_setup_rolls_back_when_health_check_fails() {
     assert!(!output.status.success());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Rolled back setup changes."));
+    assert!(stderr.contains("Rolled back."));
 
     assert_eq!(
         fs::read_to_string(home.join(".zshrc")).expect("read .zshrc"),
@@ -81,7 +82,7 @@ args = ["-y", "server"]
     assert!(!output.status.success());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Rolled back setup changes."));
+    assert!(stderr.contains("Rolled back."));
 
     assert_eq!(
         fs::read_to_string(home.join(".codex").join("config.toml")).expect("read codex config"),

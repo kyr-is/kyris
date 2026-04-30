@@ -66,7 +66,7 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
     let scope = config.sync.scope.clone();
     let log_dir = agentpact_log_dir();
 
-    let mut syncer = EventSyncer::new(cursor, scope, log_dir.clone());
+    let mut syncer = EventSyncer::new(cursor, scope.clone(), log_dir.clone());
     let client = reqwest::Client::new();
 
     let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -104,7 +104,11 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
         }
 
         syncer.check_rotation();
-        let (events, new_offset) = syncer.read_new_events();
+        let (mut events, new_offset) = syncer.read_new_events();
+        let (raw_fail_open, fail_open_line_count) = crate::fail_open_log::read();
+        let fail_open_events = filter_fail_open_in_scope(&syncer, raw_fail_open);
+        let has_fail_open = !fail_open_events.is_empty();
+        events.extend(fail_open_events);
         let kyrisd_records = filter_records_in_scope(&syncer, fetch_unsynced_records(&state));
         let synced_record_ids = kyrisd_records
             .iter()
@@ -129,6 +133,9 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
         {
             Ok(()) => {
                 syncer.commit_read(new_offset);
+                if has_fail_open {
+                    crate::fail_open_log::drain(fail_open_line_count);
+                }
                 let cursor = syncer.cursor();
                 if let Err(e) = state
                     .db
@@ -138,6 +145,10 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
                 }
                 if let Err(e) = state.db.mark_records_synced(&synced_record_ids) {
                     tracing::warn!(error = %e, "failed to mark synced kyrisd records");
+                }
+                let now = chrono::Utc::now().to_rfc3339();
+                if let Err(e) = state.db.save_sync_metadata(&scope, &now) {
+                    tracing::warn!(error = %e, "failed to persist sync metadata");
                 }
                 tracing::debug!(
                     batch_id = %batch.batch_id,
@@ -209,6 +220,20 @@ fn fetch_unsynced_records(state: &AppState) -> Vec<kyris_core::record::GatewayRe
             None => vec![],
         }
     })
+}
+
+fn filter_fail_open_in_scope(
+    syncer: &EventSyncer,
+    events: Vec<Box<serde_json::value::RawValue>>,
+) -> Vec<Box<serde_json::value::RawValue>> {
+    events
+        .into_iter()
+        .filter(|raw| {
+            serde_json::from_str::<kyris_core::event::Event>(raw.get())
+                .ok()
+                .is_some_and(|e| syncer.is_in_scope(e.working_dir.as_deref()))
+        })
+        .collect()
 }
 
 fn filter_records_in_scope(
