@@ -4,6 +4,11 @@
 # Compatible with macOS system Bash (3.2) and modern Bash (5.x).
 # No Bash 4+ features (no associative arrays, no readarray, no ${var,,}).
 
+if command -v kyris >/dev/null 2>&1; then
+    kyris agents reconcile --auto >/dev/null 2>&1 &
+    disown 2>/dev/null
+fi
+
 shopt -s extdebug
 trap '__kyris_preexec "$BASH_COMMAND"' DEBUG
 

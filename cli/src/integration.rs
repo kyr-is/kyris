@@ -5,75 +5,6 @@ use std::path::{Path, PathBuf};
 
 use crate::state::write_managed_file;
 
-pub fn claude_settings_path() -> Result<PathBuf, String> {
-    let home = home_dir()?;
-    Ok(home.join(".claude").join("settings.json"))
-}
-
-pub fn claude_hooks_dir() -> Result<PathBuf, String> {
-    let home = home_dir()?;
-    Ok(home.join(".claude").join("hooks"))
-}
-
-pub fn codex_config_path() -> Result<PathBuf, String> {
-    if let Some(path) = find_upwards(".codex/config.toml") {
-        return Ok(path);
-    }
-    if let Ok(path) = std::env::var("CODEX_HOME") {
-        return Ok(PathBuf::from(path).join("config.toml"));
-    }
-    Ok(home_dir()?.join(".codex").join("config.toml"))
-}
-
-pub fn codex_config_exists() -> bool {
-    codex_config_path().is_ok_and(|path| path.exists())
-}
-
-pub fn codex_dir() -> Result<PathBuf, String> {
-    let path = codex_config_path()?;
-    path.parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| format!("Cannot resolve parent directory for {}", path.display()))
-}
-
-pub fn codex_hooks_path() -> Result<PathBuf, String> {
-    Ok(codex_dir()?.join("hooks.json"))
-}
-
-pub fn gemini_settings_path() -> Result<PathBuf, String> {
-    if let Some(path) = find_upwards(".gemini/settings.json") {
-        return Ok(path);
-    }
-    Ok(home_dir()?.join(".gemini").join("settings.json"))
-}
-
-pub fn gemini_settings_exists() -> bool {
-    gemini_settings_path().is_ok_and(|path| path.exists())
-}
-
-pub fn opencode_config_path() -> Result<PathBuf, String> {
-    if let Some(path) = find_upwards("opencode.json") {
-        return Ok(path);
-    }
-    Ok(home_dir()?
-        .join(".config")
-        .join("opencode")
-        .join("opencode.json"))
-}
-
-pub fn opencode_config_exists() -> bool {
-    opencode_config_path().is_ok_and(|path| path.exists())
-}
-
-pub fn cline_settings_path() -> Result<PathBuf, String> {
-    Ok(home_dir()?
-        .join("Library")
-        .join("Application Support")
-        .join("Code")
-        .join("User")
-        .join("settings.json"))
-}
-
 pub fn read_json_value(path: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Ok(Value::Object(Map::new()));
@@ -95,9 +26,7 @@ pub fn read_toml_value(path: &Path) -> Result<toml::Value, String> {
     }
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    contents
-        .parse::<toml::Value>()
-        .map_err(|e| format!("Cannot parse {}: {e}", path.display()))
+    toml::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
 }
 
 pub fn write_toml_value(path: &Path, value: &toml::Value, component: &str) -> Result<bool, String> {
@@ -144,6 +73,30 @@ pub fn ensure_json_command_hook(root: &mut Value, phase: &str, command: &str) ->
     true
 }
 
+pub fn remove_json_command_hook(root: &mut Value, phase: &str, command_substr: &str) -> bool {
+    let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let Some(phase_hooks) = hooks.get_mut(phase).and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    let before = phase_hooks.len();
+    phase_hooks.retain(|entry| {
+        !entry
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|nested| {
+                nested.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|cmd| cmd.contains(command_substr))
+                })
+            })
+    });
+    phase_hooks.len() != before
+}
+
 pub fn set_json_string_path(root: &mut Value, path: &[&str], value: &str) -> bool {
     if path.is_empty() {
         return false;
@@ -163,6 +116,28 @@ pub fn set_json_string_path(root: &mut Value, path: &[&str], value: &str) -> boo
         return false;
     }
     object.insert(leaf, Value::String(value.to_string()));
+    true
+}
+
+pub fn set_json_value_path(root: &mut Value, path: &[&str], value: Value) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        let object = as_json_object(cursor);
+        cursor = object
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+
+    let object = as_json_object(cursor);
+    let leaf = path[path.len() - 1].to_string();
+    if object.get(&leaf) == Some(&value) {
+        return false;
+    }
+    object.insert(leaf, value);
     true
 }
 
@@ -188,7 +163,7 @@ pub fn ensure_toml_bool_path(root: &mut toml::Value, path: &[&str], value: bool)
     true
 }
 
-fn find_upwards(relative_path: &str) -> Option<PathBuf> {
+pub fn find_upwards(relative_path: &str) -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {
         let candidate = current.join(relative_path);
@@ -201,7 +176,7 @@ fn find_upwards(relative_path: &str) -> Option<PathBuf> {
     }
 }
 
-fn home_dir() -> Result<PathBuf, String> {
+pub fn home_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home))
 }

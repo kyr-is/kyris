@@ -66,6 +66,8 @@ pub enum Action {
     Read,
     Write,
     Think,
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for Action {
@@ -76,6 +78,7 @@ impl std::fmt::Display for Action {
             Self::Read => f.write_str("read"),
             Self::Write => f.write_str("write"),
             Self::Think => f.write_str("think"),
+            Self::Unknown => f.write_str("unknown"),
         }
     }
 }
@@ -88,6 +91,8 @@ pub enum Decision {
     Inform,
     Ask,
     Deny,
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for Decision {
@@ -97,6 +102,7 @@ impl std::fmt::Display for Decision {
             Self::Inform => f.write_str("inform"),
             Self::Ask => f.write_str("ask"),
             Self::Deny => f.write_str("deny"),
+            Self::Unknown => f.write_str("unknown"),
         }
     }
 }
@@ -108,6 +114,7 @@ pub enum AttributionMethod {
     Boundary,
     Lineage,
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -126,9 +133,10 @@ impl std::fmt::Display for AttributionMethod {
 #[serde(rename_all = "snake_case")]
 pub enum SyncState {
     SyncedToEnterprise,
-    #[default]
-    LocalOnly,
     PendingSync,
+    #[default]
+    #[serde(other)]
+    LocalOnly,
 }
 
 impl std::fmt::Display for SyncState {
@@ -149,6 +157,7 @@ pub enum CoverageState {
     Observed,
     VendorReported,
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -183,9 +192,17 @@ mod tests {
     }
 
     #[test]
-    fn testActionDeserializeInvalid() {
-        let result = serde_json::from_str::<Action>(r#""delete""#);
-        assert!(result.is_err());
+    fn testActionDeserializeUnknownFallsBack() {
+        let action: Action = serde_json::from_str(r#""deploy""#).unwrap();
+        assert_eq!(action, Action::Unknown);
+        assert_eq!(action.to_string(), "unknown");
+    }
+
+    #[test]
+    fn testDecisionDeserializeUnknownFallsBack() {
+        let decision: Decision = serde_json::from_str(r#""escalate""#).unwrap();
+        assert_eq!(decision, Decision::Unknown);
+        assert_eq!(decision.to_string(), "unknown");
     }
 
     #[test]
@@ -207,8 +224,20 @@ mod tests {
     }
 
     #[test]
+    fn testCoverageStateDeserializeUnknownFallsBack() {
+        let state: CoverageState = serde_json::from_str(r#""audited""#).unwrap();
+        assert_eq!(state, CoverageState::Unknown);
+    }
+
+    #[test]
     fn testAttributionMethodDefault() {
         let method = AttributionMethod::default();
+        assert_eq!(method, AttributionMethod::Unknown);
+    }
+
+    #[test]
+    fn testAttributionMethodDeserializeUnknownFallsBack() {
+        let method: AttributionMethod = serde_json::from_str(r#""heuristic""#).unwrap();
         assert_eq!(method, AttributionMethod::Unknown);
     }
 

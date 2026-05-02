@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
-use crate::integration::{
-    cline_settings_path, codex_config_exists, codex_config_path, codex_hooks_path,
-    gemini_settings_exists, gemini_settings_path, opencode_config_exists, opencode_config_path,
-};
+use serde::{Deserialize, Serialize};
 
 use super::probe::ProbeResult;
 
@@ -17,37 +14,84 @@ pub trait AgentDescriptor {
     fn managed_paths(&self) -> Vec<PathBuf>;
     fn kyris_content_markers(&self) -> &'static [&'static str];
     fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)>;
-}
-
-pub fn all_agents() -> Vec<Box<dyn AgentDescriptor>> {
-    vec![
-        Box::new(ClaudeCode),
-        Box::new(CodexCli),
-        Box::new(GeminiCli),
-        Box::new(Cline),
-        Box::new(OpenCode),
-    ]
-}
-
-pub fn agent_by_id(id: &str) -> Option<Box<dyn AgentDescriptor>> {
-    match id {
-        "claude-code" => Some(Box::new(ClaudeCode)),
-        "codex-cli" => Some(Box::new(CodexCli)),
-        "gemini-cli" => Some(Box::new(GeminiCli)),
-        "cline" => Some(Box::new(Cline)),
-        "opencode" => Some(Box::new(OpenCode)),
-        _ => None,
+    fn expected_surfaces(&self) -> (bool, bool, bool);
+    fn configure(&self, listen: &str, inbound_key: &str) -> Result<Vec<String>, String>;
+    fn undo(&self) -> Result<(), String>;
+    fn hook_protocol(&self) -> Option<HookProtocol> {
+        None
+    }
+    fn mcp_config(&self) -> Option<McpConfigLocation> {
+        None
     }
 }
 
-pub struct ClaudeCode;
-pub struct CodexCli;
-pub struct GeminiCli;
-pub struct Cline;
-pub struct OpenCode;
+#[derive(Debug, Clone)]
+pub enum McpConfigFormat {
+    Json { servers_path: Vec<&'static str> },
+    Toml { servers_key: &'static str },
+}
 
-fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+#[derive(Debug, Clone)]
+pub struct McpConfigLocation {
+    pub path: std::path::PathBuf,
+    pub format: McpConfigFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolMapping {
+    pub tool_name: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookProtocol {
+    pub tool_name_field: String,
+    pub detail_fields: Vec<String>,
+    pub tool_mappings: Vec<ToolMapping>,
+    pub default_action: String,
+    pub response_format: ResponseFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResponseFormat {
+    Json,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PrimaryProvider {
+    Anthropic,
+    OpenAI,
+    Google,
+}
+
+pub fn provider_env_exports(
+    provider: PrimaryProvider,
+    listen: &str,
+    inbound_key: &str,
+) -> Vec<(String, String)> {
+    match provider {
+        PrimaryProvider::Anthropic => vec![
+            ("ANTHROPIC_BASE_URL".to_string(), format!("http://{listen}")),
+            ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
+        ],
+        PrimaryProvider::OpenAI => vec![
+            ("OPENAI_BASE_URL".to_string(), format!("http://{listen}/v1")),
+            ("OPENAI_API_KEY".to_string(), inbound_key.to_string()),
+        ],
+        PrimaryProvider::Google => vec![
+            (
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                format!("http://{listen}"),
+            ),
+            ("GEMINI_API_KEY".to_string(), inbound_key.to_string()),
+            (
+                "GEMINI_API_KEY_AUTH_MECHANISM".to_string(),
+                "bearer".to_string(),
+            ),
+        ],
+    }
 }
 
 pub fn which_exists(cmd: &str) -> bool {
@@ -57,178 +101,26 @@ pub fn which_exists(cmd: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-pub fn cline_extension_installed() -> bool {
-    let ext_dir = home_dir().join(".vscode").join("extensions");
-    ext_dir.is_dir()
-        && std::fs::read_dir(&ext_dir).is_ok_and(|entries| {
-            entries.filter_map(Result::ok).any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("saoudrizwan.claude-dev")
-            })
-        })
+macro_rules! agent_registry {
+    ($($id:literal => $mod:ident::$ty:ident),* $(,)?) => {
+        pub fn all_agents() -> Vec<Box<dyn AgentDescriptor>> {
+            vec![$(Box::new(super::$mod::$ty)),*]
+        }
+        pub fn agent_by_id(id: &str) -> Option<Box<dyn AgentDescriptor>> {
+            match id {
+                $($id => Some(Box::new(super::$mod::$ty)),)*
+                _ => None,
+            }
+        }
+    };
 }
 
-impl AgentDescriptor for ClaudeCode {
-    fn id(&self) -> &'static str {
-        "claude-code"
-    }
-    fn display_name(&self) -> &'static str {
-        "Claude Code"
-    }
-    fn is_installed(&self) -> bool {
-        home_dir().join(".claude").is_dir()
-    }
-    fn probe(&self) -> ProbeResult {
-        super::probe::probe_claude_code()
-    }
-    fn managed_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(path) = crate::integration::claude_settings_path() {
-            paths.push(path);
-        }
-        paths
-    }
-    fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &["agentpact_pretooluse"]
-    }
-    fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)> {
-        vec![
-            ("ANTHROPIC_BASE_URL".to_string(), format!("http://{listen}")),
-            ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
-        ]
-    }
-}
-
-impl AgentDescriptor for CodexCli {
-    fn id(&self) -> &'static str {
-        "codex-cli"
-    }
-    fn display_name(&self) -> &'static str {
-        "Codex CLI"
-    }
-    fn is_installed(&self) -> bool {
-        codex_config_exists()
-    }
-    fn probe(&self) -> ProbeResult {
-        super::probe::probe_codex_cli()
-    }
-    fn managed_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(path) = codex_config_path() {
-            paths.push(path);
-        }
-        if let Ok(path) = codex_hooks_path() {
-            paths.push(path);
-        }
-        paths
-    }
-    fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &["kyris-mcp", "kyris_pretooluse"]
-    }
-    fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)> {
-        vec![
-            ("OPENAI_BASE_URL".to_string(), format!("http://{listen}/v1")),
-            ("OPENAI_API_KEY".to_string(), inbound_key.to_string()),
-        ]
-    }
-}
-
-impl AgentDescriptor for GeminiCli {
-    fn id(&self) -> &'static str {
-        "gemini-cli"
-    }
-    fn display_name(&self) -> &'static str {
-        "Gemini CLI"
-    }
-    fn is_installed(&self) -> bool {
-        which_exists("gemini") || gemini_settings_exists()
-    }
-    fn probe(&self) -> ProbeResult {
-        super::probe::probe_gemini_cli()
-    }
-    fn managed_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(path) = gemini_settings_path() {
-            paths.push(path);
-        }
-        paths
-    }
-    fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &["agentpact_beforetool"]
-    }
-    fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)> {
-        vec![
-            (
-                "GOOGLE_GEMINI_BASE_URL".to_string(),
-                format!("http://{listen}"),
-            ),
-            ("GEMINI_API_KEY".to_string(), inbound_key.to_string()),
-        ]
-    }
-}
-
-impl AgentDescriptor for Cline {
-    fn id(&self) -> &'static str {
-        "cline"
-    }
-    fn display_name(&self) -> &'static str {
-        "Cline"
-    }
-    fn is_installed(&self) -> bool {
-        cline_extension_installed()
-    }
-    fn probe(&self) -> ProbeResult {
-        super::probe::probe_cline()
-    }
-    fn managed_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(path) = cline_settings_path() {
-            paths.push(path);
-        }
-        paths
-    }
-    fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &["CLINE_COMMAND_PERMISSIONS"]
-    }
-    fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)> {
-        vec![
-            ("ANTHROPIC_BASE_URL".to_string(), format!("http://{listen}")),
-            ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
-        ]
-    }
-}
-
-impl AgentDescriptor for OpenCode {
-    fn id(&self) -> &'static str {
-        "opencode"
-    }
-    fn display_name(&self) -> &'static str {
-        "OpenCode"
-    }
-    fn is_installed(&self) -> bool {
-        which_exists("opencode") || opencode_config_exists()
-    }
-    fn probe(&self) -> ProbeResult {
-        super::probe::probe_opencode()
-    }
-    fn managed_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(path) = opencode_config_path() {
-            paths.push(path);
-        }
-        paths
-    }
-    fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &[]
-    }
-    fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)> {
-        vec![
-            ("ANTHROPIC_BASE_URL".to_string(), format!("http://{listen}")),
-            ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
-        ]
-    }
+agent_registry! {
+    "claude-code"  => claude_code::ClaudeCode,
+    "codex-cli"    => codex_cli::CodexCli,
+    "gemini-cli"   => gemini_cli::GeminiCli,
+    "cline"        => cline::Cline,
+    "opencode"     => opencode::OpenCode,
 }
 
 #[cfg(test)]
@@ -262,5 +154,49 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), len_before);
+    }
+
+    #[test]
+    fn testExpectedSurfacesAllAgents() {
+        let expected: &[(&str, (bool, bool, bool))] = &[
+            ("claude-code", (true, true, true)),
+            ("codex-cli", (true, true, true)),
+            ("gemini-cli", (true, true, true)),
+            ("cline", (true, true, true)),
+            ("opencode", (true, true, true)),
+        ];
+        for (id, surfaces) in expected {
+            let agent = agent_by_id(id).unwrap_or_else(|| panic!("missing agent: {id}"));
+            assert_eq!(
+                agent.expected_surfaces(),
+                *surfaces,
+                "expected_surfaces mismatch for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn testEveryAgentDeclaresExpectedSurfaces() {
+        for agent in all_agents() {
+            let (exec, tool, burn) = agent.expected_surfaces();
+            assert!(
+                exec || tool || burn,
+                "{} declares no expected surfaces",
+                agent.id()
+            );
+        }
+    }
+
+    #[test]
+    fn testEveryAgentHasMcpConfigOrHookProtocol() {
+        for agent in all_agents() {
+            let has_mcp = agent.mcp_config().is_some();
+            let has_hook = agent.hook_protocol().is_some();
+            assert!(
+                has_mcp || has_hook,
+                "{} has neither mcp_config nor hook_protocol",
+                agent.id()
+            );
+        }
     }
 }

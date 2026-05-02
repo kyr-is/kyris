@@ -19,4 +19,4 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 serde-saphyr = { workspace = true }
 utoipa = { version = "5.4", optional = true }
-schemars = { version = "0.8", optional = true }
+schemars = { version = "1.2", optional = true }

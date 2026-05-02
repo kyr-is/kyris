@@ -123,7 +123,7 @@ impl EventSyncer {
         &self,
         events: Vec<Box<serde_json::value::RawValue>>,
         machine_id: &str,
-        kyrisd_records: Vec<kyris_core::record::GatewayRecord>,
+        kyrisd_records: Vec<Box<serde_json::value::RawValue>>,
     ) -> EventBatch {
         EventBatch {
             machine_id: machine_id.to_string(),
@@ -132,6 +132,19 @@ impl EventSyncer {
             kyrisd_records,
             cursor: self.cursor.clone(),
         }
+    }
+
+    pub fn serialize_records(
+        records: Vec<kyris_core::record::GatewayRecord>,
+    ) -> Vec<Box<serde_json::value::RawValue>> {
+        records
+            .iter()
+            .filter_map(|r| {
+                serde_json::to_string(r)
+                    .ok()
+                    .and_then(|s| serde_json::value::RawValue::from_string(s).ok())
+            })
+            .collect()
     }
 }
 

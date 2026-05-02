@@ -87,11 +87,12 @@ fn check_native_integrations() {
             continue;
         }
         let exec_ok = probe.execution.level != crate::agents::profile::CapLevel::None;
+        let tool_ok = probe.tool.level != crate::agents::profile::CapLevel::None;
         let burn_ok = probe.burn_control.level != crate::agents::profile::CapLevel::None;
-        let any_ok = exec_ok || burn_ok;
+        let all_ok = exec_ok && tool_ok && burn_ok;
         println!(
             "  [{}] {} agent integration",
-            status_marker(any_ok),
+            status_marker(all_ok),
             agent.id()
         );
     }

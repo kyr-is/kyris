@@ -109,11 +109,12 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
         let fail_open_events = filter_fail_open_in_scope(&syncer, raw_fail_open);
         let has_fail_open = !fail_open_events.is_empty();
         events.extend(fail_open_events);
-        let kyrisd_records = filter_records_in_scope(&syncer, fetch_unsynced_records(&state));
-        let synced_record_ids = kyrisd_records
+        let typed_records = filter_records_in_scope(&syncer, fetch_unsynced_records(&state));
+        let synced_record_ids = typed_records
             .iter()
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
+        let kyrisd_records = EventSyncer::serialize_records(typed_records);
 
         if events.is_empty() && kyrisd_records.is_empty() {
             syncer.commit_read(new_offset);

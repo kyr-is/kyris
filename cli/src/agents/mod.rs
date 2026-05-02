@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-pub mod apply;
+pub mod claude_code;
+pub mod cline;
+pub mod codex_cli;
+pub mod configure;
 pub mod display;
+pub mod gemini_cli;
+pub mod opencode;
+pub mod prestage;
 pub mod probe;
 pub mod profile;
 pub mod reconcile;
@@ -108,9 +114,17 @@ fn run_reconcile(agent: Option<String>, auto: bool) -> Result<(), String> {
 
 fn run_setup(agent: Option<String>, auto: bool) -> Result<(), String> {
     if auto {
-        apply::apply_all()
+        prestage::prestage_all()?;
+        for agent in registry::all_agents() {
+            if agent.is_installed()
+                && let Err(e) = configure::configure_agent(agent.id())
+            {
+                eprintln!("{e}");
+            }
+        }
+        Ok(())
     } else if let Some(agent_id) = agent {
-        apply::apply_agent(&agent_id)
+        configure::setup_agent(&agent_id)
     } else {
         Err("Usage: kyris agents setup <agent> or kyris agents setup --auto".to_string())
     }

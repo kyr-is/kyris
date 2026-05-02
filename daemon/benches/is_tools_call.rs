@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn is_tools_call(message: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(message)

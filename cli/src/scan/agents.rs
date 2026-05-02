@@ -15,12 +15,16 @@ pub fn scan() -> Vec<Finding> {
         }
 
         let exec_ok = probe.execution.level != CapLevel::None;
+        let tool_ok = probe.tool.level != CapLevel::None;
         let burn_ok = probe.burn_control.level != CapLevel::None;
 
-        if !exec_ok || !burn_ok {
+        if !exec_ok || !tool_ok || !burn_ok {
             let mut missing = Vec::new();
             if !exec_ok {
                 missing.push("execution hooks");
+            }
+            if !tool_ok {
+                missing.push("tool governance");
             }
             if !burn_ok {
                 missing.push("traffic routing");
@@ -43,7 +47,10 @@ pub fn scan() -> Vec<Finding> {
                     line: None,
                 },
                 evidence: None,
-                remediation: format!("Run `kyris agents setup {}` to configure.", agent.id()),
+                remediation: format!(
+                    "Run `kyris agents setup {}` or wait for automatic reconciliation.",
+                    agent.id()
+                ),
             });
         }
     }

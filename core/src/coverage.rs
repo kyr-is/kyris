@@ -13,6 +13,7 @@ pub fn derive(action: Action, attribution_method: AttributionMethod, mode: &str)
             AttributionMethod::Boundary | AttributionMethod::Lineage => CoverageState::Observed,
             AttributionMethod::Unknown => CoverageState::Unknown,
         },
+        Action::Unknown => CoverageState::Unknown,
     }
 }
 

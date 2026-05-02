@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLIST_LABEL="is.kyr.kyrisd"
+PLIST_TEMPLATE="/etc/kyris/service/${PLIST_LABEL}.plist"
+BINARY_PATH="/usr/local/bin/kyrisd"
+
+REAL_USER="${INSTALLER_USER:-$(stat -f%Su /dev/console)}"
+if [ "$REAL_USER" = "root" ] || [ -z "$REAL_USER" ]; then
+    echo "postinstall: could not determine real user, skipping LaunchAgent setup" >&2
+    exit 0
+fi
+
+REAL_UID=$(id -u "$REAL_USER")
+REAL_HOME=$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory | awk '{print $2}')
+
+PLIST_DIR="${REAL_HOME}/Library/LaunchAgents"
+PLIST_DEST="${PLIST_DIR}/${PLIST_LABEL}.plist"
+
+su "$REAL_USER" -c "mkdir -p '${PLIST_DIR}'"
+
+sed -e "s|{{BINARY_PATH}}|${BINARY_PATH}|g" \
+    -e "s|{{HOME}}|${REAL_HOME}|g" \
+    "$PLIST_TEMPLATE" > "$PLIST_DEST"
+
+chown "${REAL_USER}" "$PLIST_DEST"
+chmod 644 "$PLIST_DEST"
+
+launchctl bootout "gui/${REAL_UID}/${PLIST_LABEL}" 2>/dev/null || true
+launchctl bootstrap "gui/${REAL_UID}" "$PLIST_DEST"
+
+echo "postinstall: ${PLIST_LABEL} loaded for user ${REAL_USER}"

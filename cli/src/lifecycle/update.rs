@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 use clap::Args;
 use regex::Regex;
-use serde::Deserialize;
 use std::path::PathBuf;
 
 use crate::service::{ServiceKind, restart_service, service_state};
 use crate::state::write_managed_bytes;
+
+use super::release;
 
 #[derive(Args)]
 pub struct UpdateArgs {
@@ -29,18 +30,6 @@ pub fn run(args: UpdateArgs) {
     }
 }
 
-#[derive(Deserialize)]
-struct GitHubRelease {
-    tag_name: String,
-    assets: Vec<GitHubAsset>,
-}
-
-#[derive(Deserialize)]
-struct GitHubAsset {
-    name: String,
-    browser_download_url: String,
-}
-
 struct RepoUpdate {
     owner: &'static str,
     repo: &'static str,
@@ -51,7 +40,7 @@ struct RepoUpdate {
 }
 
 async fn run_update(check_only: bool) -> Result<(), String> {
-    let target = release_target()?;
+    let target = release::release_target()?;
     let repos = [
         RepoUpdate {
             owner: "kyr-is",
@@ -74,7 +63,7 @@ async fn run_update(check_only: bool) -> Result<(), String> {
     let mut updates_available = 0;
     let mut updates_applied = 0;
     for repo in repos {
-        if brew_formula_installed(repo.formula) {
+        if release::brew_formula_installed(repo.formula) {
             println!(
                 "{}: Homebrew-managed install detected, use `brew upgrade {}`.",
                 repo.repo, repo.formula
@@ -87,8 +76,8 @@ async fn run_update(check_only: bool) -> Result<(), String> {
             continue;
         };
 
-        let release = fetch_latest_release(repo.owner, repo.repo).await?;
-        let latest_version = normalize_version(&release.tag_name);
+        let fetched_release = release::fetch_latest_release(repo.owner, repo.repo).await?;
+        let latest_version = normalize_version(&fetched_release.tag_name);
         if compare_versions(&current_version, &latest_version) >= 0 {
             println!("{}: up to date ({current_version}).", repo.repo);
             continue;
@@ -104,13 +93,15 @@ async fn run_update(check_only: bool) -> Result<(), String> {
         }
 
         let asset_name = format!("{}-{target}.tar.gz", repo.repo);
-        let asset = release
+        let asset = fetched_release
             .assets
             .iter()
-            .find(|asset| asset.name == asset_name)
+            .find(|a| a.name == asset_name)
             .ok_or_else(|| format!("Missing release asset {asset_name} for {}", repo.repo))?;
 
-        let temp_dir = download_and_extract(asset).await?;
+        let verified_bytes = release::download_and_verify(&fetched_release, asset).await?;
+        let temp_dir = release::extract_tarball(&verified_bytes, &asset_name)?;
+
         let mut replaced_any = false;
         for binary in repo.binaries {
             let Some(path) = which_path(binary) else {
@@ -150,69 +141,6 @@ async fn run_update(check_only: bool) -> Result<(), String> {
     Ok(())
 }
 
-async fn fetch_latest_release(owner: &str, repo: &str) -> Result<GitHubRelease, String> {
-    let url = format!(
-        "{}/repos/{owner}/{repo}/releases/latest",
-        github_releases_base_url()
-    );
-    reqwest::Client::new()
-        .get(url)
-        .header("accept", "application/vnd.github+json")
-        .header("user-agent", user_agent())
-        .send()
-        .await
-        .map_err(|e| format!("Failed to query GitHub Releases for {owner}/{repo}: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("GitHub Releases request failed for {owner}/{repo}: {e}"))?
-        .json::<GitHubRelease>()
-        .await
-        .map_err(|e| format!("Failed to parse GitHub release for {owner}/{repo}: {e}"))
-}
-
-async fn download_and_extract(asset: &GitHubAsset) -> Result<PathBuf, String> {
-    let bytes = reqwest::Client::new()
-        .get(&asset.browser_download_url)
-        .header("user-agent", user_agent())
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download {}: {e}", asset.name))?
-        .error_for_status()
-        .map_err(|e| format!("Download failed for {}: {e}", asset.name))?
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read {}: {e}", asset.name))?;
-
-    let temp_dir = std::env::temp_dir().join(format!(
-        "kyris-update-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-    std::fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("Cannot create {}: {e}", temp_dir.display()))?;
-
-    let archive_path = temp_dir.join(&asset.name);
-    std::fs::write(&archive_path, &bytes)
-        .map_err(|e| format!("Cannot write {}: {e}", archive_path.display()))?;
-
-    let status = std::process::Command::new("tar")
-        .args([
-            "-xzf",
-            &archive_path.to_string_lossy(),
-            "-C",
-            &temp_dir.to_string_lossy(),
-        ])
-        .status()
-        .map_err(|e| format!("Failed to run tar for {}: {e}", asset.name))?;
-    if !status.success() {
-        return Err(format!("tar failed while extracting {}", asset.name));
-    }
-
-    Ok(temp_dir)
-}
-
 fn installed_version(binary: &str) -> Option<String> {
     let output = std::process::Command::new(binary)
         .arg("--version")
@@ -239,16 +167,6 @@ fn which_path(binary: &str) -> Option<PathBuf> {
         None
     } else {
         Some(PathBuf::from(trimmed))
-    }
-}
-
-fn release_target() -> Result<&'static str, String> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64" | "arm64") => Ok("darwin-aarch64"),
-        ("macos", "x86_64") => Ok("darwin-x86_64"),
-        ("linux", "x86_64") => Ok("linux-x86_64"),
-        ("linux", "aarch64") => Ok("linux-aarch64"),
-        (os, arch) => Err(format!("Unsupported update target: {os}/{arch}")),
     }
 }
 
@@ -285,21 +203,6 @@ fn version_parts(version: &str) -> [u64; 3] {
         parts[index] = piece.parse().unwrap_or(0);
     }
     parts
-}
-
-fn user_agent() -> String {
-    format!("kyris/{}", env!("CARGO_PKG_VERSION"))
-}
-
-fn brew_formula_installed(formula: &str) -> bool {
-    std::process::Command::new("brew")
-        .args(["list", formula])
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
-fn github_releases_base_url() -> String {
-    "https://api.github.com".to_string()
 }
 
 #[cfg(test)]

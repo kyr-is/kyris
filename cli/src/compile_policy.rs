@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use clap::Args;
+use std::collections::HashMap;
 use std::path::Path;
 
 use agentpact::catalog::commands::id_to_shell;
@@ -19,27 +20,28 @@ pub struct CompilePolicyArgs {
 
 pub fn run(args: CompilePolicyArgs) {
     match args.agent.as_str() {
-        "cline" => print_cline(args.policy.as_deref()),
+        "cline" => print_compiled(args.policy.as_deref(), compile_cline_permissions),
+        "opencode" => print_compiled(args.policy.as_deref(), compile_opencode_permissions),
+        "codex-cli" => print_compiled(args.policy.as_deref(), compile_codex_permissions),
         other => {
             eprintln!("Unsupported agent for policy compilation: {other}");
-            eprintln!("Supported: cline");
+            eprintln!("Supported: cline, opencode, codex-cli");
             std::process::exit(1);
         }
     }
 }
 
-fn print_cline(policy_path: Option<&str>) {
-    match compile_cline_permissions(policy_path.map(Path::new)) {
+type PolicyCompiler = fn(Option<&Path>) -> Result<(serde_json::Value, u32), String>;
+
+fn print_compiled(policy_path: Option<&str>, compiler: PolicyCompiler) {
+    match compiler(policy_path.map(Path::new)) {
         Ok((output, ask_dropped)) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&output).expect("serialize")
             );
             if ask_dropped > 0 {
-                eprintln!(
-                    "Warning: {ask_dropped} ask rules dropped \
-                     -- Cline native permissions support allow/deny only."
-                );
+                eprintln!("Warning: {ask_dropped} ask rules were dropped.");
             }
         }
         Err(error) => {
@@ -125,6 +127,79 @@ pub fn compile_cline_permissions(
         "deny": deny_rules,
     });
     Ok((output, ask_dropped))
+}
+
+pub fn compile_opencode_permissions(
+    policy_path: Option<&Path>,
+) -> Result<(serde_json::Value, u32), String> {
+    let level = load_merged_policy(policy_path)?;
+
+    let mut bash_rules = serde_json::Map::new();
+
+    for (command_id, perm) in &level.commands {
+        let shell_cmd = id_to_shell(command_id);
+        let value = match perm {
+            Permission::Auto | Permission::Inform => "allow",
+            Permission::Deny => "deny",
+            Permission::Ask => "ask",
+        };
+        bash_rules.insert(shell_cmd, serde_json::Value::String(value.to_string()));
+    }
+
+    let output = serde_json::json!({ "bash": bash_rules });
+    Ok((output, 0))
+}
+
+pub fn compile_codex_permissions(
+    policy_path: Option<&Path>,
+) -> Result<(serde_json::Value, u32), String> {
+    let level = load_merged_policy(policy_path)?;
+
+    let mut rules = Vec::new();
+
+    for (command_id, perm) in &level.commands {
+        let shell_cmd = id_to_shell(command_id);
+        let permission = match perm {
+            Permission::Auto | Permission::Inform => "Allow",
+            Permission::Deny => "Forbidden",
+            Permission::Ask => "Prompt",
+        };
+        rules.push(serde_json::json!({
+            "prefix": shell_cmd,
+            "permission": permission,
+        }));
+    }
+
+    rules.sort_by(|a, b| {
+        a["prefix"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["prefix"].as_str().unwrap_or(""))
+    });
+
+    Ok((serde_json::Value::Array(rules), 0))
+}
+
+pub fn compile_mcp_tool_filters(
+    policy_path: Option<&Path>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let level = load_merged_policy(policy_path)?;
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+
+    for ((server, tool), perm) in &level.mcp {
+        if *perm == Permission::Deny {
+            filters
+                .entry(server.clone())
+                .or_default()
+                .push(tool.clone());
+        }
+    }
+
+    for list in filters.values_mut() {
+        list.sort();
+    }
+
+    Ok(filters)
 }
 
 fn dirs_home() -> Result<std::path::PathBuf, String> {
@@ -263,5 +338,106 @@ spec:
 
         let (output, _) = compile_cline_permissions(Some(dir.path())).unwrap();
         assert_eq!(output["allow"], serde_json::json!(["git status"]));
+    }
+
+    #[test]
+    fn testCompileOpencode() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".agentpact").join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+
+        writeTempYaml(
+            &policy_dir,
+            "commands.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: commands
+spec:
+  commands:
+    "npm·install": auto
+    "rm·-rf": deny
+    "docker·build": ask
+"#,
+        );
+
+        let (output, ask_dropped) =
+            compile_opencode_permissions(Some(policy_dir.as_path())).unwrap();
+        let bash = output["bash"].as_object().unwrap();
+        assert_eq!(bash["npm install"], "allow");
+        assert_eq!(bash["rm -rf"], "deny");
+        assert_eq!(bash["docker build"], "ask");
+        assert_eq!(ask_dropped, 0);
+    }
+
+    #[test]
+    fn testCompileCodex() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".agentpact").join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+
+        writeTempYaml(
+            &policy_dir,
+            "commands.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: commands
+spec:
+  commands:
+    "npm·install": auto
+    "rm·-rf": deny
+    "docker·build": ask
+"#,
+        );
+
+        let (output, ask_dropped) = compile_codex_permissions(Some(policy_dir.as_path())).unwrap();
+        let rules = output.as_array().unwrap();
+        assert_eq!(ask_dropped, 0);
+        assert_eq!(rules.len(), 3);
+
+        let by_prefix: std::collections::HashMap<&str, &str> = rules
+            .iter()
+            .map(|r| {
+                (
+                    r["prefix"].as_str().unwrap(),
+                    r["permission"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_prefix["npm install"], "Allow");
+        assert_eq!(by_prefix["rm -rf"], "Forbidden");
+        assert_eq!(by_prefix["docker build"], "Prompt");
+    }
+
+    #[test]
+    fn testCompileMcpToolFilters() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".agentpact").join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+
+        writeTempYaml(
+            &policy_dir,
+            "mcp.yaml",
+            r"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: mcp-overrides
+spec:
+  mcp:
+    filesystem:
+      read_file: auto
+      delete_file: deny
+    database:
+      drop_table: deny
+      select: auto
+",
+        );
+
+        let filters = compile_mcp_tool_filters(Some(policy_dir.as_path())).unwrap();
+        let fs_tools = filters.get("filesystem").unwrap();
+        assert_eq!(fs_tools, &["delete_file".to_string()]);
+        let db_tools = filters.get("database").unwrap();
+        assert_eq!(db_tools, &["drop_table".to_string()]);
     }
 }
