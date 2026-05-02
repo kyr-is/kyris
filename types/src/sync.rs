@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 
-use crate::record::GatewayRecord;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventBatch {
     pub machine_id: String,
     pub batch_id: String,
     pub events: Vec<Box<serde_json::value::RawValue>>,
     #[serde(default)]
-    pub kyrisd_records: Vec<GatewayRecord>,
+    pub kyrisd_records: Vec<Box<serde_json::value::RawValue>>,
     pub cursor: SyncCursor,
 }
 

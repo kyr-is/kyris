@@ -38,6 +38,8 @@ pub enum RecordStatus {
     Error,
     CircuitBreaker,
     CacheHit,
+    #[serde(other)]
+    Unknown,
 }
 
 impl std::fmt::Display for RecordStatus {
@@ -47,6 +49,7 @@ impl std::fmt::Display for RecordStatus {
             Self::Error => f.write_str("error"),
             Self::CircuitBreaker => f.write_str("circuit_breaker"),
             Self::CacheHit => f.write_str("cache_hit"),
+            Self::Unknown => f.write_str("unknown"),
         }
     }
 }
@@ -60,7 +63,7 @@ impl std::str::FromStr for RecordStatus {
             "error" => Ok(Self::Error),
             "circuit_breaker" => Ok(Self::CircuitBreaker),
             "cache_hit" => Ok(Self::CacheHit),
-            other => Err(format!("unknown record status: {other}")),
+            _ => Ok(Self::Unknown),
         }
     }
 }
@@ -69,9 +72,10 @@ impl std::str::FromStr for RecordStatus {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Metering {
-    #[default]
-    Available,
     Unavailable,
+    #[default]
+    #[serde(other)]
+    Available,
 }
 
 pub const CREATE_GATEWAY_RECORDS: &str = "\
@@ -228,6 +232,16 @@ mod tests {
             "cache_hit".parse::<RecordStatus>().unwrap(),
             RecordStatus::CacheHit
         );
-        assert!("unknown".parse::<RecordStatus>().is_err());
+        assert_eq!(
+            "rate_limited".parse::<RecordStatus>().unwrap(),
+            RecordStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn testRecordStatusDeserializeUnknownFallsBack() {
+        let status: RecordStatus = serde_json::from_str(r#""rate_limited""#).unwrap();
+        assert_eq!(status, RecordStatus::Unknown);
+        assert_eq!(status.to_string(), "unknown");
     }
 }

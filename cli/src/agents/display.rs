@@ -24,13 +24,19 @@ pub fn print_summary(agents: &[(Box<dyn AgentDescriptor>, AgentProfile)]) {
             println!(" {:<14} not found", descriptor.id());
             continue;
         }
-        let status = if profile.execution.level == CapLevel::None
+        let (need_exec, need_tool, need_burn) = descriptor.expected_surfaces();
+        let exec_met = !need_exec || profile.execution.level != CapLevel::None;
+        let tool_met = !need_tool || profile.tool.level != CapLevel::None;
+        let burn_met = !need_burn || profile.burn_control.level != CapLevel::None;
+        let status = if exec_met && tool_met && burn_met {
+            "ok".to_string()
+        } else if profile.execution.level == CapLevel::None
             && profile.tool.level == CapLevel::None
             && profile.burn_control.level == CapLevel::None
         {
             "detected, not configured".to_string()
         } else {
-            "ok".to_string()
+            "incomplete".to_string()
         };
         println!(
             " {:<14} {:<18} {:<18} {:<18} {}",

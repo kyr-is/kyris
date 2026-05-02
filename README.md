@@ -21,16 +21,26 @@ Today the practical target is macOS, with Apple Silicon as the primary supported
 ### 1.2 Homebrew
 
 ```sh
-brew install kyr-is/tap/kyris
+# System mode (needs sudo — installs to /usr/local/bin/, /etc/kyris/)
+brew install --cask kyr-is/tap/kyris
+
+# User mode (no sudo — installs to Homebrew prefix)
+brew install --cask kyr-is/tap/kyris-user
 ```
 
 ### 1.3 Install Script
 
 ```sh
+# System mode (default, needs sudo)
 curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash
+
+# User mode (no sudo)
+curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --user
 ```
 
-The script downloads the latest release, verifies its SHA-256 checksum, installs `kyris`, `kyrisd`, `kyris-mcp`, and `kyris-hook`, creates `~/.kyris/`, and loads the `launchd` service for `kyrisd`.
+System mode installs the `.pkg` to `/usr/local/bin/` and `/etc/kyris/`. User mode installs to
+`~/.local/bin/`. Both modes verify the SHA-256 checksum, install all four binaries (`kyris`,
+`kyrisd`, `kyris-mcp`, `kyris-hook`), and register the `launchd` service for `kyrisd`.
 
 ### 1.4 Quick Start
 
@@ -452,7 +462,7 @@ The current extension points line up with that scope.
 | Area | Current shape | Where you extend it |
 | --- | --- | --- |
 | Provider routing | Anthropic, OpenAI, and Google passthrough adapters in `kyrisd` | `daemon/src/adapter/` |
-| Live agent hooks | Claude Code, Codex CLI, Gemini CLI | `integrations/live-hooks/<agent>/` |
+| Live agent hooks | Claude Code, Codex CLI, Gemini CLI | `cli/src/lifecycle/install.rs` (`hook_script_source()`) |
 | Compiled policy | Cline static permission rendering | `integrations/compiled-policy/<agent>/` |
 | Query and reporting UX | Timeline, history, replay, stats, scan, status | `cli/src/` |
 | Local runtime packaging | Config templates, service definitions, install flow | `config/`, `service/`, `install.sh` |

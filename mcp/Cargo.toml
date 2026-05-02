@@ -20,7 +20,7 @@ tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "i
 serde_json = { workspace = true }
 nix = { workspace = true }
 uuid = { workspace = true }
-reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+reqwest = { workspace = true, features = ["rustls", "json"] }
 
 [dev-dependencies]
 tempfile = "3"

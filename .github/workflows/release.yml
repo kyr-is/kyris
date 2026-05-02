@@ -13,7 +13,8 @@ jobs:
   build:
     runs-on: macos-latest
     outputs:
-      sha256: ${{ steps.checksums.outputs.sha256 }}
+      pkg_sha256: ${{ steps.checksums.outputs.pkg_sha256 }}
+      tar_sha256: ${{ steps.checksums.outputs.tar_sha256 }}
     strategy:
       matrix:
         include:
@@ -63,7 +64,6 @@ jobs:
               --team-id "$APPLE_TEAM_ID" \
               --password "$APPLE_APP_PASSWORD" \
               "$bin.zip"
-            xcrun stapler staple "target/${{ matrix.target }}/release/$bin"
             rm "$bin.zip"
           done
 
@@ -85,24 +85,33 @@ jobs:
       - name: Generate contract schemas
         run: cargo run -p xtask -- schemas
 
-      - name: Create tarball
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar czf kyris-darwin-aarch64.tar.gz kyris kyrisd kyris-mcp kyris-hook
+      - name: Build pkg
+        env:
+          VERSION: ${{ github.ref_name }}
+          BINARY_DIR: target/${{ matrix.target }}/release
+        run: bash scripts/build-pkg.sh
+
+      - name: Build tarball
+        env:
+          VERSION: ${{ github.ref_name }}
+          BINARY_DIR: target/${{ matrix.target }}/release
+        run: bash scripts/build-tar.sh
 
       - name: Generate checksums
         id: checksums
         run: |
-          cd target/${{ matrix.target }}/release
-          shasum -a 256 kyris-darwin-aarch64.tar.gz > kyris-darwin-aarch64.tar.gz.sha256
-          echo "sha256=$(awk '{print $1}' kyris-darwin-aarch64.tar.gz.sha256)" >> "$GITHUB_OUTPUT"
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "pkg_sha256=$(awk '{print $1}' "target/kyris-${VERSION}.pkg.sha256")" >> "$GITHUB_OUTPUT"
+          echo "tar_sha256=$(awk '{print $1}' "target/kyris-${VERSION}-aarch64-apple-darwin.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz
-            target/${{ matrix.target }}/release/kyris-darwin-aarch64.tar.gz.sha256
+            target/kyris-*.pkg
+            target/kyris-*.pkg.sha256
+            target/kyris-*-aarch64-apple-darwin.tar.gz
+            target/kyris-*-aarch64-apple-darwin.tar.gz.sha256
             target/schemas/*.yaml
             target/schemas/*.json
 
@@ -110,10 +119,34 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve asset IDs
+        id: assets
+        env:
+          GH_TOKEN: ${{ secrets.KYRIS_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          RELEASE_JSON=$(gh api "repos/kyr-is/kyris/releases/tags/${GITHUB_REF_NAME}")
+
+          PKG_NAME="kyris-${VERSION}.pkg"
+          PKG_ASSET_ID=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name == \"${PKG_NAME}\") | .id")
+          if [ -z "$PKG_ASSET_ID" ] || [ "$PKG_ASSET_ID" = "null" ]; then
+            echo "::error::Could not find asset ${PKG_NAME}"
+            exit 1
+          fi
+          echo "pkg_asset_id=$PKG_ASSET_ID" >> "$GITHUB_OUTPUT"
+
+          TAR_NAME="kyris-${VERSION}-aarch64-apple-darwin.tar.gz"
+          TAR_ASSET_ID=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name == \"${TAR_NAME}\") | .id")
+          if [ -z "$TAR_ASSET_ID" ] || [ "$TAR_ASSET_ID" = "null" ]; then
+            echo "::error::Could not find asset ${TAR_NAME}"
+            exit 1
+          fi
+          echo "tar_asset_id=$TAR_ASSET_ID" >> "$GITHUB_OUTPUT"
+
       - name: Trigger homebrew-tap update
         uses: peter-evans/repository-dispatch@v4
         with:
           token: ${{ secrets.KYRIS_TOKEN }}
           repository: kyr-is/homebrew-tap
-          event-type: update-formula
-          client-payload: '{"tool": "kyris", "version": "${{ github.ref_name }}", "shas": {"darwin-aarch64": "${{ needs.build.outputs.sha256 }}"}}'
+          event-type: update-cask
+          client-payload: '{"tool": "kyris", "version": "${{ github.ref_name }}", "sha256": "${{ needs.build.outputs.pkg_sha256 }}", "asset_id": "${{ steps.assets.outputs.pkg_asset_id }}", "tar_sha256": "${{ needs.build.outputs.tar_sha256 }}", "tar_asset_id": "${{ steps.assets.outputs.tar_asset_id }}"}'

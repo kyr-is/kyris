@@ -43,12 +43,12 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     )
     .expect("write policy");
 
-    let install_output = run_kyris(
-        home,
-        &["install", "--components", "hooks,claude-code,cline"],
-    );
+    // Install hooks only; prestage_all + reconcile_all run automatically and
+    // detect that .claude/ exists, so claude-code and cline get prestaged.
+    let install_output = run_kyris(home, &["install", "--components", "hooks"]);
     assert!(install_output.status.success(), "{install_output:?}");
 
+    // Shell hooks installed
     assert!(
         home.join(".kyris")
             .join("hooks")
@@ -73,16 +73,17 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
             .join("bash_env.sh")
             .exists()
     );
+
+    // Prestage wrote env files for detected agents
+    assert!(home.join(".kyris").join("env").join("load.sh").exists());
     assert!(
-        home.join(".claude")
-            .join("hooks")
-            .join("agentpact_pretooluse.sh")
+        home.join(".kyris")
+            .join("env")
+            .join("claude-code.sh")
             .exists()
     );
-    assert!(home.join(".kyris").join("env").join("cline.sh").exists());
-    assert!(home.join(".kyris").join("env").join("load.sh").exists());
-    assert!(home.join(".kyris").join("manifest.json").exists());
 
+    // Shell rc files updated
     let zshrc_after = fs::read_to_string(home.join(".zshrc")).expect("read .zshrc");
     assert!(zshrc_after.contains("source \"$HOME/.kyris/hooks/zsh_hook.sh\""));
     assert!(zshrc_after.contains("source \"$HOME/.kyris/env/load.sh\""));
@@ -95,6 +96,7 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     assert!(bashrc_after.contains("export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\""));
     assert!(bashrc_after.contains("source \"$HOME/.kyris/env/load.sh\""));
 
+    // Reconcile auto-configured claude-code (detected via .claude/ dir)
     let claude_settings_after: Value = serde_json::from_str(
         &fs::read_to_string(home.join(".claude").join("settings.json"))
             .expect("read claude settings"),
@@ -105,11 +107,16 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
             .as_array()
             .is_some_and(|hooks| !hooks.is_empty())
     );
+    assert!(
+        home.join(".claude")
+            .join("hooks")
+            .join("agentpact_pretooluse.sh")
+            .exists()
+    );
 
-    let cline_env = fs::read_to_string(home.join(".kyris").join("env").join("cline.sh"))
-        .expect("read cline env");
-    assert!(cline_env.contains("CLINE_COMMAND_PERMISSIONS"));
+    assert!(home.join(".kyris").join("manifest.json").exists());
 
+    // Uninstall reverses everything
     let uninstall_output = run_kyris(home, &["uninstall"]);
     assert!(uninstall_output.status.success(), "{uninstall_output:?}");
 

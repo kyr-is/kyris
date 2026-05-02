@@ -25,40 +25,40 @@ kyris-types = { path = "types" }
 kyris-core = { path = "core" }
 kyris-agentpact-client = { path = "agentpact-client" }
 kyris-peer-cwd = { path = "peer-cwd" }
-agentpact = { git = "https://github.com/kyr-is/agentpact.git", version = ">=0.1.0" }
+agentpact = { git = "https://github.com/kyr-is/agentpact.git", tag = "v0.1.0", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value", "preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-tokio = { version = ">=1.44.2" }
-tracing = "0.1"
-tracing-subscriber = { version = ">=0.3.20", features = ["json", "env-filter"] }
-arc-swap = { version = ">=1.1.0" }
-uuid = { version = "1.16", features = ["v7"] }
-bytes = { version = ">=1.11.1" }
-reqwest = { version = "0.12", default-features = false }
-rustls = { version = ">=0.23.18", default-features = false, features = ["aws-lc-rs"] }
-axum = "0.8"
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "limit", "cors"] }
-serde-saphyr = "0.0.23"
-toml = "0.8"
-duckdb = { version = "1.10501.0", features = ["bundled"] }
-aws-lc-rs = "1.16"
-const-hex = "1.18"
-notify = "8.2"
-notify-debouncer-mini = "0.6"
-nix = { version = ">=0.23.0", features = ["process", "socket", "signal", "fs", "user"] }
-libproc = "0.14"
-tray-icon = "0.22"
-notify-rust = "4.14"
-clap = { version = "4.6", features = ["derive"] }
-regex = { version = ">=1.5.5" }
-open = "5.3"
-dialoguer = "0.12"
-console = "0.16"
-futures-util = "0.3"
-criterion = { version = "0.5", features = ["html_reports"] }
-schemars = "0.8"
+tokio = { version = "1.52" }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+arc-swap = { version = "1.9" }
+uuid = { version = "1.23", features = ["v7"] }
+bytes = { version = "1.11" }
+reqwest = { version = "0.13", default-features = false }
+rustls = { version = "0.23.40", default-features = false, features = ["aws-lc-rs"] }
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = { version = "0.6.8", features = ["trace", "limit", "cors"] }
+serde-saphyr = "0.0.25"
+toml = "1.1.2"
+duckdb = { version = "1.10502", features = ["bundled"] }
+aws-lc-rs = "1.16.3"
+const-hex = "1.19.0"
+notify = "8.2.0"
+notify-debouncer-mini = "0.7.0"
+nix = { version = "0.31.2", features = ["process", "socket", "signal", "fs", "user"] }
+libproc = "0.14.11"
+tray-icon = "0.23.1"
+notify-rust = "4.16"
+clap = { version = "4.6.1", features = ["derive"] }
+regex = { version = "1.12" }
+open = "5.3.4"
+dialoguer = "0.12.0"
+console = "0.16.3"
+futures-util = "0.3.32"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+schemars = "1.2"
 
 [profile.release]
 opt-level = "z"

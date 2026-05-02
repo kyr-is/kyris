@@ -3,6 +3,10 @@
 # Kyris Zsh hook: preexec via add-zsh-hook. Requires kyris-hook on PATH.
 # Compatible with macOS system Zsh (5.8+) and modern Zsh (5.9+).
 
+if (( $+commands[kyris] )); then
+    kyris agents reconcile --auto >/dev/null 2>&1 &!
+fi
+
 autoload -Uz add-zsh-hook
 
 __kyris_preexec() {

@@ -20,7 +20,7 @@ fn emit_schemas() {
     let out_dir = workspace_target().join("schemas");
     fs::create_dir_all(&out_dir).expect("create target/schemas");
 
-    let contracts: Vec<(&str, schemars::schema::RootSchema)> = vec![
+    let contracts: Vec<(&str, schemars::Schema)> = vec![
         (
             "agentpact-event-log",
             schema_for!(kyris_types::event::Event),
