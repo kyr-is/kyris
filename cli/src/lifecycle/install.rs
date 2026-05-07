@@ -19,21 +19,10 @@ const BASH_HOOK_SOURCE: &str = include_str!("../../../hooks/bash_hook.sh");
 const BASH_ENV_SOURCE: &str = include_str!("../../../hooks/bash_env.sh");
 
 #[derive(Args)]
-pub struct InstallArgs {
-    #[arg(long)]
-    pub all: bool,
-    #[arg(long, value_delimiter = ',')]
-    pub components: Option<Vec<String>>,
-}
+pub struct InstallArgs;
 
-pub fn run(args: InstallArgs) {
+pub fn run(_args: InstallArgs) {
     if let Err(error) = load_or_init_config() {
-        eprintln!("{error}");
-        std::process::exit(1);
-    }
-
-    let requested = requested_components(&args);
-    if let Err(error) = validate_components(&requested) {
         eprintln!("{error}");
         std::process::exit(1);
     }
@@ -49,7 +38,6 @@ pub fn run(args: InstallArgs) {
     println!("Kyris Installer");
     println!("===============");
 
-    let mut installed_any = false;
     for (component, installer) in [
         (
             HOOKS_COMPONENT,
@@ -59,13 +47,8 @@ pub fn run(args: InstallArgs) {
         (KYRIS_MCP_COMPONENT, install_kyris_mcp_binary),
         (KYRIS_HOOK_COMPONENT, install_kyris_hook_binary),
     ] {
-        if !requested.iter().any(|requested| requested == component) {
-            continue;
-        }
-
         match installer() {
             Ok(changes) => {
-                installed_any = true;
                 if changes.is_empty() {
                     println!("{component}: already configured.");
                 } else {
@@ -82,19 +65,15 @@ pub fn run(args: InstallArgs) {
         }
     }
 
-    println!();
-    if !installed_any {
-        println!("No components were installed.");
-    }
-
     println!("Component status:");
     let kyrisd_ok = check_binary("kyrisd");
     let kyris_mcp_ok = check_binary("kyris-mcp");
     let kyris_hook_ok = check_binary("kyris-hook");
-    let shell_hook_ok = check_shell_hooks();
     let agentpactd_ok = check_binary("agentpactd");
+    let bash_env_ok = check_bash_env();
+    let agents_ok = check_agent_surfaces();
 
-    if kyrisd_ok && kyris_mcp_ok && kyris_hook_ok && shell_hook_ok && agentpactd_ok {
+    if kyrisd_ok && kyris_mcp_ok && kyris_hook_ok && agentpactd_ok && bash_env_ok && agents_ok {
         println!("All known components detected.");
     } else {
         println!("Missing components:");
@@ -107,11 +86,13 @@ pub fn run(args: InstallArgs) {
         if !kyris_hook_ok {
             println!("  kyris-hook - Install via: curl -fsSL https://kyr.is/install | sh");
         }
-        if !shell_hook_ok {
-            println!("  shell hook - Run `kyris install --components hooks`.");
-        }
         if !agentpactd_ok {
             println!("  agentpactd - Install separately via AgentPact's own installer.");
+        }
+        if !bash_env_ok {
+            println!(
+                "  BASH_ENV   - Run `kyris install` to configure non-interactive shell hooks."
+            );
         }
     }
 
@@ -124,48 +105,10 @@ pub fn run(args: InstallArgs) {
     if let Err(e) = crate::agents::reconcile::reconcile_all(false) {
         eprintln!("Reconciliation: {e}");
     }
-}
 
-fn requested_components(args: &InstallArgs) -> Vec<String> {
-    if args.all {
-        return detected_components();
+    if !super::verify::verify_post_install() {
+        std::process::exit(1);
     }
-    if args.components.is_none() {
-        return vec![HOOKS_COMPONENT.to_string()];
-    }
-    args.components.clone().unwrap_or_default()
-}
-
-fn validate_components(requested: &[String]) -> Result<(), String> {
-    let unsupported: Vec<&str> = requested
-        .iter()
-        .map(String::as_str)
-        .filter(|component| {
-            !matches!(
-                *component,
-                HOOKS_COMPONENT | KYRISD_COMPONENT | KYRIS_MCP_COMPONENT | KYRIS_HOOK_COMPONENT
-            )
-        })
-        .collect();
-
-    if unsupported.is_empty() {
-        return Ok(());
-    }
-
-    Err(format!(
-        "Unsupported install components: {}. Currently supported: {HOOKS_COMPONENT}, \
-         {KYRISD_COMPONENT}, {KYRIS_MCP_COMPONENT}, {KYRIS_HOOK_COMPONENT}.",
-        unsupported.join(", ")
-    ))
-}
-
-fn detected_components() -> Vec<String> {
-    vec![
-        HOOKS_COMPONENT.to_string(),
-        KYRISD_COMPONENT.to_string(),
-        KYRIS_MCP_COMPONENT.to_string(),
-        KYRIS_HOOK_COMPONENT.to_string(),
-    ]
 }
 
 fn install_shell_hooks() -> Result<Vec<String>, String> {
@@ -206,13 +149,70 @@ fn install_shell_hooks() -> Result<Vec<String>, String> {
             "export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\"",
             "~/.bashrc",
         ),
+        (
+            PathBuf::from(&home).join(".bash_profile"),
+            "export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\"",
+            "~/.bash_profile",
+        ),
     ] {
         if ensure_line(&path, line, "hooks")? {
             changes.push(format!("updated {label}"));
         }
     }
 
+    install_bash_env_launchd(&home, &mut changes)?;
+
     Ok(changes)
+}
+
+fn install_bash_env_launchd(home: &str, changes: &mut Vec<String>) -> Result<(), String> {
+    let bash_env_value = format!("{home}/.kyris/hooks/bash_env.sh");
+    let plist_path = PathBuf::from(home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join("is.kyr.env.plist");
+
+    let plist_contents = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>is.kyr.env</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>launchctl</string>
+    <string>setenv</string>
+    <string>BASH_ENV</string>
+    <string>{bash_env_value}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#
+    );
+
+    if write_managed_file(&plist_path, &plist_contents, "hooks", Some(0o644))? {
+        changes.push(format!("wrote {}", plist_path.display()));
+    }
+
+    // Set immediately for the current session
+    let status = std::process::Command::new("launchctl")
+        .args(["setenv", "BASH_ENV", &bash_env_value])
+        .status()
+        .map_err(|e| format!("Failed to run launchctl setenv: {e}"))?;
+    if status.success() {
+        changes.push("set BASH_ENV in launchd session".to_string());
+    }
+
+    // Bootstrap the plist so it runs at next login
+    let domain = format!("gui/{}", crate::service::uid());
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist_path.to_string_lossy()])
+        .status();
+
+    Ok(())
 }
 
 fn install_kyrisd_binary() -> Result<Vec<String>, String> {
@@ -244,6 +244,12 @@ fn install_release_binary(
         return Ok(vec![format!(
             "detected Homebrew-managed {formula}; skipped local {binary} install"
         )]);
+    }
+
+    if crate::state::find_in_path(binary).is_some()
+        || bin_dir().is_ok_and(|dir| dir.join(binary).exists())
+    {
+        return Ok(vec![format!("{binary}: already on PATH")]);
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -366,41 +372,71 @@ fn launchd_label(_kind: ServiceKind) -> &'static str {
     "is.kyr.kyrisd"
 }
 
-fn which_exists(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .is_ok_and(|output| output.status.success())
-}
-
 fn check_agentpactd_available() -> bool {
-    which_exists("agentpactd")
+    crate::state::find_in_path("agentpactd").is_some()
         || bin_dir().is_ok_and(|dir| dir.join("agentpactd").exists())
         || super::release::brew_formula_installed("agentpact")
 }
 
 fn check_binary(name: &str) -> bool {
-    let found = std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    let found = crate::state::find_in_path(name).is_some()
         || bin_dir().is_ok_and(|dir| dir.join(name).exists());
     let marker = if found { "+" } else { "-" };
     println!("  [{marker}] {name}");
     found
 }
 
-fn check_shell_hooks() -> bool {
+fn check_bash_env() -> bool {
     let home = std::env::var("HOME").unwrap_or_default();
-    let zshrc = std::fs::read_to_string(format!("{home}/.zshrc")).unwrap_or_default();
-    let zshenv = std::fs::read_to_string(format!("{home}/.zshenv")).unwrap_or_default();
     let bashrc = std::fs::read_to_string(format!("{home}/.bashrc")).unwrap_or_default();
-    let found = zshrc.contains("kyris hook")
-        || bashrc.contains("kyris hook")
-        || zshenv.contains("zshenv_hook.sh")
-        || zshrc.contains("zsh_hook.sh")
-        || bashrc.contains("bash_hook.sh");
-    let marker = if found { "+" } else { "-" };
-    println!("  [{marker}] shell hooks");
-    found
+    let bash_profile = std::fs::read_to_string(format!("{home}/.bash_profile")).unwrap_or_default();
+    let plist_exists = PathBuf::from(&home)
+        .join("Library")
+        .join("LaunchAgents")
+        .join("is.kyr.env.plist")
+        .exists();
+    let ok = bashrc.contains("BASH_ENV") || bash_profile.contains("BASH_ENV") || plist_exists;
+    let marker = if ok { "+" } else { "-" };
+    println!("  [{marker}] BASH_ENV");
+    ok
+}
+
+fn check_agent_surfaces() -> bool {
+    use crate::agents::profile::CapLevel;
+    let mut all_ok = true;
+    for agent in crate::agents::registry::all_agents() {
+        let probe = agent.probe();
+        if !probe.detected {
+            continue;
+        }
+        let (need_exec, need_tool, need_burn) = agent.expected_surfaces();
+        let exec_ok = !need_exec || probe.execution.level != CapLevel::None;
+        let tool_ok = !need_tool || probe.tool.level != CapLevel::None;
+        let burn_ok = !need_burn || probe.burn_control.level != CapLevel::None;
+        let agent_ok = exec_ok && tool_ok && burn_ok;
+        if !agent_ok {
+            all_ok = false;
+        }
+        let marker = if agent_ok { "+" } else { "-" };
+        let mut missing = Vec::new();
+        if !exec_ok {
+            missing.push("command");
+        }
+        if !tool_ok {
+            missing.push("mcp");
+        }
+        if !burn_ok {
+            missing.push("burn");
+        }
+        if missing.is_empty() {
+            println!("  [{marker}] {}", agent.id());
+        } else {
+            println!(
+                "  [{marker}] {} (missing: {})",
+                agent.id(),
+                missing.join(", ")
+            );
+        }
+    }
+    all_ok
 }

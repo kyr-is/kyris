@@ -134,7 +134,7 @@ The normal workflow is simple. Exact output depends on what is installed and wha
    [kyris] Installation complete!
    ```
 
-2. Run `kyris install` to install the components you want active on the machine.
+2. Run `kyris install` to set up shell hooks, binaries, and agent integrations.
 
    Example response:
 
@@ -378,9 +378,9 @@ This repo is deliberately kept small. It separates pure types, shared local logi
 | `daemon/` | `kyrisd` | LLM routing, HTTP MCP routing, local storage, sync, tray, notifications |
 | `cli/` | `kyris` | Installer, setup, query commands, scan, status, lifecycle commands |
 | `mcp/` | `kyris-mcp` | Minimal stdio MCP wrapper for governed `tools/call` paths |
-| `hooks/helper/` | `kyris-hook` | Tiny helper binary for the shell and agent-hook protocol boundary |
+| `hooks/helper/` | `kyris-hook` | Tiny helper binary for the shell-hook protocol boundary (check, respond, send). Native agent hooks use `kyris hook check` instead. |
 | `hooks/` | Zsh and Bash hook scripts | Transport glue only; shell scripts do not own JSON protocol logic |
-| `integrations/` | Agent-specific integration assets | Live hooks for Claude Code, Codex CLI, and Gemini CLI; compiled policy for Cline |
+| `integrations/` | Agent-specific integration assets | Compiled policy template for Cline. Live hook scripts are generated at runtime by `hook_script_source()` in `cli/src/agents/configure.rs`. |
 | `config/` | Runtime defaults and examples | Includes `default.yaml`, `example.yaml`, and pricing data |
 | `service/` | Service definitions | Currently the `launchd` plist for `kyrisd` |
 
@@ -411,7 +411,7 @@ flowchart TD
 ### 3.3 Runtime Flows
 The runtime has three main flows, one per reachable surface.
 
-- **Execution flow.** Shell hooks and live hook adapters pass actions to `kyris-hook`, which talks to `agentpactd` and returns an allow / ask / deny result in the format the caller expects.
+- **Execution flow.** Shell hooks pass actions to `kyris-hook` (fast, synchronous). Live native hook adapters use `kyris hook check` (full CLI binary with hold-poll-resolve for `PACT_ASK`). Both talk to `agentpactd` and return allow / deny results in the format the caller expects.
 - **Tool flow.** `kyris-mcp` interposes on stdio MCP `tools/call`; `kyrisd` interposes on HTTP MCP. Both use AgentPact policy decisions rather than inventing a second policy model.
 - **Burn-control flow.** `kyrisd` accepts provider-native requests, forwards them upstream in the same provider format, meters the result, enriches it with local cost data, and stores it in DuckDB.
 
@@ -449,7 +449,7 @@ Several decisions are intentional enough that contributors should treat them as 
 
 - **No per-project Kyris config.** Project-specific policy belongs in AgentPact's directory walk-up tree. `kyrisd.yaml` is machine-wide.
 - **No provider normalization layer.** `kyrisd` uses native-format passthrough for provider adapters. Shared infra is metering, circuit breaking, auth, and storage, not request translation.
-- **Shell scripts stay thin.** `kyris-hook` owns the shell-to-daemon protocol boundary so the scripts remain transport glue rather than miniature JSON implementations.
+- **Shell scripts stay thin.** `kyris-hook` owns the shell-to-daemon protocol boundary so the scripts remain transport glue. Native agent hooks use `kyris hook check` in the full CLI binary for the hold-poll-resolve pattern that `PACT_ASK` requires.
 - **Coverage claims are path-based.** If Kyris is not on the path, the right answer is `observed`, `vendor_reported`, or `unknown`, not wishful thinking.
 - **`kyris-types` is a stability boundary.** Pure shared types stay separate so local crates and future hosted systems can share a contract without dragging in runtime dependencies.
 - **`kyris-mcp` stays intentionally minimal.** Stdout is reserved for JSON-RPC, so the wrapper avoids database, web stack, and heavy observability dependencies on purpose.
@@ -462,8 +462,8 @@ The current extension points line up with that scope.
 | Area | Current shape | Where you extend it |
 | --- | --- | --- |
 | Provider routing | Anthropic, OpenAI, and Google passthrough adapters in `kyrisd` | `daemon/src/adapter/` |
-| Live agent hooks | Claude Code, Codex CLI, Gemini CLI | `cli/src/lifecycle/install.rs` (`hook_script_source()`) |
-| Compiled policy | Cline static permission rendering | `integrations/compiled-policy/<agent>/` |
+| Live agent hooks | Claude Code, Codex CLI, Gemini CLI | `cli/src/agents/configure.rs` (`hook_script_source()`) and `cli/src/hook_cmd.rs` |
+| Compiled policy | Cline, OpenCode, Codex CLI permission rendering | `cli/src/compile_policy.rs` and `integrations/compiled-policy/cline/` (template) |
 | Query and reporting UX | Timeline, history, replay, stats, scan, status | `cli/src/` |
 | Local runtime packaging | Config templates, service definitions, install flow | `config/`, `service/`, `install.sh` |
 

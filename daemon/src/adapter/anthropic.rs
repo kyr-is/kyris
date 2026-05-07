@@ -14,6 +14,8 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 
+use kyris_core::config::ProviderFormat;
+
 use crate::metering::{StatsEvent, TokenCounts};
 use crate::server::AppState;
 use crate::streaming::{self, StreamTokenCounts};
@@ -54,6 +56,16 @@ async fn handle_messages(
     let trace_id = uuid::Uuid::now_v7().to_string();
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
+    let agent_id = super::extract_agent_id(&headers);
+
+    if let (Some(token), Some(aid)) = (trace_token.as_deref(), agent_id.as_deref()) {
+        tracing::debug!(
+            agent_id = aid,
+            trace_token = token,
+            "native protocol observed"
+        );
+        super::write_native_seen_breadcrumb(aid);
+    }
 
     if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
@@ -69,12 +81,13 @@ async fn handle_messages(
     let provider = config
         .providers
         .iter()
-        .find(|p| p.name == "anthropic")
+        .find(|p| p.format == ProviderFormat::Anthropic)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();
     let client = clients
-        .get("anthropic")
+        .get(&provider_name)
         .cloned()
         .unwrap_or_else(reqwest::Client::new);
     let upstream_url = format!("{}/v1/messages", provider.upstream);
@@ -116,6 +129,7 @@ async fn handle_messages(
             resp_headers,
             trace_id,
             model,
+            provider_name,
             session_id,
             trace_token,
             peer_addr,
@@ -171,7 +185,7 @@ async fn handle_messages(
 
     let _ = state.stats_tx.try_send(StatsEvent {
         trace_id: trace_id.clone(),
-        provider: "anthropic".to_string(),
+        provider: provider_name,
         model: model.clone(),
         tokens,
         cache_create: cache_creation,
@@ -209,6 +223,7 @@ fn relay_sse_stream(
     resp_headers: HeaderMap,
     trace_id: String,
     model: String,
+    provider_name: String,
     session_id: String,
     trace_token: Option<String>,
     peer_addr: SocketAddr,
@@ -274,10 +289,11 @@ fn relay_sse_stream(
             })
     };
 
-    let mut relay = Box::pin(relay);
+    let mut relay = Some(Box::pin(relay));
     let mut finalized = false;
     let trace_id_for_stream = trace_id.clone();
     let model_for_stream = model.clone();
+    let provider_name_for_stream = provider_name;
     let session_id_for_stream = session_id.clone();
     let full_stream = futures_util::stream::poll_fn(move |cx| {
         use std::task::Poll;
@@ -368,7 +384,7 @@ fn relay_sse_stream(
 
             let _ = state.stats_tx.try_send(StatsEvent {
                 trace_id: trace_id_for_stream.clone(),
-                provider: "anthropic".to_string(),
+                provider: provider_name_for_stream.clone(),
                 model: model_for_stream.clone(),
                 tokens,
                 cache_create: stream_tokens.cache_creation_input,
@@ -387,23 +403,16 @@ fn relay_sse_stream(
         };
 
         if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-            match futures_util::Stream::poll_next(relay.as_mut(), cx) {
-                Poll::Ready(Some(_)) => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    finalized = true;
-                    if let Some(chunk) = finalize_stream(false) {
-                        return Poll::Ready(Some(Ok(chunk)));
-                    }
-                    return Poll::Ready(None);
-                }
+            drop(relay.take());
+            finalized = true;
+            if let Some(chunk) = finalize_stream(false) {
+                return Poll::Ready(Some(Ok(chunk)));
             }
+            return Poll::Ready(None);
         }
 
-        match futures_util::Stream::poll_next(relay.as_mut(), cx) {
+        let r = relay.as_mut().expect("relay alive before breaker trip");
+        match futures_util::Stream::poll_next(r.as_mut(), cx) {
             Poll::Ready(Some(chunk)) => {
                 if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
                     cx.waker().wake_by_ref();
@@ -448,12 +457,12 @@ async fn handle_count_tokens(
     let provider = config
         .providers
         .iter()
-        .find(|p| p.name == "anthropic")
+        .find(|p| p.format == ProviderFormat::Anthropic)
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let clients = state.provider_clients.load();
     let client = clients
-        .get("anthropic")
+        .get(&provider.name)
         .cloned()
         .unwrap_or_else(reqwest::Client::new);
     let upstream_url = format!("{}/v1/messages/count_tokens", provider.upstream);
@@ -589,7 +598,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post};
     use bytes::Bytes;
-    use kyris_core::config::{KyrisdConfig, ProviderConfig};
+    use kyris_core::config::{KyrisdConfig, ProviderConfig, ProviderFormat};
     use tokio::sync::{mpsc, oneshot};
 
     use crate::{
@@ -701,6 +710,7 @@ mod tests {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
             api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
@@ -791,6 +801,7 @@ mod tests {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
             api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
@@ -869,6 +880,7 @@ mod tests {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
             api_key: "anthropic-secret".to_string(),
             upstream: "http://127.0.0.1:9".to_string(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
@@ -932,6 +944,7 @@ mod tests {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
             api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],

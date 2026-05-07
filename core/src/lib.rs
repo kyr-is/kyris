@@ -18,3 +18,5 @@ pub mod agentpact;
 pub mod config;
 pub mod coverage;
 pub mod fail_open_log;
+#[cfg(feature = "pending")]
+pub mod pending;

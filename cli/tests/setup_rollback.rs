@@ -40,7 +40,10 @@ fn test_claude_setup_rolls_back_when_health_check_fails() {
     assert!(!output.status.success());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Rolled back."));
+    assert!(
+        stderr.contains("Burn-control and MCP routing rolled back"),
+        "expected rollback message in stderr, got: {stderr}"
+    );
 
     assert_eq!(
         fs::read_to_string(home.join(".zshrc")).expect("read .zshrc"),
@@ -58,7 +61,6 @@ fn test_claude_setup_rolls_back_when_health_check_fails() {
             .exists()
     );
     assert!(!home.join(".kyris").join("env").join("load.sh").exists());
-    assert!(!home.join(".kyris").join("manifest.json").exists());
 }
 
 #[test]
@@ -82,12 +84,26 @@ args = ["-y", "server"]
     assert!(!output.status.success());
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Rolled back."));
-
-    assert_eq!(
-        fs::read_to_string(home.join(".codex").join("config.toml")).expect("read codex config"),
-        "[mcp_servers.filesystem]\ncommand = \"npx\"\nargs = [\"-y\", \"server\"]\n"
+    assert!(
+        stderr.contains("Burn-control and MCP routing rolled back"),
+        "expected rollback message in stderr, got: {stderr}"
     );
+
+    let config_content =
+        fs::read_to_string(home.join(".codex").join("config.toml")).expect("read codex config");
+    assert!(
+        !config_content.contains("kyris-mcp"),
+        "MCP servers should not be rewritten after rollback, got: {config_content}"
+    );
+    assert!(
+        config_content.contains("command = \"npx\""),
+        "original MCP server command should be preserved, got: {config_content}"
+    );
+    assert!(
+        config_content.contains("codex_hooks = true"),
+        "execution-surface change (codex_hooks) should survive rollback, got: {config_content}"
+    );
+
     assert!(
         !home
             .join(".kyris")
@@ -96,5 +112,4 @@ args = ["-y", "server"]
             .exists()
     );
     assert!(!home.join(".kyris").join("env").join("load.sh").exists());
-    assert!(!home.join(".kyris").join("manifest.json").exists());
 }

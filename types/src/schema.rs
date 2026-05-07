@@ -100,12 +100,17 @@ fn tls_config() -> Value {
 fn provider_config() -> Value {
     json!({
         "type": "object",
-        "required": ["name", "api_key", "upstream"],
+        "required": ["name", "format", "api_key", "upstream"],
         "additionalProperties": false,
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Provider identifier (e.g. openai, anthropic, google)"
+                "description": "Provider identifier (e.g. openai, anthropic, google, bedrock-claude)"
+            },
+            "format": {
+                "type": "string",
+                "enum": ["anthropic", "openai", "google"],
+                "description": "Wire format for this provider (anthropic, openai, or google)"
             },
             "api_key": {
                 "type": "string",
@@ -338,14 +343,17 @@ mod tests {
     }
 
     #[test]
-    fn testProviderConfigRequiresNameApiKeyUpstream() {
+    fn testProviderConfigRequiredFields() {
         let schema = generate();
         let required = schema["$defs"]["ProviderConfig"]["required"]
             .as_array()
             .unwrap();
-        assert!(required.contains(&json!("name")));
-        assert!(required.contains(&json!("api_key")));
-        assert!(required.contains(&json!("upstream")));
+        for field in ["name", "format", "api_key", "upstream"] {
+            assert!(
+                required.contains(&json!(field)),
+                "missing required: {field}"
+            );
+        }
     }
 
     #[test]

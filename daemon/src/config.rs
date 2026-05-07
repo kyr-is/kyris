@@ -28,18 +28,20 @@ pub fn try_load_config() -> Result<KyrisdConfig, String> {
 }
 
 pub fn load_config() -> KyrisdConfig {
-    let config_path = config_path();
+    load_config_from(&config_path())
+}
 
+pub fn load_config_from(config_path: &Path) -> KyrisdConfig {
     if !config_path.exists() {
-        create_default_config(&config_path);
+        create_default_config(&config_path.to_path_buf());
     }
 
-    if let Err(e) = validate_permissions(&config_path) {
+    if let Err(e) = validate_permissions(config_path) {
         tracing::error!(error = %e, "config permission check failed");
         std::process::exit(1);
     }
 
-    let contents = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+    let contents = std::fs::read_to_string(config_path).unwrap_or_else(|e| {
         tracing::error!(path = %config_path.display(), error = %e, "failed to read config");
         std::process::exit(1);
     });
@@ -59,7 +61,7 @@ pub fn load_config() -> KyrisdConfig {
         changed = true;
     }
     if changed {
-        save_config(&config_path, &config);
+        save_config(&config_path.to_path_buf(), &config);
     }
 
     kyris_core::config::apply_env_overrides(&mut config);

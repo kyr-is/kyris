@@ -20,12 +20,19 @@ pub fn scan() -> Vec<Finding> {
                 scan_json_mcp_servers(
                     &path_str,
                     &servers_path,
+                    agent.id(),
                     agent.display_name(),
                     &mut findings,
                 );
             }
             McpConfigFormat::Toml { servers_key } => {
-                scan_toml_mcp_servers(&path_str, servers_key, agent.display_name(), &mut findings);
+                scan_toml_mcp_servers(
+                    &path_str,
+                    servers_key,
+                    agent.id(),
+                    agent.display_name(),
+                    &mut findings,
+                );
             }
         }
     }
@@ -44,6 +51,7 @@ fn is_routed_url(url: &str) -> bool {
 fn scan_json_mcp_servers(
     config_path: &str,
     servers_path: &[&str],
+    agent_id: &str,
     agent_name: &str,
     findings: &mut Vec<Finding>,
 ) {
@@ -63,7 +71,13 @@ fn scan_json_mcp_servers(
     };
 
     for (name, config) in servers {
-        let cmd = config.get("command").and_then(|v| v.as_str());
+        let cmd_str = config.get("command").and_then(|v| v.as_str());
+        let cmd_array_first = config
+            .get("command")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|v| v.as_str());
+        let cmd = cmd_str.or(cmd_array_first);
         let url = config.get("url").and_then(|v| v.as_str());
 
         match (cmd, url) {
@@ -81,7 +95,7 @@ fn scan_json_mcp_servers(
                         line: None,
                     },
                     evidence: Some(format!("command: {command}")),
-                    remediation: format!("Wrap with: kyris mcp wrap --server {name} {command}"),
+                    remediation: format!("Wrap with: kyris agents setup {agent_id}"),
                 });
             }
             (None, Some(url)) if is_routed_url(url) => {}
@@ -98,7 +112,7 @@ fn scan_json_mcp_servers(
                         line: None,
                     },
                     evidence: Some(format!("url: {url}")),
-                    remediation: format!("Route through kyrisd: kyris mcp route --server {name}"),
+                    remediation: format!("Route through kyrisd: kyris agents setup {agent_id}"),
                 });
             }
             _ => {}
@@ -109,6 +123,7 @@ fn scan_json_mcp_servers(
 fn scan_toml_mcp_servers(
     config_path: &str,
     servers_key: &str,
+    agent_id: &str,
     agent_name: &str,
     findings: &mut Vec<Finding>,
 ) {
@@ -158,7 +173,7 @@ fn scan_toml_mcp_servers(
                         line: None,
                     },
                     evidence: Some(format!("url: {url}")),
-                    remediation: format!("Route through kyrisd: kyris mcp route --server {name}"),
+                    remediation: format!("Route through kyrisd: kyris agents setup {agent_id}"),
                 });
             }
             _ => {}
@@ -184,13 +199,14 @@ mod tests {
         scan_json_mcp_servers(
             path.to_str().unwrap(),
             &["mcpServers"],
+            "claude-code",
             "Claude Code",
             &mut findings,
         );
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].category, FindingCategory::UngoverndMcp);
         assert!(findings[0].title.contains("github"));
-        assert!(findings[0].remediation.contains("kyris mcp wrap"));
+        assert!(findings[0].remediation.contains("kyris agents setup"));
     }
 
     #[test]
@@ -207,6 +223,7 @@ mod tests {
         scan_json_mcp_servers(
             path.to_str().unwrap(),
             &["mcpServers"],
+            "claude-code",
             "Claude Code",
             &mut findings,
         );
@@ -227,12 +244,13 @@ mod tests {
         scan_json_mcp_servers(
             path.to_str().unwrap(),
             &["mcpServers"],
+            "cline",
             "Cline",
             &mut findings,
         );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].title.contains("Unrouted remote"));
-        assert!(findings[0].remediation.contains("kyris mcp route"));
+        assert!(findings[0].remediation.contains("kyris agents setup cline"));
     }
 
     #[test]
@@ -249,6 +267,7 @@ mod tests {
         scan_json_mcp_servers(
             path.to_str().unwrap(),
             &["mcpServers"],
+            "cline",
             "Cline",
             &mut findings,
         );
@@ -265,6 +284,7 @@ mod tests {
         scan_json_mcp_servers(
             path.to_str().unwrap(),
             &["mcpServers"],
+            "claude-code",
             "Claude Code",
             &mut findings,
         );
@@ -277,6 +297,7 @@ mod tests {
         scan_json_mcp_servers(
             "/nonexistent/settings.json",
             &["mcpServers"],
+            "claude-code",
             "Claude Code",
             &mut findings,
         );
@@ -294,9 +315,59 @@ mod tests {
         .unwrap();
 
         let mut findings = Vec::new();
-        scan_json_mcp_servers(path.to_str().unwrap(), &["mcp"], "OpenCode", &mut findings);
+        scan_json_mcp_servers(
+            path.to_str().unwrap(),
+            &["mcp"],
+            "opencode",
+            "OpenCode",
+            &mut findings,
+        );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].description.contains("OpenCode"));
+    }
+
+    #[test]
+    fn testJsonArrayCommandUnwrappedDetected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        std::fs::write(
+            &path,
+            r#"{"mcp": {"filesystem": {"command": ["npx", "-y", "my-mcp-server"]}}}"#,
+        )
+        .unwrap();
+
+        let mut findings = Vec::new();
+        scan_json_mcp_servers(
+            path.to_str().unwrap(),
+            &["mcp"],
+            "opencode",
+            "OpenCode",
+            &mut findings,
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].title.contains("filesystem"));
+        assert!(findings[0].evidence.as_ref().unwrap().contains("npx"));
+    }
+
+    #[test]
+    fn testJsonArrayCommandWrappedIgnored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.json");
+        std::fs::write(
+            &path,
+            r#"{"mcp": {"filesystem": {"command": ["kyris-mcp", "wrap", "--server", "filesystem", "npx", "-y", "server"]}}}"#,
+        )
+        .unwrap();
+
+        let mut findings = Vec::new();
+        scan_json_mcp_servers(
+            path.to_str().unwrap(),
+            &["mcp"],
+            "opencode",
+            "OpenCode",
+            &mut findings,
+        );
+        assert!(findings.is_empty());
     }
 
     #[test]
@@ -318,6 +389,7 @@ mod tests {
         scan_json_mcp_servers(
             path.to_str().unwrap(),
             &["mcpServers"],
+            "test-agent",
             "Test",
             &mut findings,
         );
@@ -343,6 +415,7 @@ command = "npx filesystem-mcp"
         scan_toml_mcp_servers(
             path.to_str().unwrap(),
             "mcp_servers",
+            "codex-cli",
             "Codex CLI",
             &mut findings,
         );
@@ -367,6 +440,7 @@ command = "kyris-mcp wrap --server filesystem npx filesystem-mcp"
         scan_toml_mcp_servers(
             path.to_str().unwrap(),
             "mcp_servers",
+            "codex-cli",
             "Codex CLI",
             &mut findings,
         );
@@ -389,12 +463,17 @@ url = "https://example.com/mcp"
         scan_toml_mcp_servers(
             path.to_str().unwrap(),
             "mcp_servers",
+            "codex-cli",
             "Codex CLI",
             &mut findings,
         );
         assert_eq!(findings.len(), 1);
         assert!(findings[0].title.contains("Unrouted remote"));
-        assert!(findings[0].remediation.contains("kyris mcp route"));
+        assert!(
+            findings[0]
+                .remediation
+                .contains("kyris agents setup codex-cli")
+        );
     }
 
     #[test]
@@ -413,6 +492,7 @@ url = "http://127.0.0.1:4710/mcp/remote/"
         scan_toml_mcp_servers(
             path.to_str().unwrap(),
             "mcp_servers",
+            "codex-cli",
             "Codex CLI",
             &mut findings,
         );

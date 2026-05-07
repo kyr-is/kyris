@@ -20,6 +20,8 @@ pub struct KyrisdConfig {
     pub pricing: PricingConfig,
     #[serde(default)]
     pub stats: StatsConfig,
+    #[serde(default)]
+    pub agents: AgentsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,9 +60,54 @@ pub struct TlsConfig {
     pub key_path: String,
 }
 
+impl TlsConfig {
+    /// Checks that cert and key paths exist when TLS is enabled.
+    ///
+    /// # Errors
+    /// Returns an error if paths are empty or do not exist on disk.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.cert_path.is_empty() {
+            return Err("tls.enabled is true but tls.cert_path is empty".to_string());
+        }
+        if self.key_path.is_empty() {
+            return Err("tls.enabled is true but tls.key_path is empty".to_string());
+        }
+        let cert = std::path::Path::new(&self.cert_path);
+        if !cert.exists() {
+            return Err(format!("tls.cert_path does not exist: {}", self.cert_path));
+        }
+        let key = std::path::Path::new(&self.key_path);
+        if !key.exists() {
+            return Err(format!("tls.key_path does not exist: {}", self.key_path));
+        }
+        Ok(())
+    }
+}
+
+impl KyrisdConfig {
+    #[must_use]
+    pub fn base_url(&self) -> String {
+        let scheme = if self.tls.enabled { "https" } else { "http" };
+        format!("{scheme}://{}", self.server.listen)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderFormat {
+    Anthropic,
+    #[serde(rename = "openai")]
+    OpenAI,
+    Google,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub name: String,
+    pub format: ProviderFormat,
     pub api_key: String,
     pub upstream: String,
     #[serde(default)]
@@ -170,6 +217,24 @@ impl Default for StatsConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsConfig {
+    #[serde(default = "default_reconcile_interval_minutes")]
+    pub reconcile_interval_minutes: u64,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            reconcile_interval_minutes: default_reconcile_interval_minutes(),
+        }
+    }
+}
+
+fn default_reconcile_interval_minutes() -> u64 {
+    15
+}
+
 fn default_listen() -> String {
     "127.0.0.1:4710".to_string()
 }
@@ -257,6 +322,7 @@ server:
   operator_key: "sk-kyris-ops-test"
 providers:
   - name: anthropic
+    format: anthropic
     api_key: "sk-ant-test"
     upstream: "https://api.anthropic.com"
     models:
@@ -270,8 +336,23 @@ circuit_breaker:
         assert_eq!(config.server.operator_key, "sk-kyris-ops-test");
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.providers[0].name, "anthropic");
+        assert_eq!(config.providers[0].format, ProviderFormat::Anthropic);
         assert_eq!(config.circuit_breaker.max_tokens, 100_000);
         assert!(config.circuit_breaker.enabled);
+    }
+
+    #[test]
+    fn testProviderFormatFromYaml() {
+        let yaml_str = r#"
+providers:
+  - name: bedrock-claude
+    format: anthropic
+    api_key: ""
+    upstream: "https://bedrock-runtime.us-east-1.amazonaws.com"
+"#;
+        let config: KyrisdConfig = serde_saphyr::from_str(yaml_str).unwrap();
+        assert_eq!(config.providers[0].name, "bedrock-claude");
+        assert_eq!(config.providers[0].format, ProviderFormat::Anthropic);
     }
 
     #[test]
@@ -305,5 +386,88 @@ mcp:
         let config = SyncConfig::default();
         assert!(!config.enabled);
         assert!(config.scope.is_empty());
+    }
+
+    #[test]
+    fn testTlsValidateDisabledOk() {
+        let tls = TlsConfig::default();
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn testTlsValidateEnabledMissingPaths() {
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: String::new(),
+            key_path: String::new(),
+        };
+        assert!(tls.validate().unwrap_err().contains("cert_path is empty"));
+    }
+
+    #[test]
+    fn testTlsValidateEnabledMissingKeyPath() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&cert, "cert").unwrap();
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: cert.to_string_lossy().to_string(),
+            key_path: String::new(),
+        };
+        assert!(tls.validate().unwrap_err().contains("key_path is empty"));
+    }
+
+    #[test]
+    fn testTlsValidateEnabledNonexistentCert() {
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: "/nonexistent/cert.pem".to_string(),
+            key_path: "/nonexistent/key.pem".to_string(),
+        };
+        assert!(tls.validate().unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn testTlsValidateEnabledValidPaths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("cert.pem");
+        let key = dir.path().join("key.pem");
+        std::fs::write(&cert, "cert").unwrap();
+        std::fs::write(&key, "key").unwrap();
+        let tls = TlsConfig {
+            enabled: true,
+            cert_path: cert.to_string_lossy().to_string(),
+            key_path: key.to_string_lossy().to_string(),
+        };
+        assert!(tls.validate().is_ok());
+    }
+
+    #[test]
+    fn testBaseUrlHttp() {
+        let config = KyrisdConfig {
+            server: ServerConfig {
+                listen: "127.0.0.1:4710".to_string(),
+                ..Default::default()
+            },
+            ..serde_saphyr::from_str("{}").unwrap()
+        };
+        assert_eq!(config.base_url(), "http://127.0.0.1:4710");
+    }
+
+    #[test]
+    fn testBaseUrlHttps() {
+        let config = KyrisdConfig {
+            server: ServerConfig {
+                listen: "0.0.0.0:4710".to_string(),
+                ..Default::default()
+            },
+            tls: TlsConfig {
+                enabled: true,
+                cert_path: "cert.pem".to_string(),
+                key_path: "key.pem".to_string(),
+            },
+            ..serde_saphyr::from_str("{}").unwrap()
+        };
+        assert_eq!(config.base_url(), "https://0.0.0.0:4710");
     }
 }

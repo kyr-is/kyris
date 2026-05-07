@@ -45,3 +45,10 @@ pub fn relay_sync_error_toast(reason: &str) {
         &format!("Relay sync failed: {reason}. Events queued locally."),
     );
 }
+
+pub fn agent_drift_repaired_toast() {
+    send_toast(
+        "Kyris: Agent Config Repaired",
+        "An agent's config was overwritten (e.g., by an update). Kyris detected and re-applied governance.",
+    );
+}

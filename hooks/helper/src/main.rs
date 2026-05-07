@@ -1,9 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-//! Minimal shell hook helper (`kyris-hook`). Translates agent hook events
+//! Minimal shell hook helper (`kyris-hook`). Translates shell hook events
 //! (check, respond, send) into `AgentPact` UDS protocol calls. Intentionally
 //! tiny — stdlib + serde only, no Tokio, no `DuckDB` — to keep cold start
 //! under 5ms and binary under 1MB.
+//!
+//! Native agent hooks (Claude Code `PreToolUse`, Codex CLI `PreToolUse`,
+//! Gemini CLI `BeforeTool`) use `kyris hook check` in the CLI binary — that
+//! binary has tokio + reqwest and can run the hold-poll-resolve pattern for
+//! `PACT_ASK` approval delegation.
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -32,14 +37,13 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: kyris-hook <check|respond|check-hook|send> [args...]");
+        eprintln!("Usage: kyris-hook <check|respond|send> [args...]");
         return ExitCode::from(1);
     }
 
     match args[1].as_str() {
         "check" => cmd_check(&args[2..]),
         "respond" => cmd_respond(&args[2..]),
-        "check-hook" => cmd_check_hook(&args[2..]),
         "send" => cmd_send(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
@@ -241,102 +245,6 @@ fn cmd_respond(args: &[String]) -> ExitCode {
     }
 }
 
-fn cmd_check_hook(args: &[String]) -> ExitCode {
-    let mut agent = String::new();
-    let mut socket_path = default_socket();
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--agent" if i + 1 < args.len() => {
-                agent.clone_from(&args[i + 1]);
-                i += 2;
-            }
-            "--socket" if i + 1 < args.len() => {
-                socket_path.clone_from(&args[i + 1]);
-                i += 2;
-            }
-            _ => i += 1,
-        }
-    }
-
-    if let Err(msg) = check_protocol_version(&socket_path) {
-        print_hook_response(&agent, "error", &msg);
-        return ExitCode::from(1);
-    }
-
-    let mut payload = String::new();
-    std::io::stdin().read_to_string(&mut payload).unwrap_or(0);
-
-    let hook_input: serde_json::Value =
-        serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
-
-    let (action, detail) = map_agent_payload(&agent, &hook_input);
-
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from));
-
-    let request = serde_json::json!({
-        "id": generate_id(),
-        "method": "permission.request",
-        "action": action,
-        "detail": detail,
-        "context": {
-            "working_dir": cwd,
-        }
-    });
-
-    let Ok(response) = send_request(&socket_path, &request) else {
-        if daemon_state_allows(&socket_path) {
-            write_fail_open_event(&action, &detail, cwd.as_deref().unwrap_or(""));
-            print_hook_response(&agent, "auto", "");
-            return ExitCode::from(0);
-        }
-        print_hook_response(&agent, "error", "daemon unreachable");
-        return ExitCode::from(1);
-    };
-
-    match parse_check_response(&response) {
-        CheckResponse::Allow { .. } => {
-            print_hook_response(&agent, "auto", "");
-            ExitCode::from(0)
-        }
-        CheckResponse::Deny { reason } => {
-            print_hook_response(&agent, "deny", reason.as_deref().unwrap_or(""));
-            ExitCode::from(1)
-        }
-        CheckResponse::Ask {
-            approval_token,
-            approval_id,
-            breaker_count,
-        } => {
-            send_void(&socket_path, &approval_token);
-            let reason = response
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("requires approval");
-            let detail = match breaker_count {
-                Some(count) => format!(
-                    "{reason} ({count} commands without human input) [approval_id={approval_id}]"
-                ),
-                None => format!("{reason} [approval_id={approval_id}]"),
-            };
-            print_hook_ask_response(&agent, &detail);
-            ExitCode::from(1)
-        }
-        CheckResponse::Invalid(_) => {
-            let reason = response
-                .get("error")
-                .or_else(|| response.get("reason"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("denied by policy");
-            print_hook_response(&agent, "deny", reason);
-            ExitCode::from(1)
-        }
-    }
-}
-
 fn cmd_send(args: &[String]) -> ExitCode {
     if args.len() < 2 {
         eprintln!("Usage: kyris-hook send <socket_path> <json_message>");
@@ -392,16 +300,6 @@ fn parse_check_args(args: &[String]) -> (String, String, String) {
     }
 
     (command, cwd, socket)
-}
-
-fn send_void(socket_path: &str, approval_token: &str) {
-    let request = serde_json::json!({
-        "id": generate_id(),
-        "method": "permission.respond",
-        "approval_token": approval_token,
-        "response": "voided",
-    });
-    let _ = send_request(socket_path, &request);
 }
 
 #[cfg(unix)]
@@ -558,311 +456,17 @@ fn generate_id() -> String {
     )
 }
 
-#[derive(serde::Deserialize)]
-struct ToolMapping {
-    tool_name: String,
-    action: String,
-}
-
-#[derive(serde::Deserialize)]
-struct HookProtocol {
-    tool_name_field: String,
-    detail_fields: Vec<String>,
-    tool_mappings: Vec<ToolMapping>,
-    default_action: String,
-    response_format: ResponseFormat,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ResponseFormat {
-    Json,
-    Text,
-}
-
-fn load_hook_protocol(agent: &str) -> Option<HookProtocol> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = format!("{home}/.kyris/agents/{agent}/hook-protocol.json");
-    let contents = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
-}
-
-fn map_agent_payload(agent: &str, input: &serde_json::Value) -> (String, String) {
-    if let Some(protocol) = load_hook_protocol(agent) {
-        return map_with_protocol(&protocol, input);
-    }
-    let method = input["method"].as_str().unwrap_or("call");
-    let detail = input["detail"].as_str().unwrap_or("");
-    (method.to_string(), detail.to_string())
-}
-
-fn map_with_protocol(protocol: &HookProtocol, input: &serde_json::Value) -> (String, String) {
-    let tool = input[&protocol.tool_name_field]
-        .as_str()
-        .unwrap_or("unknown");
-
-    let action = protocol
-        .tool_mappings
-        .iter()
-        .find(|m| m.tool_name == tool)
-        .map_or(protocol.default_action.as_str(), |m| m.action.as_str());
-
-    let detail = protocol
-        .detail_fields
-        .iter()
-        .find_map(|field| input[field].as_str())
-        .unwrap_or(tool);
-
-    (action.to_string(), detail.to_string())
-}
-
-fn response_format_for_agent(agent: &str) -> ResponseFormat {
-    load_hook_protocol(agent).map_or(ResponseFormat::Text, |p| p.response_format)
-}
-
-fn print_hook_ask_response(agent: &str, reason: &str) {
-    match response_format_for_agent(agent) {
-        ResponseFormat::Json => {
-            let result = serde_json::json!({"decision": "deny", "reason": reason});
-            println!("{}", serde_json::to_string(&result).unwrap_or_default());
-        }
-        ResponseFormat::Text => {
-            eprintln!("[agentpact] {reason}");
-            println!("deny");
-        }
-    }
-}
-
-fn print_hook_response(agent: &str, decision: &str, error_msg: &str) {
-    match response_format_for_agent(agent) {
-        ResponseFormat::Json => {
-            let result = match decision {
-                "auto" | "inform" => serde_json::json!({"decision": "approve"}),
-                _ => serde_json::json!({"decision": "deny", "reason": error_msg}),
-            };
-            println!("{}", serde_json::to_string(&result).unwrap_or_default());
-        }
-        ResponseFormat::Text => {
-            if decision == "auto" || decision == "inform" {
-                println!("allow");
-            } else {
-                println!("deny");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
-    fn claude_code_protocol() -> HookProtocol {
-        HookProtocol {
-            tool_name_field: "tool_name".to_string(),
-            detail_fields: vec!["tool_input".to_string(), "input".to_string()],
-            tool_mappings: vec![
-                ToolMapping {
-                    tool_name: "Bash".to_string(),
-                    action: "execute".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "bash".to_string(),
-                    action: "execute".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "Read".to_string(),
-                    action: "read".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "read_file".to_string(),
-                    action: "read".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "Write".to_string(),
-                    action: "write".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "write_file".to_string(),
-                    action: "write".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "Edit".to_string(),
-                    action: "write".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "edit_file".to_string(),
-                    action: "write".to_string(),
-                },
-            ],
-            default_action: "call".to_string(),
-            response_format: ResponseFormat::Json,
-        }
-    }
+    static ENV_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    fn codex_cli_protocol() -> HookProtocol {
-        HookProtocol {
-            tool_name_field: "tool_name".to_string(),
-            detail_fields: vec!["input".to_string()],
-            tool_mappings: vec![
-                ToolMapping {
-                    tool_name: "shell".to_string(),
-                    action: "execute".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "read_file".to_string(),
-                    action: "read".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "write_file".to_string(),
-                    action: "write".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "apply_diff".to_string(),
-                    action: "write".to_string(),
-                },
-            ],
-            default_action: "call".to_string(),
-            response_format: ResponseFormat::Text,
-        }
-    }
-
-    fn gemini_cli_protocol() -> HookProtocol {
-        HookProtocol {
-            tool_name_field: "tool_name".to_string(),
-            detail_fields: vec!["arguments".to_string()],
-            tool_mappings: vec![
-                ToolMapping {
-                    tool_name: "shell".to_string(),
-                    action: "execute".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "run_command".to_string(),
-                    action: "execute".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "read_file".to_string(),
-                    action: "read".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "write_file".to_string(),
-                    action: "write".to_string(),
-                },
-                ToolMapping {
-                    tool_name: "edit_file".to_string(),
-                    action: "write".to_string(),
-                },
-            ],
-            default_action: "call".to_string(),
-            response_format: ResponseFormat::Text,
-        }
-    }
-
-    #[test]
-    fn testMapClaudeCodePayload() {
-        let input = serde_json::json!({
-            "tool_name": "Bash",
-            "tool_input": "git status"
-        });
-        let (action, detail) = map_with_protocol(&claude_code_protocol(), &input);
-        assert_eq!(action, "execute");
-        assert_eq!(detail, "git status");
-    }
-
-    #[test]
-    fn testMapClaudeCodeReadTool() {
-        let input = serde_json::json!({
-            "tool_name": "Read",
-            "tool_input": "/tmp/file.txt"
-        });
-        let (action, _) = map_with_protocol(&claude_code_protocol(), &input);
-        assert_eq!(action, "read");
-    }
-
-    #[test]
-    fn testMapClaudeCodeWriteTools() {
-        let protocol = claude_code_protocol();
-        for tool in ["Write", "write_file", "Edit", "edit_file"] {
-            let input = serde_json::json!({ "tool_name": tool, "tool_input": "/tmp/f" });
-            let (action, _) = map_with_protocol(&protocol, &input);
-            assert_eq!(action, "write", "failed for tool: {tool}");
-        }
-    }
-
-    #[test]
-    fn testMapClaudeCodeUnknownToolFallsBackToCall() {
-        let input = serde_json::json!({ "tool_name": "CustomMcpTool", "tool_input": "data" });
-        let (action, detail) = map_with_protocol(&claude_code_protocol(), &input);
-        assert_eq!(action, "call");
-        assert_eq!(detail, "data");
-    }
-
-    #[test]
-    fn testMapClaudeCodeFallsBackToToolNameWhenNoInput() {
-        let input = serde_json::json!({ "tool_name": "SomeTool" });
-        let (action, detail) = map_with_protocol(&claude_code_protocol(), &input);
-        assert_eq!(action, "call");
-        assert_eq!(detail, "SomeTool");
-    }
-
-    #[test]
-    fn testMapCodexCliPayload() {
-        let input = serde_json::json!({
-            "tool_name": "shell",
-            "input": "ls -la"
-        });
-        let (action, detail) = map_with_protocol(&codex_cli_protocol(), &input);
-        assert_eq!(action, "execute");
-        assert_eq!(detail, "ls -la");
-    }
-
-    #[test]
-    fn testMapCodexCliWriteTools() {
-        let protocol = codex_cli_protocol();
-        for tool in ["write_file", "apply_diff"] {
-            let input = serde_json::json!({ "tool_name": tool, "input": "content" });
-            let (action, _) = map_with_protocol(&protocol, &input);
-            assert_eq!(action, "write", "failed for tool: {tool}");
-        }
-    }
-
-    #[test]
-    fn testMapGeminiCliPayload() {
-        let input = serde_json::json!({
-            "tool_name": "run_command",
-            "arguments": "echo hello"
-        });
-        let (action, detail) = map_with_protocol(&gemini_cli_protocol(), &input);
-        assert_eq!(action, "execute");
-        assert_eq!(detail, "echo hello");
-    }
-
-    #[test]
-    fn testMapGeminiCliWriteTools() {
-        let protocol = gemini_cli_protocol();
-        for tool in ["write_file", "edit_file"] {
-            let input = serde_json::json!({ "tool_name": tool, "arguments": "content" });
-            let (action, _) = map_with_protocol(&protocol, &input);
-            assert_eq!(action, "write", "failed for tool: {tool}");
-        }
-    }
-
-    #[test]
-    fn testMapUnknownAgent() {
-        let input = serde_json::json!({
-            "method": "call",
-            "detail": "some action"
-        });
-        let (action, detail) = map_agent_payload("unknown-agent", &input);
-        assert_eq!(action, "call");
-        assert_eq!(detail, "some action");
-    }
-
-    #[test]
-    fn testMapUnknownAgentMissingFields() {
-        let input = serde_json::json!({});
-        let (action, detail) = map_agent_payload("unknown-agent", &input);
-        assert_eq!(action, "call");
-        assert_eq!(detail, "");
+    fn lock_env_tests() -> MutexGuard<'static, ()> {
+        ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
@@ -996,35 +600,6 @@ mod tests {
     }
 
     #[test]
-    fn testPrintHookResponseClaudeCodeApprove() {
-        let result = hook_response_json("claude-code", "auto", "");
-        assert_eq!(result["decision"], "approve");
-    }
-
-    #[test]
-    fn testPrintHookResponseClaudeCodeInform() {
-        let result = hook_response_json("claude-code", "inform", "");
-        assert_eq!(result["decision"], "approve");
-    }
-
-    #[test]
-    fn testPrintHookResponseClaudeCodeDeny() {
-        let result = hook_response_json("claude-code", "deny", "not allowed");
-        assert_eq!(result["decision"], "deny");
-        assert_eq!(result["reason"], "not allowed");
-    }
-
-    fn hook_response_json(agent: &str, decision: &str, error_msg: &str) -> serde_json::Value {
-        match agent {
-            "claude-code" => match decision {
-                "auto" | "inform" => serde_json::json!({"decision": "approve"}),
-                _ => serde_json::json!({"decision": "deny", "reason": error_msg}),
-            },
-            _ => serde_json::Value::Null,
-        }
-    }
-
-    #[test]
     fn testDaemonStateAllowsReturnsTrue() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("daemon.state");
@@ -1100,6 +675,7 @@ mod tests {
 
     #[test]
     fn testDefaultSocketUsesEnvVar() {
+        let _guard = lock_env_tests();
         unsafe { std::env::set_var("AGENTPACT_SOCK", "/custom/path.sock") };
         let sock = default_socket();
         assert_eq!(sock, "/custom/path.sock");
@@ -1108,6 +684,7 @@ mod tests {
 
     #[test]
     fn testDefaultSocketFallsBackToHome() {
+        let _guard = lock_env_tests();
         unsafe { std::env::remove_var("AGENTPACT_SOCK") };
         let sock = default_socket();
         assert!(sock.ends_with(".agentpact/agentpact.sock"));

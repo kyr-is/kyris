@@ -103,6 +103,7 @@ pub fn reconcile_one(agent_id: &str) -> Result<AgentProfile, String> {
     Ok(profile)
 }
 
+#[allow(clippy::too_many_lines)]
 fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> {
     let mut profile =
         load_agent_profile(agent.id())?.unwrap_or_else(|| AgentProfile::new_empty(agent.id()));
@@ -121,10 +122,22 @@ fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> 
 
     profile.detected = true;
 
+    let burn_control_native = profile.burn_control.level == CapLevel::Native;
+
     // Auto-configure: agent is present but has never been configured.
-    if !was_configured(agent.id()) {
-        if let Err(e) = super::configure::configure_agent(agent.id()) {
-            eprintln!("Auto-configure {} failed: {e}", agent.id());
+    // Skip if the user explicitly disabled this agent via `kyris agents undo`.
+    if !was_configured(agent.id()) && !profile.disabled {
+        match super::configure::configure_agent(
+            agent.id(),
+            &profile.agent_specific,
+            burn_control_native,
+        ) {
+            Ok(()) => {
+                println!("Auto-configured {}", agent.id());
+            }
+            Err(e) => {
+                eprintln!("Auto-configure {} failed: {e}", agent.id());
+            }
         }
         // Re-probe after configure to get updated surface states.
         let updated = agent.probe();
@@ -151,8 +164,17 @@ fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> 
     }
 
     if needs_repair {
-        if let Err(e) = super::configure::configure_agent(agent.id()) {
-            eprintln!("Repair {} failed: {e}", agent.id());
+        match super::configure::configure_agent(
+            agent.id(),
+            &profile.agent_specific,
+            burn_control_native,
+        ) {
+            Ok(()) => {
+                println!("Repaired {}", agent.id());
+            }
+            Err(e) => {
+                eprintln!("Repair {} failed: {e}", agent.id());
+            }
         }
         let updated = agent.probe();
         probe.execution = updated.execution;
@@ -161,30 +183,53 @@ fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> 
         probe.managed_files = updated.managed_files;
     }
 
+    // Migrate legacy single-field native evidence to per-surface.
+    profile.migrate_native_evidence();
+
     // Check for native protocol promotion via kyrisd breadcrumb.
+    // The breadcrumb (x-kyris-trace-token on LLM path) only proves
+    // burn-control nativeness. Execution and tool surfaces need their own
+    // evidence sources when agents add native AgentPact support.
     if let Some(ts) = check_native_breadcrumb(agent.id())
-        && profile.last_native_seen.is_none()
+        && profile.native_evidence.burn_control.is_none()
     {
-        profile.last_native_seen = Some(ts);
+        profile.native_evidence.burn_control = Some(ts);
     }
 
-    // Update surface states from probe.
+    // Update surface states from probe, preserving native levels that the
+    // probe cannot detect (probe only sees filesystem artifacts, not protocol).
     profile.execution = probe.execution;
     profile.tool = probe.tool;
-    profile.burn_control = probe.burn_control;
+    if profile.burn_control.level != CapLevel::Native {
+        profile.burn_control = probe.burn_control;
+    }
 
-    // If native was observed, promote expected adapted surfaces to native.
-    if profile.last_native_seen.is_some() {
-        let (need_exec, need_tool, need_burn) = agent.expected_surfaces();
-        if need_exec && profile.execution.level == CapLevel::Adapted {
-            profile.execution = super::profile::SurfaceState::native();
-        }
-        if need_tool && profile.tool.level == CapLevel::Adapted {
-            profile.tool = super::profile::SurfaceState::native();
-        }
+    // Per-surface native promotion: only promote surfaces with evidence.
+    if profile.native_evidence.burn_control.is_some() {
+        let (_, _, need_burn) = agent.expected_surfaces();
         if need_burn && profile.burn_control.level == CapLevel::Adapted {
+            if let Err(e) = agent.undo_burn_control() {
+                eprintln!("Burn-control cleanup for {} failed: {e}", agent.id());
+            }
+            if let Err(e) =
+                super::configure::configure_agent(agent.id(), &profile.agent_specific, true)
+            {
+                eprintln!("Re-configure {} after promotion failed: {e}", agent.id());
+            }
             profile.burn_control = super::profile::SurfaceState::native();
+            let updated = agent.probe();
+            probe.managed_files = updated.managed_files;
         }
+    }
+    // Execution and tool promotion placeholders. No evidence source exists
+    // today — when native hook/MCP protocols arrive, AgentDescriptor will need
+    // dedicated `undo_execution()` / `undo_tool()` methods to remove adapted
+    // artifacts without tearing down other surfaces.
+    if profile.native_evidence.execution.is_some() && profile.execution.level == CapLevel::Adapted {
+        profile.execution = super::profile::SurfaceState::native();
+    }
+    if profile.native_evidence.tool.is_some() && profile.tool.level == CapLevel::Adapted {
+        profile.tool = super::profile::SurfaceState::native();
     }
 
     profile.managed_files = probe.managed_files;

@@ -154,20 +154,7 @@ fn installed_version(binary: &str) -> Option<String> {
 }
 
 fn which_path(binary: &str) -> Option<PathBuf> {
-    let output = std::process::Command::new("which")
-        .arg(binary)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(output.stdout).ok()?;
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
+    crate::state::find_in_path(binary)
 }
 
 fn extract_version(output: &str) -> Option<String> {

@@ -17,8 +17,12 @@ struct Credentials {
 }
 
 fn load_credentials() -> Option<Credentials> {
-    let home = std::env::var("HOME").ok()?;
-    let path = format!("{home}/.kyris/credentials.json");
+    let path = if let Ok(p) = std::env::var("KYRIS_CREDENTIALS_PATH") {
+        PathBuf::from(p)
+    } else {
+        let home = std::env::var("HOME").ok()?;
+        PathBuf::from(format!("{home}/.kyris/credentials.json"))
+    };
     let contents = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
     let machine_id = parsed.get("machine_id")?.as_str()?.to_string();
@@ -30,6 +34,9 @@ fn load_credentials() -> Option<Credentials> {
 }
 
 fn agentpact_log_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("AGENTPACT_HOME") {
+        return PathBuf::from(home).join("log");
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(format!("{home}/.agentpact/log"))
 }

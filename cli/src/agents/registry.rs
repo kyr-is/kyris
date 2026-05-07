@@ -11,17 +11,37 @@ pub trait AgentDescriptor {
     fn display_name(&self) -> &'static str;
     fn is_installed(&self) -> bool;
     fn probe(&self) -> ProbeResult;
-    fn managed_paths(&self) -> Vec<PathBuf>;
     fn kyris_content_markers(&self) -> &'static [&'static str];
-    fn env_exports(&self, listen: &str, inbound_key: &str) -> Vec<(String, String)>;
+    fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)>;
     fn expected_surfaces(&self) -> (bool, bool, bool);
-    fn configure(&self, listen: &str, inbound_key: &str) -> Result<Vec<String>, String>;
+    fn configure_execution(
+        &self,
+        _base_url: &str,
+        _inbound_key: &str,
+        _agent_specific: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    fn configure_burn_control(
+        &self,
+        _base_url: &str,
+        _inbound_key: &str,
+        _agent_specific: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
     fn undo(&self) -> Result<(), String>;
+    fn undo_burn_control(&self) -> Result<(), String> {
+        Ok(())
+    }
     fn hook_protocol(&self) -> Option<HookProtocol> {
         None
     }
     fn mcp_config(&self) -> Option<McpConfigLocation> {
         None
+    }
+    fn burn_control_config_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
     }
 }
 
@@ -41,6 +61,7 @@ pub struct McpConfigLocation {
 pub struct ToolMapping {
     pub tool_name: String,
     pub action: String,
+    pub detail_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,42 +70,35 @@ pub struct HookProtocol {
     pub detail_fields: Vec<String>,
     pub tool_mappings: Vec<ToolMapping>,
     pub default_action: String,
-    pub response_format: ResponseFormat,
+    pub allow_response: AllowResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ResponseFormat {
-    Json,
-    Text,
+#[serde(rename_all = "snake_case")]
+pub enum AllowResponse {
+    EmptyStdout,
+    Json { body: serde_json::Value },
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum PrimaryProvider {
-    Anthropic,
     OpenAI,
     Google,
 }
 
 pub fn provider_env_exports(
     provider: PrimaryProvider,
-    listen: &str,
+    base_url: &str,
     inbound_key: &str,
 ) -> Vec<(String, String)> {
     match provider {
-        PrimaryProvider::Anthropic => vec![
-            ("ANTHROPIC_BASE_URL".to_string(), format!("http://{listen}")),
-            ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
-        ],
         PrimaryProvider::OpenAI => vec![
-            ("OPENAI_BASE_URL".to_string(), format!("http://{listen}/v1")),
+            ("OPENAI_BASE_URL".to_string(), format!("{base_url}/v1")),
             ("OPENAI_API_KEY".to_string(), inbound_key.to_string()),
         ],
         PrimaryProvider::Google => vec![
-            (
-                "GOOGLE_GEMINI_BASE_URL".to_string(),
-                format!("http://{listen}"),
-            ),
+            ("GOOGLE_GEMINI_BASE_URL".to_string(), base_url.to_string()),
             ("GEMINI_API_KEY".to_string(), inbound_key.to_string()),
             (
                 "GEMINI_API_KEY_AUTH_MECHANISM".to_string(),
@@ -95,10 +109,7 @@ pub fn provider_env_exports(
 }
 
 pub fn which_exists(cmd: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(cmd)
-        .output()
-        .is_ok_and(|output| output.status.success())
+    crate::state::find_in_path(cmd).is_some()
 }
 
 macro_rules! agent_registry {

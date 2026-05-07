@@ -249,9 +249,6 @@ async fn resolve_ask_via_tty(
     decision.unwrap_or_else(|_| PactDecision::Deny(daemon_unavailable_message()))
 }
 
-const KYRISD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-const KYRISD_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
-
 async fn resolve_ask_via_kyrisd(
     approval_id: &str,
     approval_token: &str,
@@ -266,76 +263,28 @@ async fn resolve_ask_via_kyrisd(
     };
 
     let client = reqwest::Client::new();
-    let hold_body = serde_json::json!({
-        "id": approval_id,
-        "approval_token": approval_token,
-        "server": server_name,
-        "tool": tool_name,
-    });
-
-    let hold_result = client
-        .post(format!("{}/api/pending/hold", conn.base_url))
-        .header("authorization", format!("Bearer {}", conn.operator_key))
-        .json(&hold_body)
-        .send()
-        .await;
-
-    if hold_result.is_err() || !hold_result.as_ref().unwrap().status().is_success() {
-        return deny_ask_immediately(approval_token, sock_path, socket_timeout).await;
-    }
 
     eprintln!(
         "[kyris-mcp] {server_name}/{tool_name} held for approval — resolve with 'kyris pending'"
     );
 
-    let deadline = tokio::time::Instant::now() + KYRISD_POLL_TIMEOUT;
-    loop {
-        tokio::time::sleep(KYRISD_POLL_INTERVAL).await;
-        if tokio::time::Instant::now() >= deadline {
-            cancel_held_request(&client, &conn.base_url, &conn.operator_key, approval_id).await;
-            return deny_ask_immediately(approval_token, sock_path, socket_timeout).await;
-        }
+    let resolution = kyris_core::pending::hold_poll_resolve(
+        &client,
+        &conn,
+        approval_id,
+        approval_token,
+        server_name,
+        tool_name,
+    )
+    .await;
 
-        let status_result = client
-            .get(format!(
-                "{}/api/pending/{}/status",
-                conn.base_url, approval_id
-            ))
-            .header("authorization", format!("Bearer {}", conn.operator_key))
-            .send()
-            .await;
-
-        let Ok(resp) = status_result else {
-            continue;
-        };
-        let Ok(body) = resp.json::<serde_json::Value>().await else {
-            continue;
-        };
-
-        match body.get("state").and_then(|s| s.as_str()) {
-            Some("held") => {}
-            Some("approved") => return PactDecision::Allow,
-            Some("denied") => return PactDecision::Deny(no_tty_message()),
-            _ => {
-                cancel_held_request(&client, &conn.base_url, &conn.operator_key, approval_id).await;
-                return deny_ask_immediately(approval_token, sock_path, socket_timeout).await;
-            }
+    match resolution {
+        kyris_core::pending::Resolution::Approved => PactDecision::Allow,
+        kyris_core::pending::Resolution::Denied => PactDecision::Deny(no_tty_message()),
+        kyris_core::pending::Resolution::Failed(_) => {
+            deny_ask_immediately(approval_token, sock_path, socket_timeout).await
         }
     }
-}
-
-async fn cancel_held_request(
-    client: &reqwest::Client,
-    base_url: &str,
-    operator_key: &str,
-    pending_id: &str,
-) {
-    let url = format!("{base_url}/api/pending/{pending_id}/cancel");
-    let _ = client
-        .delete(&url)
-        .header("authorization", format!("Bearer {operator_key}"))
-        .send()
-        .await;
 }
 
 async fn deny_ask_immediately(

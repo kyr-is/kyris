@@ -31,6 +31,14 @@ pub fn extract_trace_token(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
+pub fn extract_agent_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-kyris-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 pub fn relay_trace_attach_sync(
     state: &AppState,
     trace_token: &str,
@@ -81,6 +89,22 @@ pub async fn relay_trace_attach(
             None
         }
     }
+}
+
+pub fn write_native_seen_breadcrumb(agent_id: &str) {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home)
+        .join(".kyris")
+        .join("agents")
+        .join(".native-seen");
+    let path = dir.join(agent_id);
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(&path, chrono::Utc::now().to_rfc3339());
 }
 
 pub async fn resolve_peer_working_dir(peer_addr: SocketAddr) -> Option<String> {
@@ -182,5 +206,52 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-kyris-trace-token", HeaderValue::from_static(""));
         assert_eq!(extract_trace_token(&headers), None);
+    }
+
+    #[test]
+    fn testExtractAgentIdPresent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-kyris-agent-id", HeaderValue::from_static("claude-code"));
+        assert_eq!(extract_agent_id(&headers), Some("claude-code".to_string()));
+    }
+
+    #[test]
+    fn testExtractAgentIdMissing() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_agent_id(&headers), None);
+    }
+
+    #[test]
+    fn testExtractAgentIdEmpty() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-kyris-agent-id", HeaderValue::from_static(""));
+        assert_eq!(extract_agent_id(&headers), None);
+    }
+
+    #[test]
+    fn testWriteNativeSeenBreadcrumb() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        let dir = temp
+            .path()
+            .join(".kyris")
+            .join("agents")
+            .join(".native-seen");
+
+        write_native_seen_breadcrumb("claude-code");
+
+        let path = dir.join("claude-code");
+        assert!(path.exists());
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains('T'),
+            "expected ISO-8601 timestamp: {contents}"
+        );
+
+        // Idempotent: second call doesn't overwrite
+        let first_contents = contents;
+        write_native_seen_breadcrumb("claude-code");
+        let second_contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(first_contents, second_contents);
     }
 }

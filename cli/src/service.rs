@@ -173,7 +173,7 @@ fn run_command(command: &str, args: &[&str], brew_prefix: Option<String>) -> Res
     }
 }
 
-fn uid() -> u32 {
+pub fn uid() -> u32 {
     std::process::Command::new("id")
         .arg("-u")
         .output()

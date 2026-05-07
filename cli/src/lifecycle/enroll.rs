@@ -90,22 +90,17 @@ fn enroll(args: EnrollArgs) -> Result<(), String> {
 
     println!("Enrollment complete.");
     println!("Credentials written to {}", credentials_path()?.display());
+    let base_url = config.base_url();
     let state = service_state(ServiceKind::Kyrisd);
     if state.managed_by_homebrew || state.launchd_loaded {
         restart_service(ServiceKind::Kyrisd)?;
-        wait_for_kyrisd_health(&config.server.listen)?;
+        wait_for_kyrisd_health(&base_url)?;
         println!("Restarted kyrisd to activate sync.");
-        println!(
-            "kyrisd is healthy at http://{}/healthz",
-            config.server.listen
-        );
+        println!("kyrisd is healthy at {base_url}/healthz");
     } else {
         println!("Restart kyrisd to activate sync.");
-        if wait_for_kyrisd_health(&config.server.listen).is_ok() {
-            println!(
-                "kyrisd is already healthy at http://{}/healthz",
-                config.server.listen
-            );
+        if wait_for_kyrisd_health(&base_url).is_ok() {
+            println!("kyrisd is already healthy at {base_url}/healthz");
         }
     }
     println!("Machine enrolled as {}", enrollment.machine_id);
@@ -377,8 +372,8 @@ fn verify_force_rotation(
     Ok(())
 }
 
-fn wait_for_kyrisd_health(listen: &str) -> Result<(), String> {
-    let url = format!("http://{listen}/healthz");
+fn wait_for_kyrisd_health(base_url: &str) -> Result<(), String> {
+    let url = format!("{base_url}/healthz");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
