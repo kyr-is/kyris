@@ -14,7 +14,7 @@ name = "kyris-mcp"
 path = "src/main.rs"
 
 [dependencies]
-kyris-core = { workspace = true }
+kyris-core = { workspace = true, features = ["pending"] }
 kyris-agentpact-client = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "io-std", "net", "sync", "signal", "time"] }
 serde_json = { workspace = true }

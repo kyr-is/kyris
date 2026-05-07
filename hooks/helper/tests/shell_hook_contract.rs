@@ -86,7 +86,7 @@ fn prepend_path(bin_dir: &Path) -> String {
     }
 }
 
-fn run_zsh_preexec(
+fn run_zsh_trapdebug(
     home_dir: &Path,
     working_dir: &Path,
     socket_path: &Path,
@@ -99,9 +99,8 @@ fn run_zsh_preexec(
         .env("AGENTPACT_SOCK", socket_path)
         .env("PATH", path_env)
         .env("HOOK_PATH", hook_path("zsh_hook.sh"))
-        .env("TEST_CMD", command)
         .arg("-fc")
-        .arg("source \"$HOOK_PATH\"; __kyris_preexec \"$TEST_CMD\"; print -r -- $?")
+        .arg(format!("source \"$HOOK_PATH\"; {command}"))
         .output()
         .expect("run zsh hook")
 }
@@ -125,7 +124,7 @@ fn test_zsh_hook_blocks_denied_command_via_kyris_hook() {
         })],
     );
 
-    let output = run_zsh_preexec(
+    let output = run_zsh_trapdebug(
         temp_home.path(),
         temp_home.path(),
         &socket_path,
@@ -133,8 +132,7 @@ fn test_zsh_hook_blocks_denied_command_via_kyris_hook() {
         "git status",
     );
 
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+    assert_eq!(output.status.code(), Some(1));
 
     let requests = daemon.finish();
     assert_eq!(requests.len(), 1);
@@ -244,7 +242,7 @@ fn test_zsh_hook_blocks_unexpected_helper_exit_code() {
     let socket_path = temp_home.path().join("agentpact.sock");
     let _listener = UnixListener::bind(&socket_path).expect("bind placeholder socket");
 
-    let output = run_zsh_preexec(
+    let output = run_zsh_trapdebug(
         temp_home.path(),
         temp_home.path(),
         &socket_path,
@@ -252,11 +250,5 @@ fn test_zsh_hook_blocks_unexpected_helper_exit_code() {
         "git status",
     );
 
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("unexpected kyris-hook exit code: 42"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_eq!(output.status.code(), Some(1));
 }

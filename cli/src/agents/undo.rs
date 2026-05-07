@@ -13,13 +13,14 @@ pub fn undo_agent(agent_id: &str) -> Result<(), String> {
     agent.undo()?;
     undo_env_agent(agent_id)?;
 
-    if let Ok(Some(mut profile)) = load_agent_profile(agent_id) {
-        profile.execution = super::profile::SurfaceState::none();
-        profile.tool = super::profile::SurfaceState::none();
-        profile.burn_control = super::profile::SurfaceState::none();
-        profile.managed_files.clear();
-        let _ = save_agent_profile(&profile);
-    }
+    let mut profile = load_agent_profile(agent_id)?
+        .unwrap_or_else(|| super::profile::AgentProfile::new_empty(agent_id));
+    profile.execution = super::profile::SurfaceState::none();
+    profile.tool = super::profile::SurfaceState::none();
+    profile.burn_control = super::profile::SurfaceState::none();
+    profile.managed_files.clear();
+    profile.disabled = true;
+    save_agent_profile(&profile)?;
 
     Ok(())
 }

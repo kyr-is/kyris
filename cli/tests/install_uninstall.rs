@@ -23,7 +23,11 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
 
     let kyris_bin = home.join(".kyris").join("bin");
     fs::create_dir_all(&kyris_bin).expect("create .kyris/bin");
+    fs::write(kyris_bin.join("kyris"), "").expect("write fake kyris");
     fs::write(kyris_bin.join("agentpactd"), "").expect("write fake agentpactd");
+    fs::write(kyris_bin.join("kyrisd"), "").expect("write fake kyrisd");
+    fs::write(kyris_bin.join("kyris-mcp"), "").expect("write fake kyris-mcp");
+    fs::write(kyris_bin.join("kyris-hook"), "").expect("write fake kyris-hook");
 
     let zshrc = "# zsh baseline\n";
     let zshenv = "# zshenv baseline\n";
@@ -43,9 +47,9 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     )
     .expect("write policy");
 
-    // Install hooks only; prestage_all + reconcile_all run automatically and
+    // prestage_all + reconcile_all run automatically and
     // detect that .claude/ exists, so claude-code and cline get prestaged.
-    let install_output = run_kyris(home, &["install", "--components", "hooks"]);
+    let install_output = run_kyris(home, &["install"]);
     assert!(install_output.status.success(), "{install_output:?}");
 
     // Shell hooks installed
@@ -95,6 +99,17 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     assert!(bashrc_after.contains("source \"$HOME/.kyris/hooks/bash_hook.sh\""));
     assert!(bashrc_after.contains("export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\""));
     assert!(bashrc_after.contains("source \"$HOME/.kyris/env/load.sh\""));
+
+    let bash_profile_after =
+        fs::read_to_string(home.join(".bash_profile")).expect("read .bash_profile");
+    assert!(bash_profile_after.contains("export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\""));
+
+    assert!(
+        home.join("Library")
+            .join("LaunchAgents")
+            .join("is.kyr.env.plist")
+            .exists()
+    );
 
     // Reconcile auto-configured claude-code (detected via .claude/ dir)
     let claude_settings_after: Value = serde_json::from_str(
@@ -148,4 +163,78 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     assert!(!home.join(".kyris").join("hooks").exists());
     assert!(!home.join(".kyris").join("env").exists());
     assert!(!home.join(".kyris").join("manifest.json").exists());
+    assert!(!home.join(".bash_profile").exists());
+    assert!(
+        !home
+            .join("Library")
+            .join("LaunchAgents")
+            .join("is.kyr.env.plist")
+            .exists()
+    );
+}
+
+#[test]
+fn test_install_output_shows_bash_env_check() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+
+    fs::create_dir_all(home.join(".kyris").join("bin")).expect("create .kyris/bin");
+    fs::write(home.join(".kyris").join("bin").join("kyris"), "").expect("fake kyris");
+    fs::write(home.join(".kyris").join("bin").join("agentpactd"), "").expect("fake agentpactd");
+    fs::write(home.join(".kyris").join("bin").join("kyrisd"), "").expect("fake kyrisd");
+    fs::write(home.join(".kyris").join("bin").join("kyris-mcp"), "").expect("fake kyris-mcp");
+    fs::write(home.join(".kyris").join("bin").join("kyris-hook"), "").expect("fake kyris-hook");
+    fs::write(home.join(".zshrc"), "").expect("write .zshrc");
+    fs::write(home.join(".bashrc"), "").expect("write .bashrc");
+    fs::create_dir_all(home.join(".agentpact").join("policy")).expect("create policy dir");
+    fs::write(
+        home.join(".agentpact").join("policy").join("pact.yaml"),
+        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"ls\": auto\n",
+    )
+    .expect("write policy");
+
+    let output = run_kyris(home, &["install"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("BASH_ENV"),
+        "install output should show BASH_ENV check: {stdout}"
+    );
+}
+
+#[test]
+fn test_install_output_shows_per_agent_surfaces() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+
+    fs::create_dir_all(home.join(".kyris").join("bin")).expect("create .kyris/bin");
+    fs::write(home.join(".kyris").join("bin").join("kyris"), "").expect("fake kyris");
+    fs::write(home.join(".kyris").join("bin").join("agentpactd"), "").expect("fake agentpactd");
+    fs::write(home.join(".kyris").join("bin").join("kyrisd"), "").expect("fake kyrisd");
+    fs::write(home.join(".kyris").join("bin").join("kyris-mcp"), "").expect("fake kyris-mcp");
+    fs::write(home.join(".kyris").join("bin").join("kyris-hook"), "").expect("fake kyris-hook");
+    fs::write(home.join(".zshrc"), "").expect("write .zshrc");
+    fs::write(home.join(".bashrc"), "").expect("write .bashrc");
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    fs::write(home.join(".claude").join("settings.json"), "{}").expect("write claude settings");
+    fs::create_dir_all(home.join(".agentpact").join("policy")).expect("create policy dir");
+    fs::write(
+        home.join(".agentpact").join("policy").join("pact.yaml"),
+        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"ls\": auto\n",
+    )
+    .expect("write policy");
+
+    let output = run_kyris(home, &["install"]);
+    assert!(output.status.success(), "{output:?}");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.to_lowercase().contains("shell hooks"),
+        "install output should not mention 'shell hooks': {stdout}"
+    );
+    assert!(
+        stdout.contains("Component status:"),
+        "install output should show 'Component status:': {stdout}"
+    );
 }

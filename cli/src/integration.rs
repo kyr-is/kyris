@@ -35,7 +35,12 @@ pub fn write_toml_value(path: &Path, value: &toml::Value, component: &str) -> Re
     write_managed_file(path, &contents, component, Some(0o600))
 }
 
-pub fn ensure_json_command_hook(root: &mut Value, phase: &str, command: &str) -> bool {
+pub fn ensure_json_command_hook(
+    root: &mut Value,
+    phase: &str,
+    command: &str,
+    nested: bool,
+) -> bool {
     let object = as_json_object(root);
     let hooks = object
         .entry("hooks".to_string())
@@ -46,30 +51,22 @@ pub fn ensure_json_command_hook(root: &mut Value, phase: &str, command: &str) ->
         .or_insert_with(|| Value::Array(Vec::new()));
     let hooks_array = as_json_array(phase_hooks);
 
-    let already_present = hooks_array.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_some_and(|nested| {
-                nested.iter().any(|hook| {
-                    hook.get("type").and_then(Value::as_str) == Some("command")
-                        && hook.get("command").and_then(Value::as_str) == Some(command)
-                })
-            })
-    });
+    let already_present = hooks_array
+        .iter()
+        .any(|entry| entry_has_command(entry, command));
     if already_present {
         return false;
     }
 
-    hooks_array.push(json!({
-        "matcher": "",
-        "hooks": [
-            {
-                "type": "command",
-                "command": command,
-            }
-        ]
-    }));
+    let entry = if nested {
+        json!({
+            "matcher": "",
+            "hooks": [{"type": "command", "command": command}]
+        })
+    } else {
+        json!({"type": "command", "command": command})
+    };
+    hooks_array.push(entry);
     true
 }
 
@@ -82,19 +79,45 @@ pub fn remove_json_command_hook(root: &mut Value, phase: &str, command_substr: &
     };
 
     let before = phase_hooks.len();
-    phase_hooks.retain(|entry| {
-        !entry
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_some_and(|nested| {
-                nested.iter().any(|hook| {
-                    hook.get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|cmd| cmd.contains(command_substr))
-                })
-            })
-    });
+    phase_hooks.retain(|entry| !entry_has_command_substr(entry, command_substr));
     phase_hooks.len() != before
+}
+
+fn entry_has_command(entry: &Value, command: &str) -> bool {
+    if entry.get("type").and_then(Value::as_str) == Some("command")
+        && entry.get("command").and_then(Value::as_str) == Some(command)
+    {
+        return true;
+    }
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|nested| {
+            nested.iter().any(|hook| {
+                hook.get("type").and_then(Value::as_str) == Some("command")
+                    && hook.get("command").and_then(Value::as_str) == Some(command)
+            })
+        })
+}
+
+fn entry_has_command_substr(entry: &Value, substr: &str) -> bool {
+    if entry
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|cmd| cmd.contains(substr))
+    {
+        return true;
+    }
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|nested| {
+            nested.iter().any(|hook| {
+                hook.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|cmd| cmd.contains(substr))
+            })
+        })
 }
 
 pub fn set_json_string_path(root: &mut Value, path: &[&str], value: &str) -> bool {
@@ -138,6 +161,28 @@ pub fn set_json_value_path(root: &mut Value, path: &[&str], value: Value) -> boo
         return false;
     }
     object.insert(leaf, value);
+    true
+}
+
+pub fn ensure_toml_string_path(root: &mut toml::Value, path: &[&str], value: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        let table = as_toml_table(cursor);
+        cursor = table
+            .entry((*key).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    }
+
+    let table = as_toml_table(cursor);
+    let leaf = path[path.len() - 1].to_string();
+    if table.get(&leaf).and_then(toml::Value::as_str) == Some(value) {
+        return false;
+    }
+    table.insert(leaf, toml::Value::String(value.to_string()));
     true
 }
 
@@ -202,4 +247,104 @@ fn as_toml_table(value: &mut toml::Value) -> &mut toml::Table {
         *value = toml::Value::Table(toml::Table::new());
     }
     value.as_table_mut().expect("value converted to TOML table")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testEnsureNestedHookWritesMatcherShape() {
+        let mut root = json!({});
+        assert!(ensure_json_command_hook(
+            &mut root,
+            "PreToolUse",
+            "bash /tmp/hook.sh",
+            true
+        ));
+        let entry = &root["hooks"]["PreToolUse"][0];
+        assert_eq!(entry["matcher"], "");
+        assert_eq!(entry["hooks"][0]["type"], "command");
+        assert_eq!(entry["hooks"][0]["command"], "bash /tmp/hook.sh");
+    }
+
+    #[test]
+    fn testEnsureFlatHookWritesDirectShape() {
+        let mut root = json!({});
+        assert!(ensure_json_command_hook(
+            &mut root,
+            "BeforeTool",
+            "bash /tmp/hook.sh",
+            false
+        ));
+        let entry = &root["hooks"]["BeforeTool"][0];
+        assert_eq!(entry["type"], "command");
+        assert_eq!(entry["command"], "bash /tmp/hook.sh");
+        assert!(entry.get("matcher").is_none());
+        assert!(entry.get("hooks").is_none());
+    }
+
+    #[test]
+    fn testEnsureHookIdempotentBothShapes() {
+        let mut root = json!({});
+        assert!(ensure_json_command_hook(
+            &mut root,
+            "PreToolUse",
+            "bash /tmp/a.sh",
+            true
+        ));
+        assert!(!ensure_json_command_hook(
+            &mut root,
+            "PreToolUse",
+            "bash /tmp/a.sh",
+            true
+        ));
+
+        let mut root = json!({});
+        assert!(ensure_json_command_hook(
+            &mut root,
+            "BeforeTool",
+            "bash /tmp/b.sh",
+            false
+        ));
+        assert!(!ensure_json_command_hook(
+            &mut root,
+            "BeforeTool",
+            "bash /tmp/b.sh",
+            false
+        ));
+    }
+
+    #[test]
+    fn testRemoveNestedHook() {
+        let mut root = json!({});
+        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/kyris_hook.sh", true);
+        assert!(remove_json_command_hook(
+            &mut root,
+            "PreToolUse",
+            "kyris_hook"
+        ));
+        assert!(root["hooks"]["PreToolUse"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn testRemoveFlatHook() {
+        let mut root = json!({});
+        ensure_json_command_hook(&mut root, "BeforeTool", "bash /tmp/kyris_hook.sh", false);
+        assert!(remove_json_command_hook(
+            &mut root,
+            "BeforeTool",
+            "kyris_hook"
+        ));
+        assert!(root["hooks"]["BeforeTool"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn testRemoveHookLeavesOtherEntries() {
+        let mut root = json!({});
+        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/kyris.sh", true);
+        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/other.sh", true);
+        assert!(remove_json_command_hook(&mut root, "PreToolUse", "kyris"));
+        assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+    }
 }

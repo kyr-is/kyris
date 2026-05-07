@@ -18,6 +18,7 @@ mod agents;
 mod check;
 mod compile_policy;
 mod continue_cmd;
+mod hook_cmd;
 mod integration;
 mod lifecycle;
 mod mcp_cmd;
@@ -47,6 +48,7 @@ enum Command {
     History(query::history::HistoryArgs),
     Check(check::CheckArgs),
     CompilePolicy(compile_policy::CompilePolicyArgs),
+    Hook(hook_cmd::HookArgs),
     Pending(pending::PendingArgs),
     Continue(continue_cmd::ContinueArgs),
     Scan(scan::ScanArgs),
@@ -56,6 +58,7 @@ enum Command {
     Daemon(lifecycle::daemon_cmd::DaemonArgs),
     Mcp(mcp_cmd::McpArgs),
     Uninstall(lifecycle::uninstall::UninstallArgs),
+    Verify(lifecycle::verify::VerifyArgs),
     Status(status::StatusArgs),
     Version(version::VersionArgs),
 }
@@ -71,6 +74,7 @@ fn main() {
         Command::History(args) => query::history::run(args),
         Command::Check(args) => check::run(args),
         Command::CompilePolicy(args) => compile_policy::run(args),
+        Command::Hook(args) => hook_cmd::run(args),
         Command::Pending(args) => pending::run(args),
         Command::Continue(args) => continue_cmd::run(args),
         Command::Scan(args) => scan::run(args),
@@ -80,6 +84,7 @@ fn main() {
         Command::Daemon(args) => lifecycle::daemon_cmd::run(args),
         Command::Mcp(args) => mcp_cmd::run(args),
         Command::Uninstall(args) => lifecycle::uninstall::run(args),
+        Command::Verify(args) => lifecycle::verify::run(args),
         Command::Status(args) => status::run(args),
         Command::Version(args) => version::run(args),
     }
@@ -142,6 +147,31 @@ mod tests {
     #[test]
     fn testParseMcpWrap() {
         assert!(try_parse(&["mcp", "wrap", "node", "server.js"]).is_ok());
+    }
+
+    #[test]
+    fn testParseHookCheck() {
+        assert!(try_parse(&["hook", "check", "--agent", "claude-code"]).is_ok());
+    }
+
+    #[test]
+    fn testParseHookCheckMissingAgent() {
+        assert!(try_parse(&["hook", "check"]).is_err());
+    }
+
+    #[test]
+    fn testParseVerify() {
+        assert!(try_parse(&["verify"]).is_ok());
+    }
+
+    #[test]
+    fn testParseVerifyPostInstall() {
+        assert!(try_parse(&["verify", "--post-install"]).is_ok());
+    }
+
+    #[test]
+    fn testParseVerifyPostUninstall() {
+        assert!(try_parse(&["verify", "--post-uninstall"]).is_ok());
     }
 
     #[test]

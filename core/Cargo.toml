@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 description = "Shared library for the Kyris workspace: re-exports kyris-types, adds I/O helpers (config loading, env overrides, AgentPact protocol, project config discovery)"
 
+[features]
+pending = ["tokio", "reqwest"]
+
 [dependencies]
 kyris-types = { workspace = true }
 serde = { workspace = true }
@@ -16,6 +19,8 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"], optional = true }
+reqwest = { workspace = true, features = ["rustls", "json"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

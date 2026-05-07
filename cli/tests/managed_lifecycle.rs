@@ -144,7 +144,7 @@ fn test_install_skips_local_kyrisd_when_homebrew_managed() {
             ),
             ("KYRIS_TEST_BREW_LIST_KYRIS", "1"),
         ],
-        &["install", "--components", "kyrisd"],
+        &["install"],
     );
 
     assert!(output.status.success(), "{output:?}");

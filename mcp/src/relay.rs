@@ -5,7 +5,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 
 use kyris_core::agentpact::ToolAnnotations;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
@@ -122,6 +122,175 @@ fn build_denied_response(original_id: &serde_json::Value, message: &str) -> Stri
     .to_string()
 }
 
+enum FrameMode {
+    Unknown,
+    Newline,
+    BraceDepth,
+    ContentLength,
+}
+
+async fn read_brace_delimited<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut message = Vec::new();
+    let mut depth: u32 = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if message.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(message));
+        }
+        let mut consumed = 0;
+        for &byte in available {
+            consumed += 1;
+            message.push(byte);
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if in_string {
+                match byte {
+                    b'\\' => escape_next = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            reader.consume(consumed);
+                            return Ok(Some(message));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        reader.consume(consumed);
+    }
+}
+
+async fn read_content_length<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut header_line = String::new();
+    loop {
+        header_line.clear();
+        let n = reader.read_line(&mut header_line).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = header_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.to_ascii_lowercase().starts_with("content-length:") {
+            break;
+        }
+    }
+    let length_str = header_line.trim()["Content-Length:".len()..].trim();
+    let length: usize = length_str.parse().map_err(|e| {
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid Content-Length: {e}"),
+        ))
+    })?;
+    let mut blank = String::new();
+    loop {
+        blank.clear();
+        let n = reader.read_line(&mut blank).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if blank.trim().is_empty() {
+            break;
+        }
+    }
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+async fn read_message<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    mode: &mut FrameMode,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    loop {
+        match mode {
+            FrameMode::Unknown => {
+                let buf = reader.fill_buf().await?;
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                let first = buf.iter().find(|b| !b.is_ascii_whitespace());
+                match first {
+                    Some(b'{') => *mode = FrameMode::BraceDepth,
+                    Some(b'C') => *mode = FrameMode::ContentLength,
+                    Some(_) => *mode = FrameMode::Newline,
+                    None => {
+                        let len = buf.len();
+                        reader.consume(len);
+                    }
+                }
+            }
+            FrameMode::Newline => {
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).await?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                return Ok(Some(trimmed.as_bytes().to_vec()));
+            }
+            FrameMode::BraceDepth => {
+                let mut buf = reader.fill_buf().await?;
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                while !buf.is_empty() && buf[0].is_ascii_whitespace() {
+                    reader.consume(1);
+                    buf = reader.fill_buf().await?;
+                }
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                if buf[0] == b'C' {
+                    *mode = FrameMode::ContentLength;
+                    continue;
+                }
+                if buf[0] != b'{' {
+                    reader.consume(1);
+                    continue;
+                }
+                return read_brace_delimited(reader).await;
+            }
+            FrameMode::ContentLength => {
+                return read_content_length(reader).await;
+            }
+        }
+    }
+}
+
+fn normalize(msg: &[u8]) -> Vec<u8> {
+    if !msg.contains(&b'\n') {
+        return msg.to_vec();
+    }
+    match serde_json::from_slice::<serde_json::Value>(msg) {
+        Ok(v) => serde_json::to_vec(&v).unwrap_or_else(|_| msg.to_vec()),
+        Err(_) => msg.to_vec(),
+    }
+}
+
 async fn relay_agent_to_server(
     stdin: tokio::io::Stdin,
     mut child_stdin: tokio::process::ChildStdin,
@@ -131,14 +300,14 @@ async fn relay_agent_to_server(
     socket_timeout: std::time::Duration,
     annotation_cache: AnnotationCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let reader = BufReader::new(stdin);
-    let mut lines = reader.lines();
+    let mut reader = BufReader::new(stdin);
+    let mut mode = FrameMode::Unknown;
 
-    while let Some(line) = lines.next_line().await? {
-        let bytes = line.as_bytes();
-        if framing::is_tools_call(bytes) {
-            let tool_name = extract_tool_name(bytes).unwrap_or_else(|| "unknown".to_string());
-            let original_id = extract_request_id(bytes).unwrap_or(serde_json::Value::Null);
+    while let Some(msg) = read_message(&mut reader, &mut mode).await? {
+        let compact = normalize(&msg);
+        if framing::is_tools_call(&compact) {
+            let tool_name = extract_tool_name(&compact).unwrap_or_else(|| "unknown".to_string());
+            let original_id = extract_request_id(&compact).unwrap_or(serde_json::Value::Null);
 
             let annotations = annotation_cache
                 .read()
@@ -159,7 +328,7 @@ async fn relay_agent_to_server(
 
             match decision {
                 PactDecision::Allow => {
-                    child_stdin.write_all(bytes).await?;
+                    child_stdin.write_all(&compact).await?;
                     child_stdin.write_all(b"\n").await?;
                     child_stdin.flush().await?;
                 }
@@ -172,7 +341,7 @@ async fn relay_agent_to_server(
                 }
             }
         } else {
-            child_stdin.write_all(bytes).await?;
+            child_stdin.write_all(&compact).await?;
             child_stdin.write_all(b"\n").await?;
             child_stdin.flush().await?;
         }
@@ -186,23 +355,23 @@ async fn relay_server_to_agent(
     stdout: SharedStdout,
     annotation_cache: AnnotationCache,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let reader = BufReader::new(child_stdout);
-    let mut lines = reader.lines();
-    while let Some(line) = lines.next_line().await? {
-        let bytes = line.as_bytes();
-        if framing::is_tools_list_response(bytes) {
-            let annotations = framing::extract_tool_annotations(bytes);
+    let mut reader = BufReader::new(child_stdout);
+    let mut mode = FrameMode::Unknown;
+    while let Some(msg) = read_message(&mut reader, &mut mode).await? {
+        let compact = normalize(&msg);
+        if framing::is_tools_list_response(&compact) {
+            let annotations = framing::extract_tool_annotations(&compact);
             if !annotations.is_empty() {
                 let mut cache = annotation_cache.write().await;
                 for (name, ann) in annotations {
                     cache.insert(name, ann);
                 }
             }
-        } else if framing::is_tools_list_changed(bytes) {
+        } else if framing::is_tools_list_changed(&compact) {
             annotation_cache.write().await.clear();
         }
         let mut out = stdout.lock().await;
-        out.write_all(bytes).await?;
+        out.write_all(&compact).await?;
         out.write_all(b"\n").await?;
         out.flush().await?;
     }
@@ -239,5 +408,120 @@ mod tests {
         assert_eq!(v["id"], 7);
         assert_eq!(v["error"]["code"], -32001);
         assert_eq!(v["error"]["message"], "Blocked by policy");
+    }
+
+    #[tokio::test]
+    async fn testReadMessageNewlineDelimited() {
+        let input = b"{\"id\":1}\n{\"id\":2}\n";
+        let cursor = std::io::Cursor::new(input.to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut mode = FrameMode::Unknown;
+
+        let msg1 = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        assert_eq!(msg1, b"{\"id\":1}");
+
+        let msg2 = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        assert_eq!(msg2, b"{\"id\":2}");
+
+        let eof = read_message(&mut reader, &mut mode).await.unwrap();
+        assert!(eof.is_none());
+    }
+
+    #[tokio::test]
+    async fn testReadMessageBraceDepthPrettyPrinted() {
+        let input = b"{\n  \"id\": 1,\n  \"method\": \"test\"\n}\n{\n  \"id\": 2\n}\n";
+        let cursor = std::io::Cursor::new(input.to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut mode = FrameMode::Unknown;
+
+        let msg1 = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        let v1: serde_json::Value = serde_json::from_slice(&msg1).unwrap();
+        assert_eq!(v1["id"], 1);
+
+        let msg2 = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&msg2).unwrap();
+        assert_eq!(v2["id"], 2);
+    }
+
+    #[tokio::test]
+    async fn testReadMessageBraceDepthWithStringBraces() {
+        let input = b"{\"data\":\"{nested}\"}\n";
+        let cursor = std::io::Cursor::new(input.to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut mode = FrameMode::Unknown;
+
+        let msg = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(v["data"], "{nested}");
+    }
+
+    #[tokio::test]
+    async fn testReadMessageContentLength() {
+        let body = b"{\"id\":1}";
+        let input = format!(
+            "Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut reader = BufReader::new(cursor);
+        let mut mode = FrameMode::Unknown;
+
+        let msg = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        assert_eq!(msg, body);
+    }
+
+    #[tokio::test]
+    async fn testReadMessageContentLengthMultiple() {
+        let body1 = b"{\"id\":1}";
+        let body2 = b"{\"id\":2}";
+        let input = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            body1.len(),
+            std::str::from_utf8(body1).unwrap(),
+            body2.len(),
+            std::str::from_utf8(body2).unwrap(),
+        );
+        let cursor = std::io::Cursor::new(input.into_bytes());
+        let mut reader = BufReader::new(cursor);
+        let mut mode = FrameMode::Unknown;
+
+        let msg1 = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        assert_eq!(msg1, body1);
+
+        let msg2 = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        assert_eq!(msg2, body2);
+    }
+
+    #[tokio::test]
+    async fn testReadMessageEscapedQuotesInString() {
+        let input = b"{\"data\":\"has \\\"quotes\\\" and {braces}\"}\n";
+        let cursor = std::io::Cursor::new(input.to_vec());
+        let mut reader = BufReader::new(cursor);
+        let mut mode = FrameMode::Unknown;
+
+        let msg = read_message(&mut reader, &mut mode).await.unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(v["data"], "has \"quotes\" and {braces}");
+    }
+
+    #[test]
+    fn testNormalizeCompactPassthrough() {
+        let input = b"{\"id\":1,\"method\":\"test\"}";
+        assert_eq!(normalize(input), input);
+    }
+
+    #[test]
+    fn testNormalizePrettyPrintedToCompact() {
+        let input = b"{\n  \"id\": 1,\n  \"method\": \"test\"\n}";
+        let result = normalize(input);
+        let expected = b"{\"id\":1,\"method\":\"test\"}";
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn testNormalizeInvalidJsonPassthrough() {
+        let input = b"not json\nstuff";
+        assert_eq!(normalize(input), input);
     }
 }

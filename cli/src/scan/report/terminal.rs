@@ -29,6 +29,10 @@ pub fn render(findings: &[Finding]) {
     let categories = [
         (FindingCategory::ApiKey, "API Keys"),
         (FindingCategory::UngoverndAgent, "Ungoverned Agents"),
+        (
+            FindingCategory::DegradedAgent,
+            "Degraded Agent Integrations",
+        ),
         (FindingCategory::UngoverndMcp, "Ungoverned MCP Servers"),
         (FindingCategory::LlmTraffic, "LLM Traffic"),
     ];

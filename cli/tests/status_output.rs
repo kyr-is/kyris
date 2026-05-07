@@ -63,6 +63,184 @@ fn test_status_reports_version_skew() {
 }
 
 #[test]
+fn test_status_claude_code_burn_control_none_without_loader_sourced() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    fs::write(home.join(".claude").join("settings.json"), "{}").expect("write settings");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("claude-code.sh"),
+        "export ANTHROPIC_BASE_URL=http://127.0.0.1:4710\n",
+    )
+    .expect("write claude env");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("claude-code") && l.contains("burn:"))
+        .expect("claude-code line in status output");
+    assert!(
+        line.contains("burn:none"),
+        "expected burn:none, got: {line}"
+    );
+}
+
+#[test]
+fn test_status_claude_code_burn_control_active_with_loader_sourced() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    fs::write(home.join(".claude").join("settings.json"), "{}").expect("write settings");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("claude-code.sh"),
+        "export ANTHROPIC_BASE_URL=http://127.0.0.1:4710\n",
+    )
+    .expect("write claude env");
+
+    fs::write(home.join(".zshrc"), "source \"$HOME/.kyris/env/load.sh\"\n").expect("write .zshrc");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("claude-code") && l.contains("burn:"))
+        .expect("claude-code line in status output");
+    assert!(line.contains("proxy"), "expected burn:proxy, got: {line}");
+}
+
+#[test]
+fn test_status_cline_execution_none_without_loader_sourced() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    let ext_dir = home
+        .join(".vscode")
+        .join("extensions")
+        .join("saoudrizwan.claude-dev-3.0.0");
+    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("cline-policy.sh"),
+        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
+    )
+    .expect("write cline policy env");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("cline") && l.contains("cmd:"))
+        .expect("cline line in status output");
+    assert!(line.contains("cmd:none"), "expected cmd:none, got: {line}");
+}
+
+#[test]
+fn test_status_cline_execution_active_with_loader_sourced() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    let ext_dir = home
+        .join(".vscode")
+        .join("extensions")
+        .join("saoudrizwan.claude-dev-3.0.0");
+    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("cline-policy.sh"),
+        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
+    )
+    .expect("write cline policy env");
+
+    fs::write(home.join(".zshrc"), "source \"$HOME/.kyris/env/load.sh\"\n").expect("write .zshrc");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("cline") && l.contains("cmd:"))
+        .expect("cline line in status output");
+    assert!(line.contains("policy"), "expected cmd:policy, got: {line}");
+}
+
+#[test]
+fn test_status_cline_execution_active_via_launchd_plist() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    let ext_dir = home
+        .join(".vscode")
+        .join("extensions")
+        .join("saoudrizwan.claude-dev-3.0.0");
+    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("cline-policy.sh"),
+        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
+    )
+    .expect("write cline policy env");
+
+    let plist_dir = home.join("Library").join("LaunchAgents");
+    fs::create_dir_all(&plist_dir).expect("create LaunchAgents dir");
+    fs::write(plist_dir.join("is.kyr.cline-policy.plist"), "<plist/>\n")
+        .expect("write cline plist");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("cline") && l.contains("cmd:"))
+        .expect("cline line in status output");
+    assert!(line.contains("policy"), "expected cmd:policy, got: {line}");
+}
+
+#[test]
+fn test_status_does_not_show_shell_hooks_section() {
+    let temp_home = TempDir::new().expect("temp home");
+    write_kyrisd_config(temp_home.path(), "127.0.0.1:1");
+
+    let output = run_status(temp_home.path(), None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        assert!(
+            !line.to_lowercase().contains("shell hooks"),
+            "status should not show 'shell hooks', found: {line}"
+        );
+    }
+}
+
+#[test]
 fn test_status_reports_degraded_cline_policy() {
     let temp_home = TempDir::new().expect("temp home");
     write_kyrisd_config(temp_home.path(), "127.0.0.1:1");
@@ -70,10 +248,10 @@ fn test_status_reports_degraded_cline_policy() {
     let env_dir = temp_home.path().join(".kyris").join("env");
     fs::create_dir_all(&env_dir).expect("create env dir");
     fs::write(
-        env_dir.join("cline.sh"),
+        env_dir.join("cline-policy.sh"),
         "export CLINE_COMMAND_PERMISSIONS='{}'\n",
     )
-    .expect("write cline env");
+    .expect("write cline policy env");
 
     let policy_dir = temp_home.path().join(".agentpact").join("policy");
     fs::create_dir_all(&policy_dir).expect("create policy dir");

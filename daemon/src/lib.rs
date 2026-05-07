@@ -30,6 +30,7 @@ pub mod metering;
 pub mod notify;
 pub mod pending;
 pub mod pricing_fetch;
+pub mod reconcile_watcher;
 pub mod server;
 pub mod storage;
 pub mod streaming;

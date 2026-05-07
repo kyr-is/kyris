@@ -57,14 +57,13 @@ pub fn build_provider_clients(config: &KyrisdConfig) -> HashMap<String, reqwest:
 }
 
 pub async fn run(config: KyrisdConfig) {
-    if config.tls.enabled {
-        tracing::error!(
-            "TLS is configured but not yet implemented — refusing to start without encryption guarantee"
-        );
+    if let Err(e) = config.tls.validate() {
+        tracing::error!("{e}");
         std::process::exit(1);
     }
 
     let listen_addr = config.server.listen.clone();
+    let tls_enabled = config.tls.enabled;
     let max_body = config.server.max_request_body_bytes;
     let drain_timeout = config.server.drain_timeout_seconds;
 
@@ -88,6 +87,7 @@ pub async fn run(config: KyrisdConfig) {
 
     let stats_config = config.stats.clone();
     let session_idle_minutes = config.circuit_breaker.session_idle_minutes;
+    let tls_config = config.tls.clone();
 
     let state = Arc::new(AppState {
         config: Arc::new(ArcSwap::from_pointee(config)),
@@ -112,6 +112,7 @@ pub async fn run(config: KyrisdConfig) {
     tokio::spawn(crate::sync::daemon_sync::run_sync_loop(state.clone()));
     tokio::spawn(crate::pricing_fetch::run_pricing_fetch(state.clone()));
     tokio::spawn(run_pending_prune(state.pending.clone()));
+    tokio::spawn(crate::reconcile_watcher::run_reconcile_loop(state.clone()));
 
     let inbound_auth_config = state.config.clone();
     let routed_routes = Router::new()
@@ -137,13 +138,20 @@ pub async fn run(config: KyrisdConfig) {
         .await
         .expect("bind listen address");
 
-    tracing::info!(listen = %listen_addr, "kyrisd listening");
+    let scheme = if tls_enabled { "https" } else { "http" };
+    tracing::info!(listen = %listen_addr, %scheme, "kyrisd listening");
 
     tokio::spawn(sighup_reload(state.clone()));
 
-    serve_with_graceful_shutdown(listener, app, shutdown_signal())
-        .await
-        .expect("server error");
+    if tls_enabled {
+        serve_tls_with_graceful_shutdown(listener, app, &tls_config, shutdown_signal())
+            .await
+            .expect("TLS server error");
+    } else {
+        serve_with_graceful_shutdown(listener, app, shutdown_signal())
+            .await
+            .expect("server error");
+    }
 
     match drain_and_flush_stats(
         stats_tx,
@@ -173,6 +181,64 @@ where
     )
     .with_graceful_shutdown(shutdown)
     .await
+}
+
+async fn serve_tls_with_graceful_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    tls: &kyris_core::config::TlsConfig,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use tokio_rustls::TlsAcceptor;
+
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&tls.cert_path)
+        .expect("read TLS certificate file")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("parse TLS certificates");
+
+    let key = PrivateKeyDer::from_pem_file(&tls.key_path).expect("read TLS private key file");
+
+    let rustls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("build TLS server config");
+
+    let acceptor = TlsAcceptor::from(Arc::new(rustls_config));
+
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (tcp_stream, remote_addr) = accepted?;
+                let acceptor = acceptor.clone();
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(tcp_stream).await else {
+                        tracing::debug!(%remote_addr, "TLS handshake failed");
+                        return;
+                    };
+                    let stream = hyper_util::rt::TokioIo::new(tls_stream);
+                    let service = hyper_util::service::TowerToHyperService::new(app.into_service());
+                    if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(stream, service)
+                    .await
+                    {
+                        tracing::debug!(%remote_addr, error = %e, "connection error");
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn drain_and_flush_stats(
@@ -516,6 +582,7 @@ async fn healthz() -> Json<HealthzResponse> {
 
 fn provider_configs_match(old: &ProviderConfig, new: &ProviderConfig) -> bool {
     old.name == new.name
+        && old.format == new.format
         && old.api_key == new.api_key
         && old.upstream == new.upstream
         && old.models == new.models
@@ -638,6 +705,7 @@ mod tests {
     use super::*;
 
     use axum::routing::get;
+    use kyris_core::config::ProviderFormat;
     use tokio::sync::{Notify, oneshot};
 
     use crate::metering::TokenCounts;
@@ -665,8 +733,14 @@ mod tests {
     }
 
     fn make_provider(name: &str, api_key: &str, upstream: &str) -> ProviderConfig {
+        let format = match name {
+            "anthropic" => ProviderFormat::Anthropic,
+            "google" => ProviderFormat::Google,
+            _ => ProviderFormat::OpenAI,
+        };
         ProviderConfig {
             name: name.to_string(),
+            format,
             api_key: api_key.to_string(),
             upstream: upstream.to_string(),
             models: vec![format!("{name}-model")],

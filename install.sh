@@ -144,6 +144,57 @@ install_user() {
   info "  Service:  ${PLIST_LABEL} (launchd)"
 }
 
+verify_install() {
+  local bin_dir
+  if [ "$MODE" = "user" ]; then
+    bin_dir="$HOME/.local/bin"
+  else
+    bin_dir="/usr/local/bin"
+  fi
+
+  info "Running post-install verification..."
+  local failures=0
+
+  # All binaries present and executable
+  for bin in kyris kyrisd kyris-mcp kyris-hook; do
+    if [ ! -x "$bin_dir/$bin" ]; then
+      info "FAIL: $bin not found at $bin_dir/$bin"
+      failures=$((failures + 1))
+    fi
+  done
+
+  # Binaries respond to --version
+  if [ -x "$bin_dir/kyrisd" ]; then
+    if ! "$bin_dir/kyrisd" --version >/dev/null 2>&1; then
+      info "FAIL: kyrisd does not respond to --version"
+      failures=$((failures + 1))
+    fi
+  fi
+
+  # launchd plist exists
+  local plist="$HOME/Library/LaunchAgents/is.kyr.kyrisd.plist"
+  if [ ! -f "$plist" ]; then
+    info "FAIL: launchd plist missing at $plist"
+    failures=$((failures + 1))
+  fi
+
+  # launchd service loaded
+  local real_uid
+  real_uid=$(id -u)
+  if ! launchctl print "gui/${real_uid}/is.kyr.kyrisd" >/dev/null 2>&1; then
+    info "FAIL: is.kyr.kyrisd not loaded in launchd"
+    failures=$((failures + 1))
+  fi
+
+  if [ $failures -gt 0 ]; then
+    err "Post-install verification failed ($failures check(s))."
+  fi
+
+  info "Post-install verification passed."
+  info ""
+  info "Next: run 'kyris install' to configure shell hooks and agent integrations."
+}
+
 main() {
   parse_args "$@"
   info "kyris installer (${MODE} mode)"
@@ -157,8 +208,7 @@ main() {
     install_system
   fi
 
-  info ""
-  info "Run 'kyris status' to verify."
+  verify_install
 }
 
 main "$@"

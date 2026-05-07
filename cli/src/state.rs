@@ -439,6 +439,17 @@ fn remove_dir_if_empty(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn find_in_path(cmd: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(cmd);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

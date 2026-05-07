@@ -1443,6 +1443,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
+name = "fnv"
+version = "1.0.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1843,6 +1849,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1966,6 +1991,7 @@ dependencies = [
  "bytes",
  "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2385,6 +2411,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
@@ -2407,10 +2434,12 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "kyris-types",
+ "reqwest 0.13.3",
  "serde",
  "serde-saphyr",
  "serde_json",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 
@@ -2453,6 +2482,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "tempfile",
  "utoipa",
 ]
 
@@ -2469,6 +2499,8 @@ dependencies = [
  "criterion",
  "duckdb",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "kyris-agentpact-client",
  "kyris-core",
  "kyris-peer-cwd",
@@ -2478,11 +2510,13 @@ dependencies = [
  "notify-rust",
  "reqwest 0.13.3",
  "resvg",
+ "rustls",
  "serde",
  "serde-saphyr",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tower",
  "tower-http",
  "tracing",
@@ -3886,6 +3920,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",

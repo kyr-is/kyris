@@ -31,10 +31,10 @@ pub fn run(args: DaemonArgs) {
     }
 }
 
-fn configured_listen() -> String {
+fn configured_base_url() -> String {
     load_config().map_or_else(
-        |_| "127.0.0.1:4710".to_string(),
-        |config| config.server.listen,
+        |_| "http://127.0.0.1:4710".to_string(),
+        |config| config.base_url(),
     )
 }
 
@@ -63,7 +63,7 @@ fn stop() {
 }
 
 fn status() {
-    let listen = configured_listen();
+    let base_url = configured_base_url();
     let state = service_state(ServiceKind::Kyrisd);
     if state.managed_by_homebrew {
         println!(
@@ -76,15 +76,15 @@ fn status() {
         println!("Service: not loaded");
     }
 
-    match health_status(&listen) {
+    match health_status(&base_url) {
         Ok(status_code) if status_code.is_success() => {
-            println!("Health: healthy at http://{listen}/healthz");
+            println!("Health: healthy at {base_url}/healthz");
         }
         Ok(status_code) => {
-            println!("Health: unhealthy at http://{listen}/healthz ({status_code})");
+            println!("Health: unhealthy at {base_url}/healthz ({status_code})");
         }
         Err(error) => {
-            println!("Health: unreachable at http://{listen}/healthz ({error})");
+            println!("Health: unreachable at {base_url}/healthz ({error})");
         }
     }
 }
@@ -155,8 +155,8 @@ fn tail_log_content(content: &[u8], max_bytes: usize) -> String {
     }
 }
 
-fn health_status(listen: &str) -> Result<reqwest::StatusCode, String> {
-    let url = format!("http://{listen}/healthz");
+fn health_status(base_url: &str) -> Result<reqwest::StatusCode, String> {
+    let url = format!("{base_url}/healthz");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

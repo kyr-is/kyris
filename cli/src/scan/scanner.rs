@@ -16,6 +16,7 @@ pub struct Finding {
 pub enum FindingCategory {
     ApiKey,
     UngoverndAgent,
+    DegradedAgent,
     UngoverndMcp,
     LlmTraffic,
 }

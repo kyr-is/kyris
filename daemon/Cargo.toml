@@ -39,6 +39,10 @@ tray-icon = { workspace = true }
 notify-rust = { workspace = true }
 futures-util = { workspace = true }
 const-hex = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = "0.26"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }

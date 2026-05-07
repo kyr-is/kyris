@@ -223,11 +223,15 @@ impl DuckDbWriter {
 }
 
 pub fn open_db() -> DuckDbWriter {
-    let home = std::env::var("HOME").unwrap_or_else(|_| {
-        tracing::error!("HOME not set — cannot locate database directory");
-        std::process::exit(1);
-    });
-    let path = PathBuf::from(format!("{home}/.kyris/kyrisd.duckdb"));
+    let path = if let Ok(p) = std::env::var("KYRIS_DB_PATH") {
+        PathBuf::from(p)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| {
+            tracing::error!("HOME not set — cannot locate database directory");
+            std::process::exit(1);
+        });
+        PathBuf::from(format!("{home}/.kyris/kyrisd.duckdb"))
+    };
     DuckDbWriter::try_open(&path).unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to open database");
         std::process::exit(1);

@@ -17,7 +17,6 @@ pub fn run(_args: StatusArgs) {
 
     check_agentpactd();
     check_kyrisd();
-    check_hooks();
     check_native_integrations();
     check_enrollment();
     check_versions();
@@ -37,12 +36,12 @@ fn check_agentpactd() {
 }
 
 fn check_kyrisd() {
-    let listen = load_config().map_or_else(
-        |_| "127.0.0.1:4710".to_string(),
-        |config| config.server.listen,
+    let base_url = load_config().map_or_else(
+        |_| "http://127.0.0.1:4710".to_string(),
+        |config| config.base_url(),
     );
     let state = service_state(ServiceKind::Kyrisd);
-    let healthy = health_status(&listen).is_ok_and(|status| status.is_success());
+    let healthy = health_status(&base_url).is_ok_and(|status| status.is_success());
     let service = if state.managed_by_homebrew {
         format!(
             "homebrew/{}",
@@ -54,58 +53,93 @@ fn check_kyrisd() {
         "not-loaded".to_string()
     };
     println!(
-        "  [{}] kyrisd ({}, http://{listen}/healthz)",
+        "  [{}] kyrisd ({}, {base_url}/healthz)",
         status_marker(healthy),
         service
     );
 }
 
-fn has_shell_hooks(content: &str) -> bool {
-    content.contains("kyris")
-        || content.contains("agentpact")
-        || content.contains("zsh_hook.sh")
-        || content.contains("bash_hook.sh")
-}
-
-fn check_hooks() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let zshrc = std::fs::read_to_string(format!("{home}/.zshrc")).unwrap_or_default();
-    let zshenv = std::fs::read_to_string(format!("{home}/.zshenv")).unwrap_or_default();
-    let bashrc = std::fs::read_to_string(format!("{home}/.bashrc")).unwrap_or_default();
-    println!(
-        "  [{}] shell hooks",
-        status_marker(
-            has_shell_hooks(&zshrc) || has_shell_hooks(&zshenv) || has_shell_hooks(&bashrc)
-        )
-    );
-}
-
 fn check_native_integrations() {
+    use crate::agents::profile::{AdaptedMechanism, CapLevel};
+
     for agent in crate::agents::registry::all_agents() {
         let probe = agent.probe();
         if !probe.detected {
             continue;
         }
-        let exec_ok = probe.execution.level != crate::agents::profile::CapLevel::None;
-        let tool_ok = probe.tool.level != crate::agents::profile::CapLevel::None;
-        let burn_ok = probe.burn_control.level != crate::agents::profile::CapLevel::None;
-        let all_ok = exec_ok && tool_ok && burn_ok;
+        let exec_ok = probe.execution.level != CapLevel::None;
+        let tool_ok = probe.tool.level != CapLevel::None;
+        let burn_ok = probe.burn_control.level != CapLevel::None;
+        let all_live = [&probe.execution, &probe.tool, &probe.burn_control]
+            .iter()
+            .all(|s| {
+                s.level == CapLevel::None
+                    || s.level == CapLevel::Native
+                    || matches!(
+                        s.mechanism,
+                        Some(
+                            AdaptedMechanism::LiveHook
+                                | AdaptedMechanism::EnvVarProxy
+                                | AdaptedMechanism::McpWrapping
+                        )
+                    )
+            });
+        let marker = if !exec_ok || !tool_ok || !burn_ok {
+            "-"
+        } else if all_live {
+            "+"
+        } else {
+            "~"
+        };
+        let fmt = |s: &crate::agents::profile::SurfaceState| -> String {
+            match s.level {
+                CapLevel::None => "none".into(),
+                CapLevel::Native => "native".into(),
+                CapLevel::Adapted => match &s.mechanism {
+                    Some(m) => format!("{m}"),
+                    None => "adapted".into(),
+                },
+            }
+        };
         println!(
-            "  [{}] {} agent integration",
-            status_marker(all_ok),
-            agent.id()
+            "  [{marker}] {:<14} cmd:{:<7} mcp:{:<7} burn:{}",
+            agent.id(),
+            fmt(&probe.execution),
+            fmt(&probe.tool),
+            fmt(&probe.burn_control),
         );
     }
 
-    check_cline_policy();
+    check_compiled_policy_degradation();
 }
 
-fn check_cline_policy() {
-    match crate::compile_policy::compile_cline_permissions(None) {
-        Ok((_, ask_dropped)) if ask_dropped > 0 => {
-            println!("  [!] cline compiled policy degraded ({ask_dropped} ask rules dropped)");
+type PolicyCompiler = fn(Option<&std::path::Path>) -> Result<(serde_json::Value, u32), String>;
+
+fn check_compiled_policy_degradation() {
+    let compilers: &[(&str, PolicyCompiler)] = &[
+        (
+            "cline",
+            crate::compile_policy::compile_cline_permissions_summary,
+        ),
+        (
+            "opencode",
+            crate::compile_policy::compile_opencode_permissions,
+        ),
+        (
+            "codex-cli",
+            crate::compile_policy::compile_codex_permissions,
+        ),
+        (
+            "gemini-cli",
+            crate::compile_policy::compile_gemini_permissions,
+        ),
+    ];
+    for (agent, compiler) in compilers {
+        if let Ok((_, ask_dropped)) = compiler(None)
+            && ask_dropped > 0
+        {
+            println!("  [!] {agent} compiled policy degraded ({ask_dropped} ask rules dropped)");
         }
-        Ok(_) | Err(_) => {}
     }
 }
 
@@ -177,18 +211,9 @@ fn installed_component_version(name: &str) -> Option<String> {
 }
 
 fn component_binary_path(name: &str) -> Option<PathBuf> {
-    let which_output = std::process::Command::new("which")
-        .arg(name)
-        .output()
-        .ok()?;
-    if which_output.status.success() {
-        let path = String::from_utf8(which_output.stdout).ok()?;
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
+    if let Some(path) = crate::state::find_in_path(name) {
+        return Some(path);
     }
-
     let local = bin_dir().ok()?.join(name);
     if local.exists() { Some(local) } else { None }
 }
@@ -198,8 +223,8 @@ fn extract_version(output: &str) -> Option<String> {
     regex.find(output).map(|match_| match_.as_str().to_string())
 }
 
-fn health_status(listen: &str) -> Result<reqwest::StatusCode, String> {
-    let url = format!("http://{listen}/healthz");
+fn health_status(base_url: &str) -> Result<reqwest::StatusCode, String> {
+    let url = format!("{base_url}/healthz");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -220,26 +245,6 @@ mod tests {
     fn testStatusMarker() {
         assert_eq!(status_marker(true), "+");
         assert_eq!(status_marker(false), "-");
-    }
-
-    #[test]
-    fn testHasShellHooksWithKyris() {
-        assert!(has_shell_hooks("eval $(kyris hook init)"));
-    }
-
-    #[test]
-    fn testHasShellHooksWithAgentpact() {
-        assert!(has_shell_hooks("export AGENTPACT_SOCK=agentpact.sock"));
-    }
-
-    #[test]
-    fn testHasShellHooksEmpty() {
-        assert!(!has_shell_hooks(""));
-    }
-
-    #[test]
-    fn testHasShellHooksUnrelated() {
-        assert!(!has_shell_hooks("export PATH=/usr/bin\nalias ls='ls -la'"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
-# Kyris Zsh hook: preexec via add-zsh-hook. Requires kyris-hook on PATH.
+# Kyris Zsh hook. Requires kyris-hook on PATH.
+# Interactive: preexec via add-zsh-hook (supports prompt UX).
+# Non-interactive: TRAPDEBUG (covers agent-spawned `zsh -c`).
 # Compatible with macOS system Zsh (5.8+) and modern Zsh (5.9+).
 
 if (( $+commands[kyris] )); then
@@ -219,4 +221,64 @@ __kyris_protocol_ok() {
     return 0
 }
 
-add-zsh-hook preexec __kyris_preexec
+if [[ -o interactive ]]; then
+    add-zsh-hook preexec __kyris_preexec
+else
+    TRAPDEBUG() {
+        local cmd="$ZSH_DEBUG_CMD"
+        local sock="${AGENTPACT_SOCK:-$HOME/.agentpact/agentpact.sock}"
+        local sentinel="$HOME/.kyris/.daemon-unreachable"
+
+        if __kyris_sentinel_active "$sentinel"; then
+            return 1
+        fi
+
+        if [[ ! -S "$sock" ]]; then
+            __kyris_restart_daemon "$sock" || {
+                if __kyris_daemon_state_allows "$sock"; then
+                    logger -t agentpact "fail-open: $cmd"
+                    __kyris_record_fail_open "$cmd"
+                    return 0
+                fi
+                __kyris_write_sentinel "$sentinel"
+                return 1
+            }
+        fi
+
+        if ! __kyris_protocol_ok "$sock"; then
+            return 1
+        fi
+
+        if (( ! $+commands[kyris-hook] )); then
+            logger -t agentpact "fail-open (kyris-hook not on PATH): $cmd"
+            __kyris_record_fail_open "$cmd"
+            return 0
+        fi
+
+        local output exit_code attempt=0
+        while (( attempt < 2 )); do
+            output=$(kyris-hook check "$cmd" --cwd "$PWD" --socket "$sock")
+            exit_code=$?
+            [[ $exit_code -ne 10 ]] && break
+            (( attempt++ ))
+            if (( attempt == 1 )); then
+                __kyris_restart_daemon "$sock" || break
+            fi
+        done
+
+        if [[ $exit_code -eq 10 ]]; then
+            if __kyris_daemon_state_allows "$sock"; then
+                logger -t agentpact "fail-open: $cmd"
+                __kyris_record_fail_open "$cmd"
+                return 0
+            fi
+            __kyris_write_sentinel "$sentinel"
+            return 1
+        fi
+
+        case $exit_code in
+            0|11) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+fi

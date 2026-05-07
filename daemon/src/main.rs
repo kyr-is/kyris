@@ -31,7 +31,16 @@ fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let config = config::load_config();
+    let config = match args.first().map(String::as_str) {
+        Some("--config") => {
+            let path = args.get(1).unwrap_or_else(|| {
+                eprintln!("--config requires a path argument");
+                std::process::exit(1);
+            });
+            config::load_config_from(std::path::Path::new(path))
+        }
+        _ => config::load_config(),
+    };
 
     tray::spawn_tray();
 

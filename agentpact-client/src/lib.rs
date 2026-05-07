@@ -14,8 +14,8 @@ use std::time::Duration;
 
 pub use kyris_core::agentpact::{
     ApprovalResponse, McpContext, McpPermissionDecision, ToolAnnotations,
-    build_mcp_permission_request, build_permission_respond_request, daemon_unavailable_message,
-    default_socket_path, parse_mcp_permission_response,
+    build_hook_permission_request, build_mcp_permission_request, build_permission_respond_request,
+    daemon_unavailable_message, default_socket_path, parse_mcp_permission_response,
 };
 
 const RETRY_BACKOFFS: &[u64] = &[50, 100, 250];
@@ -35,6 +35,38 @@ pub fn request_mcp_tool_permission(
     socket_timeout: Duration,
 ) -> Result<McpPermissionDecision, String> {
     let request = build_mcp_permission_request(request_id_prefix, server_name, tool_name, mcp_ctx);
+    send_daemon_request_with_retry(socket_path, &request, socket_timeout)
+        .map(|response| parse_mcp_permission_response(&response))
+}
+
+/// Requests `AgentPact` permission for an agent hook action (native hooks).
+///
+/// Unlike `request_mcp_tool_permission`, this preserves the `HookProtocol`-mapped
+/// action (execute/read/write/call) and sends only `working_dir` in context — no
+/// `mcp_server` field. When `seed_boundary_pid` is provided, the daemon will
+/// attempt to register the given PID as a boundary anchor after validating
+/// ancestry and signature table match.
+///
+/// # Errors
+///
+/// Returns an error when the request cannot be sent to `agentpactd` or when the daemon
+/// response is malformed.
+pub fn request_hook_permission(
+    socket_path: &str,
+    request_id_prefix: &str,
+    action: &str,
+    detail: &str,
+    working_dir: Option<&str>,
+    seed_boundary_pid: Option<u32>,
+    socket_timeout: Duration,
+) -> Result<McpPermissionDecision, String> {
+    let request = build_hook_permission_request(
+        request_id_prefix,
+        action,
+        detail,
+        working_dir,
+        seed_boundary_pid,
+    );
     send_daemon_request_with_retry(socket_path, &request, socket_timeout)
         .map(|response| parse_mcp_permission_response(&response))
 }

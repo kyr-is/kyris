@@ -63,6 +63,31 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 #[must_use]
+pub fn build_hook_permission_request(
+    request_id_prefix: &str,
+    action: &str,
+    detail: &str,
+    working_dir: Option<&str>,
+    seed_boundary_pid: Option<u32>,
+) -> serde_json::Value {
+    let mut context = serde_json::json!({});
+    if let Some(dir) = working_dir {
+        context["working_dir"] = serde_json::json!(dir);
+    }
+    let mut request = serde_json::json!({
+        "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
+        "method": "permission.request",
+        "action": action,
+        "detail": detail,
+        "context": context,
+    });
+    if let Some(pid) = seed_boundary_pid {
+        request["seed_boundary_pid"] = serde_json::json!(pid);
+    }
+    request
+}
+
+#[must_use]
 pub fn build_mcp_permission_request(
     request_id_prefix: &str,
     server_name: &str,
@@ -188,6 +213,47 @@ mod tests {
                 .as_str()
                 .is_some_and(|id| id.starts_with("kyris-mcp-"))
         );
+    }
+
+    #[test]
+    fn testBuildHookPermissionRequest() {
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "execute",
+            "ls -la",
+            Some("/tmp/repo"),
+            None,
+        );
+        assert_eq!(request["method"], "permission.request");
+        assert_eq!(request["action"], "execute");
+        assert_eq!(request["detail"], "ls -la");
+        assert_eq!(request["context"]["working_dir"], "/tmp/repo");
+        assert!(request["context"]["mcp_server"].is_null());
+        assert!(request["seed_boundary_pid"].is_null());
+        assert!(
+            request["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("kyris-hook-"))
+        );
+    }
+
+    #[test]
+    fn testBuildHookPermissionRequestNoWorkingDir() {
+        let request = build_hook_permission_request("kyris-hook", "call", "unknown", None, None);
+        assert_eq!(request["action"], "call");
+        assert!(request["context"]["working_dir"].is_null());
+    }
+
+    #[test]
+    fn testBuildHookPermissionRequestWithSeedPid() {
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "execute",
+            "git status",
+            Some("/tmp"),
+            Some(12345),
+        );
+        assert_eq!(request["seed_boundary_pid"], 12345);
     }
 
     #[test]

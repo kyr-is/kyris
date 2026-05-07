@@ -28,7 +28,7 @@ pub fn run(_args: PendingArgs) {
         eprintln!("{error}");
         std::process::exit(1);
     });
-    let base_url = format!("http://{}", config.server.listen);
+    let base_url = config.base_url();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

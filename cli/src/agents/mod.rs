@@ -40,6 +40,9 @@ pub enum AgentsCommand {
         agent: Option<String>,
         #[arg(long)]
         auto: bool,
+        /// Agent-specific settings as key=value pairs (e.g. --set max-budget-usd=50)
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        settings: Vec<String>,
     },
     /// Remove all Kyris integrations for an agent
     Undo { agent: String },
@@ -49,7 +52,11 @@ pub fn run(args: AgentsArgs) {
     let result = match args.command {
         Some(AgentsCommand::Status { agent }) => run_status(agent),
         Some(AgentsCommand::Reconcile { agent, auto }) => run_reconcile(agent, auto),
-        Some(AgentsCommand::Setup { agent, auto }) => run_setup(agent, auto),
+        Some(AgentsCommand::Setup {
+            agent,
+            auto,
+            settings,
+        }) => run_setup(agent, auto, settings),
         Some(AgentsCommand::Undo { agent }) => run_undo(&agent),
         None => {
             if let Some(agent) = args.agent {
@@ -112,19 +119,38 @@ fn run_reconcile(agent: Option<String>, auto: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn run_setup(agent: Option<String>, auto: bool) -> Result<(), String> {
+fn parse_settings(raw: Vec<String>) -> Result<std::collections::HashMap<String, String>, String> {
+    let mut map = std::collections::HashMap::new();
+    for entry in raw {
+        let (k, v) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("Invalid --set value '{entry}': expected KEY=VALUE"))?;
+        if k.is_empty() {
+            return Err(format!("Invalid --set value '{entry}': empty key"));
+        }
+        map.insert(k.to_string(), v.to_string());
+    }
+    Ok(map)
+}
+
+fn run_setup(agent: Option<String>, auto: bool, settings: Vec<String>) -> Result<(), String> {
+    let agent_specific = parse_settings(settings)?;
     if auto {
+        if !agent_specific.is_empty() {
+            return Err("--set cannot be used with --auto".to_string());
+        }
         prestage::prestage_all()?;
         for agent in registry::all_agents() {
             if agent.is_installed()
-                && let Err(e) = configure::configure_agent(agent.id())
+                && let Err(e) =
+                    configure::configure_agent(agent.id(), &std::collections::HashMap::new(), false)
             {
                 eprintln!("{e}");
             }
         }
         Ok(())
     } else if let Some(agent_id) = agent {
-        configure::setup_agent(&agent_id)
+        configure::setup_agent(&agent_id, &agent_specific)
     } else {
         Err("Usage: kyris agents setup <agent> or kyris agents setup --auto".to_string())
     }
@@ -132,4 +158,52 @@ fn run_setup(agent: Option<String>, auto: bool) -> Result<(), String> {
 
 fn run_undo(agent_id: &str) -> Result<(), String> {
     undo::undo_agent(agent_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testParseSettingsValid() {
+        let result = parse_settings(vec![
+            "max-budget-usd=50".to_string(),
+            "max-turns=100".to_string(),
+        ]);
+        let map = result.unwrap();
+        assert_eq!(map.get("max-budget-usd").unwrap(), "50");
+        assert_eq!(map.get("max-turns").unwrap(), "100");
+    }
+
+    #[test]
+    fn testParseSettingsEmpty() {
+        let result = parse_settings(vec![]);
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn testParseSettingsMissingEquals() {
+        let result = parse_settings(vec!["no-equals".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn testParseSettingsEmptyKey() {
+        let result = parse_settings(vec!["=value".to_string()]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn testParseSettingsEmptyValue() {
+        let result = parse_settings(vec!["key=".to_string()]);
+        let map = result.unwrap();
+        assert_eq!(map.get("key").unwrap(), "");
+    }
+
+    #[test]
+    fn testParseSettingsValueWithEquals() {
+        let result = parse_settings(vec!["key=a=b".to_string()]);
+        let map = result.unwrap();
+        assert_eq!(map.get("key").unwrap(), "a=b");
+    }
 }

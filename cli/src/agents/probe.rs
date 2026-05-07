@@ -44,52 +44,6 @@ pub(super) fn not_detected() -> ProbeResult {
     }
 }
 
-pub(super) fn probe_live_hook_agent(
-    detected: bool,
-    settings_path: Option<&std::path::Path>,
-    hook_phase: &str,
-    hook_marker: &str,
-    agent_id: &str,
-    burn_control_var: &str,
-) -> ProbeResult {
-    if !detected {
-        return not_detected();
-    }
-
-    let has_hook = settings_path.is_some_and(|p| json_has_hook(p, hook_phase, hook_marker));
-
-    let execution = if has_hook {
-        SurfaceState::adapted(AdaptedMechanism::LiveHook)
-    } else {
-        SurfaceState::none()
-    };
-    let tool = if has_hook {
-        SurfaceState::adapted(AdaptedMechanism::LiveHook)
-    } else {
-        SurfaceState::none()
-    };
-    let burn_control = if env_file_has_var(agent_id, burn_control_var) {
-        SurfaceState::adapted(AdaptedMechanism::EnvVarProxy)
-    } else {
-        SurfaceState::none()
-    };
-
-    let mut managed_files = Vec::new();
-    if let Some(path) = settings_path
-        && let Some(fp) = fingerprint(path)
-    {
-        managed_files.push(fp);
-    }
-
-    ProbeResult {
-        detected: true,
-        execution,
-        tool,
-        burn_control,
-        managed_files,
-    }
-}
-
 pub(super) fn probe_config_rewrite_burn_control(
     config_path: Option<&std::path::Path>,
     base_url_check: impl FnOnce(&serde_json::Value) -> bool,
@@ -98,7 +52,7 @@ pub(super) fn probe_config_rewrite_burn_control(
 ) -> SurfaceState {
     let has_base_url =
         config_path.is_some_and(|p| read_json_value(p).is_ok_and(|v| base_url_check(&v)));
-    let has_env_proxy = env_file_has_var(agent_id, env_var);
+    let has_env_proxy = env_file_has_var(agent_id, env_var) && env_loader_sourced();
     if has_base_url || has_env_proxy {
         SurfaceState::adapted(AdaptedMechanism::ConfigRewrite)
     } else {
@@ -115,30 +69,44 @@ pub(super) fn json_has_mcp_wrap(path: &std::path::Path, servers_key: &str) -> bo
         .and_then(|s| s.as_object())
         .is_some_and(|servers| {
             servers.values().any(|s| {
-                s.get("command")
+                let cmd = s.get("command");
+                let str_match = cmd
                     .and_then(|c| c.as_str())
-                    .is_some_and(|c| c == "kyris-mcp")
+                    .is_some_and(|c| c == "kyris-mcp");
+                let arr_match = cmd
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|first| first == "kyris-mcp");
+                str_match || arr_match
             })
         })
 }
 
 pub(super) fn env_file_has_var(agent_id: &str, var_name: &str) -> bool {
-    let Ok(env_file) = env_dir().map(|d| d.join(format!("{agent_id}.sh"))) else {
+    let Ok(dir) = env_dir() else {
         return false;
     };
-    std::fs::read_to_string(env_file).is_ok_and(|contents| contents.contains(var_name))
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let primary = format!("{agent_id}.sh");
+    let dash_prefix = format!("{agent_id}-");
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".sh")
+            && (name.as_ref() == primary || name.starts_with(dash_prefix.as_str()))
+            && std::fs::read_to_string(entry.path())
+                .is_ok_and(|contents| contents.contains(var_name))
+    })
 }
 
-fn json_has_hook(path: &std::path::Path, phase: &str, marker: &str) -> bool {
-    let Ok(value) = read_json_value(path) else {
-        return false;
-    };
-    value
-        .get("hooks")
-        .and_then(|h| h.get(phase))
-        .and_then(|a| a.as_array())
-        .is_some_and(|hooks| {
-            let serialized = serde_json::to_string(hooks).unwrap_or_default();
-            serialized.contains(marker)
-        })
+/// Returns true if the user's shell RC files source `~/.kyris/env/load.sh`,
+/// meaning env-based agent configuration will actually be loaded at runtime.
+pub(super) fn env_loader_sourced() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let zshrc = std::fs::read_to_string(format!("{home}/.zshrc")).unwrap_or_default();
+    let bashrc = std::fs::read_to_string(format!("{home}/.bashrc")).unwrap_or_default();
+    zshrc.contains(".kyris/env/load.sh") || bashrc.contains(".kyris/env/load.sh")
 }

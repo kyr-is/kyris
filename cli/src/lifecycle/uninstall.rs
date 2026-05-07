@@ -19,6 +19,8 @@ pub fn run(_args: UninstallArgs) {
         }
     }
 
+    unload_env_launchd();
+
     match restore_all_manifest_entries() {
         Ok(actions) if actions.is_empty() => {
             println!("No managed install actions were recorded.");
@@ -33,4 +35,26 @@ pub fn run(_args: UninstallArgs) {
             std::process::exit(1);
         }
     }
+
+    super::verify::verify_post_uninstall();
+}
+
+fn unload_env_launchd() {
+    let domain = format!("gui/{}", crate::service::uid());
+
+    let target = format!("{domain}/is.kyr.env");
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &target])
+        .status();
+    let _ = std::process::Command::new("launchctl")
+        .args(["unsetenv", "BASH_ENV"])
+        .status();
+
+    let target = format!("{domain}/is.kyr.cline-policy");
+    let _ = std::process::Command::new("launchctl")
+        .args(["bootout", &target])
+        .status();
+    let _ = std::process::Command::new("launchctl")
+        .args(["unsetenv", "CLINE_COMMAND_PERMISSIONS"])
+        .status();
 }

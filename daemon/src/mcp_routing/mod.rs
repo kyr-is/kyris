@@ -1,23 +1,26 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-//! HTTP MCP routing. Proxies `POST /mcp/{server}/{path}` to configured
-//! upstream MCP servers, applying policy checks before forwarding. Server
-//! names and upstream URLs are resolved from the daemon config.
+//! HTTP MCP routing. Proxies Streamable HTTP MCP transport (POST, GET,
+//! DELETE) on `/mcp/{server}/{path}` to configured upstream MCP servers.
+//! POST tools/call requests are policy-checked via `AgentPact`; all other
+//! requests are forwarded directly. SSE responses are streamed as received.
 pub mod policy;
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     Router,
     body::Body,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
 use kyris_core::agentpact::ToolAnnotations;
 
 use crate::server::AppState;
@@ -76,40 +79,127 @@ impl AnnotationCache {
     }
 }
 
-pub fn routes(state: Arc<AppState>) -> Router {
-    Router::new().route("/mcp/{server}/{*path}", post(handle_mcp).with_state(state))
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+fn is_hop_by_hop(name: &str) -> bool {
+    HOP_BY_HOP_HEADERS
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
 }
 
-async fn handle_mcp(
+fn forward_request_headers(
+    mut builder: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    for (key, value) in headers {
+        let name = key.as_str();
+        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    builder
+}
+
+fn is_sse_response(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+}
+
+fn build_upstream_response(
+    status: StatusCode,
+    upstream_headers: &reqwest::header::HeaderMap,
+    body: Body,
+) -> Result<Response, StatusCode> {
+    let mut builder = Response::builder().status(status);
+    for (key, value) in upstream_headers {
+        let name = key.as_str();
+        if is_hop_by_hop(name)
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    builder
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn resolve_server<'a>(
+    config: &'a kyris_core::config::KyrisdConfig,
+    server_name: &str,
+) -> Result<&'a kyris_core::config::McpServerConfig, StatusCode> {
+    if !config.mcp.enabled {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    config
+        .mcp
+        .servers
+        .iter()
+        .find(|s| s.name == server_name)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+fn get_mcp_client(state: &AppState, server_name: &str) -> reqwest::Client {
+    state
+        .provider_clients
+        .load()
+        .get(&format!("mcp_{server_name}"))
+        .cloned()
+        .unwrap_or_else(reqwest::Client::new)
+}
+
+pub fn routes(state: Arc<AppState>) -> Router {
+    Router::new().route(
+        "/mcp/{server}/{*path}",
+        post(handle_mcp_post)
+            .get(handle_mcp_get)
+            .delete(handle_mcp_delete)
+            .with_state(state),
+    )
+}
+
+async fn handle_mcp_post(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path((server_name, path)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let config = state.config.load();
+    let server = resolve_server(&config, &server_name)?;
 
-    if !config.mcp.enabled {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    let server = config
-        .mcp
-        .servers
-        .iter()
-        .find(|s| s.name == server_name)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    let working_dir = headers
+    let working_dir = match headers
         .get("x-working-dir")
         .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+        .map(str::to_string)
+    {
+        Some(dir) => Some(dir),
+        None if policy::is_tools_call_request(&path, &body) => {
+            crate::adapter::resolve_peer_working_dir(peer_addr).await
+        }
+        None => None,
+    };
 
     if policy::is_tools_call_request(&path, &body) && working_dir.is_none() {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::json!({"error": "X-Working-Dir header required for tools/call"})
+                serde_json::json!({"error": "could not determine working directory for tools/call: set X-Working-Dir header or connect from the agent process"})
                     .to_string(),
             ))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
@@ -215,25 +305,25 @@ async fn handle_mcp(
         policy::PolicyDecision::Allow => {}
     }
 
-    let clients = state.provider_clients.load();
-    let client = clients
-        .get(&format!("mcp_{server_name}"))
-        .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+    let client = get_mcp_client(&state, &server_name);
     let upstream_url = format!("{}/{}", server.upstream, path);
 
-    let response = client
-        .post(&upstream_url)
-        .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, server = %server_name, "mcp upstream failed");
-            StatusCode::BAD_GATEWAY
-        })?;
+    let req = forward_request_headers(client.post(&upstream_url).body(body.to_vec()), &headers);
+    let response = req.send().await.map_err(|e| {
+        tracing::error!(error = %e, server = %server_name, "mcp upstream POST failed");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let status = response.status();
+    let resp_headers = response.headers().clone();
+
+    if is_sse_response(&resp_headers) {
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        return build_upstream_response(status, &resp_headers, Body::from_stream(stream));
+    }
+
     let resp_body = response
         .bytes()
         .await
@@ -245,11 +335,67 @@ async fn handle_mcp(
             .update_from_response(&server_name, &resp_body);
     }
 
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    build_upstream_response(status, &resp_headers, Body::from(resp_body))
+}
+
+async fn handle_mcp_get(
+    State(state): State<Arc<AppState>>,
+    Path((server_name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    let config = state.config.load();
+    let server = resolve_server(&config, &server_name)?;
+
+    let client = get_mcp_client(&state, &server_name);
+    let upstream_url = format!("{}/{}", server.upstream, path);
+
+    let req = forward_request_headers(client.get(&upstream_url), &headers);
+    let response = req.send().await.map_err(|e| {
+        tracing::error!(error = %e, server = %server_name, "mcp upstream GET failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+
+    if is_sse_response(&resp_headers) {
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other));
+        return build_upstream_response(status, &resp_headers, Body::from_stream(stream));
+    }
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    build_upstream_response(status, &resp_headers, Body::from(body))
+}
+
+async fn handle_mcp_delete(
+    State(state): State<Arc<AppState>>,
+    Path((server_name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    let config = state.config.load();
+    let server = resolve_server(&config, &server_name)?;
+
+    let client = get_mcp_client(&state, &server_name);
+    let upstream_url = format!("{}/{}", server.upstream, path);
+
+    let req = forward_request_headers(client.delete(&upstream_url), &headers);
+    let response = req.send().await.map_err(|e| {
+        tracing::error!(error = %e, server = %server_name, "mcp upstream DELETE failed");
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    build_upstream_response(status, &resp_headers, Body::from(body))
 }
 
 fn extract_json_rpc_method(body: &[u8]) -> Option<String> {
@@ -455,12 +601,15 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
         });
         (address, shutdown_tx, handle)
     }
@@ -603,5 +752,402 @@ mod tests {
         let _ = router_shutdown.send(());
         router_handle.await.unwrap();
         daemon_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteReturnsBadRequestWithoutWorkingDir() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote/tools/call"))
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("could not determine working directory"),
+            "expected peer-cwd fallback error message, got: {}",
+            body["error"]
+        );
+
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+    }
+
+    #[derive(Clone, Debug)]
+    struct RecordedHeaders {
+        headers: Vec<(String, String)>,
+    }
+
+    async fn record_upstream_get(
+        State(recorded): State<Arc<Mutex<Option<RecordedHeaders>>>>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let h: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        *recorded.lock().unwrap() = Some(RecordedHeaders { headers: h });
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            r#"{"ok":true}"#,
+        )
+    }
+
+    async fn sse_upstream_post(
+        State(recorded): State<Arc<Mutex<Option<RecordedRequest>>>>,
+        _headers: HeaderMap,
+        body: Bytes,
+    ) -> impl IntoResponse {
+        *recorded.lock().unwrap() = Some(RecordedRequest {
+            body: body.to_vec(),
+        });
+        (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            "data: {\"chunk\":1}\n\ndata: {\"chunk\":2}\n\n",
+        )
+    }
+
+    async fn record_upstream_delete(
+        State(recorded): State<Arc<Mutex<Option<RecordedHeaders>>>>,
+        headers: HeaderMap,
+    ) -> impl IntoResponse {
+        let h: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        *recorded.lock().unwrap() = Some(RecordedHeaders { headers: h });
+        (StatusCode::OK, [("content-type", "application/json")], "{}")
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteForwardsGetRequest() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let upstream_recorded = Arc::new(Mutex::new(None::<RecordedHeaders>));
+        let upstream = Router::new()
+            .route("/sse", axum::routing::get(record_upstream_get))
+            .with_state(upstream_recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: upstream_url.clone(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{router_url}/mcp/remote/sse"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_text = response.text().await.unwrap();
+        assert_eq!(body_text, r#"{"ok":true}"#);
+        assert!(upstream_recorded.lock().unwrap().is_some());
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteForwardsDeleteRequest() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let upstream_recorded = Arc::new(Mutex::new(None::<RecordedHeaders>));
+        let upstream = Router::new()
+            .route(
+                "/session/abc",
+                axum::routing::delete(record_upstream_delete),
+            )
+            .with_state(upstream_recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: upstream_url.clone(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .delete(format!("{router_url}/mcp/remote/session/abc"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(upstream_recorded.lock().unwrap().is_some());
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteStreamsSSEResponse() {
+        let _guard = lock_mcp_route_tests();
+        let upstream_recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/tools/call", axum::routing::post(sse_upstream_post))
+            .with_state(upstream_recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("agentpact.sock");
+        let daemon_recorded = Arc::new(Mutex::new(None));
+        let daemon_handle = spawn_agentpact_stub(
+            &sock_path,
+            serde_json::json!({"code": "PACT_OK"}),
+            daemon_recorded,
+        );
+        policy::set_test_agentpact_socket(Some(sock_path.clone()));
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: upstream_url.clone(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "stream_tool", "arguments": {}}
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote/tools/call"))
+            .header("content-type", "application/json")
+            .header("x-working-dir", "/tmp/project")
+            .body(request_body.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "expected text/event-stream, got: {content_type}"
+        );
+        let body_text = response.text().await.unwrap();
+        assert!(body_text.contains("\"chunk\":1"));
+        assert!(body_text.contains("\"chunk\":2"));
+
+        policy::set_test_agentpact_socket(None);
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+        daemon_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteForwardsHeaders() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let upstream_recorded = Arc::new(Mutex::new(None::<RecordedHeaders>));
+        let upstream = Router::new().route(
+            "/ping",
+            axum::routing::get({
+                let recorded = upstream_recorded.clone();
+                move |headers: HeaderMap| {
+                    let recorded = recorded.clone();
+                    async move {
+                        let h: Vec<(String, String)> = headers
+                            .iter()
+                            .map(|(k, v)| {
+                                (k.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                            })
+                            .collect();
+                        *recorded.lock().unwrap() = Some(RecordedHeaders { headers: h });
+                        (
+                            StatusCode::OK,
+                            [
+                                ("content-type", "application/json"),
+                                ("mcp-session-id", "sess-upstream-abc"),
+                            ],
+                            r#"{"ok":true}"#,
+                        )
+                    }
+                }
+            }),
+        );
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: upstream_url.clone(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{router_url}/mcp/remote/ping"))
+            .header("mcp-session-id", "sess-client-123")
+            .header("last-event-id", "evt-42")
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let upstream_headers = upstream_recorded.lock().unwrap().clone().unwrap().headers;
+        let has_header = |name: &str| -> Option<String> {
+            upstream_headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(
+            has_header("mcp-session-id"),
+            Some("sess-client-123".to_string()),
+        );
+        assert_eq!(has_header("last-event-id"), Some("evt-42".to_string()));
+        assert_eq!(has_header("accept"), Some("text/event-stream".to_string()),);
+        assert!(
+            has_header("host").is_none() || has_header("host").unwrap().contains("127.0.0.1"),
+            "host should not be the client's original host"
+        );
+
+        let resp_session = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(resp_session, "sess-upstream-abc");
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteGetReturnsNotFoundWhenDisabled() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = false;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{router_url}/mcp/remote/sse"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = response.bytes().await.unwrap();
+
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteDeleteReturnsNotFoundWhenDisabled() {
+        let _guard = lock_mcp_route_tests();
+        policy::set_test_agentpact_socket(None);
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = false;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .delete(format!("{router_url}/mcp/remote/session/abc"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let _ = response.bytes().await.unwrap();
+
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
     }
 }
