@@ -23,6 +23,8 @@ jobs:
 
       - if: env.ACT != 'true'
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
 
       - uses: taiki-e/install-action@v2
         with:
@@ -38,9 +40,7 @@ jobs:
         run: cargo deny check
 
       - name: Test with coverage
-        run: |
-          cargo llvm-cov --all-features
-          cargo test --benches -p kyrisd
+        run: cargo llvm-cov --all-features --all-targets
 
       - name: Update coverage gist
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
