@@ -494,3 +494,72 @@ If you need more implementation context, read these next.
 3. [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution workflow and project expectations.
 
 The short version is simple: AgentPact defines the contract, Kyris gets onto the path, and the code in this repo should stay honest about the difference.
+
+<hr>
+
+## Appendix: CLI Reference
+
+### Lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `kyris install` | Install shell hooks, binaries, and configure detected agents |
+| `kyris uninstall` | Remove all Kyris modifications (restores backups) |
+| `kyris update [--check]` | Update Kyris binaries. `--check` prints available update without applying |
+| `kyris enroll [--force] [--relay-url URL]` | Enroll machine with Kyris hosted service via GitHub device flow. `--force` re-authenticates |
+| `kyris verify [--post-install] [--post-uninstall] [--json]` | Verify installation state |
+| `kyris version` | Print version |
+
+### Agent Management
+
+| Command | Description |
+|---------|-------------|
+| `kyris agents` | Summary of all agents (reconciles first) |
+| `kyris agents <agent>` | Detail view for one agent |
+| `kyris agents status [agent]` | Show agent integration status |
+| `kyris agents setup <agent> [--set KEY=VALUE...]` | Configure one agent. `--set` passes agent-specific settings (e.g. `--set maxSessionTurns=100`) |
+| `kyris agents setup --auto` | Detect installed agents and configure each |
+| `kyris agents reconcile [agent] [--auto]` | Detect reinstalls, repair config. `--auto` debounces (shell startup) |
+| `kyris agents undo <agent>` | Remove all Kyris integrations for an agent |
+
+### Query & Inspection
+
+| Command | Description |
+|---------|-------------|
+| `kyris status` | Show component health: daemons, hooks, agents, enrollment |
+| `kyris timeline [--last N]` | Unified event stream (default last 20) |
+| `kyris history [--agent X] [--action X] [--decision X] [--since T] [--until T] [--dir D] [--sync-state S]` | Filtered event search |
+| `kyris stats [--since DURATION]` | Burn-control summary: tokens, spend, decisions (default 7d) |
+| `kyris replay <session>` | Reconstruct one session in order |
+
+### Policy & Security
+
+| Command | Description |
+|---------|-------------|
+| `kyris check <command>` | Test a command against current policy (returns allow/deny) |
+| `kyris compile-policy --agent <agent> [--policy PATH]` | Render AgentPact policy into agent-native permission format |
+| `kyris scan run [--format terminal\|json\|html] [-o FILE] [--scanners X,Y]` | Security scan: running agents, exposed keys, MCP configs, traffic |
+| `kyris scan patterns list` | List available scan patterns |
+
+### Daemon Control
+
+| Command | Description |
+|---------|-------------|
+| `kyris daemon start` | Start kyrisd |
+| `kyris daemon stop` | Stop kyrisd |
+| `kyris daemon status` | Show kyrisd process state |
+| `kyris daemon logs` | Tail kyrisd logs |
+
+### Operator Workflows
+
+| Command | Description |
+|---------|-------------|
+| `kyris pending` | List pending approval requests (PACT_ASK decisions awaiting resolution) |
+| `kyris continue <session>` | Resume/resolve a held session |
+
+### Internal (used by hooks, not user-facing)
+
+| Command | Description |
+|---------|-------------|
+| `kyris hook check --agent <agent>` | Native agent hook adapter — reads hook payload from stdin, round-trips to agentpactd |
+| `kyris mcp wrap [--server NAME] <cmd> [args...]` | Wrap a stdio MCP server with policy enforcement |
