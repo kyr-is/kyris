@@ -20,6 +20,7 @@ pub fn run(_args: StatusArgs) {
     check_native_integrations();
     check_enrollment();
     check_versions();
+    check_updates();
 }
 
 fn check_agentpactd() {
@@ -177,6 +178,99 @@ fn check_versions() {
     }
 }
 
+/// Show available updates inline based on the cached check result. Spawns a
+/// detached background refresh when the cache is stale (>24h) or missing —
+/// the network call doesn't block `kyris status` returning. Next status
+/// invocation will see the refreshed cache.
+fn check_updates() {
+    println!();
+    println!("Updates");
+    println!("-------");
+
+    let cached = crate::lifecycle::update::UpdateCheckResult::load();
+    let needs_refresh = cached
+        .as_ref()
+        .is_none_or(|c| c.is_stale(UPDATE_CHECK_MAX_AGE_HOURS));
+
+    match cached {
+        None => {
+            println!("  [?] no cached check yet — refreshing in background");
+        }
+        Some(cache) => {
+            for status in &cache.repos {
+                render_repo_update_line(status);
+            }
+            // Hint the freshness so users can sanity-check why an upgrade they
+            // expected isn't showing up yet (e.g., they tagged the release
+            // 30 minutes ago and the cache is from yesterday).
+            if needs_refresh {
+                println!("  (cache is stale; refreshing in background)");
+            } else {
+                println!("  (last checked: {})", cache.checked_at);
+            }
+        }
+    }
+
+    if needs_refresh {
+        spawn_background_update_check();
+    }
+}
+
+const UPDATE_CHECK_MAX_AGE_HOURS: i64 = 24;
+
+fn render_repo_update_line(status: &crate::lifecycle::update::RepoUpdateStatus) {
+    let mut stdout = std::io::stdout().lock();
+    render_repo_update_line_io(status, &mut stdout);
+}
+
+/// Pure formatting — writes one status line to `writer`. Separated from the
+/// stdout caller so unit tests can capture and assert the output.
+fn render_repo_update_line_io<W: std::io::Write>(
+    status: &crate::lifecycle::update::RepoUpdateStatus,
+    writer: &mut W,
+) {
+    let line = match status.channel.as_str() {
+        "brew" => {
+            // Brew users have their own update mechanism; redirect them to it
+            // rather than competing with `brew upgrade` from inside kyris.
+            let current = status.current.as_deref().unwrap_or("?");
+            format!(
+                "  [b] {}: {} (Homebrew-managed — `brew outdated --cask kyr-is/tap/{}`)",
+                status.repo, current, status.repo
+            )
+        }
+        "missing" => format!("  [-] {}: not installed", status.repo),
+        _ => match (status.current.as_deref(), status.latest.as_deref()) {
+            (Some(c), Some(l)) if status.has_script_update() => format!(
+                "  [!] {}: {} → {} available  (run: kyris update)",
+                status.repo, c, l
+            ),
+            (Some(c), Some(_)) => format!("  [+] {}: {} (up to date)", status.repo, c),
+            (Some(c), None) => format!(
+                "  [?] {}: {} (latest version unknown — last check failed)",
+                status.repo, c
+            ),
+            (None, _) => format!("  [?] {}: version unknown", status.repo),
+        },
+    };
+    let _ = writeln!(writer, "{line}");
+}
+
+/// Spawn `kyris update --background` as a detached child so the network check
+/// happens off the critical path. Returns immediately — `kyris status` is
+/// expected to be fast even on first run with stale or missing cache.
+fn spawn_background_update_check() {
+    let Ok(self_path) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(self_path)
+        .args(["update", "--background"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 fn agentpact_socket() -> String {
     std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -250,5 +344,98 @@ mod tests {
     #[test]
     fn test_extract_version() {
         assert_eq!(extract_version("kyrisd 0.1.2"), Some("0.1.2".to_string()));
+    }
+
+    use crate::lifecycle::update::RepoUpdateStatus;
+
+    fn render(status: &RepoUpdateStatus) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        render_repo_update_line_io(status, &mut buf);
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn testRenderUpdateAvailableLineIncludesArrowAndCommandHint() {
+        let status = RepoUpdateStatus {
+            repo: "kyris".into(),
+            current: Some("0.1.6".into()),
+            latest: Some("0.1.7".into()),
+            channel: "script".into(),
+        };
+        let line = render(&status);
+        assert!(line.contains("kyris"), "missing repo name in: {line}");
+        assert!(line.contains("0.1.6"), "missing current version in: {line}");
+        assert!(line.contains("0.1.7"), "missing latest version in: {line}");
+        assert!(line.contains("→"), "missing arrow in: {line}");
+        assert!(
+            line.contains("kyris update"),
+            "missing command hint in: {line}"
+        );
+    }
+
+    #[test]
+    fn testRenderUpToDateLineMarksWithPlusAndOmitsCommand() {
+        let status = RepoUpdateStatus {
+            repo: "kyris".into(),
+            current: Some("0.1.7".into()),
+            latest: Some("0.1.7".into()),
+            channel: "script".into(),
+        };
+        let line = render(&status);
+        assert!(line.contains("[+]"), "missing up-to-date marker in: {line}");
+        assert!(line.contains("0.1.7"));
+        assert!(
+            !line.contains("kyris update"),
+            "should not nag when up to date: {line}"
+        );
+    }
+
+    #[test]
+    fn testRenderBrewLineRedirectsToBrewCommand() {
+        let status = RepoUpdateStatus {
+            repo: "kyris".into(),
+            current: Some("0.1.6".into()),
+            latest: None,
+            channel: "brew".into(),
+        };
+        let line = render(&status);
+        assert!(
+            line.contains("Homebrew-managed"),
+            "missing brew label in: {line}"
+        );
+        assert!(
+            line.contains("brew outdated"),
+            "missing brew command hint in: {line}"
+        );
+        assert!(
+            !line.contains("kyris update"),
+            "should not suggest `kyris update` for brew installs: {line}"
+        );
+    }
+
+    #[test]
+    fn testRenderMissingLineSaysNotInstalled() {
+        let status = RepoUpdateStatus {
+            repo: "agentpact".into(),
+            current: None,
+            latest: None,
+            channel: "missing".into(),
+        };
+        let line = render(&status);
+        assert!(line.contains("agentpact"));
+        assert!(line.contains("not installed"), "got: {line}");
+    }
+
+    #[test]
+    fn testRenderUnknownLatestExplainsCheckFailed() {
+        let status = RepoUpdateStatus {
+            repo: "kyris".into(),
+            current: Some("0.1.6".into()),
+            latest: None,
+            channel: "script".into(),
+        };
+        let line = render(&status);
+        assert!(line.contains("0.1.6"));
+        assert!(line.contains("check failed"), "got: {line}");
     }
 }

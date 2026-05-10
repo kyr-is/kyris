@@ -2,11 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::{Path, PathBuf};
 
+use crate::config_writer::{NoopValidator, TomlShapeValidator, WellFormedJsonValidator};
 use crate::integration::{
     ensure_toml_bool_path, ensure_toml_string_path, read_json_value, read_toml_value,
     remove_json_command_hook, write_json_value, write_toml_value,
 };
 use crate::state::restore_manifest_entry;
+
+use super::codex_cli_schema::CodexConfigShape;
+
+fn codex_config_validator() -> TomlShapeValidator<CodexConfigShape> {
+    TomlShapeValidator::new()
+}
 
 use super::probe::{ProbeResult, fingerprint, not_detected};
 use super::registry::{
@@ -14,6 +21,39 @@ use super::registry::{
 };
 
 pub struct CodexCli;
+
+fn ensure_codex_kyris_model_provider(
+    config: &mut toml::Value,
+    base_url_v1: &str,
+    inbound_key: &str,
+) -> bool {
+    let mut changed = false;
+    if ensure_toml_string_path(config, &["model_providers", "kyris", "name"], "Kyris") {
+        changed = true;
+    }
+    if ensure_toml_string_path(
+        config,
+        &["model_providers", "kyris", "base_url"],
+        base_url_v1,
+    ) {
+        changed = true;
+    }
+    if ensure_toml_string_path(
+        config,
+        &["model_providers", "kyris", "wire_api"],
+        "responses",
+    ) {
+        changed = true;
+    }
+    if ensure_toml_string_path(
+        config,
+        &["model_providers", "kyris", "experimental_bearer_token"],
+        inbound_key,
+    ) {
+        changed = true;
+    }
+    changed
+}
 
 pub fn codex_config_path() -> Result<PathBuf, String> {
     if let Some(path) = crate::integration::find_upwards(".codex/config.toml") {
@@ -153,7 +193,12 @@ impl AgentDescriptor for CodexCli {
 
         let mut config = read_toml_value(&config_path)?;
         if ensure_toml_bool_path(&mut config, &["features", "codex_hooks"], true) {
-            write_toml_value(&config_path, &config, "codex-cli")?;
+            write_toml_value(
+                &config_path,
+                &config,
+                "codex-cli",
+                &codex_config_validator(),
+            )?;
             changes.push(format!("updated {}", config_path.display()));
         }
 
@@ -162,11 +207,13 @@ impl AgentDescriptor for CodexCli {
                 let rules_content = crate::compile_policy::serialize_codex_rules_file(&rules);
                 if !rules_content.is_empty() {
                     let rules_path = codex_dir()?.join("rules").join("agentpact.rules");
+                    // .rules is opaque text — no schema.
                     if crate::state::write_managed_file(
                         &rules_path,
                         &rules_content,
                         "codex-cli",
                         None,
+                        &NoopValidator,
                     )? {
                         changes.push(format!("wrote {}", rules_path.display()));
                     }
@@ -204,18 +251,7 @@ impl AgentDescriptor for CodexCli {
         let base_url_v1 = format!("{base_url}/v1");
         let mut config_changed =
             ensure_toml_string_path(&mut config, &["openai_base_url"], &base_url_v1);
-        if ensure_toml_string_path(
-            &mut config,
-            &["model_providers", "kyris", "base_url"],
-            &base_url_v1,
-        ) {
-            config_changed = true;
-        }
-        if ensure_toml_string_path(
-            &mut config,
-            &["model_providers", "kyris", "experimental_bearer_token"],
-            inbound_key,
-        ) {
+        if ensure_codex_kyris_model_provider(&mut config, &base_url_v1, inbound_key) {
             config_changed = true;
         }
 
@@ -228,7 +264,12 @@ impl AgentDescriptor for CodexCli {
             config_changed = true;
         }
         if config_changed {
-            write_toml_value(&config_path, &config, "codex-cli")?;
+            write_toml_value(
+                &config_path,
+                &config,
+                "codex-cli",
+                &codex_config_validator(),
+            )?;
             changes.push(format!("updated {}", config_path.display()));
         }
         if !mcp_result.http_rewrites.is_empty() {
@@ -243,7 +284,7 @@ impl AgentDescriptor for CodexCli {
         if hooks_path.exists() {
             let mut hooks = read_json_value(&hooks_path)?;
             if remove_json_command_hook(&mut hooks, "PreToolUse", "kyris_pretooluse") {
-                write_json_value(&hooks_path, &hooks, "codex-cli")?;
+                write_json_value(&hooks_path, &hooks, "codex-cli", &WellFormedJsonValidator)?;
                 println!("Removed hook from {}", hooks_path.display());
             }
         }
@@ -252,7 +293,12 @@ impl AgentDescriptor for CodexCli {
         if config_path.exists() {
             let mut config = read_toml_value(&config_path)?;
             if ensure_toml_bool_path(&mut config, &["features", "codex_hooks"], false) {
-                write_toml_value(&config_path, &config, "codex-cli")?;
+                write_toml_value(
+                    &config_path,
+                    &config,
+                    "codex-cli",
+                    &codex_config_validator(),
+                )?;
                 println!("Reset codex_hooks in {}", config_path.display());
             }
         }
@@ -302,5 +348,37 @@ impl AgentDescriptor for CodexCli {
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testCodexKyrisModelProviderIsValidForCodex0130() {
+        let mut config: toml::Value =
+            toml::from_str("[model_providers.kyris]\nbase_url = \"http://old.example/v1\"\n")
+                .expect("parse config");
+
+        assert!(ensure_codex_kyris_model_provider(
+            &mut config,
+            "http://127.0.0.1:4710/v1",
+            "sk-kyris-test"
+        ));
+
+        let provider = config["model_providers"]["kyris"]
+            .as_table()
+            .expect("kyris provider");
+        assert_eq!(provider["name"].as_str(), Some("Kyris"));
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("http://127.0.0.1:4710/v1")
+        );
+        assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        assert_eq!(
+            provider["experimental_bearer_token"].as_str(),
+            Some("sk-kyris-test")
+        );
     }
 }

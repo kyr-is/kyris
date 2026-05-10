@@ -18,29 +18,40 @@ Today the practical target is macOS, with Apple Silicon as the primary supported
 - `kyris-hook` helper binary for shell and native hook integrations
 - `launchd` service template for `kyrisd` on macOS
 
-### 1.2 Homebrew
+### 1.2 Install (user mode — currently the only shipping mode)
+
+**Homebrew (recommended):**
 
 ```sh
-# System mode (needs sudo — installs to /usr/local/bin/, /etc/kyris/)
-brew install --cask kyr-is/tap/kyris
-
-# User mode (no sudo — installs to Homebrew prefix)
-brew install --cask kyr-is/tap/kyris-user
+brew install --cask kyr-is/tap/kyris   # auto-installs agentpact via depends_on
+brew services start kyris
+kyris install                          # configure shell hooks and agent integrations
 ```
 
-### 1.3 Install Script
+**Install script:**
 
 ```sh
-# System mode (default, needs sudo)
 curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash
-
-# User mode (no sudo)
-curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --user
+kyris install                          # configure shell hooks and agent integrations
 ```
 
-System mode installs the `.pkg` to `/usr/local/bin/` and `/etc/kyris/`. User mode installs to
-`~/.local/bin/`. Both modes verify the SHA-256 checksum, install all four binaries (`kyris`,
-`kyrisd`, `kyris-mcp`, `kyris-hook`), and register the `launchd` service for `kyrisd`.
+Both paths install the same four binaries (`kyris`, `kyrisd`, `kyris-mcp`, `kyris-hook`) and the same hardened `launchd` plist. The script auto-installs agentpact if it's missing (chained `curl ... | bash` of agentpact's install.sh) and auto-detects `brew` to delegate when present; pass `--no-brew` to force the script path or `--no-agentpact` to skip the dependency check. No `sudo` required. The daemon runs as the developer; state lives under `~/.kyris/`.
+
+**Uninstall** (works regardless of how it was installed):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --uninstall
+# or, if installed via brew:
+brew uninstall --cask --zap kyr-is/tap/kyris
+```
+
+The script's `--uninstall` runs `kyris uninstall` first to clean up shell hooks and agent integrations, detects brew-installed kyris and delegates to `brew uninstall --cask --zap`, and finally removes binaries, the launchd plist, and `~/.kyris/`. Does **not** remove agentpact (kyris is the dependent, not the dependency).
+
+**Mixing channels is unsupported.** If you install kyris via brew but agentpact via the script (or vice versa), dependency tracking is incomplete — brew won't refuse to uninstall a script-installed agentpact while kyris still needs it. Pick one channel per machine and stick with it.
+
+### 1.3 Enterprise mode (planned, phase 2)
+
+Enterprise mode will install `kyrisd` as a root `LaunchDaemon` with tamper-proof local audit logs, signed event entries, root-owned config at `/etc/kyris/`, and a shared socket at `/var/run/kyrisd.sock` — for regulated environments and MDM-managed fleets where the audit trail must survive an adversarial operator. The current `install.sh` rejects `--enterprise` with a "not yet available" message.
 
 ### 1.4 Quick Start
 
@@ -538,6 +549,9 @@ The short version is simple: AgentPact defines the contract, Kyris gets onto the
 |---------|-------------|
 | `kyris check <command>` | Test a command against current policy (returns allow/deny) |
 | `kyris compile-policy --agent <agent> [--policy PATH]` | Render AgentPact policy into agent-native permission format |
+| `kyris always list` | Show active "always" overrides across `commands.local.yaml` and `mcp.local.yaml` (kind, selector, created_at, file path) |
+| `kyris always revoke <selector>` | Revoke a named override (command, path, or `server:tool` for MCP) |
+| `kyris always revoke --last` | Revoke the most recently created override across all override files |
 | `kyris scan run [--format terminal\|json\|html] [-o FILE] [--scanners X,Y]` | Security scan: running agents, exposed keys, MCP configs, traffic |
 | `kyris scan patterns list` | List available scan patterns |
 

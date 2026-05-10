@@ -3,6 +3,7 @@
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
+use crate::config_writer::ConfigValidator;
 use crate::state::write_managed_file;
 
 pub fn read_json_value(path: &Path) -> Result<Value, String> {
@@ -14,10 +15,15 @@ pub fn read_json_value(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
 }
 
-pub fn write_json_value(path: &Path, value: &Value, component: &str) -> Result<bool, String> {
+pub fn write_json_value(
+    path: &Path,
+    value: &Value,
+    component: &str,
+    validator: &dyn ConfigValidator,
+) -> Result<bool, String> {
     let contents = serde_json::to_string_pretty(value)
         .map_err(|e| format!("Cannot serialize {}: {e}", path.display()))?;
-    write_managed_file(path, &contents, component, Some(0o600))
+    write_managed_file(path, &contents, component, Some(0o600), validator)
 }
 
 pub fn read_toml_value(path: &Path) -> Result<toml::Value, String> {
@@ -29,10 +35,15 @@ pub fn read_toml_value(path: &Path) -> Result<toml::Value, String> {
     toml::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
 }
 
-pub fn write_toml_value(path: &Path, value: &toml::Value, component: &str) -> Result<bool, String> {
+pub fn write_toml_value(
+    path: &Path,
+    value: &toml::Value,
+    component: &str,
+    validator: &dyn ConfigValidator,
+) -> Result<bool, String> {
     let contents = toml::to_string_pretty(value)
         .map_err(|e| format!("Cannot serialize {}: {e}", path.display()))?;
-    write_managed_file(path, &contents, component, Some(0o600))
+    write_managed_file(path, &contents, component, Some(0o600), validator)
 }
 
 pub fn ensure_json_command_hook(

@@ -345,7 +345,8 @@ fn remove_pid_file() {
     let _ = std::fs::remove_file(pid_path);
 }
 
-/// Routes that require auth: circuit-breaker reset, pending requests.
+/// Routes that require auth: circuit-breaker reset, pending requests, and
+/// the `/operator/*` data-inspection endpoints used by tests and dashboards.
 fn authed_operational_routes(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, post};
 
@@ -369,7 +370,15 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/pending/{id}/status",
-            get(pending_status).with_state(state),
+            get(pending_status).with_state(state.clone()),
+        )
+        .route(
+            "/operator/gateway-records",
+            get(operator_gateway_records).with_state(state.clone()),
+        )
+        .route(
+            "/operator/session-tokens/{session_id}",
+            get(operator_session_token).with_state(state),
         )
 }
 
@@ -445,10 +454,10 @@ fn agentpact_socket_path() -> String {
 }
 
 async fn send_permission_response(
+    socket: String,
     approval_token: &str,
     decision: ResolveDecision,
 ) -> Result<(), String> {
-    let socket = agentpact_socket_path();
     let token = approval_token.to_string();
     tokio::task::spawn_blocking(move || {
         agentpact::send_permission_response(
@@ -462,6 +471,16 @@ async fn send_permission_response(
     })
     .await
     .map_err(|e| format!("permission.respond task failed: {e}"))?
+}
+
+/// Resolve the agentpact socket path, preferring an explicit `AppState` override
+/// (set in tests) and falling back to the env-var/default lookup used by the
+/// rest of the codebase.
+fn agentpact_socket_for(state: &AppState) -> String {
+    state
+        .agentpact_socket
+        .as_ref()
+        .map_or_else(agentpact_socket_path, |p| p.display().to_string())
 }
 
 async fn resolve_pending(
@@ -481,7 +500,8 @@ async fn resolve_pending(
         Err(ResolveError::AlreadyResolved(_)) => return StatusCode::CONFLICT,
     };
 
-    if let Err(error) = send_permission_response(&claim.approval_token, decision).await {
+    let socket = agentpact_socket_for(&state);
+    if let Err(error) = send_permission_response(socket, &claim.approval_token, decision).await {
         tracing::warn!(pending_id = %id, %error, "failed to resolve pending request with agentpactd");
         state.pending.abandon_claim(claim);
         return StatusCode::BAD_GATEWAY;
@@ -521,7 +541,8 @@ async fn hold_pending(
 
 async fn cancel_pending(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
     if let Some(token) = state.pending.cancel(&id) {
-        let _ = send_permission_response(&token, ResolveDecision::Denied).await;
+        let socket = agentpact_socket_for(&state);
+        let _ = send_permission_response(socket, &token, ResolveDecision::Denied).await;
     }
     StatusCode::OK
 }
@@ -536,6 +557,77 @@ async fn pending_status(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "not found" })),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// /operator/* — read-only data inspection. Auth: operator_key (Bearer).
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+struct GatewayRecordsQuery {
+    provider: Option<String>,
+    model: Option<String>,
+    status: Option<String>,
+    session_id: Option<String>,
+    trace_id: Option<String>,
+    mcp_server: Option<String>,
+    mcp_tool: Option<String>,
+    /// RFC3339 timestamp; only records strictly newer are returned.
+    since: Option<String>,
+    /// Hard cap is `10_000`; default `1_000`.
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct GatewayRecordsResponse {
+    records: Vec<kyris_core::record::GatewayRecord>,
+}
+
+async fn operator_gateway_records(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<GatewayRecordsQuery>,
+) -> Result<Json<GatewayRecordsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let filter = storage::GatewayRecordFilter {
+        provider: q.provider.as_deref(),
+        model: q.model.as_deref(),
+        status: q.status.as_deref(),
+        session_id: q.session_id.as_deref(),
+        trace_id: q.trace_id.as_deref(),
+        mcp_server: q.mcp_server.as_deref(),
+        mcp_tool: q.mcp_tool.as_deref(),
+        since: q.since.as_deref(),
+        limit: q.limit,
+    };
+    match state.db.query_gateway_records(filter) {
+        Ok(records) => Ok(Json(GatewayRecordsResponse { records })),
+        Err(err) => {
+            tracing::warn!(error = %err, "operator gateway-records query failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            ))
+        }
+    }
+}
+
+async fn operator_session_token(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<Json<kyris_core::record::SessionTokenRow>, (StatusCode, Json<serde_json::Value>)> {
+    match state.db.query_session_token(&session_id) {
+        Ok(Some(row)) => Ok(Json(row)),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "session not found", "session_id": session_id })),
+        )),
+        Err(err) => {
+            tracing::warn!(error = %err, %session_id, "operator session-token query failed");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            ))
+        }
     }
 }
 
@@ -750,6 +842,14 @@ mod tests {
     }
 
     fn make_test_state(config: KyrisdConfig, temp_root: &std::path::Path) -> Arc<AppState> {
+        make_test_state_with_socket(config, temp_root, None)
+    }
+
+    fn make_test_state_with_socket(
+        config: KyrisdConfig,
+        temp_root: &std::path::Path,
+        agentpact_socket: Option<std::path::PathBuf>,
+    ) -> Arc<AppState> {
         let (stats_tx, _stats_rx) = mpsc::channel(8);
         Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(config)),
@@ -761,7 +861,7 @@ mod tests {
             )),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
             pending: Arc::new(PendingStore::new()),
-            agentpact_socket: None,
+            agentpact_socket,
             mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
         })
     }
@@ -1265,6 +1365,461 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp_missing.status(), 404);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    fn seed_gateway_records(state: &Arc<AppState>) {
+        // Two distinct providers/models so the filter can discriminate.
+        state
+            .db
+            .insert_batch(&[
+                sample_event("trace-a", Some("sess-x")),
+                sample_event("trace-b", Some("sess-y")),
+            ])
+            .expect("seed insert");
+        let mut anthropic_event = sample_event("trace-c", Some("sess-x"));
+        anthropic_event.provider = "anthropic".to_string();
+        anthropic_event.model = "claude-haiku".to_string();
+        state
+            .db
+            .insert_batch(&[anthropic_event])
+            .expect("seed anthropic insert");
+    }
+
+    async fn spawn_operator_app(
+        state: Arc<AppState>,
+    ) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/operator/gateway-records",
+                axum::routing::get(operator_gateway_records).with_state(state.clone()),
+            )
+            .route(
+                "/operator/session-tokens/{session_id}",
+                axum::routing::get(operator_session_token).with_state(state),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (addr, shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn testOperatorGatewayRecordsReturnsAll() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        seed_gateway_records(&state);
+
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/gateway-records"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 3);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorGatewayRecordsFilterByProvider() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        seed_gateway_records(&state);
+
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!(
+                "{addr}/operator/gateway-records?provider=anthropic"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["provider"], "anthropic");
+        assert_eq!(records[0]["model"], "claude-haiku");
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorGatewayRecordsFilterBySessionId() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        seed_gateway_records(&state);
+
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/gateway-records?session_id=sess-x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record["session_id"], "sess-x");
+        }
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorGatewayRecordsLimit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        seed_gateway_records(&state);
+
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/gateway-records?limit=1"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["records"].as_array().unwrap().len(), 1);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorSessionTokensReturnsRow() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        state
+            .db
+            .upsert_session_tokens("sess-x", 4242)
+            .expect("upsert");
+
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/session-tokens/sess-x"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["session_id"], "sess-x");
+        assert_eq!(body["total_tokens"], 4242);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorSessionTokensReturns404ForUnknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/session-tokens/nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    // -- end-to-end Ask resolution -------------------------------------
+    //
+    // These tests prove the full kyris-core ↔ kyrisd HTTP chain works for
+    // the approval-prompt flow. They mount all three pending routes against
+    // an in-process axum server, drive `hold_poll_resolve` (the same code
+    // path `kyris hook check` uses when agentpactd returns Ask), and
+    // simulate the user typing `y` or `n` in `kyris pending` by POSTing
+    // /api/pending/{id}/resolve from a parallel task.
+    //
+    // What this catches:
+    // - protocol drift between kyris-core's client and kyrisd's handlers
+    // - missing routes / wrong methods
+    // - regressions in hold/poll/resolve state transitions
+    // - the prompt-→-resolve loop being broken end-to-end (the very bug
+    //   that motivates this whole testing pass)
+    //
+    // What this does NOT catch:
+    // - kyris hook check's stdin parsing (covered by hook_cmd unit tests)
+    // - agentpactd's Ask emission (covered by agentpact's own tests)
+    // - the interactive prompt UI (covered by pending::tests in the cli)
+    //
+    // POLL_INTERVAL in kyris-core is 1s, so each test takes ~1.5–2 seconds.
+
+    async fn spawn_pending_app(
+        state: Arc<AppState>,
+    ) -> (String, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/api/pending/hold",
+                axum::routing::post(hold_pending).with_state(state.clone()),
+            )
+            .route(
+                "/api/pending/{id}/status",
+                axum::routing::get(pending_status).with_state(state.clone()),
+            )
+            .route(
+                "/api/pending/{id}/resolve",
+                axum::routing::post(resolve_pending).with_state(state),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        (addr, shutdown_tx, handle)
+    }
+
+    /// Mock agentpactd UDS server. Accepts permission-respond requests from
+    /// kyrisd's `resolve_pending` and unconditionally returns `PACT_OK` so
+    /// the HTTP resolve handler succeeds. Real agentpactd is more selective;
+    /// for the e2e prompt flow we only care that the HTTP-side state
+    /// transition fires, not that agentpactd validates the token.
+    ///
+    /// Sync because the inner spawn handles all the awaiting; clippy flags
+    /// it as `unused_async` otherwise.
+    fn spawn_mock_agentpactd_socket(
+        socket_path: std::path::PathBuf,
+    ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        // Ensure the socket path is fresh.
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind mock UDS");
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accept = listener.accept() => {
+                        let Ok((mut stream, _)) = accept else { continue };
+                        tokio::spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                            let mut buf = Vec::new();
+                            let _ = stream.read_to_end(&mut buf).await;
+                            // Always respond PACT_OK — sufficient for the
+                            // resolve handler to treat the round-trip as
+                            // successful.
+                            let _ = stream.write_all(b"{\"code\":\"PACT_OK\"}\n").await;
+                            let _ = stream.shutdown().await;
+                        });
+                    }
+                    _ = &mut shutdown_rx => {
+                        break;
+                    }
+                }
+            }
+        });
+        (shutdown_tx, handle)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn testEndToEndApprovalReturnsApproved() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock_sock = dir.path().join("mock-agentpactd.sock");
+        let (mock_shutdown, mock_handle) = spawn_mock_agentpactd_socket(mock_sock.clone());
+
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state_with_socket(config, dir.path(), Some(mock_sock));
+        let (addr, shutdown_tx, handle) = spawn_pending_app(state).await;
+
+        // Spawn the hook-side: hold + poll. This is exactly what
+        // `kyris hook check` runs after agentpactd returns Ask.
+        let task_conn = kyris_core::config::KyrisdConnection {
+            base_url: addr.clone(),
+            operator_key: "test-operator-key".to_string(),
+        };
+        let resolution_task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            kyris_core::pending::hold_poll_resolve(
+                &client,
+                &task_conn,
+                "e2e-approve-1",
+                "test-token",
+                "github",
+                "read_file",
+            )
+            .await
+        });
+
+        // Wait long enough for hold_poll_resolve to POST /api/pending/hold
+        // and start polling. POLL_INTERVAL is 1s; we resolve well before the
+        // first poll cycle so the request is ready when polling starts.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Simulate `kyris pending` user typing "y": POST to /api/pending/<id>/resolve.
+        let resolve_resp = reqwest::Client::new()
+            .post(format!("{addr}/api/pending/e2e-approve-1/resolve"))
+            .header("authorization", "Bearer test-operator-key")
+            .json(&serde_json::json!({"decision": "approved"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resolve_resp.status(), 200, "resolve should succeed");
+
+        // Wait for the polling task to observe the state change. Allow up to
+        // 3 seconds (covers POLL_INTERVAL=1s plus jitter).
+        let resolution = tokio::time::timeout(std::time::Duration::from_secs(3), resolution_task)
+            .await
+            .expect("hold_poll_resolve did not return within 3s")
+            .expect("task did not panic");
+
+        assert_eq!(resolution, kyris_core::pending::Resolution::Approved);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+        let _ = mock_shutdown.send(());
+        let _ = mock_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn testEndToEndDenialReturnsDenied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock_sock = dir.path().join("mock-agentpactd.sock");
+        let (mock_shutdown, mock_handle) = spawn_mock_agentpactd_socket(mock_sock.clone());
+
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state_with_socket(config, dir.path(), Some(mock_sock));
+        let (addr, shutdown_tx, handle) = spawn_pending_app(state).await;
+
+        let task_conn = kyris_core::config::KyrisdConnection {
+            base_url: addr.clone(),
+            operator_key: "test-operator-key".to_string(),
+        };
+        let resolution_task = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            kyris_core::pending::hold_poll_resolve(
+                &client,
+                &task_conn,
+                "e2e-deny-1",
+                "test-token",
+                "github",
+                "write_file",
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Simulate `kyris pending` user typing "n".
+        let resolve_resp = reqwest::Client::new()
+            .post(format!("{addr}/api/pending/e2e-deny-1/resolve"))
+            .header("authorization", "Bearer test-operator-key")
+            .json(&serde_json::json!({"decision": "denied"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resolve_resp.status(), 200);
+
+        let resolution = tokio::time::timeout(std::time::Duration::from_secs(3), resolution_task)
+            .await
+            .expect("hold_poll_resolve did not return within 3s")
+            .expect("task did not panic");
+
+        assert_eq!(resolution, kyris_core::pending::Resolution::Denied);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+        let _ = mock_shutdown.send(());
+        let _ = mock_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn testEndToEndListPendingReflectsHeldRequest() {
+        // Verifies the kyris pending CLI's `GET /api/pending` listing path
+        // sees a held request — the CLI uses this to display "what's
+        // waiting for approval" before prompting.
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new()
+            .route(
+                "/api/pending/hold",
+                axum::routing::post(hold_pending).with_state(state.clone()),
+            )
+            .route(
+                "/api/pending",
+                axum::routing::get(list_pending).with_state(state.clone()),
+            )
+            .route(
+                "/api/pending/{id}/resolve",
+                axum::routing::post(resolve_pending).with_state(state),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        // Hold a request directly via the HTTP API (mimics kyris hook check).
+        let client = reqwest::Client::new();
+        let hold_resp = client
+            .post(format!("{addr}/api/pending/hold"))
+            .header("authorization", "Bearer test-operator-key")
+            .json(&serde_json::json!({
+                "id": "e2e-list-1",
+                "approval_token": "test-token",
+                "server": "anthropic",
+                "tool": "agent",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(hold_resp.status().is_success());
+
+        // Listing should show the held request — this is what `kyris pending`
+        // displays to the user before prompting.
+        let list_resp = client
+            .get(format!("{addr}/api/pending"))
+            .header("authorization", "Bearer test-operator-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), 200);
+        let body: serde_json::Value = list_resp.json().await.unwrap();
+        let requests = body["requests"].as_array().expect("requests array");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["id"], "e2e-list-1");
+        assert_eq!(requests[0]["server"], "anthropic");
+        assert_eq!(requests[0]["state"], "held");
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();

@@ -8,10 +8,35 @@
     <array>
         <string>{{BINARY_PATH}}</string>
     </array>
-    <key>KeepAlive</key>
-    <true/>
     <key>RunAtLoad</key>
     <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ExitTimeOut</key>
+    <integer>20</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}/.kyris</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+    </dict>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>{{HOME}}/.kyris/kyrisd.stdout.log</string>
     <key>StandardErrorPath</key>

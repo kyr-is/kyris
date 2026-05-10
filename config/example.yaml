@@ -44,8 +44,10 @@ mcp:
   servers:
     - name: github
       upstream: "http://localhost:8080"
+      working_dir: "/path/to/project"
     - name: database
       upstream: "http://localhost:8081"
+      working_dir: "/path/to/project"
 
 circuit_breaker:
   enabled: true

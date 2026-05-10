@@ -1,20 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //! HTTP MCP routing. Proxies Streamable HTTP MCP transport (POST, GET,
-//! DELETE) on `/mcp/{server}/{path}` to configured upstream MCP servers.
+//! DELETE) on `/mcp/{server}` and `/mcp/{server}/{path}` to configured
+//! upstream MCP servers.
 //! POST tools/call requests are policy-checked via `AgentPact`; all other
 //! requests are forwarded directly. SSE responses are streamed as received.
 pub mod policy;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     Router,
     body::Body,
-    extract::{ConnectInfo, Path, State},
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
@@ -102,7 +102,10 @@ fn forward_request_headers(
 ) -> reqwest::RequestBuilder {
     for (key, value) in headers {
         let name = key.as_str();
-        if is_hop_by_hop(name) || name.eq_ignore_ascii_case("host") {
+        if is_hop_by_hop(name)
+            || name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("x-working-dir")
+        {
             continue;
         }
         builder = builder.header(key, value);
@@ -163,43 +166,66 @@ fn get_mcp_client(state: &AppState, server_name: &str) -> reqwest::Client {
 }
 
 pub fn routes(state: Arc<AppState>) -> Router {
-    Router::new().route(
-        "/mcp/{server}/{*path}",
-        post(handle_mcp_post)
-            .get(handle_mcp_get)
-            .delete(handle_mcp_delete)
-            .with_state(state),
-    )
+    Router::new()
+        .route(
+            "/mcp/{server}",
+            post(handle_mcp_root_post)
+                .get(handle_mcp_root_get)
+                .delete(handle_mcp_root_delete),
+        )
+        .route(
+            "/mcp/{server}/{*path}",
+            post(handle_mcp_post)
+                .get(handle_mcp_get)
+                .delete(handle_mcp_delete),
+        )
+        .with_state(state)
+}
+
+async fn handle_mcp_root_post(
+    State(state): State<Arc<AppState>>,
+    Path(server_name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    forward_mcp_post(state, server_name, String::new(), headers, body).await
 }
 
 async fn handle_mcp_post(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path((server_name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, StatusCode> {
+    forward_mcp_post(state, server_name, path, headers, body).await
+}
+
+async fn forward_mcp_post(
+    state: Arc<AppState>,
+    server_name: String,
+    path: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let config = state.config.load();
     let server = resolve_server(&config, &server_name)?;
 
-    let working_dir = match headers
-        .get("x-working-dir")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-    {
-        Some(dir) => Some(dir),
-        None if policy::is_tools_call_request(&path, &body) => {
-            crate::adapter::resolve_peer_working_dir(peer_addr).await
-        }
-        None => None,
-    };
+    let working_dir = server
+        .working_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty());
 
     if policy::is_tools_call_request(&path, &body) && working_dir.is_none() {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::json!({"error": "could not determine working directory for tools/call: set X-Working-Dir header or connect from the agent process"})
+                serde_json::json!({
+                    "error": "mcp_working_dir_required",
+                    "detail": format!(
+                        "MCP server '{server_name}' requires mcp.servers[].working_dir for tools/call policy evaluation."
+                    )
+                })
                     .to_string(),
             ))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
@@ -216,7 +242,7 @@ async fn handle_mcp_post(
         &server_name,
         &path,
         &body,
-        working_dir.as_deref(),
+        working_dir,
         mcp_operation.as_deref(),
         &annotations,
         socket_timeout,
@@ -306,7 +332,7 @@ async fn handle_mcp_post(
     }
 
     let client = get_mcp_client(&state, &server_name);
-    let upstream_url = format!("{}/{}", server.upstream, path);
+    let upstream_url = upstream_url(&server.upstream, &path);
 
     let req = forward_request_headers(client.post(&upstream_url).body(body.to_vec()), &headers);
     let response = req.send().await.map_err(|e| {
@@ -329,7 +355,7 @@ async fn handle_mcp_post(
         .await
         .map_err(|_| StatusCode::BAD_GATEWAY)?;
 
-    if is_tools_list_path(&path) {
+    if is_tools_list_request(&path, &body) {
         state
             .mcp_annotation_cache
             .update_from_response(&server_name, &resp_body);
@@ -338,16 +364,33 @@ async fn handle_mcp_post(
     build_upstream_response(status, &resp_headers, Body::from(resp_body))
 }
 
+async fn handle_mcp_root_get(
+    State(state): State<Arc<AppState>>,
+    Path(server_name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    forward_mcp_get(state, server_name, String::new(), headers).await
+}
+
 async fn handle_mcp_get(
     State(state): State<Arc<AppState>>,
     Path((server_name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    forward_mcp_get(state, server_name, path, headers).await
+}
+
+async fn forward_mcp_get(
+    state: Arc<AppState>,
+    server_name: String,
+    path: String,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     let config = state.config.load();
     let server = resolve_server(&config, &server_name)?;
 
     let client = get_mcp_client(&state, &server_name);
-    let upstream_url = format!("{}/{}", server.upstream, path);
+    let upstream_url = upstream_url(&server.upstream, &path);
 
     let req = forward_request_headers(client.get(&upstream_url), &headers);
     let response = req.send().await.map_err(|e| {
@@ -372,16 +415,33 @@ async fn handle_mcp_get(
     build_upstream_response(status, &resp_headers, Body::from(body))
 }
 
+async fn handle_mcp_root_delete(
+    State(state): State<Arc<AppState>>,
+    Path(server_name): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    forward_mcp_delete(state, server_name, String::new(), headers).await
+}
+
 async fn handle_mcp_delete(
     State(state): State<Arc<AppState>>,
     Path((server_name, path)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    forward_mcp_delete(state, server_name, path, headers).await
+}
+
+async fn forward_mcp_delete(
+    state: Arc<AppState>,
+    server_name: String,
+    path: String,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     let config = state.config.load();
     let server = resolve_server(&config, &server_name)?;
 
     let client = get_mcp_client(&state, &server_name);
-    let upstream_url = format!("{}/{}", server.upstream, path);
+    let upstream_url = upstream_url(&server.upstream, &path);
 
     let req = forward_request_headers(client.delete(&upstream_url), &headers);
     let response = req.send().await.map_err(|e| {
@@ -398,14 +458,28 @@ async fn handle_mcp_delete(
     build_upstream_response(status, &resp_headers, Body::from(body))
 }
 
+fn upstream_url(upstream: &str, path: &str) -> String {
+    let base = upstream.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}/{path}")
+    }
+}
+
 fn extract_json_rpc_method(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("method")?.as_str().map(String::from))
 }
 
-fn is_tools_list_path(path: &str) -> bool {
+fn is_tools_list_request(path: &str, body: &[u8]) -> bool {
     path.contains("tools/list")
+        || serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("method")?.as_str().map(String::from))
+            .is_some_and(|m| m == "tools/list")
 }
 
 #[cfg(test)]
@@ -454,6 +528,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: upstream_url.clone(),
+            working_dir: Some("/tmp/project".to_string()),
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -471,7 +546,6 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/mcp/remote/tools/call"))
             .header("content-type", "application/json")
-            .header("x-working-dir", "/tmp/project")
             .body(request_body.to_string())
             .send()
             .await
@@ -484,6 +558,78 @@ mod tests {
         let policy_request = daemon_recorded.lock().unwrap().clone().unwrap();
         assert_eq!(policy_request["method"], "permission.request");
         assert_eq!(policy_request["action"], "call");
+        assert_eq!(policy_request["detail"], "read_file");
+        assert_eq!(policy_request["context"]["mcp_server"], "remote");
+        assert_eq!(policy_request["context"]["working_dir"], "/tmp/project");
+        assert_eq!(policy_request["context"]["mcp_operation"], "tools/call");
+
+        let upstream_request = upstream_recorded.lock().unwrap().clone().unwrap();
+        let forwarded: serde_json::Value = serde_json::from_slice(&upstream_request.body).unwrap();
+        assert_eq!(forwarded["method"], "tools/call");
+        assert_eq!(forwarded["params"]["name"], "read_file");
+
+        policy::set_test_agentpact_socket(None);
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+        daemon_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRootRouteAllowsAndForwardsToolsCall() {
+        let _guard = lock_mcp_route_tests();
+        let upstream_recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/", post(record_upstream_request))
+            .with_state(upstream_recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("agentpact.sock");
+        let daemon_recorded = Arc::new(Mutex::new(None));
+        let daemon_handle = spawn_agentpact_stub(
+            &sock_path,
+            serde_json::json!({"code": "PACT_OK"}),
+            daemon_recorded.clone(),
+        );
+        policy::set_test_agentpact_socket(Some(sock_path.clone()));
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: upstream_url.clone(),
+            working_dir: Some("/tmp/project".to_string()),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"path": "README.md"}}
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote"))
+            .header("content-type", "application/json")
+            .body(request_body.to_string())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_json: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(response_json["result"]["ok"], true);
+
+        let policy_request = daemon_recorded.lock().unwrap().clone().unwrap();
+        assert_eq!(policy_request["method"], "permission.request");
         assert_eq!(policy_request["detail"], "read_file");
         assert_eq!(policy_request["context"]["mcp_server"], "remote");
         assert_eq!(policy_request["context"]["working_dir"], "/tmp/project");
@@ -521,6 +667,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: Some("/tmp/project".to_string()),
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -538,7 +685,6 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/mcp/remote/tools/call"))
             .header("content-type", "application/json")
-            .header("x-working-dir", "/tmp/project")
             .body(request_body.to_string())
             .send()
             .await
@@ -650,6 +796,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -685,6 +832,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "known".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -728,6 +876,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: Some("/tmp/project".to_string()),
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -738,7 +887,6 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/mcp/remote/tools/call"))
             .header("content-type", "application/json")
-            .header("x-working-dir", "/tmp/project")
             .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"dangerous_tool"}}"#)
             .send()
             .await
@@ -765,6 +913,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -783,12 +932,12 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = response.json().await.unwrap();
         assert!(
-            body["error"]
+            body["detail"]
                 .as_str()
                 .unwrap()
-                .contains("could not determine working directory"),
-            "expected peer-cwd fallback error message, got: {}",
-            body["error"]
+                .contains("requires mcp.servers[].working_dir"),
+            "expected explicit config error message, got: {}",
+            body["detail"]
         );
 
         let _ = router_shutdown.send(());
@@ -860,6 +1009,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: upstream_url.clone(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -904,6 +1054,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: upstream_url.clone(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -951,6 +1102,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: upstream_url.clone(),
+            working_dir: Some("/tmp/project".to_string()),
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -968,7 +1120,6 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/mcp/remote/tools/call"))
             .header("content-type", "application/json")
-            .header("x-working-dir", "/tmp/project")
             .body(request_body.to_string())
             .send()
             .await
@@ -1038,6 +1189,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: upstream_url.clone(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1100,6 +1252,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1131,6 +1284,7 @@ mod tests {
         config.mcp.servers = vec![McpServerConfig {
             name: "remote".to_string(),
             upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: None,
         }];
 
         let temp_dir = tempfile::tempdir().unwrap();

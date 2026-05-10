@@ -15,6 +15,52 @@ pub fn dropped_count() -> u64 {
     DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Filters for `query_gateway_records` (operator API).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GatewayRecordFilter<'a> {
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub trace_id: Option<&'a str>,
+    pub mcp_server: Option<&'a str>,
+    pub mcp_tool: Option<&'a str>,
+    pub since: Option<&'a str>,
+    pub limit: Option<u32>,
+}
+
+fn gateway_row_to_record(
+    row: &duckdb::Row<'_>,
+) -> duckdb::Result<kyris_core::record::GatewayRecord> {
+    use std::str::FromStr as _;
+    let status_str: String = row.get(11)?;
+    let metering_str: Option<String> = row.get::<_, Option<String>>(17)?;
+    Ok(kyris_core::record::GatewayRecord {
+        id: row.get(0)?,
+        trace_id: row.get(1)?,
+        timestamp: row.get(2)?,
+        provider: row.get(3)?,
+        model: row.get(4)?,
+        tokens_in: row.get(5)?,
+        tokens_out: row.get(6)?,
+        tokens_cache_create: row.get(7)?,
+        tokens_cache_read: row.get(8)?,
+        cost_usd: row.get(9)?,
+        latency_ms: row.get(10)?,
+        status: kyris_core::record::RecordStatus::from_str(&status_str)
+            .unwrap_or(kyris_core::record::RecordStatus::Unknown),
+        session_id: row.get(12)?,
+        synced: row.get(13)?,
+        mcp_server: row.get(14)?,
+        mcp_tool: row.get(15)?,
+        working_dir: row.get(16)?,
+        metering: match metering_str.as_deref() {
+            Some("unavailable") => kyris_core::record::Metering::Unavailable,
+            _ => kyris_core::record::Metering::Available,
+        },
+    })
+}
+
 pub struct DuckDbWriter {
     conn: std::sync::Mutex<Connection>,
 }
@@ -202,6 +248,93 @@ impl DuckDbWriter {
             stmt.execute(duckdb::params![record_id])?;
         }
         Ok(())
+    }
+
+    /// Read-only query of `gateway_records` for the operator API.
+    ///
+    /// All filter parameters AND together. Pass `None` for "no filter".
+    /// Results are ordered newest first and capped by `limit`.
+    pub fn query_gateway_records(
+        &self,
+        filters: GatewayRecordFilter<'_>,
+    ) -> duckdb::Result<Vec<kyris_core::record::GatewayRecord>> {
+        use std::fmt::Write as _;
+
+        let mut sql = String::from(
+            "SELECT id, trace_id, \
+                    strftime(timestamp, '%Y-%m-%dT%H:%M:%SZ') AS timestamp, \
+                    provider, model, \
+                    tokens_in, tokens_out, tokens_cache_create, tokens_cache_read, \
+                    cost_usd, latency_ms, status, session_id, synced, \
+                    mcp_server, mcp_tool, working_dir, metering \
+             FROM gateway_records WHERE 1 = 1",
+        );
+        let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        if let Some(provider) = filters.provider {
+            sql.push_str(" AND provider = ?");
+            params.push(Box::new(provider.to_string()));
+        }
+        if let Some(model) = filters.model {
+            sql.push_str(" AND model = ?");
+            params.push(Box::new(model.to_string()));
+        }
+        if let Some(status) = filters.status {
+            sql.push_str(" AND status = ?");
+            params.push(Box::new(status.to_string()));
+        }
+        if let Some(session_id) = filters.session_id {
+            sql.push_str(" AND session_id = ?");
+            params.push(Box::new(session_id.to_string()));
+        }
+        if let Some(trace_id) = filters.trace_id {
+            sql.push_str(" AND trace_id = ?");
+            params.push(Box::new(trace_id.to_string()));
+        }
+        if let Some(mcp_server) = filters.mcp_server {
+            sql.push_str(" AND mcp_server = ?");
+            params.push(Box::new(mcp_server.to_string()));
+        }
+        if let Some(mcp_tool) = filters.mcp_tool {
+            sql.push_str(" AND mcp_tool = ?");
+            params.push(Box::new(mcp_tool.to_string()));
+        }
+        if let Some(since) = filters.since {
+            sql.push_str(" AND timestamp >= ?::TIMESTAMP");
+            params.push(Box::new(since.to_string()));
+        }
+        sql.push_str(" ORDER BY timestamp DESC");
+        let limit = filters.limit.unwrap_or(1_000).min(10_000);
+        let _ = write!(sql, " LIMIT {limit}");
+
+        let conn = self.conn.lock().expect("lock db");
+        let mut stmt = conn.prepare(&sql)?;
+        let param_refs: Vec<&dyn duckdb::ToSql> =
+            params.iter().map(std::convert::AsRef::as_ref).collect();
+        let rows = stmt.query_map(&param_refs[..], gateway_row_to_record)?;
+        rows.collect()
+    }
+
+    /// Read-only query of `session_tokens` for the operator API.
+    pub fn query_session_token(
+        &self,
+        session_id: &str,
+    ) -> duckdb::Result<Option<kyris_core::record::SessionTokenRow>> {
+        let conn = self.conn.lock().expect("lock db");
+        let mut stmt = conn.prepare(
+            "SELECT session_id, total_tokens, \
+                    strftime(last_activity, '%Y-%m-%dT%H:%M:%SZ') AS last_activity \
+             FROM session_tokens WHERE session_id = ?",
+        )?;
+        let mut rows = stmt.query(duckdb::params![session_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(kyris_core::record::SessionTokenRow {
+                session_id: row.get(0)?,
+                total_tokens: row.get(1)?,
+                last_activity: row.get(2)?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn probe_writable(&self) -> bool {
