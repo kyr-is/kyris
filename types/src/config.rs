@@ -145,6 +145,8 @@ impl Default for McpConfig {
 pub struct McpServerConfig {
     pub name: String,
     pub upstream: String,
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -373,12 +375,17 @@ mcp:
   servers:
     - name: github
       upstream: "http://localhost:8080"
+      working_dir: "/workspace/project"
 "#;
         let config: KyrisdConfig = serde_saphyr::from_str(yaml_str).unwrap();
         assert!(config.mcp.enabled);
         assert_eq!(config.mcp.pending_timeout_seconds, 120);
         assert_eq!(config.mcp.servers.len(), 1);
         assert_eq!(config.mcp.servers[0].name, "github");
+        assert_eq!(
+            config.mcp.servers[0].working_dir.as_deref(),
+            Some("/workspace/project")
+        );
     }
 
     #[test]

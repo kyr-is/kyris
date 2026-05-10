@@ -23,6 +23,12 @@ tls:
 mcp:
   enabled: false
   pending_timeout_seconds: 60
+  # Each HTTP MCP server that may receive tools/call must set working_dir.
+  # Kyris does not infer this from client connections.
+  # servers:
+  #   - name: example
+  #     upstream: "http://localhost:8080"
+  #     working_dir: "/path/to/project"
 
 circuit_breaker:
   enabled: true

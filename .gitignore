@@ -28,3 +28,4 @@ lcov.info
 .vars
 .env
 .actrc
+.ci.yml

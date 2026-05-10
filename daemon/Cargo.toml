@@ -14,7 +14,7 @@ name = "kyrisd"
 path = "src/main.rs"
 
 [dependencies]
-kyris-core = { workspace = true }
+kyris-core = { workspace = true, features = ["pending"] }
 kyris-agentpact-client = { workspace = true }
 kyris-peer-cwd = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "signal", "macros", "io-util", "time"] }
@@ -46,6 +46,9 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
 
 [build-dependencies]
 resvg = "0.47"

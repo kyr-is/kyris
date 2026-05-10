@@ -13,8 +13,7 @@ jobs:
   build:
     runs-on: macos-latest
     outputs:
-      pkg_sha256: ${{ steps.checksums.outputs.pkg_sha256 }}
-      tar_sha256: ${{ steps.checksums.outputs.tar_sha256 }}
+      sha256: ${{ steps.checksums.outputs.sha256 }}
     strategy:
       matrix:
         include:
@@ -85,31 +84,22 @@ jobs:
       - name: Generate contract schemas
         run: cargo run -p xtask -- schemas
 
-      - name: Build pkg
-        env:
-          VERSION: ${{ github.ref_name }}
-          BINARY_DIR: target/${{ matrix.target }}/release
-        run: bash scripts/build-pkg.sh
-
       - name: Build tarball
         env:
           VERSION: ${{ github.ref_name }}
           BINARY_DIR: target/${{ matrix.target }}/release
         run: bash scripts/build-tar.sh
 
-      - name: Generate checksums
+      - name: Generate checksum
         id: checksums
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          echo "pkg_sha256=$(awk '{print $1}' "target/kyris-${VERSION}.pkg.sha256")" >> "$GITHUB_OUTPUT"
-          echo "tar_sha256=$(awk '{print $1}' "target/kyris-${VERSION}-aarch64-apple-darwin.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(awk '{print $1}' "target/kyris-${VERSION}-aarch64-apple-darwin.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            target/kyris-*.pkg
-            target/kyris-*.pkg.sha256
             target/kyris-*-aarch64-apple-darwin.tar.gz
             target/kyris-*-aarch64-apple-darwin.tar.gz.sha256
             target/schemas/*.yaml
@@ -119,7 +109,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve asset IDs
+      - name: Resolve asset ID
         id: assets
         env:
           GH_TOKEN: ${{ secrets.KYRIS_TOKEN }}
@@ -127,21 +117,13 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           RELEASE_JSON=$(gh api "repos/kyr-is/kyris/releases/tags/${GITHUB_REF_NAME}")
 
-          PKG_NAME="kyris-${VERSION}.pkg"
-          PKG_ASSET_ID=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name == \"${PKG_NAME}\") | .id")
-          if [ -z "$PKG_ASSET_ID" ] || [ "$PKG_ASSET_ID" = "null" ]; then
-            echo "::error::Could not find asset ${PKG_NAME}"
-            exit 1
-          fi
-          echo "pkg_asset_id=$PKG_ASSET_ID" >> "$GITHUB_OUTPUT"
-
           TAR_NAME="kyris-${VERSION}-aarch64-apple-darwin.tar.gz"
-          TAR_ASSET_ID=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name == \"${TAR_NAME}\") | .id")
-          if [ -z "$TAR_ASSET_ID" ] || [ "$TAR_ASSET_ID" = "null" ]; then
+          ASSET_ID=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name == \"${TAR_NAME}\") | .id")
+          if [ -z "$ASSET_ID" ] || [ "$ASSET_ID" = "null" ]; then
             echo "::error::Could not find asset ${TAR_NAME}"
             exit 1
           fi
-          echo "tar_asset_id=$TAR_ASSET_ID" >> "$GITHUB_OUTPUT"
+          echo "asset_id=$ASSET_ID" >> "$GITHUB_OUTPUT"
 
       - name: Trigger homebrew-tap update
         uses: peter-evans/repository-dispatch@v4
@@ -149,4 +131,4 @@ jobs:
           token: ${{ secrets.KYRIS_TOKEN }}
           repository: kyr-is/homebrew-tap
           event-type: update-cask
-          client-payload: '{"tool": "kyris", "version": "${{ github.ref_name }}", "sha256": "${{ needs.build.outputs.pkg_sha256 }}", "asset_id": "${{ steps.assets.outputs.pkg_asset_id }}", "tar_sha256": "${{ needs.build.outputs.tar_sha256 }}", "tar_asset_id": "${{ steps.assets.outputs.tar_asset_id }}"}'
+          client-payload: '{"tool": "kyris", "version": "${{ github.ref_name }}", "sha256": "${{ needs.build.outputs.sha256 }}", "asset_id": "${{ steps.assets.outputs.asset_id }}"}'

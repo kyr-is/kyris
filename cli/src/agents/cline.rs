@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
+use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{read_json_value, set_json_string_path, write_json_value};
 use crate::state::restore_manifest_entry;
 
@@ -69,7 +70,13 @@ fn install_cline_policy_launchd(json: &str, changes: &mut Vec<String>) -> Result
         .join(".kyris")
         .join("env")
         .join("cline-policy.json");
-    if crate::state::write_managed_file(&value_path, json, "cline", Some(0o600))? {
+    if crate::state::write_managed_file(
+        &value_path,
+        json,
+        "cline",
+        Some(0o600),
+        &WellFormedJsonValidator,
+    )? {
         changes.push(format!("wrote {}", value_path.display()));
     }
 
@@ -98,7 +105,15 @@ fn install_cline_policy_launchd(json: &str, changes: &mut Vec<String>) -> Result
 "#,
         value_path = value_path.display()
     );
-    if crate::state::write_managed_file(&plist_path, &plist_contents, "cline", Some(0o644))? {
+    // launchd plist is XML; we don't have an XML validator. plutil-lint via
+    // CommandValidator could be added later; for now skip schema check.
+    if crate::state::write_managed_file(
+        &plist_path,
+        &plist_contents,
+        "cline",
+        Some(0o644),
+        &NoopValidator,
+    )? {
         changes.push(format!("wrote {}", plist_path.display()));
     }
 
@@ -251,7 +266,14 @@ impl AgentDescriptor for Cline {
         let loader_changes = super::prestage::ensure_env_loader()?;
         changes.extend(loader_changes);
         let env_file = crate::state::env_dir()?.join("cline-policy.sh");
-        if crate::state::write_managed_file(&env_file, &contents, "cline", Some(0o600))? {
+        // Shell env file (export VAR='...') — opaque text, no schema.
+        if crate::state::write_managed_file(
+            &env_file,
+            &contents,
+            "cline",
+            Some(0o600),
+            &NoopValidator,
+        )? {
             changes.push(format!("wrote {}", env_file.display()));
         }
 
@@ -317,7 +339,7 @@ impl AgentDescriptor for Cline {
                 inbound_key,
             );
             if mcp_result.changed {
-                write_json_value(&mcp_path, &settings, "cline")?;
+                write_json_value(&mcp_path, &settings, "cline", &WellFormedJsonValidator)?;
                 changes.push(format!("rewrote MCP servers in {}", mcp_path.display()));
             }
             if !mcp_result.http_rewrites.is_empty() {
@@ -339,7 +361,12 @@ impl AgentDescriptor for Cline {
             }
         }
         if state_changed {
-            write_json_value(&global_state_path, &state, "cline")?;
+            write_json_value(
+                &global_state_path,
+                &state,
+                "cline",
+                &WellFormedJsonValidator,
+            )?;
             changes.push(format!(
                 "wrote base URLs in {}",
                 global_state_path.display()
@@ -371,7 +398,12 @@ impl AgentDescriptor for Cline {
                     }
                 }
                 if changed {
-                    write_json_value(&global_state_path, &state, "cline")?;
+                    write_json_value(
+                        &global_state_path,
+                        &state,
+                        "cline",
+                        &WellFormedJsonValidator,
+                    )?;
                     println!(
                         "Removed base URL overrides from {}",
                         global_state_path.display()

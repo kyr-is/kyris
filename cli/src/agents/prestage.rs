@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
+use crate::config_writer::NoopValidator;
 use crate::state::{ensure_line, env_dir, load_or_init_config, write_managed_file};
 
 use super::registry::{self, AgentDescriptor};
@@ -75,11 +76,13 @@ fn prestage_env(
     let mut changes = ensure_env_loader()?;
 
     let env_file = env_dir()?.join(format!("{}.sh", agent.id()));
+    // Shell env file (export VAR=...) — opaque text.
     if write_managed_file(
         &env_file,
         &exports_to_shell(&exports),
         "agents",
         Some(0o600),
+        &NoopValidator,
     )? {
         changes.push(format!("wrote {}", env_file.display()));
     }
@@ -96,7 +99,14 @@ pub fn ensure_env_loader() -> Result<Vec<String>, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let mut changes = Vec::new();
 
-    if write_managed_file(&loader_path, ENV_LOADER_SOURCE, "agents", Some(0o600))? {
+    // Shell loader script — opaque text.
+    if write_managed_file(
+        &loader_path,
+        ENV_LOADER_SOURCE,
+        "agents",
+        Some(0o600),
+        &NoopValidator,
+    )? {
         changes.push(format!("wrote {}", loader_path.display()));
     }
 

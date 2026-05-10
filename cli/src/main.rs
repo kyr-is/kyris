@@ -15,8 +15,10 @@
 #![cfg_attr(test, allow(non_snake_case))]
 
 mod agents;
+mod always_cmd;
 mod check;
 mod compile_policy;
+mod config_writer;
 mod continue_cmd;
 mod hook_cmd;
 mod integration;
@@ -33,7 +35,7 @@ mod version;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "kyris")]
+#[command(name = "kyris", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -42,6 +44,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Agents(agents::AgentsArgs),
+    Always(always_cmd::AlwaysArgs),
     Timeline(query::timeline::TimelineArgs),
     Replay(query::replay::ReplayArgs),
     Stats(query::stats::StatsArgs),
@@ -68,6 +71,7 @@ fn main() {
 
     match cli.command {
         Command::Agents(args) => agents::run(args),
+        Command::Always(args) => always_cmd::run(args),
         Command::Timeline(args) => query::timeline::run(args),
         Command::Replay(args) => query::replay::run(args),
         Command::Stats(args) => query::stats::run(args),
@@ -172,6 +176,36 @@ mod tests {
     #[test]
     fn testParseVerifyPostUninstall() {
         assert!(try_parse(&["verify", "--post-uninstall"]).is_ok());
+    }
+
+    #[test]
+    fn testParseAlwaysList() {
+        assert!(try_parse(&["always", "list"]).is_ok());
+    }
+
+    #[test]
+    fn testParseAlwaysRevokeNamed() {
+        assert!(try_parse(&["always", "revoke", "git·status"]).is_ok());
+    }
+
+    #[test]
+    fn testParseAlwaysRevokeLast() {
+        assert!(try_parse(&["always", "revoke", "--last"]).is_ok());
+    }
+
+    #[test]
+    fn testParseAlwaysRevokeNoArgsFails() {
+        assert!(try_parse(&["always", "revoke"]).is_err());
+    }
+
+    #[test]
+    fn testParseAlwaysRevokeBothArgsFails() {
+        assert!(try_parse(&["always", "revoke", "--last", "git·status"]).is_err());
+    }
+
+    #[test]
+    fn testParseAlwaysNoSubcommandFails() {
+        assert!(try_parse(&["always"]).is_err());
     }
 
     #[test]

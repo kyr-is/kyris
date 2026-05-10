@@ -3,6 +3,7 @@
 pub mod claude_code;
 pub mod cline;
 pub mod codex_cli;
+pub mod codex_cli_schema;
 pub mod configure;
 pub mod display;
 pub mod gemini_cli;

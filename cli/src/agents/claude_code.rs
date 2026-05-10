@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
+use crate::config_writer::WellFormedJsonValidator;
 use crate::integration::{read_json_value, write_json_value};
 
 use super::probe::{
@@ -153,7 +154,12 @@ impl AgentDescriptor for ClaudeCode {
                 inbound_key,
             );
             if mcp_result.changed {
-                write_json_value(&settings_path, &settings, "claude-code")?;
+                write_json_value(
+                    &settings_path,
+                    &settings,
+                    "claude-code",
+                    &WellFormedJsonValidator,
+                )?;
                 changes.push(format!(
                     "rewrote MCP servers in {}",
                     settings_path.display()

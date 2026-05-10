@@ -3,6 +3,7 @@
 use clap::Args;
 use std::path::PathBuf;
 
+use crate::config_writer::NoopValidator;
 use crate::service::{ServiceKind, service_state, start_service};
 use crate::state::{
     bin_dir, ensure_line, ensure_parent, hooks_dir, load_or_init_config, write_managed_bytes,
@@ -10,6 +11,7 @@ use crate::state::{
 };
 
 const HOOKS_COMPONENT: &str = "hooks";
+const KYRIS_COMPONENT: &str = "kyris";
 const KYRISD_COMPONENT: &str = "kyrisd";
 const KYRIS_MCP_COMPONENT: &str = "kyris-mcp";
 const KYRIS_HOOK_COMPONENT: &str = "kyris-hook";
@@ -43,6 +45,7 @@ pub fn run(_args: InstallArgs) {
             HOOKS_COMPONENT,
             install_shell_hooks as fn() -> Result<Vec<String>, String>,
         ),
+        (KYRIS_COMPONENT, install_kyris_binary),
         (KYRISD_COMPONENT, install_kyrisd_binary),
         (KYRIS_MCP_COMPONENT, install_kyris_mcp_binary),
         (KYRIS_HOOK_COMPONENT, install_kyris_hook_binary),
@@ -123,7 +126,8 @@ fn install_shell_hooks() -> Result<Vec<String>, String> {
         ("bash_env.sh", BASH_ENV_SOURCE),
     ] {
         let path = hooks_dir.join(name);
-        if write_managed_file(&path, contents, "hooks", Some(0o755))? {
+        // Shell hook scripts — opaque text.
+        if write_managed_file(&path, contents, "hooks", Some(0o755), &NoopValidator)? {
             changes.push(format!("wrote {}", path.display()));
         }
     }
@@ -193,7 +197,14 @@ fn install_bash_env_launchd(home: &str, changes: &mut Vec<String>) -> Result<(),
 "#
     );
 
-    if write_managed_file(&plist_path, &plist_contents, "hooks", Some(0o644))? {
+    // launchd plist (XML) — no XML validator wired yet; safe to skip.
+    if write_managed_file(
+        &plist_path,
+        &plist_contents,
+        "hooks",
+        Some(0o644),
+        &NoopValidator,
+    )? {
         changes.push(format!("wrote {}", plist_path.display()));
     }
 
@@ -223,6 +234,27 @@ fn install_kyrisd_binary() -> Result<Vec<String>, String> {
         "kyrisd",
         Some(ServiceKind::Kyrisd),
     )
+}
+
+fn install_kyris_binary() -> Result<Vec<String>, String> {
+    let current_exe =
+        std::env::current_exe().map_err(|e| format!("Cannot locate running kyris binary: {e}"))?;
+    let binary_bytes = std::fs::read(&current_exe)
+        .map_err(|e| format!("Cannot read {}: {e}", current_exe.display()))?;
+    let install_path = bin_dir()?.join("kyris");
+
+    let mut changes = ensure_bin_path(KYRIS_COMPONENT)?;
+    // Compiled binary — no schema check applies.
+    if write_managed_bytes(
+        &install_path,
+        &binary_bytes,
+        KYRIS_COMPONENT,
+        Some(0o755),
+        &NoopValidator,
+    )? {
+        changes.push(format!("wrote {}", install_path.display()));
+    }
+    Ok(changes)
 }
 
 fn install_kyris_mcp_binary() -> Result<Vec<String>, String> {
@@ -263,7 +295,14 @@ fn install_release_binary(
     let install_path = bin_dir()?.join(binary);
 
     let mut changes = ensure_bin_path("install")?;
-    if write_managed_bytes(&install_path, &binary_bytes, binary, Some(0o755))? {
+    // Compiled binary — no schema check applies.
+    if write_managed_bytes(
+        &install_path,
+        &binary_bytes,
+        binary,
+        Some(0o755),
+        &NoopValidator,
+    )? {
         changes.push(format!("wrote {}", install_path.display()));
     }
 
@@ -328,7 +367,14 @@ fn install_launchd_service(
     let mut changes = Vec::new();
     ensure_parent(&log_path)?;
     let plist_contents = launchd_plist(launchd_label(kind), binary_path, &log_path);
-    if write_managed_file(&plist_path, &plist_contents, component, Some(0o644))? {
+    // launchd plist (XML) — no XML validator wired yet.
+    if write_managed_file(
+        &plist_path,
+        &plist_contents,
+        component,
+        Some(0o644),
+        &NoopValidator,
+    )? {
         changes.push(format!("wrote {}", plist_path.display()));
     }
 

@@ -3,7 +3,10 @@
 use chrono::Utc;
 use kyris_core::config::KyrisdConfig;
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use crate::config_writer::{ConfigValidator, WellFormedYamlValidator};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
@@ -125,7 +128,16 @@ pub fn save_config(config: &KyrisdConfig) -> Result<(), String> {
     let path = config_path()?;
     let contents =
         serde_saphyr::to_string(config).map_err(|e| format!("Cannot serialize config: {e}"))?;
-    let _ = write_managed_file(&path, &contents, "config", Some(0o600))?;
+    // KyrisdConfig is the source of truth for the YAML schema, so a
+    // shape-validator would be redundant — `serde_saphyr::to_string` already
+    // proves the value round-trips. Verify well-formedness as cheap insurance.
+    let _ = write_managed_file(
+        &path,
+        &contents,
+        "config",
+        Some(0o600),
+        &WellFormedYamlValidator,
+    )?;
     Ok(())
 }
 
@@ -157,11 +169,15 @@ pub fn ensure_line(path: &Path, line: &str, component: &str) -> Result<bool, Str
     Ok(true)
 }
 
+/// Write `contents` to `path` if different from existing. Validation runs
+/// before any disk mutation; the actual write is atomic (temp file in same
+/// dir + fsync + rename) so a crash mid-write leaves the original intact.
 pub fn write_managed_file(
     path: &Path,
     contents: &str,
     component: &str,
     mode: Option<u32>,
+    validator: &dyn ConfigValidator,
 ) -> Result<bool, String> {
     if path.exists() {
         let existing = std::fs::read_to_string(path)
@@ -171,21 +187,26 @@ pub fn write_managed_file(
         }
     }
 
+    validator
+        .validate(contents)
+        .map_err(|e| format!("validation failed for {}: {e}", path.display()))?;
+
     backup_existing(path, component)?;
     ensure_parent(path)?;
-    std::fs::write(path, contents).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-    if let Some(mode) = mode {
-        set_permissions(path, mode)?;
-    }
+    atomic_write(path, contents.as_bytes(), mode)?;
     record_manifest(path, None, component)?;
     Ok(true)
 }
 
+/// Binary equivalent of `write_managed_file`. Validators run on the raw bytes
+/// after a UTF-8 lossy decode, so use `NoopValidator` for genuinely binary
+/// content (compiled binaries, etc.) where validation is meaningless.
 pub fn write_managed_bytes(
     path: &Path,
     contents: &[u8],
     component: &str,
     mode: Option<u32>,
+    validator: &dyn ConfigValidator,
 ) -> Result<bool, String> {
     if path.exists() {
         let existing =
@@ -195,14 +216,45 @@ pub fn write_managed_bytes(
         }
     }
 
+    // For binary callers using NoopValidator the decode is wasted work
+    // (multi-MB binaries → multi-MB allocation), so skip it explicitly.
+    // Text-bearing bytes that need real validation pay the lossy-decode cost.
+    if !validator.is_noop() {
+        let as_str = String::from_utf8_lossy(contents);
+        validator
+            .validate(&as_str)
+            .map_err(|e| format!("validation failed for {}: {e}", path.display()))?;
+    }
+
     backup_existing(path, component)?;
     ensure_parent(path)?;
-    std::fs::write(path, contents).map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-    if let Some(mode) = mode {
-        set_permissions(path, mode)?;
-    }
+    atomic_write(path, contents, mode)?;
     record_manifest(path, None, component)?;
     Ok(true)
+}
+
+/// Atomic write: temp file in the same directory as `path`, fsync, rename.
+/// Same-directory matters — POSIX rename is atomic only within a filesystem,
+/// and using the parent directory guarantees that. Permissions are applied
+/// to the temp file BEFORE the rename so the final file is never visible
+/// with default tempfile permissions.
+fn atomic_write(path: &Path, contents: &[u8], mode: Option<u32>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Cannot resolve parent of {}", path.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| format!("Cannot create temp file in {}: {e}", parent.display()))?;
+    tmp.write_all(contents)
+        .map_err(|e| format!("Cannot write temp file: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("Cannot fsync temp file: {e}"))?;
+    if let Some(mode) = mode {
+        set_permissions(tmp.path(), mode)?;
+    }
+    tmp.persist(path)
+        .map_err(|e| format!("Cannot persist {}: {}", path.display(), e.error))?;
+    Ok(())
 }
 
 pub fn load_manifest() -> Result<Vec<ManifestEntry>, String> {

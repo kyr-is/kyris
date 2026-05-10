@@ -5,6 +5,7 @@ use kyris_core::sync::EnrollmentResponse;
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 
+use crate::config_writer::JsonShapeValidator;
 use crate::service::{ServiceKind, restart_service, service_state};
 use crate::state::{credentials_path, load_or_init_config, save_config, write_managed_file};
 
@@ -252,7 +253,11 @@ fn write_credentials(credentials: &EnrollmentResponse) -> Result<(), String> {
     let path = credentials_path()?;
     let contents = serde_json::to_string_pretty(credentials)
         .map_err(|e| format!("Cannot serialize enrollment credentials: {e}"))?;
-    let _ = write_managed_file(&path, &contents, "credentials", Some(0o600))?;
+    // Validate the round-trip against the same EnrollmentResponse shape — if
+    // the serializer ever produces output the deserializer can't read, this
+    // catches it before it lands on disk.
+    let validator = JsonShapeValidator::<EnrollmentResponse>::new();
+    let _ = write_managed_file(&path, &contents, "credentials", Some(0o600), &validator)?;
     Ok(())
 }
 

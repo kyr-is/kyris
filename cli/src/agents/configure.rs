@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{
     ensure_json_command_hook, read_json_value, set_json_string_path, write_json_value,
 };
@@ -38,13 +39,23 @@ pub(super) fn install_live_hook_adapter(
     let script_source = hook_script_source(agent_id);
     let mut changes = Vec::new();
 
-    if write_managed_file(script_path, &script_source, component, Some(0o755))? {
+    // Hook script is opaque shell — no schema to validate against.
+    if write_managed_file(
+        script_path,
+        &script_source,
+        component,
+        Some(0o755),
+        &NoopValidator,
+    )? {
         changes.push(format!("wrote {}", script_path.display()));
     }
 
     let mut hooks = read_json_value(hooks_file_path)?;
     if ensure_json_command_hook(&mut hooks, hook_phase, &shell_command(script_path), nested) {
-        write_json_value(hooks_file_path, &hooks, component)?;
+        // Hooks file format varies per agent (claude/cline/codex/gemini have
+        // different shapes); well-formedness is the safe baseline. Per-agent
+        // shape validators can be added incrementally.
+        write_json_value(hooks_file_path, &hooks, component, &WellFormedJsonValidator)?;
         changes.push(format!("updated {}", hooks_file_path.display()));
     }
 
@@ -234,7 +245,7 @@ pub(super) fn apply_json_config_rewrites(
     }
     let mut changes = Vec::new();
     if config_changed {
-        write_json_value(config_path, &config, component)?;
+        write_json_value(config_path, &config, component, &WellFormedJsonValidator)?;
         changes.push(format!("updated {}", config_path.display()));
     }
     Ok(changes)
@@ -278,6 +289,7 @@ pub fn upsert_mcp_upstreams(rewrites: &[(String, String)]) -> Result<bool, Strin
                 .push(kyris_core::config::McpServerConfig {
                     name: name.clone(),
                     upstream: upstream.clone(),
+                    working_dir: None,
                 });
             changed = true;
         }

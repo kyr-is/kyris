@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
+use crate::config_writer::WellFormedJsonValidator;
 use crate::integration::{read_json_value, set_json_value_path, write_json_value};
 use crate::state::restore_manifest_entry;
 
@@ -142,7 +143,7 @@ impl AgentDescriptor for OpenCode {
             }
         }
         if config_changed {
-            write_json_value(&path, &config, "opencode")?;
+            write_json_value(&path, &config, "opencode", &WellFormedJsonValidator)?;
             changes.push(format!("updated {}", path.display()));
         }
 
@@ -183,7 +184,7 @@ impl AgentDescriptor for OpenCode {
             inbound_key,
         );
         if mcp_result.changed {
-            write_json_value(&path, &config, "opencode")?;
+            write_json_value(&path, &config, "opencode", &WellFormedJsonValidator)?;
             changes.push(format!("rewrote MCP servers in {}", path.display()));
         }
         if !mcp_result.http_rewrites.is_empty() {

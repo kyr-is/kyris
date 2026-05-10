@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use clap::Args;
 use serde::Deserialize;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 
 use crate::state::load_or_init_config;
 
@@ -81,7 +81,10 @@ pub fn run(_args: PendingArgs) {
                         request.held_since_ms / 1000,
                     );
 
-                    let Some(decision) = prompt_decision(&request) else {
+                    let stdin = std::io::stdin();
+                    let mut reader = BufReader::new(stdin.lock());
+                    let mut writer = std::io::stdout().lock();
+                    let Some(decision) = prompt_decision(&request, &mut reader, &mut writer) else {
                         continue;
                     };
 
@@ -116,13 +119,24 @@ pub fn run(_args: PendingArgs) {
     });
 }
 
-fn prompt_decision(request: &PendingRequest) -> Option<&'static str> {
+/// Display the approval prompt and read the user's response. The reader and
+/// writer are injected so unit tests can drive the prompt without real stdin.
+fn prompt_decision<R: BufRead, W: Write>(
+    request: &PendingRequest,
+    reader: &mut R,
+    writer: &mut W,
+) -> Option<&'static str> {
     let tool = request.tool.as_deref().unwrap_or("unknown");
-    print!("Approve {} / {}? [y/n/always/skip] ", request.server, tool);
-    let _ = std::io::stdout().flush();
+    write!(
+        writer,
+        "Approve {} / {}? [y/n/always/skip] ",
+        request.server, tool
+    )
+    .ok()?;
+    writer.flush().ok()?;
 
     let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
+    if reader.read_line(&mut input).is_err() {
         return None;
     }
 
@@ -186,5 +200,106 @@ mod tests {
         let resp: PendingResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.requests.len(), 1);
         assert!(resp.requests[0].tool.is_none());
+    }
+
+    fn fixture(server: &str, tool: Option<&str>) -> PendingRequest {
+        PendingRequest {
+            id: "req-1".to_string(),
+            server: server.to_string(),
+            tool: tool.map(str::to_string),
+            state: "held".to_string(),
+            held_since_ms: 0,
+        }
+    }
+
+    fn run_prompt(server: &str, tool: Option<&str>, input: &str) -> (Option<&'static str>, String) {
+        let req = fixture(server, tool);
+        let mut reader = std::io::Cursor::new(input.as_bytes().to_vec());
+        let mut writer: Vec<u8> = Vec::new();
+        let decision = prompt_decision(&req, &mut reader, &mut writer);
+        (decision, String::from_utf8(writer).expect("utf8"))
+    }
+
+    #[test]
+    fn testPromptDisplaysServerToolAndChoices() {
+        let (_, displayed) = run_prompt("github", Some("read_file"), "y\n");
+        assert!(
+            displayed.contains("Approve"),
+            "missing 'Approve' verb in: {displayed}"
+        );
+        assert!(
+            displayed.contains("github"),
+            "missing server name in: {displayed}"
+        );
+        assert!(
+            displayed.contains("read_file"),
+            "missing tool name in: {displayed}"
+        );
+        assert!(
+            displayed.contains("[y/n/always/skip]"),
+            "missing choice list in: {displayed}"
+        );
+    }
+
+    #[test]
+    fn testPromptUnknownToolDisplaysPlaceholder() {
+        let (_, displayed) = run_prompt("github", None, "n\n");
+        assert!(
+            displayed.contains("unknown"),
+            "missing 'unknown' placeholder for null tool in: {displayed}"
+        );
+    }
+
+    #[test]
+    fn testPromptApprovedReturnsApproved() {
+        let (decision, _) = run_prompt("github", Some("read_file"), "y\n");
+        assert_eq!(decision, Some("approved"));
+    }
+
+    #[test]
+    fn testPromptDeniedReturnsDenied() {
+        let (decision, _) = run_prompt("github", Some("read_file"), "n\n");
+        assert_eq!(decision, Some("denied"));
+    }
+
+    #[test]
+    fn testPromptAlwaysReturnsAlways() {
+        let (decision, _) = run_prompt("github", Some("read_file"), "always\n");
+        assert_eq!(decision, Some("always"));
+    }
+
+    #[test]
+    fn testPromptSkipReturnsNone() {
+        let (decision, _) = run_prompt("github", Some("read_file"), "skip\n");
+        assert!(
+            decision.is_none(),
+            "skip should map to None (treated as no-op by caller)"
+        );
+    }
+
+    #[test]
+    fn testPromptEmptyInputReturnsNone() {
+        let (decision, _) = run_prompt("github", Some("read_file"), "\n");
+        assert!(decision.is_none(), "empty input should map to None");
+    }
+
+    #[test]
+    fn testPromptEofReturnsNone() {
+        // Empty buffer simulates EOF — read_line returns Ok(0) which we treat
+        // as no decision; tests the path that catches stdin closure.
+        let (decision, _) = run_prompt("github", Some("read_file"), "");
+        assert!(decision.is_none(), "EOF should map to None");
+    }
+
+    #[test]
+    fn testPromptIsFlushedBeforeRead() {
+        // Verifies the prompt is fully written before we try to read input —
+        // without flush, the prompt could sit in the buffer while the user
+        // types blind. Vec<u8> writes are synchronous so flush is a no-op
+        // there, but the call must still succeed (no panic, returns Some).
+        let (decision, displayed) = run_prompt("github", Some("read_file"), "y\n");
+        assert_eq!(decision, Some("approved"));
+        // The full prompt must appear before any decision logic completes.
+        assert!(displayed.ends_with("[y/n/always/skip] "));
     }
 }
