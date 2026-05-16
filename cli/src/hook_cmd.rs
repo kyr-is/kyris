@@ -26,6 +26,29 @@ pub struct HookArgs {
 #[derive(clap::Subcommand)]
 pub enum HookCommand {
     Check(HookCheckArgs),
+    /// Delegate a `PACT_ASK` or circuit-breaker approval to kyrisd's
+    /// pending-approval system. Used by shell hooks in non-interactive
+    /// (no-TTY) shells where prompting is impossible. Blocks until the
+    /// developer resolves the request via `kyris pending`, then sends
+    /// `permission.respond` to agentpactd and exits 0 (approved) or
+    /// non-zero (denied/failed).
+    Hold(HookHoldArgs),
+}
+
+#[derive(Args)]
+pub struct HookHoldArgs {
+    /// Approval ID from agentpactd (`req_id` field in kyris-hook output).
+    #[arg(long)]
+    pub req_id: String,
+    /// Approval token from agentpactd.
+    #[arg(long)]
+    pub token: String,
+    /// Human-readable description shown in `kyris pending` (the command text).
+    #[arg(long)]
+    pub display: String,
+    /// Path to the agentpactd UDS socket (defaults to the standard location).
+    #[arg(long)]
+    pub socket: Option<String>,
 }
 
 #[derive(Args)]
@@ -37,7 +60,31 @@ pub struct HookCheckArgs {
 pub fn run(args: HookArgs) {
     match args.command {
         HookCommand::Check(check_args) => run_check(check_args),
+        HookCommand::Hold(hold_args) => run_hold(hold_args),
     }
+}
+
+fn run_hold(args: HookHoldArgs) {
+    let sock_path = args
+        .socket
+        .unwrap_or_else(|| agentpact::default_socket_path().display().to_string());
+    let socket_timeout = std::time::Duration::from_secs(5);
+
+    // Reuse resolve_ask: it holds the request in kyrisd's pending system,
+    // polls for developer resolution, sends permission.respond to agentpactd,
+    // and returns the exit code.  EmptyStdout means no extra output — the
+    // shell hook only cares about the exit code.
+    let ask_ctx = AskContext {
+        allow_response: &AllowResponse::EmptyStdout,
+        approval_id: &args.req_id,
+        approval_token: &args.token,
+        server: &args.display,
+        tool: "",
+        sock_path: &sock_path,
+        socket_timeout,
+    };
+    let exit_code = resolve_ask(&ask_ctx);
+    std::process::exit(exit_code);
 }
 
 fn discover_agent_pid() -> Option<u32> {
@@ -150,7 +197,7 @@ fn run_check(args: HookCheckArgs) {
             emit_allow(&allow_response);
             std::process::exit(0);
         }
-        Ok(McpPermissionDecision::Deny(reason)) | Err(reason) => {
+        Ok(McpPermissionDecision::Deny { reason, .. }) | Err(reason) => {
             emit_deny(&reason);
             std::process::exit(2);
         }

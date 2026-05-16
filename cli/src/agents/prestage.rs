@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::config_writer::NoopValidator;
+use crate::lifecycle::log::InstallLog;
 use crate::state::{ensure_line, env_dir, load_or_init_config, write_managed_file};
 
 use super::registry::{self, AgentDescriptor};
@@ -15,7 +16,7 @@ for file in "$HOME/.kyris/env/"*.sh; do
 done
 "#;
 
-pub fn prestage_all() -> Result<(), String> {
+pub fn prestage_all(log: Option<&InstallLog>) -> Result<(), String> {
     let config = load_or_init_config()?;
     let base_url = config.base_url();
     let inbound_key = &config.server.inbound_key;
@@ -24,8 +25,14 @@ pub fn prestage_all() -> Result<(), String> {
         let changes = prestage_agent_inner(agent.as_ref(), &base_url, inbound_key)?;
         if !changes.is_empty() {
             println!("Prestaged {}:", agent.id());
+            if let Some(l) = log {
+                l.info(&format!("prestaged {}", agent.id()));
+            }
             for change in &changes {
                 println!("  {change}");
+                if let Some(l) = log {
+                    l.info(&format!("  {} {change}", agent.id()));
+                }
             }
         }
     }

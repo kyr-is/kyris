@@ -1,8 +1,14 @@
 # SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
+# shellcheck shell=bash
 # Kyris Bash hook: extdebug + DEBUG trap. Requires kyris-hook on PATH.
 # Compatible with macOS system Bash (3.2) and modern Bash (5.x).
 # No Bash 4+ features (no associative arrays, no readarray, no ${var,,}).
+#
+# This file is sourced (not executed); the shellcheck shell directive
+# above tells shellcheck which dialect to apply without polluting the
+# file with a shebang that would mislead "is this script executable?"
+# tooling.
 
 if command -v kyris >/dev/null 2>&1; then
     kyris agents reconcile --auto >/dev/null 2>&1 &
@@ -29,7 +35,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         }
     fi
@@ -57,7 +63,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         }
         output=$(kyris-hook check "$cmd" --cwd "$PWD" --socket "$sock")
@@ -69,7 +75,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         fi
     fi
@@ -99,8 +105,24 @@ __kyris_preexec() {
     esac
 }
 
+__kyris_have_tty() {
+    [ -e /dev/tty ] && { exec 3</dev/tty; } 2>/dev/null && exec 3>&-
+}
+
 __kyris_circuit_breaker_prompt() {
     local cmd="$1" sock="$2" req_id="$3" token="$4" count="$5"
+    if ! __kyris_have_tty; then
+        if command -v kyris >/dev/null 2>&1; then
+            kyris hook hold --req-id "$req_id" --token "$token" \
+                --display "circuit-breaker (${count} commands): $cmd" \
+                --socket "$sock" 2>/dev/null
+            return $?
+        else
+            kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                --token "$token" --response denied 2>/dev/null
+            return 1
+        fi
+    fi
     printf '\033[33m[kyris] circuit breaker:\033[0m %s commands without human input. Review: kyris timeline --last 10. [y/n] ' "$count" >&2
     read -r answer < /dev/tty
     case "$answer" in
@@ -120,6 +142,17 @@ __kyris_circuit_breaker_prompt() {
 
 __kyris_prompt_user() {
     local cmd="$1" sock="$2" req_id="$3" token="$4"
+    if ! __kyris_have_tty; then
+        if command -v kyris >/dev/null 2>&1; then
+            kyris hook hold --req-id "$req_id" --token "$token" \
+                --display "$cmd" --socket "$sock" 2>/dev/null
+            return $?
+        else
+            kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                --token "$token" --response denied 2>/dev/null
+            return 1
+        fi
+    fi
     printf '\033[33m[kyris] allow?\033[0m %s [y/n/always] ' "$cmd" >&2
     read -r answer < /dev/tty
     case "$answer" in
@@ -146,7 +179,12 @@ __kyris_prompt_user() {
 
 __kyris_record_fail_open() {
     local cmd="$1"
-    local log="$HOME/.kyris/fail-open.jsonl"
+    # fail-open log lives under $XDG_STATE_HOME/kyris/ after the XDG
+    # migration (default $HOME/.local/state/kyris/fail-open.jsonl). The
+    # daemon's reader resolves the same path, so writer and reader agree.
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/kyris"
+    local log="$log_dir/fail-open.jsonl"
+    mkdir -p "$log_dir" 2>/dev/null
     local id ts esc_cmd esc_pwd
     id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || return
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)

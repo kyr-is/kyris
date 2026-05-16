@@ -3,6 +3,7 @@
 use chrono::Utc;
 use std::path::Path;
 
+use crate::lifecycle::log::InstallLog;
 use crate::state::{kyris_home, load_agent_profile, save_agent_profile};
 
 use super::profile::{AgentProfile, CapLevel};
@@ -71,7 +72,7 @@ fn file_contains_marker(path: &Path, markers: &[&str]) -> bool {
 
 pub type ReconcileResult = Result<Vec<(Box<dyn AgentDescriptor>, AgentProfile)>, String>;
 
-pub fn reconcile_all(auto: bool) -> ReconcileResult {
+pub fn reconcile_all(auto: bool, log: Option<&InstallLog>) -> ReconcileResult {
     if auto
         && let Ok(path) = last_reconcile_path()
         && should_skip_debounce(&path)
@@ -87,7 +88,7 @@ pub fn reconcile_all(auto: bool) -> ReconcileResult {
 
     let mut results = Vec::new();
     for agent in registry::all_agents() {
-        let profile = reconcile_agent(agent.as_ref())?;
+        let profile = reconcile_agent(agent.as_ref(), log)?;
         results.push((agent, profile));
     }
 
@@ -98,13 +99,16 @@ pub fn reconcile_all(auto: bool) -> ReconcileResult {
 pub fn reconcile_one(agent_id: &str) -> Result<AgentProfile, String> {
     let agent =
         registry::agent_by_id(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
-    let profile = reconcile_agent(agent.as_ref())?;
+    let profile = reconcile_agent(agent.as_ref(), None)?;
     touch_last_reconcile();
     Ok(profile)
 }
 
 #[allow(clippy::too_many_lines)]
-fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> {
+fn reconcile_agent(
+    agent: &dyn AgentDescriptor,
+    log: Option<&InstallLog>,
+) -> Result<AgentProfile, String> {
     let mut profile =
         load_agent_profile(agent.id())?.unwrap_or_else(|| AgentProfile::new_empty(agent.id()));
 
@@ -131,12 +135,19 @@ fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> 
             agent.id(),
             &profile.agent_specific,
             burn_control_native,
+            log,
         ) {
             Ok(()) => {
                 println!("Auto-configured {}", agent.id());
+                if let Some(l) = log {
+                    l.info(&format!("auto-configured {}", agent.id()));
+                }
             }
             Err(e) => {
                 eprintln!("Auto-configure {} failed: {e}", agent.id());
+                if let Some(l) = log {
+                    l.error(&format!("auto-configure {} failed: {e}", agent.id()));
+                }
             }
         }
         // Re-probe after configure to get updated surface states.
@@ -168,12 +179,19 @@ fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> 
             agent.id(),
             &profile.agent_specific,
             burn_control_native,
+            log,
         ) {
             Ok(()) => {
                 println!("Repaired {}", agent.id());
+                if let Some(l) = log {
+                    l.info(&format!("repaired {}", agent.id()));
+                }
             }
             Err(e) => {
                 eprintln!("Repair {} failed: {e}", agent.id());
+                if let Some(l) = log {
+                    l.error(&format!("repair {} failed: {e}", agent.id()));
+                }
             }
         }
         let updated = agent.probe();
@@ -212,9 +230,15 @@ fn reconcile_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> 
                 eprintln!("Burn-control cleanup for {} failed: {e}", agent.id());
             }
             if let Err(e) =
-                super::configure::configure_agent(agent.id(), &profile.agent_specific, true)
+                super::configure::configure_agent(agent.id(), &profile.agent_specific, true, log)
             {
                 eprintln!("Re-configure {} after promotion failed: {e}", agent.id());
+                if let Some(l) = log {
+                    l.error(&format!(
+                        "re-configure {} after promotion failed: {e}",
+                        agent.id()
+                    ));
+                }
             }
             profile.burn_control = super::profile::SurfaceState::native();
             let updated = agent.probe();

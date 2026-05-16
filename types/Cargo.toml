@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "kyris-types"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,6 +17,10 @@ schema = ["schemars"]
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# Explicitly authorized GA exception per forest/03-architecture.md §0.4 #1.
+# serde-saphyr is still 0.0.x; no GA alternative provides the same YAML+serde
+# integration. Used here only for test fixtures and the bundled pricing
+# include_str! parsing — no production runtime dependency.
 serde-saphyr = { workspace = true }
 utoipa = { version = "5.4", optional = true }
 schemars = { version = "1.2", optional = true }

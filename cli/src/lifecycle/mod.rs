@@ -6,6 +6,7 @@
 pub mod daemon_cmd;
 pub mod enroll;
 pub mod install;
+pub mod log;
 pub mod release;
 pub mod uninstall;
 pub mod update;

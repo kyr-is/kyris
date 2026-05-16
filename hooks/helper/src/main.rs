@@ -57,6 +57,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     if let Err(msg) = check_protocol_version(&socket_path) {
         eprintln!("[agentpact] {msg}");
+        log_error(&msg);
         return ExitCode::from(10);
     }
 
@@ -113,6 +114,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
         CheckResponse::Invalid(reason) => {
             eprintln!("[agentpact] {reason}");
+            log_error(&reason);
             ExitCode::from(1)
         }
     }
@@ -333,9 +335,43 @@ fn send_request(
     ))
 }
 
+// kyris-hook is intentionally standalone (no dependency on kyris-core) so
+// the hook stays a tiny binary. We inline the XDG path resolution that
+// kyris_core::paths exposes — keep both in sync.
+fn xdg_state_dir() -> String {
+    std::env::var("XDG_STATE_HOME").map_or_else(
+        |_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/.local/state/kyris")
+        },
+        |s| format!("{s}/kyris"),
+    )
+}
+
+fn log_error(msg: &str) {
+    let dir = xdg_state_dir();
+    let log_dir = format!("{dir}/log");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let path = format!("{log_dir}/kyris.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts = format_utc_timestamp(secs);
+    let _ = writeln!(file, "{ts} [kyris-hook] [ERROR] {msg}");
+}
+
 fn write_fail_open_event(action: &str, detail: &str, working_dir: &str) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = format!("{home}/.kyris/fail-open.jsonl");
+    let dir = xdg_state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{dir}/fail-open.jsonl");
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -648,13 +684,17 @@ mod tests {
     #[test]
     fn testWriteFailOpenEvent() {
         let dir = tempfile::tempdir().unwrap();
-        let kyris_dir = dir.path().join(".kyris");
-        std::fs::create_dir_all(&kyris_dir).unwrap();
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        // fail-open log lives under $XDG_STATE_HOME/kyris/ after the XDG
+        // migration. Set both HOME (fallback) and XDG_STATE_HOME to point
+        // at the tempdir so the new path resolves there.
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::set_var("XDG_STATE_HOME", dir.path().to_str().unwrap());
+        }
 
         write_fail_open_event("execute", "rm -rf /", "/home/user/project");
 
-        let path = kyris_dir.join("fail-open.jsonl");
+        let path = dir.path().join("kyris").join("fail-open.jsonl");
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(content.lines().next().unwrap()).unwrap();

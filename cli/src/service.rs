@@ -78,16 +78,48 @@ pub fn service_state(kind: ServiceKind) -> ServiceState {
 
 pub fn candidate_log_paths(kind: ServiceKind) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        match kind {
-            ServiceKind::Kyrisd => {
-                paths.push(home.join(".kyris").join("kyrisd.stderr.log"));
-                paths.push(home.join("Library").join("Logs").join("kyrisd.log"));
+    match kind {
+        ServiceKind::Kyrisd => {
+            // Unified log — all components write here; preferred for
+            // human diagnostics. Lives under XDG_STATE_HOME after the
+            // XDG migration.
+            paths.push(kyris_core::paths::log_path());
+            // Launchd-captured stderr fallback (full tracing output
+            // including DEBUG; exists when kyrisd runs under launchd).
+            paths.push(kyris_core::paths::stderr_log_path());
+            if let Ok(home) = std::env::var("HOME") {
+                paths.push(
+                    PathBuf::from(home)
+                        .join("Library")
+                        .join("Logs")
+                        .join("kyrisd.log"),
+                );
             }
-            ServiceKind::Agentpactd => {
-                paths.push(home.join(".agentpact").join("agentpactd.log"));
-                paths.push(home.join("Library").join("Logs").join("agentpactd.log"));
+        }
+        ServiceKind::Agentpactd => {
+            // agentpact moved its log dir under XDG_STATE_HOME with its
+            // own XDG migration. Honor the same env var; fall back to
+            // the default location under HOME.
+            let agentpact_log = if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+                PathBuf::from(state).join("agentpact").join("log")
+            } else if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("state")
+                    .join("agentpact")
+                    .join("log")
+            } else {
+                PathBuf::from("/tmp/agentpact/log")
+            };
+            paths.push(agentpact_log.join("daemon.stderr.log"));
+            paths.push(agentpact_log.join("daemon.stdout.log"));
+            if let Ok(home) = std::env::var("HOME") {
+                paths.push(
+                    PathBuf::from(home)
+                        .join("Library")
+                        .join("Logs")
+                        .join("agentpactd.log"),
+                );
             }
         }
     }

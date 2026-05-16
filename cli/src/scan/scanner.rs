@@ -17,6 +17,10 @@ pub enum FindingCategory {
     ApiKey,
     UngoverndAgent,
     DegradedAgent,
+    /// Agent is installed and governed by the vendor's own policy system
+    /// (e.g. Cursor Business, Windsurf Teams, GitHub Copilot org settings)
+    /// rather than by Kyris. Not ungoverned, but opaque to Kyris audit.
+    VendorNativeAgent,
     UngoverndMcp,
     LlmTraffic,
 }

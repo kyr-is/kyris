@@ -199,6 +199,10 @@ impl AgentDescriptor for OpenCode {
         Ok(())
     }
     fn undo_burn_control(&self) -> Result<(), String> {
+        // Remove MCP upstreams before restoring the config file.
+        let mcp_names = super::configure::mcp_server_names_from_agent(self);
+        super::configure::remove_mcp_upstreams(&mcp_names)?;
+
         for path in self.burn_control_config_paths() {
             if restore_manifest_entry(&path)? {
                 println!("Reverted {}", path.display());

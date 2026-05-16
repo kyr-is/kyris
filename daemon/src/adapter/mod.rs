@@ -92,13 +92,7 @@ pub async fn relay_trace_attach(
 }
 
 pub fn write_native_seen_breadcrumb(agent_id: &str) {
-    let Ok(home) = std::env::var("HOME") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(home)
-        .join(".kyris")
-        .join("agents")
-        .join(".native-seen");
+    let dir = kyris_core::paths::agents_dir().join(".native-seen");
     let path = dir.join(agent_id);
     if path.exists() {
         return;
@@ -231,7 +225,10 @@ mod tests {
     #[test]
     fn testWriteNativeSeenBreadcrumb() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        unsafe { std::env::set_var("HOME", temp.path()) };
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::remove_var("KYRIS_HOME");
+        }
         let dir = temp
             .path()
             .join(".kyris")

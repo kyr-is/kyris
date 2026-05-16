@@ -22,6 +22,8 @@ pub struct KyrisdConfig {
     pub stats: StatsConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
+    #[serde(default)]
+    pub spend: SpendConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +233,34 @@ impl Default for AgentsConfig {
             reconcile_interval_minutes: default_reconcile_interval_minutes(),
         }
     }
+}
+
+/// Spend warning configuration. Toasts fire when the rolling spend total
+/// crosses any threshold. Default: no thresholds (warnings disabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendConfig {
+    /// Dollar amounts at which to fire a toast notification. Each threshold
+    /// fires once when the rolling window total crosses it upward; resets
+    /// when spend drops back below (e.g. after the window rolls over).
+    /// Example: `[10.0, 50.0, 100.0]`
+    #[serde(default)]
+    pub warn_thresholds_usd: Vec<f64>,
+    /// Rolling window for spend aggregation in hours. Default: 24.
+    #[serde(default = "default_spend_window_hours")]
+    pub window_hours: u64,
+}
+
+impl Default for SpendConfig {
+    fn default() -> Self {
+        Self {
+            warn_thresholds_usd: Vec::new(),
+            window_hours: default_spend_window_hours(),
+        }
+    }
+}
+
+fn default_spend_window_hours() -> u64 {
+    24
 }
 
 fn default_reconcile_interval_minutes() -> u64 {

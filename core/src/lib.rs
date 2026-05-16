@@ -3,7 +3,9 @@
 //! Shared library layer. Re-exports `kyris-types` and adds I/O helpers:
 //! config loading with environment variable overrides, `AgentPact` protocol
 //! types, and governance coverage derivation logic.
-#![forbid(unsafe_code)]
+// `paths.rs` reads/writes env vars in its tests, so unsafe is required for
+// the env-mutation calls (Rust 2024 marks env mutation unsafe). Scope:
+// only the test helper in paths.rs uses unsafe; production code is safe.
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(non_snake_case))]
@@ -18,5 +20,6 @@ pub mod agentpact;
 pub mod config;
 pub mod coverage;
 pub mod fail_open_log;
+pub mod paths;
 #[cfg(feature = "pending")]
 pub mod pending;

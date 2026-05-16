@@ -5,21 +5,38 @@ use kyris_agentpact_client::{
     self as agentpact, ApprovalResponse as UserApprovalResponse, McpContext, ToolAnnotations,
 };
 
+pub use kyris_core::agentpact::DenyCode;
+
 #[derive(Debug, PartialEq)]
 pub enum PactDecision {
     Allow,
-    Deny(String),
+    Deny {
+        code: DenyCode,
+        reason: String,
+        /// Daemon-supplied recovery hint; `None` means use the static I-05 table.
+        hint: Option<String>,
+    },
 }
 
 type PermissionRequestOutcome = agentpact::McpPermissionDecision;
 
-fn daemon_unavailable_message() -> String {
-    agentpact::daemon_unavailable_message()
+fn daemon_unavailable_deny() -> PactDecision {
+    PactDecision::Deny {
+        code: DenyCode::DaemonUnreachable,
+        reason: agentpact::daemon_unavailable_message(),
+        hint: None,
+    }
 }
 
-fn no_tty_message() -> String {
-    "Kyris: tool requires approval but no terminal is available. Use 'kyris pending' to approve, adjust policy to 'auto', or run from a terminal."
-        .to_string()
+fn no_tty_deny() -> PactDecision {
+    PactDecision::Deny {
+        code: DenyCode::PolicyDenied,
+        reason: "tool requires approval but no terminal is available".to_string(),
+        hint: Some(
+            "Use 'kyris pending' to approve, adjust policy to 'auto', or run from a terminal"
+                .to_string(),
+        ),
+    }
 }
 
 fn agentpact_socket_path() -> String {
@@ -136,7 +153,11 @@ pub async fn check_permission_with_socket(
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
     if let Err(msg) = agentpact::check_protocol_compatibility() {
-        return PactDecision::Deny(msg);
+        return PactDecision::Deny {
+            code: DenyCode::PolicyError,
+            reason: msg,
+            hint: Some("Check that kyris and agentpactd use the same protocol version".to_string()),
+        };
     }
 
     let tool = tool_name.to_string();
@@ -173,13 +194,13 @@ pub async fn check_permission_with_socket(
             );
             return PactDecision::Allow;
         }
-        return PactDecision::Deny(daemon_unavailable_message());
+        return daemon_unavailable_deny();
     };
 
     match outcome {
         Ok(PermissionRequestOutcome::Allow) => PactDecision::Allow,
-        Ok(PermissionRequestOutcome::Deny(reason)) => {
-            PactDecision::Deny(format!("Blocked by policy: {reason}"))
+        Ok(PermissionRequestOutcome::Deny { code, reason, hint }) => {
+            PactDecision::Deny { code, reason, hint }
         }
         Ok(PermissionRequestOutcome::Ask {
             approval_id,
@@ -219,7 +240,11 @@ pub async fn check_permission_with_socket(
             );
             PactDecision::Allow
         }
-        Err(reason) => PactDecision::Deny(reason),
+        Err(reason) => PactDecision::Deny {
+            code: DenyCode::DaemonUnreachable,
+            reason,
+            hint: None,
+        },
     }
 }
 
@@ -240,13 +265,21 @@ async fn resolve_ask_via_tty(
         let user_response = prompt_user_tty(&server, &tool);
         match send_permission_response_with_socket(&socket, &token, user_response, timeout) {
             Ok(()) if user_response.allows_execution() => PactDecision::Allow,
-            Ok(()) => PactDecision::Deny("Blocked by policy".to_string()),
-            Err(reason) => PactDecision::Deny(reason),
+            Ok(()) => PactDecision::Deny {
+                code: DenyCode::PolicyDenied,
+                reason: "User denied".to_string(),
+                hint: None,
+            },
+            Err(reason) => PactDecision::Deny {
+                code: DenyCode::DaemonUnreachable,
+                reason,
+                hint: None,
+            },
         }
     })
     .await;
 
-    decision.unwrap_or_else(|_| PactDecision::Deny(daemon_unavailable_message()))
+    decision.unwrap_or_else(|_| daemon_unavailable_deny())
 }
 
 async fn resolve_ask_via_kyrisd(
@@ -280,7 +313,7 @@ async fn resolve_ask_via_kyrisd(
 
     match resolution {
         kyris_core::pending::Resolution::Approved => PactDecision::Allow,
-        kyris_core::pending::Resolution::Denied => PactDecision::Deny(no_tty_message()),
+        kyris_core::pending::Resolution::Denied => no_tty_deny(),
         kyris_core::pending::Resolution::Failed(_) => {
             deny_ask_immediately(approval_token, sock_path, socket_timeout).await
         }
@@ -304,7 +337,7 @@ async fn deny_ask_immediately(
         Err(e) => eprintln!("[kyris-mcp] deny task panicked: {e}"),
         Ok(Ok(())) => {}
     }
-    PactDecision::Deny(no_tty_message())
+    no_tty_deny()
 }
 
 fn allow_on_daemon_unavailable() -> bool {
@@ -373,7 +406,11 @@ mod tests {
         let response = serde_json::json!({"code": "PACT_DENIED", "reason": "blocked by policy"});
         assert_eq!(
             agentpact::parse_mcp_permission_response(&response),
-            PermissionRequestOutcome::Deny("blocked by policy".to_string())
+            PermissionRequestOutcome::Deny {
+                code: DenyCode::PolicyDenied,
+                reason: "blocked by policy".to_string(),
+                hint: None,
+            }
         );
     }
 
@@ -398,7 +435,11 @@ mod tests {
         let response = serde_json::json!({"result": "UNKNOWN"});
         assert_eq!(
             agentpact::parse_mcp_permission_response(&response),
-            PermissionRequestOutcome::Deny("invalid response from agentpactd".to_string())
+            PermissionRequestOutcome::Deny {
+                code: DenyCode::PolicyError,
+                reason: "invalid response from agentpactd".to_string(),
+                hint: None,
+            }
         );
     }
 
@@ -461,7 +502,13 @@ mod tests {
             std::time::Duration::from_millis(500),
         )
         .await;
-        assert_eq!(decision, PactDecision::Deny(no_tty_message()));
+        assert!(matches!(
+            decision,
+            PactDecision::Deny {
+                code: DenyCode::PolicyDenied,
+                ..
+            }
+        ));
 
         server.join().expect("join server");
         let _ = std::fs::remove_file(&socket_path);
@@ -541,7 +588,7 @@ mod tests {
             std::time::Duration::from_millis(100),
         )
         .await;
-        assert!(matches!(decision, PactDecision::Deny(_)));
+        assert!(matches!(decision, PactDecision::Deny { .. }));
     }
 
     #[tokio::test]
@@ -601,7 +648,11 @@ mod tests {
         .await;
         assert_eq!(
             decision,
-            PactDecision::Deny("Blocked by policy: blocked by admin".to_string())
+            PactDecision::Deny {
+                code: DenyCode::PolicyDenied,
+                reason: "blocked by admin".to_string(),
+                hint: None,
+            }
         );
         server.join().expect("join");
         let _ = std::fs::remove_file(&socket_path);

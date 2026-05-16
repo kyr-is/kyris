@@ -10,6 +10,83 @@ use agentpact::policy::loader::{
 };
 use agentpact::protocol::types::Permission;
 
+/// Filesystem access mode for a single path glob, modeled after Codex CLI's
+/// `FileSystemAccessMode` (`codex-rs/protocol/src/permissions.rs`). Lives in
+/// kyris — not in `AgentPact` — because the value set, wire form, and the
+/// fail-closed projection from `AgentPact`'s `Permission` are kyris-side
+/// implementation choices, not part of the `AgentPact` standard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAccessMode {
+    /// No access (deny both read and write).
+    None,
+    /// Read allowed, write denied.
+    #[allow(dead_code)] // reserved for future read-only path permission
+    Read,
+    /// Read and write allowed.
+    Write,
+}
+
+impl FileAccessMode {
+    /// Canonical wire token used in Codex's `[permissions.<profile>.filesystem]`
+    /// table. Matches `FileSystemAccessMode`'s `serde(rename_all = "lowercase")`.
+    #[must_use]
+    pub fn as_codex_token(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+/// Network-access primitive for a single domain or URL pattern, modeled after
+/// Codex CLI's `NetworkDomainPermission`. As with [`FileAccessMode`], the
+/// projection lives in kyris because network egress is non-interactive at
+/// the sandbox layer — `Ask` collapses to `Deny` (fail-closed). A different
+/// `AgentPact` implementation might choose a different mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAccess {
+    Allow,
+    Deny,
+}
+
+impl NetworkAccess {
+    /// Canonical wire token used in Codex's `[permissions.<profile>.network.domains]`
+    /// table.
+    #[must_use]
+    pub fn as_codex_token(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// Project an `AgentPact` `Permission` onto a Codex-style filesystem access mode
+/// for compiled (non-interactive) enforcement.
+///
+/// `Ask` fails closed at the sandbox layer because there is no prompt path
+/// at file-permission decision time. When a live `PreToolUse` hook is present,
+/// the hook is what interprets `Ask` interactively; the compiled config is
+/// defense-in-depth for the hook-down case.
+#[must_use]
+pub fn permission_to_file_mode(perm: Permission) -> FileAccessMode {
+    match perm {
+        Permission::Auto | Permission::Inform => FileAccessMode::Write,
+        Permission::Ask | Permission::Deny => FileAccessMode::None,
+    }
+}
+
+/// Project an `AgentPact` `Permission` onto a Codex-style network decision.
+/// See [`permission_to_file_mode`] for the fail-closed rationale.
+#[must_use]
+pub fn permission_to_network_access(perm: Permission) -> NetworkAccess {
+    match perm {
+        Permission::Auto | Permission::Inform => NetworkAccess::Allow,
+        Permission::Ask | Permission::Deny => NetworkAccess::Deny,
+    }
+}
+
 #[derive(Args)]
 pub struct CompilePolicyArgs {
     #[arg(long)]
@@ -376,6 +453,103 @@ pub fn serialize_gemini_policy_toml(rules: &serde_json::Value) -> String {
     out
 }
 
+/// Output of [`compile_codex_permissions_table`]: the two permission tables
+/// Codex CLI supports plus any precision-loss warnings.
+pub struct CodexPermissionsTable {
+    /// Entries for `[permissions.kyris.filesystem]`: path-glob → access mode.
+    pub filesystem: std::collections::BTreeMap<String, String>,
+    /// Entries for `[permissions.kyris.network.domains]`: hostname → "allow"|"deny".
+    /// URL path components are stripped; host is extracted.
+    pub network_domains: std::collections::BTreeMap<String, String>,
+    /// Warnings about policy dimensions that lost precision during compilation.
+    pub gaps: Vec<String>,
+}
+
+/// Compile `AgentPact` `paths` and `domains` policy into the two permission
+/// tables that Codex CLI supports natively.
+///
+/// **Filesystem** (`paths`): direct mapping — each path glob gets a Codex
+/// access mode via [`permission_to_file_mode`]. `Ask` fails closed to `none`.
+///
+/// **Network** (`domains`): host-only mapping — Codex matches by hostname, not
+/// URL path. If a domain key includes a path component (`"api.example.com/v2/*"`)
+/// the host is extracted (`"api.example.com"`) and the path is dropped with a
+/// gap warning. `Ask` fails closed to `deny`.
+///
+/// Empty tables are omitted; callers should skip writing `[permissions.kyris]`
+/// when both maps are empty.
+pub fn compile_codex_permissions_table(
+    policy_path: Option<&Path>,
+) -> Result<CodexPermissionsTable, String> {
+    let level = load_merged_policy(policy_path)?;
+
+    let mut filesystem = std::collections::BTreeMap::new();
+    let mut network_domains = std::collections::BTreeMap::new();
+    let mut url_paths_dropped: Vec<String> = Vec::new();
+    let mut ask_collapsed: Vec<String> = Vec::new();
+
+    for (path_glob, perm) in &level.paths {
+        if *perm == Permission::Ask {
+            ask_collapsed.push(path_glob.clone());
+        }
+        let mode = permission_to_file_mode(*perm);
+        filesystem.insert(path_glob.clone(), mode.as_codex_token().to_string());
+    }
+
+    for (domain_key, perm) in &level.domains {
+        let host = extract_host(domain_key);
+        if host != domain_key.as_str() {
+            url_paths_dropped.push(domain_key.clone());
+        }
+        if *perm == Permission::Ask {
+            ask_collapsed.push(domain_key.clone());
+        }
+        let access = permission_to_network_access(*perm);
+        network_domains.insert(host, access.as_codex_token().to_string());
+    }
+
+    let mut gaps = Vec::new();
+    if !url_paths_dropped.is_empty() {
+        gaps.push(format!(
+            "{} domain rule(s) had URL path components stripped — Codex matches host only: {}",
+            url_paths_dropped.len(),
+            url_paths_dropped.join(", ")
+        ));
+    }
+    if !ask_collapsed.is_empty() {
+        gaps.push(format!(
+            "{} ask rule(s) compiled as deny/none in [permissions.kyris] — no prompt path at Codex sandbox layer: {}",
+            ask_collapsed.len(),
+            ask_collapsed.join(", ")
+        ));
+    }
+
+    Ok(CodexPermissionsTable {
+        filesystem,
+        network_domains,
+        gaps,
+    })
+}
+
+/// Extract the hostname from a domain key, stripping any scheme prefix
+/// and URL path component.
+///
+/// - `"api.example.com"`        → `"api.example.com"`
+/// - `"api.example.com/v2/*"`   → `"api.example.com"`
+/// - `"https://api.example.com/v2"` → `"api.example.com"`
+fn extract_host(domain_key: &str) -> String {
+    let without_scheme = if let Some(pos) = domain_key.find("://") {
+        &domain_key[pos + 3..]
+    } else {
+        domain_key
+    };
+    without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
+}
+
 pub fn compile_mcp_tool_filters(
     policy_path: Option<&Path>,
 ) -> Result<HashMap<String, Vec<String>>, String> {
@@ -398,24 +572,18 @@ pub fn compile_mcp_tool_filters(
     Ok(filters)
 }
 
+/// Returns precision-loss warnings from compiling the current policy into
+/// Codex CLI's native permission tables.
+///
+/// Paths and domains are now compiled into `[permissions.kyris]` in
+/// `config.toml`. This function surfaces only what was lost in translation:
+/// URL path components stripped from domain keys (Codex is host-only) and
+/// ask rules that collapsed to deny/none (no prompt path at the sandbox layer).
+/// Returns an empty Vec when all rules compile without loss.
 pub fn detect_codex_gaps(policy_path: Option<&Path>) -> Vec<String> {
-    let Ok(level) = load_merged_policy(policy_path) else {
-        return Vec::new();
-    };
-    let mut gaps = Vec::new();
-    if !level.paths.is_empty() {
-        let count = level.paths.len();
-        gaps.push(format!(
-            "file-edit policy ({count} path rules) not enforceable in compiled mode — Codex CLI has no native file permission primitive"
-        ));
-    }
-    if !level.domains.is_empty() {
-        let count = level.domains.len();
-        gaps.push(format!(
-            "network policy ({count} domain rules) not enforceable in compiled mode — Codex CLI has no native network permission primitive"
-        ));
-    }
-    gaps
+    compile_codex_permissions_table(policy_path)
+        .map(|table| table.gaps)
+        .unwrap_or_default()
 }
 
 fn dirs_home() -> Result<std::path::PathBuf, String> {
@@ -955,7 +1123,8 @@ spec:
     }
 
     #[test]
-    fn testDetectCodexGapsWithPaths() {
+    fn testDetectCodexGapsCleanPathsAndDomains() {
+        // Paths and domains now compile cleanly — no gaps for these.
         let dir = tempfile::tempdir().unwrap();
         let policy_dir = dir.path().join(".agentpact").join("policy");
         std::fs::create_dir_all(&policy_dir).unwrap();
@@ -973,13 +1142,15 @@ spec:
     "/etc/secrets": deny
   domains:
     "example.com": auto
+    "*.evil.com": deny
 "#,
         );
 
         let gaps = detect_codex_gaps(Some(policy_dir.as_path()));
-        assert_eq!(gaps.len(), 2);
-        assert!(gaps[0].contains("2 path rules"));
-        assert!(gaps[1].contains("1 domain rules"));
+        assert!(
+            gaps.is_empty(),
+            "clean paths/domains should produce no gaps; got: {gaps:?}"
+        );
     }
 
     #[test]
@@ -996,5 +1167,271 @@ spec:
 
         let gaps = detect_codex_gaps(Some(policy_dir.as_path()));
         assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn testDetectCodexGapsUrlPathDropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".agentpact").join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+
+        writeTempYaml(
+            &policy_dir,
+            "domains.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: domains
+spec:
+  domains:
+    "api.example.com/v2/*": deny
+    "clean.example.com": auto
+"#,
+        );
+
+        let gaps = detect_codex_gaps(Some(policy_dir.as_path()));
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("URL path components stripped"));
+        assert!(gaps[0].contains("api.example.com/v2/*"));
+    }
+
+    #[test]
+    fn testDetectCodexGapsAskCollapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".agentpact").join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+
+        writeTempYaml(
+            &policy_dir,
+            "policy.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: asks
+spec:
+  paths:
+    "/home/user/sensitive/*": ask
+  domains:
+    "internal.corp": ask
+"#,
+        );
+
+        let gaps = detect_codex_gaps(Some(policy_dir.as_path()));
+        assert_eq!(
+            gaps.len(),
+            1,
+            "should report one ask-collapsed gap; got: {gaps:?}"
+        );
+        assert!(gaps[0].contains("ask rule(s) compiled as deny/none"));
+    }
+
+    // --- compile_codex_permissions_table ---
+
+    #[test]
+    fn testCompileCodexPermissionsTableClean() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        writeTempYaml(
+            &policy_dir,
+            "policy.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: mixed
+spec:
+  paths:
+    "/tmp/safe/*": auto
+    "/etc/secrets": deny
+  domains:
+    "api.example.com": auto
+    "*.evil.com": deny
+"#,
+        );
+
+        let table = compile_codex_permissions_table(Some(&policy_dir)).unwrap();
+        assert_eq!(table.filesystem["/tmp/safe/*"], "write");
+        assert_eq!(table.filesystem["/etc/secrets"], "none");
+        assert_eq!(table.network_domains["api.example.com"], "allow");
+        assert_eq!(table.network_domains["*.evil.com"], "deny");
+        assert!(table.gaps.is_empty());
+    }
+
+    #[test]
+    fn testCompileCodexPermissionsTableUrlPathStripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        writeTempYaml(
+            &policy_dir,
+            "policy.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: url-paths
+spec:
+  domains:
+    "api.example.com/v2/*": deny
+    "https://cdn.example.com/assets": auto
+    "clean.host.com": deny
+"#,
+        );
+
+        let table = compile_codex_permissions_table(Some(&policy_dir)).unwrap();
+        // Host extracted, path dropped.
+        assert_eq!(table.network_domains["api.example.com"], "deny");
+        assert_eq!(table.network_domains["cdn.example.com"], "allow");
+        assert_eq!(table.network_domains["clean.host.com"], "deny");
+        // Both stripped entries are grouped into one gap message.
+        assert_eq!(
+            table.gaps.len(),
+            1,
+            "one grouped URL-path gap expected; got: {:?}",
+            table.gaps
+        );
+        assert!(table.gaps[0].contains("URL path components stripped"));
+        assert!(table.gaps[0].contains("2 domain rule(s)"));
+    }
+
+    #[test]
+    fn testCompileCodexPermissionsTableAskCollapse() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        writeTempYaml(
+            &policy_dir,
+            "policy.yaml",
+            r#"apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: asks
+spec:
+  paths:
+    "/sensitive/*": ask
+  domains:
+    "internal.corp": ask
+"#,
+        );
+
+        let table = compile_codex_permissions_table(Some(&policy_dir)).unwrap();
+        assert_eq!(table.filesystem["/sensitive/*"], "none");
+        assert_eq!(table.network_domains["internal.corp"], "deny");
+        let combined = table.gaps.join(" ");
+        assert!(combined.contains("ask rule(s) compiled as deny/none"));
+    }
+
+    #[test]
+    fn testCompileCodexPermissionsTableEmpty() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        writeTempYaml(
+            &policy_dir,
+            "pact.yaml",
+            "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: empty\nspec: {}\n",
+        );
+
+        let table = compile_codex_permissions_table(Some(&policy_dir)).unwrap();
+        assert!(table.filesystem.is_empty());
+        assert!(table.network_domains.is_empty());
+        assert!(table.gaps.is_empty());
+    }
+
+    #[test]
+    fn testExtractHost() {
+        assert_eq!(extract_host("api.example.com"), "api.example.com");
+        assert_eq!(extract_host("api.example.com/v2/*"), "api.example.com");
+        assert_eq!(
+            extract_host("https://cdn.example.com/assets"),
+            "cdn.example.com"
+        );
+        assert_eq!(extract_host("http://localhost:8080/path"), "localhost:8080");
+        assert_eq!(extract_host("*.evil.com"), "*.evil.com");
+    }
+
+    // --- FileAccessMode / NetworkAccess projections ---
+
+    #[test]
+    fn testFileAccessModeCodexToken() {
+        assert_eq!(FileAccessMode::None.as_codex_token(), "none");
+        assert_eq!(FileAccessMode::Read.as_codex_token(), "read");
+        assert_eq!(FileAccessMode::Write.as_codex_token(), "write");
+    }
+
+    #[test]
+    fn testNetworkAccessCodexToken() {
+        assert_eq!(NetworkAccess::Allow.as_codex_token(), "allow");
+        assert_eq!(NetworkAccess::Deny.as_codex_token(), "deny");
+    }
+
+    #[test]
+    fn testPermissionToFileMode() {
+        // Auto and Inform both grant write — the "inform" log component is
+        // the live hook's responsibility, not the compiled sandbox config.
+        assert_eq!(
+            permission_to_file_mode(Permission::Auto),
+            FileAccessMode::Write
+        );
+        assert_eq!(
+            permission_to_file_mode(Permission::Inform),
+            FileAccessMode::Write
+        );
+        // Ask fails closed at the sandbox layer (no prompt path).
+        assert_eq!(
+            permission_to_file_mode(Permission::Ask),
+            FileAccessMode::None
+        );
+        assert_eq!(
+            permission_to_file_mode(Permission::Deny),
+            FileAccessMode::None
+        );
+    }
+
+    #[test]
+    fn testPermissionToNetworkAccess() {
+        assert_eq!(
+            permission_to_network_access(Permission::Auto),
+            NetworkAccess::Allow
+        );
+        assert_eq!(
+            permission_to_network_access(Permission::Inform),
+            NetworkAccess::Allow
+        );
+        assert_eq!(
+            permission_to_network_access(Permission::Ask),
+            NetworkAccess::Deny
+        );
+        assert_eq!(
+            permission_to_network_access(Permission::Deny),
+            NetworkAccess::Deny
+        );
+    }
+
+    #[test]
+    fn testDetectCodexGapsNoFalsePositivesForCleanPolicy() {
+        // Paths and domains compile fully — gaps only appear for precision loss
+        // (URL path components, ask collapse), not for the mere presence of rules.
+        let dir = tempfile::tempdir().unwrap();
+        let policy_dir = dir.path().join(".agentpact").join("policy");
+        std::fs::create_dir_all(&policy_dir).unwrap();
+        writeTempYaml(
+            &policy_dir,
+            "policy.yaml",
+            r#"apiVersion: agentpact/v1
+kind: Pact
+metadata:
+  name: clean
+spec:
+  paths:
+    "./scripts/deploy.sh": deny
+  domains:
+    "api.example.com": deny
+"#,
+        );
+        let gaps = detect_codex_gaps(Some(policy_dir.as_path()));
+        assert!(
+            gaps.is_empty(),
+            "clean deny rules should compile without gaps; got: {gaps:?}"
+        );
     }
 }

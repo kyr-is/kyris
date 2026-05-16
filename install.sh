@@ -15,22 +15,55 @@ AGENTPACT_REPO="kyr-is/agentpact"
 TAP="kyr-is/tap"
 CASK="${TAP}/kyris"
 ACTION="install"
+# Required agentpact version is derived at runtime from the Cargo.toml
+# bundled inside Kyrisd.app/Contents/Resources/Cargo.toml (or from the local
+# checkout in --local mode). Single source of truth, no constants to drift.
+AGENTPACT_VERSION=""
 LOCAL_DIR=""
 SKIP_AGENTPACT=0
 NO_BREW=0
-UPGRADE_FROM=""
+RESET_DATA=0
 
-# Files inside ~/.kyris/ that hold genuine USER state (not kyris-install
-# scaffolding). Preserved across upgrades by copying aside before the
-# uninstall-then-reinstall cycle and restoring after the new install completes.
-# The list is intentionally short — these three are the runtime state the
-# daemon owns; everything else under ~/.kyris/ (manifest, backups, hooks,
-# env) is managed by kyris install and gets regenerated.
-USER_STATE_FILES=(
-  "kyrisd.yaml"
-  "credentials.json"
-  "kyrisd.duckdb"
-)
+# Bundle layout. Only kyrisd (the long-running daemon) is wrapped in a
+# .app bundle — the bundle gives macOS a stable CFBundleIdentifier so
+# notifications, SMAppService, and TCC can attribute the daemon
+# properly. The CLI binaries (kyris, kyris-mcp, kyris-hook) are
+# transient and stay as bare files in ~/.local/bin/. We symlink the
+# kyrisd CLI shim from ~/.local/bin to inside the bundle so callers
+# (shell hooks, integration tests, ad-hoc `kyrisd doctor` invocations)
+# keep working unchanged.
+APP_INSTALL_DIR="$HOME/Applications"
+APP_NAME="Kyrisd.app"
+APP_PATH="${APP_INSTALL_DIR}/${APP_NAME}"
+APP_BINARY="${APP_PATH}/Contents/MacOS/kyrisd"
+BIN_SHIM_DIR="$HOME/.local/bin"
+
+# File-system layout (XDG Base Directory + an install-managed runtime dir).
+# User data lives outside the install-managed runtime dir so upgrade —
+# which is uninstall + install — wipes the runtime freely without losing
+# keys, credentials, or event-log history.
+#
+#   $HOME/.kyris/                   install-managed runtime (manifest,
+#                                   hooks, env, backups, pid) — wiped by
+#                                   uninstall.
+#   $XDG_CONFIG_HOME/kyris/         kyrisd.yaml — survives uninstall.
+#   $XDG_DATA_HOME/kyris/           credentials.json, kyrisd.duckdb (event
+#                                   log) — survives uninstall.
+#   $XDG_STATE_HOME/kyris/          kyris.log, kyrisd.{stderr,stdout}.log,
+#                                   crash/, diagnostics/, fail-open.jsonl —
+#                                   survives uninstall; wiped only by
+#                                   --reset-data or `brew uninstall --zap`.
+RUNTIME_DIR="$HOME/.kyris"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kyris"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/kyris"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/kyris"
+LOG_DIR="${STATE_DIR}/log"
+
+# Cached installer (same pattern as agentpact). Written on every successful
+# install so any future uninstall — including cascades from a dependent —
+# can run a script that exactly matches the on-disk layout, without
+# network dependency or tag-URL fragility.
+INSTALLER_CACHE="${RUNTIME_DIR}/installer.sh"
 
 # Shared package registry — vendor-namespaced, follows XDG_DATA_HOME convention.
 # Each kyr-is package writes a manifest here at install time and removes it at
@@ -80,7 +113,43 @@ launchctl_print_succeeds() {
 }
 
 ensure_kyris_runtime_dir() {
-  mkdir -p "$HOME/.kyris"
+  mkdir -p "$RUNTIME_DIR"
+}
+
+# Create the runtime dir plus every XDG dir the daemon will write into.
+# Called before launchd bootstrap so the plist's StandardErrorPath under
+# STATE_DIR/log/ resolves on first run — launchd silently drops output
+# if the parent dir is missing.
+ensure_all_dirs() {
+  mkdir -p "$RUNTIME_DIR" "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$LOG_DIR"
+}
+
+# Cache a copy of the install.sh for this exact version at
+# ~/.kyris/installer.sh. The cached script is what dependents and future
+# uninstalls prefer over a network fetch — same code that placed the
+# files removes them.
+cache_installer() {
+  local version_ref="${1:-main}"
+  ensure_kyris_runtime_dir
+  local source_url="https://raw.githubusercontent.com/${REPO}/${version_ref}/install.sh"
+
+  # --local mode: just copy our own on-disk script when $0 points at a
+  # real file. (curl|bash sets $0 to "bash"; fall through to network.)
+  if [ -n "$LOCAL_DIR" ] && [ -f "$0" ]; then
+    cp "$0" "$INSTALLER_CACHE"
+    chmod 755 "$INSTALLER_CACHE"
+    info "Cached installer from local source at $INSTALLER_CACHE"
+    return 0
+  fi
+
+  if curl -fsSL "$source_url" -o "${INSTALLER_CACHE}.tmp" 2>/dev/null; then
+    mv "${INSTALLER_CACHE}.tmp" "$INSTALLER_CACHE"
+    chmod 755 "$INSTALLER_CACHE"
+    info "Cached installer at $INSTALLER_CACHE (from ${source_url})"
+  else
+    rm -f "${INSTALLER_CACHE}.tmp"
+    info "WARN: could not cache installer from ${source_url}; uninstall will fall back to network fetch."
+  fi
 }
 
 # `launchctl bootout` is async — without this, the new daemon can race the old
@@ -121,15 +190,20 @@ register_package() {
   local version="$1"
   local binary_path="$2"
   mkdir -p "$REGISTRY_DIR"
+  # installer_script_path is the cached installer (see cache_installer);
+  # dependents and any future uninstall prefer it over the uninstall_url
+  # network fetch. uninstall_url is pinned to the version-matched tag so a
+  # network fallback still gets a script matching this on-disk layout.
   cat > "$SELF_MANIFEST" <<EOF
 {
   "name": "kyris",
   "version": "$version",
   "install_method": "script",
   "depends_on": ["agentpact"],
-  "uninstall_url": "https://raw.githubusercontent.com/${REPO}/main/install.sh",
+  "uninstall_url": "https://raw.githubusercontent.com/${REPO}/v${version}/install.sh",
   "uninstall_args": "--uninstall",
-  "binary_path": "$binary_path"
+  "binary_path": "$binary_path",
+  "installer_script_path": "$INSTALLER_CACHE"
 }
 EOF
 }
@@ -144,10 +218,9 @@ unregister_package() {
   fi
 }
 
-# Detect agentpactd in any of the locations install.sh or brew might have used.
-# kyris is the dependent here, so it CAN know about its dependency by name —
-# this is the legitimate downward direction.
-agentpactd_present() {
+# Locate the agentpactd binary kyris will talk to. Checks every path
+# install.sh or brew might have used so we detect cross-channel installs.
+agentpactd_path() {
   local path
   for path in \
     "$HOME/.local/bin/agentpactd" \
@@ -155,47 +228,208 @@ agentpactd_present() {
     "/usr/local/bin/agentpactd"
   do
     if [ -x "$path" ]; then
+      printf '%s\n' "$path"
       return 0
     fi
   done
   return 1
 }
 
-# Install agentpact via its official install script. Used when kyris is being
-# installed but agentpact isn't already present. The auto-install honors the
-# same channel-detection logic agentpact's own install.sh uses.
+# Read agentpact version from a kyris Cargo.toml. The workspace
+# [workspace.dependencies] agentpact entry is the single source of truth —
+# build-app-bundle.sh copies Cargo.toml into Contents/Resources/ so the
+# installed bundle carries the exact version it was built against.
+extract_agentpact_version_from_cargo() {
+  local cargo_toml="$1"
+  [ -f "$cargo_toml" ] || return 1
+  awk '
+    /^agentpact[[:space:]]*=/ {
+      if (match($0, /version[[:space:]]*=[[:space:]]*"[^"]+"/)) {
+        v = substr($0, RSTART, RLENGTH)
+        sub(/^version[[:space:]]*=[[:space:]]*"/, "", v)
+        sub(/"$/, "", v)
+        print v
+        exit 0
+      }
+      if (match($0, /tag[[:space:]]*=[[:space:]]*"v?[^"]+"/)) {
+        v = substr($0, RSTART, RLENGTH)
+        sub(/^tag[[:space:]]*=[[:space:]]*"v?/, "", v)
+        sub(/"$/, "", v)
+        print v
+        exit 0
+      }
+    }
+  ' "$cargo_toml"
+}
+
+# Sets AGENTPACT_VERSION. Sources, in order:
+#   1. $AGENTPACT_VERSION already set (env override; for debugging)
+#   2. The Cargo.toml shipped inside the bundle ($BUNDLE_CARGO_TOML, set by
+#      install_remote after extraction)
+#   3. The local checkout's Cargo.toml ($LOCAL_PROJECT_ROOT/Cargo.toml in
+#      --local mode)
+resolve_agentpact_version() {
+  if [ -n "$AGENTPACT_VERSION" ]; then
+    return 0
+  fi
+
+  local source=""
+  if [ -n "${BUNDLE_CARGO_TOML:-}" ] && [ -f "$BUNDLE_CARGO_TOML" ]; then
+    AGENTPACT_VERSION="$(extract_agentpact_version_from_cargo "$BUNDLE_CARGO_TOML")" || true
+    source="$BUNDLE_CARGO_TOML"
+  elif [ -n "$LOCAL_DIR" ] && [ -f "$LOCAL_PROJECT_ROOT/Cargo.toml" ]; then
+    AGENTPACT_VERSION="$(extract_agentpact_version_from_cargo "$LOCAL_PROJECT_ROOT/Cargo.toml")" || true
+    source="$LOCAL_PROJECT_ROOT/Cargo.toml"
+  fi
+
+  [ -n "$AGENTPACT_VERSION" ] \
+    || err "Could not determine required agentpact version from $source. The bundled Cargo.toml is missing the [workspace.dependencies] agentpact entry."
+  info "Required agentpact version: ${AGENTPACT_VERSION} (from $source)"
+}
+
+# Build a raw.githubusercontent.com URL for agentpact's install.sh at a given
+# version tag (or "main"). Versioned URLs let us run an installer that knows
+# the exact file layout of the version being uninstalled — critical when
+# layouts change across releases.
+agentpact_installer_url() {
+  local ref="$1"
+  printf 'https://raw.githubusercontent.com/%s/%s/install.sh\n' \
+    "$AGENTPACT_REPO" "$ref"
+}
+
+# Run the agentpact installer remotely with VERSION pinned. The installer is
+# always fetched at the target version's tag — its layout and the binary's
+# layout agree.
+install_agentpact_remote() {
+  local version="$1"
+  info "Installing agentpact v${version} via chained curl..."
+  curl -fsSL "$(agentpact_installer_url "v${version}")" \
+    | VERSION="v${version}" bash \
+    || err "Failed to install agentpact v${version}. Install it manually, then re-run with --no-agentpact."
+}
+
+# Run the agentpact installer remotely in --uninstall mode. Fetches the
+# installer matching the currently-installed version (not main) so its
+# uninstall logic matches the on-disk layout. Tolerates failure (e.g. a
+# partial prior install) so the subsequent reinstall can still proceed.
+# Read a string field from a JSON manifest written by register_package.
+# Tightly coupled to our own writer format (one field per line); not a
+# general JSON parser.
+manifest_field() {
+  local manifest="$1"
+  local field="$2"
+  grep -E "\"${field}\":" "$manifest" 2>/dev/null \
+    | sed -E "s/.*\"${field}\":[[:space:]]*\"([^\"]+)\".*/\1/" \
+    | head -1
+}
+
+# Path to agentpact's cached install.sh, if present. Returns empty when the
+# kyr-packages manifest doesn't exist, lacks an installer_script_path entry,
+# or that path doesn't resolve to an executable file.
+agentpact_cached_installer() {
+  local manifest="${REGISTRY_DIR}/agentpact.json"
+  [ -f "$manifest" ] || return 1
+  local cached
+  cached="$(manifest_field "$manifest" installer_script_path)"
+  [ -n "$cached" ] || return 1
+  [ -x "$cached" ] || return 1
+  printf '%s\n' "$cached"
+}
+
+uninstall_agentpact_remote() {
+  local installed_version="$1"
+
+  # Prefer the cached installer that agentpact wrote on its own install —
+  # it's the exact code that placed the on-disk layout, no network,
+  # no risk of tag-URL drift. Falls back to a version-matched curl, then
+  # to main, in increasing-fragility order.
+  local cached
+  if cached="$(agentpact_cached_installer 2>/dev/null)"; then
+    info "Removing existing agentpact via cached installer at $cached"
+    if "$cached" --uninstall; then
+      return 0
+    fi
+    info "Cached agentpact installer failed; falling back to network fetch."
+  fi
+
+  local ref
+  if [ -n "$installed_version" ]; then
+    ref="v${installed_version}"
+    info "Removing existing agentpact v${installed_version} via its version-matched installer..."
+  else
+    ref="main"
+    info "Removing existing agentpact (version unknown) via the main installer..."
+  fi
+  if ! curl -fsSL "$(agentpact_installer_url "$ref")" \
+       | bash -s -- --uninstall; then
+    if [ "$ref" != "main" ]; then
+      info "Version-matched agentpact installer failed; retrying via main..."
+      curl -fsSL "$(agentpact_installer_url "main")" \
+        | bash -s -- --uninstall \
+        || info "WARN: agentpact --uninstall exited non-zero on fallback; continuing with reinstall."
+    else
+      info "WARN: agentpact --uninstall exited non-zero; continuing with reinstall."
+    fi
+  fi
+}
+
+# Install or update agentpact to the exact version this kyris build requires.
+# If agentpact is missing → install. If installed at the correct version →
+# skip. If installed at a different version → uninstall + install. Mirrors
+# the postflight logic in the homebrew kyris cask.
 ensure_agentpact_installed() {
   if [ "$SKIP_AGENTPACT" -eq 1 ]; then
-    info "Skipping agentpact dependency check (--no-agentpact)."
+    info "Skipping agentpact dependency management (--no-agentpact)."
     return 0
   fi
 
-  if agentpactd_present; then
-    info "agentpact already installed; continuing."
+  resolve_agentpact_version
+
+  local installed_path installed_version=""
+  if installed_path="$(agentpactd_path 2>/dev/null)"; then
+    installed_version="$("$installed_path" --version 2>/dev/null | awk '{print $2}')" || true
+  fi
+
+  if [ -n "$installed_version" ] && [ "$installed_version" = "$AGENTPACT_VERSION" ]; then
+    info "agentpact ${installed_version} already installed at the required version; continuing."
     return 0
   fi
 
-  # In --local mode, prefer a sibling agentpact source dir if one exists with
-  # a built binary. Falls back to chained curl from upstream.
+  # In --local mode, prefer the sibling agentpact source dir if it has a
+  # built binary at the right version. Lets the dev iterate without touching
+  # the upstream installer at all.
   if [ -n "$LOCAL_DIR" ]; then
     local candidate
     for candidate in "$LOCAL_PROJECT_ROOT/../agentpact" "$LOCAL_PROJECT_ROOT/../../agentpact"; do
       if [ -d "$candidate" ] && [ -f "$candidate/install.sh" ] \
          && [ -x "$candidate/target/release/agentpactd" ]; then
-        local agentpact_root
+        local agentpact_root local_version=""
         agentpact_root="$(cd "$candidate" && pwd)"
-        info "Auto-installing agentpact from sibling source at $agentpact_root..."
-        "$agentpact_root/install.sh" --local "$agentpact_root/target/release" \
-          || err "Failed to auto-install agentpact from local source."
-        return 0
+        local_version="$("$candidate/target/release/agentpactd" --version 2>/dev/null | awk '{print $2}')" || true
+        if [ -n "$local_version" ] && [ "$local_version" = "$AGENTPACT_VERSION" ]; then
+          info "Auto-installing agentpact ${AGENTPACT_VERSION} from sibling source at $agentpact_root..."
+          if [ -n "$installed_version" ]; then
+            "$agentpact_root/install.sh" --uninstall \
+              || info "WARN: local agentpact --uninstall exited non-zero; continuing."
+          fi
+          "$agentpact_root/install.sh" --local "$agentpact_root/target/release" \
+            || err "Failed to install agentpact from local source."
+          return 0
+        fi
+        info "Sibling agentpact at $agentpact_root reports ${local_version:-unknown}, need ${AGENTPACT_VERSION}; falling back to upstream."
+        break
       fi
     done
   fi
 
-  info "kyris requires agentpact. Installing agentpact first via chained curl..."
-  curl -fsSL "https://raw.githubusercontent.com/${AGENTPACT_REPO}/main/install.sh" | bash \
-    || err "Failed to auto-install agentpact. Install it manually, then re-run with --no-agentpact."
-  info "agentpact installed; continuing with kyris install."
+  if [ -n "$installed_version" ]; then
+    info "agentpact ${installed_version} installed but kyris requires ${AGENTPACT_VERSION}; uninstalling first..."
+    uninstall_agentpact_remote "$installed_version"
+  else
+    info "agentpact not installed; installing v${AGENTPACT_VERSION}..."
+  fi
+  install_agentpact_remote "$AGENTPACT_VERSION"
+  info "agentpact v${AGENTPACT_VERSION} ready; continuing with kyris install."
 }
 
 brew_available() { command -v brew >/dev/null 2>&1; }
@@ -226,7 +460,7 @@ try_brew_install() {
 usage() {
   cat <<EOF
 Usage: install.sh [--user] [--local <dir>] [--no-agentpact] [--no-brew]
-       install.sh --uninstall [--no-brew]
+       install.sh --uninstall [--no-brew] [--reset-data]
 
   (no flag)      Install in user mode (default).
   --user         Explicit form of the default. No sudo required.
@@ -239,12 +473,22 @@ Usage: install.sh [--user] [--local <dir>] [--no-agentpact] [--no-brew]
                  agentpact is available at runtime.
   --no-brew      Skip brew detection and install via the script path even when
                  Homebrew is available. Symmetric on --uninstall.
-  --uninstall    Stop kyrisd and remove all installed files, runtime state,
-                 config, launchd files, and package receipts. Also cleans up any
-                 residue from prior system-mode installs (may prompt for sudo).
-                 Does NOT remove agentpact (kyris is the dependent, not the
-                 dependency). Run agentpact/install.sh --uninstall separately.
-                 If brew installed kyris, delegates to 'brew uninstall --cask --zap'.
+  --uninstall    Stop kyrisd and remove install-managed files (binary bundle,
+                 launchd plist, ~/.kyris/ runtime dir, package receipt). User
+                 data under ~/.config/kyris/, ~/.local/share/kyris/, and
+                 ~/.local/state/kyris/ is PRESERVED. Does NOT remove agentpact
+                 (kyris is the dependent, not the dependency). If brew
+                 installed kyris, delegates to 'brew uninstall --cask'.
+  --reset-data   Only with --uninstall: also wipe the XDG dirs (config, data,
+                 state). For brew installs, adds --zap. For script installs,
+                 removes them directly. Use this when you want a true clean
+                 slate, e.g. before re-enrolling on a new machine.
+
+File layout (XDG Base Directory):
+  ~/.kyris/                      install-managed runtime (manifest, hooks, env)
+  ~/.config/kyris/               kyrisd.yaml
+  ~/.local/share/kyris/          credentials.json, kyrisd.duckdb (event log)
+  ~/.local/state/kyris/          log/, crash/, diagnostics/, fail-open.jsonl
 
 Enterprise mode (root LaunchDaemon, tamper-proof logs, /var/run/kyrisd.sock,
 /etc/kyris/-managed policy) is planned for phase 2 and is not yet available.
@@ -259,6 +503,7 @@ parse_args() {
       --uninstall) ACTION="uninstall" ;;
       --no-agentpact|--skip-deps) SKIP_AGENTPACT=1 ;;
       --no-brew) NO_BREW=1 ;;
+      --reset-data) RESET_DATA=1 ;;
       --local)
         shift
         [ $# -gt 0 ] || err "--local requires a directory argument"
@@ -272,6 +517,9 @@ parse_args() {
     esac
     shift
   done
+  if [ "$RESET_DATA" -eq 1 ] && [ "$ACTION" != "uninstall" ]; then
+    err "--reset-data only makes sense with --uninstall"
+  fi
 }
 
 detect_target() {
@@ -297,20 +545,6 @@ resolve_version() {
   VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
     | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"//;s/".*//')"
   [ -n "${VERSION}" ] || err "Could not determine latest release version"
-}
-
-check_existing() {
-  local bin_path="$HOME/.local/bin/kyrisd"
-  if [ -x "$bin_path" ]; then
-    INSTALLED_VERSION="$("$bin_path" --version 2>/dev/null | awk '{print $2}')" || true
-    RELEASE_VERSION="${VERSION#v}"
-    if [ "${INSTALLED_VERSION}" = "${RELEASE_VERSION}" ]; then
-      info "kyris ${INSTALLED_VERSION} is already installed and up-to-date."
-      exit 0
-    fi
-    info "Upgrading kyris ${INSTALLED_VERSION} → ${RELEASE_VERSION}"
-    UPGRADE_FROM="${INSTALLED_VERSION}"
-  fi
 }
 
 validate_local_dir() {
@@ -572,13 +806,29 @@ uninstall_all() {
     # binary so manifest is still readable from ~/.kyris/.
     manifest_driven_cleanup
     scorched_earth_cleanup
-    info "Detected brew-installed kyris; delegating to 'brew uninstall --cask --zap ${CASK}'..."
-    brew uninstall --cask --zap "$CASK" \
-      || err "brew uninstall failed; resolve manually before re-running."
+    # --reset-data adds --zap so brew also wipes the XDG dirs (per kyris.rb's
+    # zap stanza); without it, plain `brew uninstall --cask` keeps user data.
+    if [ "$RESET_DATA" -eq 1 ]; then
+      info "Detected brew-installed kyris; delegating to 'brew uninstall --cask --zap ${CASK}' (--reset-data)..."
+      brew uninstall --cask --zap "$CASK" \
+        || err "brew uninstall --zap failed; resolve manually before re-running."
+    else
+      info "Detected brew-installed kyris; delegating to 'brew uninstall --cask ${CASK}'..."
+      brew uninstall --cask "$CASK" \
+        || err "brew uninstall failed; resolve manually before re-running."
+    fi
     unregister_package
     verify_uninstall
     echo ""
-    info "Uninstall complete (via brew)."
+    if [ "$RESET_DATA" -eq 1 ]; then
+      info "Uninstall complete (data wiped via --reset-data → brew uninstall --zap)."
+    else
+      info "Uninstall complete (via brew). User data preserved at:"
+      info "  Config: $CONFIG_DIR"
+      info "  Data:   $DATA_DIR (credentials.json, kyrisd.duckdb)"
+      info "  State:  $STATE_DIR (logs, crash dumps)"
+      info "Run with --reset-data to wipe them too."
+    fi
     return 0
   fi
 
@@ -618,7 +868,12 @@ uninstall_all() {
   wait_for_pid_exit kyrisd 15
 
   remove_path "$plist_dest"
-  for bin in kyris kyrisd kyris-mcp kyris-hook; do
+  # Bundle holds all four binaries; the CLI shims in ~/.local/bin
+  # are symlinks pointing inside the bundle. Pre-bundle installs had
+  # regular files at the same shim paths, which remove_path handles
+  # equivalently (rm -rf strips either symlinks or regular files).
+  remove_path "$APP_PATH"
+  for bin in kyrisd kyris kyris-mcp kyris-hook; do
     remove_path "$HOME/.local/bin/$bin"
   done
   remove_path "$HOME/.kyris"
@@ -650,138 +905,230 @@ uninstall_all() {
 
   unregister_package
 
-  if [ "${UPGRADE_IN_PROGRESS:-0}" -eq 1 ]; then
-    # Don't run verify_uninstall during upgrade — the new install will
-    # immediately rewrite paths and fail it. Don't print "uninstall complete"
-    # either since this is a transient phase of upgrade.
-    return 0
+  if [ "$RESET_DATA" -eq 1 ]; then
+    reset_data
   fi
 
   verify_uninstall
 
   echo ""
-  info "Uninstall complete."
+  if [ "$RESET_DATA" -eq 1 ]; then
+    info "Uninstall complete (data wiped via --reset-data)."
+  else
+    info "Uninstall complete. User data preserved at:"
+    info "  Config: $CONFIG_DIR"
+    info "  Data:   $DATA_DIR (credentials.json, kyrisd.duckdb)"
+    info "  State:  $STATE_DIR (logs, crash dumps)"
+    info "Run with --reset-data to wipe them too."
+  fi
 }
 
-install_local() {
-  BIN_DIR="$HOME/.local/bin"
-  mkdir -p "$BIN_DIR"
-  for bin in kyris kyrisd kyris-mcp kyris-hook; do
-    cp "$LOCAL_DIR/$bin" "$BIN_DIR/$bin"
-    chmod 755 "$BIN_DIR/$bin"
+# Wipe the XDG dirs that uninstall_all preserves by default. Only invoked
+# when --reset-data is passed alongside --uninstall.
+reset_data() {
+  info "--reset-data: wiping user data dirs..."
+  remove_path "$CONFIG_DIR"
+  remove_path "$DATA_DIR"
+  remove_path "$STATE_DIR"
+}
+
+# Place Kyrisd.app at $APP_PATH and wire up the launchd service to load
+# kyrisd from inside the bundle, then symlink ALL FOUR CLI binaries
+# (kyrisd, kyris, kyris-mcp, kyris-hook) from inside the bundle into
+# ~/.local/bin/. Two input modes, self-detected from $1:
+#
+#   1. Pre-built bundle (release path): $1 is a Kyrisd.app directory.
+#      Used by install_remote. The bundle already ships the launchd
+#      plist template at Contents/Resources/is.kyr.kyrisd.plist.
+#
+#   2. Bare binaries (dev path): $1 is a directory containing the four
+#      binaries. Used by install_local. We invoke build-app-bundle.sh
+#      from $LOCAL_PROJECT_ROOT/scripts/ against $LOCAL_PROJECT_ROOT/
+#      to wrap them into a Kyrisd.app on the fly.
+install_kyrisd_bundle() {
+  local source_path="$1"
+
+  mkdir -p "$APP_INSTALL_DIR" "$BIN_SHIM_DIR"
+
+  # Wipe any prior bundle + shims. Drop shims first so the old bundle
+  # isn't held by stale symlinks while we replace it.
+  for bin in kyrisd kyris kyris-mcp kyris-hook; do
+    rm -f "$BIN_SHIM_DIR/$bin"
+  done
+  rm -rf "$APP_PATH"
+
+  if [ -d "$source_path" ] && [ -f "$source_path/Contents/Info.plist" ]; then
+    info "Installing pre-built Kyrisd.app to $APP_PATH"
+    cp -R "$source_path" "$APP_INSTALL_DIR/"
+  elif [ -d "$source_path" ] && [ -x "$source_path/kyrisd" ]; then
+    # Directory of bare binaries — build the bundle locally using the
+    # dev's checkout. Only reachable via --local mode, where
+    # LOCAL_PROJECT_ROOT is guaranteed to point at the kyris source.
+    [ -n "${LOCAL_PROJECT_ROOT:-}" ] \
+      || err "Bare-binary install path requires --local mode (LOCAL_PROJECT_ROOT not set)"
+    local build_script="${LOCAL_PROJECT_ROOT}/scripts/build-app-bundle.sh"
+    [ -x "$build_script" ] || err "Missing $build_script"
+    [ -f "${LOCAL_PROJECT_ROOT}/service/Info.plist.template" ] \
+      || err "Missing ${LOCAL_PROJECT_ROOT}/service/Info.plist.template"
+    info "Wrapping binaries from $source_path in Kyrisd.app at $APP_PATH"
+    local bundle_tmp commit version
+    bundle_tmp="$(mktemp -d)"
+    commit="$(git -C "$LOCAL_PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    version="$("$source_path/kyrisd" --version 2>/dev/null | awk '{print $2}')" || version=""
+    [ -n "$version" ] || version="0.0.0"
+
+    BINARY_DIR="$source_path" VERSION="$version" COMMIT="$commit" OUT_DIR="$bundle_tmp" \
+      bash "$build_script" \
+      || { rm -rf "$bundle_tmp"; err "Bundle build failed"; }
+    mv "${bundle_tmp}/Kyrisd.app" "$APP_PATH"
+    rm -rf "$bundle_tmp"
+  else
+    err "install_kyrisd_bundle: source $source_path is neither a Kyrisd.app nor a directory containing kyrisd"
+  fi
+
+  # CLI shims for ALL FOUR binaries. Each is a symlink from
+  # ~/.local/bin/<name> into the bundle. Keeps the user's PATH clean
+  # (only Contents/MacOS/ holds the real binaries) while making
+  # `kyrisd doctor`, `kyris install`, etc. work unchanged.
+  for bin in kyrisd kyris kyris-mcp kyris-hook; do
+    ln -sf "$APP_PATH/Contents/MacOS/$bin" "$BIN_SHIM_DIR/$bin"
+    chmod 755 "$BIN_SHIM_DIR/$bin"
   done
 
   PLIST_LABEL="is.kyr.kyrisd"
-  PLIST_TEMPLATE="$LOCAL_PROJECT_ROOT/service/${PLIST_LABEL}.plist"
   PLIST_DIR="$HOME/Library/LaunchAgents"
   PLIST_DEST="${PLIST_DIR}/${PLIST_LABEL}.plist"
 
-  [ -f "$PLIST_TEMPLATE" ] || err "Plist template not found at $PLIST_TEMPLATE"
+  # The launchd template ships inside the bundle (Contents/Resources/),
+  # whether we got the bundle pre-built or just built it via mode 2.
+  local plist_template="${APP_PATH}/Contents/Resources/${PLIST_LABEL}.plist"
+  [ -f "$plist_template" ] \
+    || err "Bundle is missing launchd template at $plist_template"
   mkdir -p "$PLIST_DIR"
-  ensure_kyris_runtime_dir
-  sed -e "s|{{BINARY_PATH}}|${BIN_DIR}/kyrisd|g" \
+  # Create the runtime dir AND all XDG dirs before launchd loads the plist.
+  # The plist's StandardErrorPath is under STATE_DIR/log/, and launchd
+  # silently drops output if the parent dir is missing.
+  ensure_all_dirs
+
+  # Point launchd at the binary INSIDE the bundle. macOS reads the
+  # bundle's CFBundleIdentifier at launch time, so the running process
+  # gets the bundle identity for free.
+  #
+  # Notification permission: requested on daemon first-run, not here.
+  # macOS UNUserNotificationCenter only honors `requestAuthorization`
+  # from a process registered with LaunchServices as a foreground-
+  # eligible app — which launchctl-bootstrapped Kyrisd.app is, but a
+  # script-invoked helper binary is not. The dialog appears the
+  # instant launchd starts the daemon below; the user is still
+  # looking at the install output, so the UX is effectively
+  # install-time anyway. See `daemon/src/notify.rs` for the request
+  # path, and Apple Forums thread 679326 for the platform constraint.
+  sed -e "s|{{BINARY_PATH}}|${APP_BINARY}|g" \
       -e "s|{{HOME}}|${HOME}|g" \
-      -e "s|{{PATH}}|${BIN_DIR}:/usr/local/bin:/usr/bin:/bin|g" \
-      "$PLIST_TEMPLATE" > "$PLIST_DEST"
+      -e "s|{{PATH}}|${BIN_SHIM_DIR}:/usr/local/bin:/usr/bin:/bin|g" \
+      "$plist_template" > "$PLIST_DEST"
   chmod 644 "$PLIST_DEST"
 
   bootstrap_user_launchagent "$PLIST_LABEL" "$PLIST_DEST"
+}
+
+install_local() {
+  # --local mode reads the agentpact version from the local Cargo.toml
+  # checkout (the bundle hasn't been built yet at this point).
+  BUNDLE_CARGO_TOML="${LOCAL_PROJECT_ROOT}/Cargo.toml"
+  [ -f "$BUNDLE_CARGO_TOML" ] \
+    || err "Missing $BUNDLE_CARGO_TOML — cannot determine required agentpact version."
+
+  ensure_agentpact_installed
+
+  # All four binaries get bundled into Kyrisd.app and exposed via
+  # symlinks in ~/.local/bin. install_kyrisd_bundle self-detects the
+  # bare-binaries-vs-pre-built-bundle path and reads the launchd plist
+  # template from inside the resulting bundle.
+  install_kyrisd_bundle "$LOCAL_DIR"
 
   local installed_version
-  installed_version="$("$BIN_DIR/kyrisd" --version 2>/dev/null | awk '{print $2}')" || installed_version=""
+  installed_version="$("$APP_BINARY" --version 2>/dev/null | awk '{print $2}')" || installed_version=""
   [ -n "$installed_version" ] || installed_version="unknown"
-  register_package "$installed_version" "$BIN_DIR/kyrisd"
+
+  # Cache the installer. In --local mode cache_installer prefers $0 (the
+  # on-disk script in the checkout) over a network fetch.
+  if [ "$installed_version" != "unknown" ]; then
+    cache_installer "v${installed_version}"
+  else
+    cache_installer "main"
+  fi
+  register_package "$installed_version" "$APP_BINARY"
 
   echo ""
   info "Installation complete (user mode, from local build)."
-  info "  Binaries: $BIN_DIR/{kyris,kyrisd,kyris-mcp,kyris-hook}"
-  info "  Service:  ${PLIST_LABEL} (launchd)"
+  info "  Bundle:   $APP_PATH"
+  info "  CLI shims: $BIN_SHIM_DIR/{kyrisd,kyris,kyris-mcp,kyris-hook}"
+  info "  Service:  $PLIST_LABEL (launchd)"
 }
 
 install_remote() {
   RELEASE_VERSION="${VERSION#v}"
-  TAR_NAME="kyris-${RELEASE_VERSION}-aarch64-apple-darwin.tar.gz"
-  DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${TAR_NAME}"
-  CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+  TARGET="aarch64-apple-darwin"
+  APP_TAR_NAME="Kyrisd-${RELEASE_VERSION}-${TARGET}.app.tar.gz"
+  APP_DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${APP_TAR_NAME}"
+  APP_CHECKSUM_URL="${APP_DOWNLOAD_URL}.sha256"
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf "${TMP_DIR}"' EXIT
 
-  info "Downloading kyris ${VERSION} (.tar.gz)..."
-  curl -fsSL -o "${TMP_DIR}/${TAR_NAME}" "${DOWNLOAD_URL}"
-  curl -fsSL -o "${TMP_DIR}/${TAR_NAME}.sha256" "${CHECKSUM_URL}"
+  info "Downloading kyris ${VERSION} bundle..."
+  curl -fsSL -o "${TMP_DIR}/${APP_TAR_NAME}" "${APP_DOWNLOAD_URL}" \
+    || err "Download failed: ${APP_DOWNLOAD_URL}"
+  curl -fsSL -o "${TMP_DIR}/${APP_TAR_NAME}.sha256" "${APP_CHECKSUM_URL}" \
+    || err "Checksum download failed: ${APP_CHECKSUM_URL}"
+  info "Verifying bundle checksum..."
+  (cd "${TMP_DIR}" && shasum -a 256 -c "${APP_TAR_NAME}.sha256") \
+    || err "Bundle checksum verification failed"
+  info "Extracting bundle..."
+  tar xzf "${TMP_DIR}/${APP_TAR_NAME}" -C "${TMP_DIR}"
 
-  info "Verifying checksum..."
-  (cd "${TMP_DIR}" && shasum -a 256 -c "${TAR_NAME}.sha256") \
-    || err "Checksum verification failed"
+  local bundle_source="${TMP_DIR}/Kyrisd.app"
+  [ -d "$bundle_source" ] || err "Extracted bundle missing at $bundle_source"
 
-  info "Extracting..."
-  tar xzf "${TMP_DIR}/${TAR_NAME}" -C "${TMP_DIR}"
+  # Point the agentpact version resolver at the Cargo.toml that ships
+  # inside the bundle. ensure_agentpact_installed (called next from main)
+  # reads it to know which agentpact version this kyris build expects.
+  BUNDLE_CARGO_TOML="${bundle_source}/Contents/Resources/Cargo.toml"
+  [ -f "$BUNDLE_CARGO_TOML" ] \
+    || err "Bundle is missing Contents/Resources/Cargo.toml; release was built without the version-pinning manifest."
 
-  BIN_DIR="$HOME/.local/bin"
-  mkdir -p "$BIN_DIR"
-  for bin in kyris kyrisd kyris-mcp kyris-hook; do
-    cp "${TMP_DIR}/${bin}" "$BIN_DIR/${bin}"
-    chmod 755 "$BIN_DIR/${bin}"
-  done
+  ensure_agentpact_installed
 
-  PLIST_LABEL="is.kyr.kyrisd"
-  PLIST_TEMPLATE="${TMP_DIR}/service/${PLIST_LABEL}.plist"
-  PLIST_DIR="$HOME/Library/LaunchAgents"
-  PLIST_DEST="${PLIST_DIR}/${PLIST_LABEL}.plist"
+  install_kyrisd_bundle "$bundle_source"
 
-  mkdir -p "$PLIST_DIR"
-  ensure_kyris_runtime_dir
-  sed -e "s|{{BINARY_PATH}}|${BIN_DIR}/kyrisd|g" \
-      -e "s|{{HOME}}|${HOME}|g" \
-      -e "s|{{PATH}}|${BIN_DIR}:/usr/local/bin:/usr/bin:/bin|g" \
-      "$PLIST_TEMPLATE" > "$PLIST_DEST"
-  chmod 644 "$PLIST_DEST"
-
-  bootstrap_user_launchagent "$PLIST_LABEL" "$PLIST_DEST"
-
-  register_package "${RELEASE_VERSION}" "$BIN_DIR/kyrisd"
+  # Cache the installer at the version-matched tag URL. cache_installer
+  # uses RELEASE_VERSION (set above) to pick the right tag.
+  if [ -n "${RELEASE_VERSION:-}" ]; then
+    cache_installer "v${RELEASE_VERSION}"
+  else
+    cache_installer "main"
+  fi
+  register_package "${RELEASE_VERSION}" "$APP_BINARY"
 
   echo ""
   info "Installation complete (user mode)."
-  info "  Binaries: $BIN_DIR/{kyris,kyrisd,kyris-mcp,kyris-hook}"
-  info "  Service:  ${PLIST_LABEL} (launchd)"
+  info "  Bundle:   $APP_PATH"
+  info "  CLI shims: $BIN_SHIM_DIR/{kyrisd,kyris,kyris-mcp,kyris-hook}"
+  info "  Service:  $PLIST_LABEL (launchd)"
 }
 
-verify_install() {
-  local bin_dir="$HOME/.local/bin"
+configure_and_verify() {
+  local kyris_bin="$BIN_SHIM_DIR/kyris"
 
-  info "Running post-install verification..."
-  local verify_status=0
-  (
-    if [ -x "$bin_dir/kyris" ]; then
-      "$bin_dir/kyris" verify --post-install
-    else
-      exit 127
-    fi
-  ) &
-  local verify_pid=$!
-  local elapsed=0
-  while kill -0 "$verify_pid" >/dev/null 2>&1; do
-    if [ "$elapsed" -ge 100 ]; then
-      kill "$verify_pid" >/dev/null 2>&1 || true
-      wait "$verify_pid" 2>/dev/null || true
-      err "Post-install verification timed out."
-    fi
-    sleep 0.1
-    elapsed=$((elapsed + 1))
-  done
+  [ -x "$kyris_bin" ] || err "kyris CLI not found at $kyris_bin after install."
 
-  if ! wait "$verify_pid"; then
-    verify_status=$?
-  fi
+  info "Configuring shell hooks and agent integrations..."
+  # `kyris install` writes hook scripts, edits shell rc files, bootstraps the
+  # BASH_ENV launchagent, prestages + reconciles agent integrations, and runs
+  # verify_post_install internally. Its exit status reflects the full state.
+  "$kyris_bin" install || err "kyris install failed; see output above."
 
-  if [ "$verify_status" -ne 0 ]; then
-    err "Post-install verification failed."
-  fi
-
-  info "Post-install verification passed."
-  info ""
-  info "Next: run 'kyris install' to configure shell hooks and agent integrations."
+  info "Install log: $LOG_DIR/kyris.log"
 }
 
 verify_uninstall() {
@@ -799,9 +1146,14 @@ verify_uninstall() {
     failures=$((failures + 1))
   fi
 
+  # Paths that uninstall must always remove. XDG dirs ($CONFIG_DIR,
+  # $DATA_DIR, $STATE_DIR) are intentionally NOT in this list — they hold
+  # user data and survive uninstall by design. Only --reset-data wipes
+  # them; that case is checked separately below.
   for path in \
     "$HOME/Library/LaunchAgents/is.kyr.kyrisd.plist" \
-    "$HOME/.kyris" \
+    "$APP_PATH" \
+    "$RUNTIME_DIR" \
     "$SELF_MANIFEST" \
     "/etc/kyris"
   do
@@ -810,6 +1162,15 @@ verify_uninstall() {
       failures=$((failures + 1))
     fi
   done
+
+  if [ "$RESET_DATA" -eq 1 ]; then
+    for path in "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR"; do
+      if [ -e "$path" ] || [ -L "$path" ]; then
+        info "FAIL: --reset-data left residue at $path"
+        failures=$((failures + 1))
+      fi
+    done
+  fi
 
   for bin in kyris kyrisd kyris-mcp kyris-hook; do
     for path in "$HOME/.local/bin/$bin" "/usr/local/bin/$bin"; do
@@ -875,56 +1236,23 @@ verify_uninstall() {
   info "Uninstall verification passed."
 }
 
-# Copy user-state files into a temp directory so the upgrade can wipe ~/.kyris/
-# without losing the user's config, credentials, or event-log history. Sets
-# the global UPGRADE_STATE_DIR for restore_user_state to read.
-preserve_user_state() {
-  UPGRADE_STATE_DIR="$(mktemp -d)"
-  local file copied=0
-  for file in "${USER_STATE_FILES[@]}"; do
-    if [ -f "$HOME/.kyris/$file" ]; then
-      cp "$HOME/.kyris/$file" "$UPGRADE_STATE_DIR/$file"
-      copied=$((copied + 1))
-    fi
-  done
-  info "Preserved $copied user-state file(s) for upgrade at $UPGRADE_STATE_DIR"
-}
-
-# Restore the preserved user-state files into ~/.kyris/ after the new install
-# completes. Idempotent — silently skips files that aren't in the temp dir.
-restore_user_state() {
-  if [ -z "${UPGRADE_STATE_DIR:-}" ] || [ ! -d "$UPGRADE_STATE_DIR" ]; then
-    return 0
+# If an old kyris is installed, run a full uninstall first so file drift
+# (renamed files, removed paths) from the old release is purged cleanly.
+# XDG user data survives — uninstall_all does not touch CONFIG/DATA/STATE
+# dirs unless --reset-data is set, which install path doesn't pass.
+upgrade_if_installed() {
+  local bin_path="$HOME/.local/bin/kyrisd"
+  [ -x "$bin_path" ] || return 0
+  local installed_version
+  installed_version="$("$bin_path" --version 2>/dev/null | awk '{print $2}')" || installed_version=""
+  local target_version="${RELEASE_VERSION:-${VERSION#v}}"
+  if [ -n "$installed_version" ] && [ -n "$target_version" ] \
+     && [ "$installed_version" = "$target_version" ]; then
+    info "kyris ${installed_version} already installed at the target version; reinstalling cleanly."
+  elif [ -n "$installed_version" ]; then
+    info "Upgrading kyris ${installed_version} → ${target_version:-(unknown)}"
   fi
-  ensure_kyris_runtime_dir
-  local file restored=0
-  for file in "${USER_STATE_FILES[@]}"; do
-    if [ -f "$UPGRADE_STATE_DIR/$file" ]; then
-      cp "$UPGRADE_STATE_DIR/$file" "$HOME/.kyris/$file"
-      chmod 600 "$HOME/.kyris/$file"
-      restored=$((restored + 1))
-    fi
-  done
-  rm -rf "$UPGRADE_STATE_DIR"
-  UPGRADE_STATE_DIR=""
-  info "Restored $restored user-state file(s) after upgrade"
-}
-
-# Full uninstall-then-reinstall cycle to handle file drift across versions.
-# Called when check_existing detected an installed-version mismatch. Triggers
-# the same tier 1+2+3 cleanup as a real uninstall (so renamed/removed files
-# from the old release are purged) but preserves user state.
-upgrade_via_full_reset() {
-  info "Resetting old install before fresh install of ${RELEASE_VERSION:-new version}..."
-  preserve_user_state
-  # Run uninstall_all in upgrade mode by setting a flag the function honors.
-  UPGRADE_IN_PROGRESS=1
   uninstall_all
-  UPGRADE_IN_PROGRESS=0
-  # uninstall_all removed ~/.kyris/ along with everything else; recreate it
-  # and put user state back so the daemon's first start sees its config.
-  ensure_kyris_runtime_dir
-  restore_user_state
 }
 
 main() {
@@ -947,28 +1275,17 @@ main() {
 
   if [ -n "$LOCAL_DIR" ]; then
     validate_local_dir
-    ensure_agentpact_installed
-    # --local upgrades pass through full uninstall first too (file drift can
-    # come from local builds across branches just as easily as remote tags).
-    if [ -x "$HOME/.local/bin/kyrisd" ]; then
-      RELEASE_VERSION="local"
-      UPGRADE_FROM="$("$HOME/.local/bin/kyrisd" --version 2>/dev/null | awk '{print $2}')" || UPGRADE_FROM=""
-      [ -n "$UPGRADE_FROM" ] && upgrade_via_full_reset
-    fi
+    RELEASE_VERSION="local"
+    upgrade_if_installed
     install_local
   else
     resolve_version
-    check_existing
-    ensure_agentpact_installed
-    # If check_existing detected a version change, do a full reset before
-    # installing the new bits. Otherwise just install fresh.
-    if [ -n "$UPGRADE_FROM" ]; then
-      upgrade_via_full_reset
-    fi
+    RELEASE_VERSION="${VERSION#v}"
+    upgrade_if_installed
     install_remote
   fi
 
-  verify_install
+  configure_and_verify
 }
 
 main "$@"

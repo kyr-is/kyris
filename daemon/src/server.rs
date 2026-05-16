@@ -62,6 +62,19 @@ pub async fn run(config: KyrisdConfig) {
         std::process::exit(1);
     }
 
+    // Install signal streams BEFORE anything else (in particular,
+    // before the TCP listener binds). Creating any stream for a signal
+    // causes tokio to install its OS-level handler, which overrides
+    // Rust's default (SIGINT/SIGTERM → terminate with non-zero exit).
+    // Until this point, a signal that arrives while we're still doing
+    // startup work kills the process ungracefully — no drain, no
+    // socket cleanup, exit 130 (SIGINT) or 143 (SIGTERM).
+    //
+    // The streams themselves queue signals internally, so any signal
+    // delivered between this point and the select loop is captured
+    // and processed when we eventually call .recv().
+    let signals = ShutdownSignals::install();
+
     let listen_addr = config.server.listen.clone();
     let tls_enabled = config.tls.enabled;
     let max_body = config.server.max_request_body_bytes;
@@ -86,6 +99,7 @@ pub async fn run(config: KyrisdConfig) {
     write_pid_file();
 
     let stats_config = config.stats.clone();
+    let spend_config = config.spend.clone();
     let session_idle_minutes = config.circuit_breaker.session_idle_minutes;
     let tls_config = config.tls.clone();
 
@@ -106,6 +120,7 @@ pub async fn run(config: KyrisdConfig) {
         db.clone(),
         circuit_breaker,
         stats_config,
+        spend_config,
         session_idle_minutes,
     ));
 
@@ -141,14 +156,21 @@ pub async fn run(config: KyrisdConfig) {
     let scheme = if tls_enabled { "https" } else { "http" };
     tracing::info!(listen = %listen_addr, %scheme, "kyrisd listening");
 
-    tokio::spawn(sighup_reload(state.clone()));
+    tokio::spawn(sighup_reload(state.clone(), signals.sighup));
+    tokio::spawn(sigusr1_diagnostics(signals.sigusr1));
+    tokio::spawn(tray_state_poller(state.clone()));
 
     if tls_enabled {
-        serve_tls_with_graceful_shutdown(listener, app, &tls_config, shutdown_signal())
-            .await
-            .expect("TLS server error");
+        serve_tls_with_graceful_shutdown(
+            listener,
+            app,
+            &tls_config,
+            shutdown_signal(signals.shutdown),
+        )
+        .await
+        .expect("TLS server error");
     } else {
-        serve_with_graceful_shutdown(listener, app, shutdown_signal())
+        serve_with_graceful_shutdown(listener, app, shutdown_signal(signals.shutdown))
             .await
             .expect("server error");
     }
@@ -291,8 +313,7 @@ fn probe_agentpact_socket() -> Option<std::path::PathBuf> {
 }
 
 fn check_crash_recovery() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pid_path = format!("{home}/.kyris/kyrisd.pid");
+    let pid_path = kyris_core::paths::pid_path();
     let Ok(contents) = std::fs::read_to_string(&pid_path) else {
         return;
     };
@@ -329,9 +350,8 @@ fn check_crash_recovery() {
 }
 
 fn write_pid_file() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pid_path = format!("{home}/.kyris/kyrisd.pid");
-    if let Some(parent) = std::path::Path::new(&pid_path).parent() {
+    let pid_path = kyris_core::paths::pid_path();
+    if let Some(parent) = pid_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
@@ -340,9 +360,7 @@ fn write_pid_file() {
 }
 
 fn remove_pid_file() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pid_path = format!("{home}/.kyris/kyrisd.pid");
-    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(kyris_core::paths::pid_path());
 }
 
 /// Routes that require auth: circuit-breaker reset, pending requests, and
@@ -382,13 +400,13 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
         )
 }
 
-/// Health/readiness routes -- no auth required (load-balancer probes).
+/// Health/readiness route -- no auth required.
+/// Returns 200 only when kyrisd is fully initialised and ready to serve
+/// requests: at least one provider configured, DB writable, no dropped writes.
 fn health_routes(state: Arc<AppState>) -> Router {
     use axum::routing::get;
 
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz).with_state(state))
+    Router::new().route("/healthz", get(healthz).with_state(state))
 }
 
 #[derive(Deserialize)]
@@ -528,6 +546,12 @@ async fn hold_pending(
     let pending_timeout = state.config.load().mcp.pending_timeout_seconds;
     let pending = state.pending.clone();
     let timeout_id = body.id.clone();
+
+    // Clone for the dialog task before fields are moved into hold()
+    let dialog_id = body.id.clone();
+    let dialog_server = body.server.clone();
+    let dialog_tool = body.tool.clone();
+
     let _rx = state
         .pending
         .hold(body.id.clone(), body.approval_token, body.server, body.tool);
@@ -536,6 +560,39 @@ async fn hold_pending(
         pending.timeout(&timeout_id);
     });
     state.pending.set_timeout_handle(&body.id, handle);
+
+    // Show the approval dialog immediately rather than waiting for `kyris pending`.
+    #[cfg(feature = "tray")]
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            let tool_label = dialog_tool.as_deref().unwrap_or("unknown tool");
+            let response = crate::notify::ask_approval(
+                &format!("Kyris: Allow {dialog_server}"),
+                &format!("Agent wants to run {tool_label}. Allow?"),
+            )
+            .await;
+            let decision = match response {
+                "yes" => ResolveDecision::Approved,
+                "always" => ResolveDecision::Always,
+                _ => ResolveDecision::Denied,
+            };
+            let Ok(claim) = state.pending.claim(&dialog_id) else {
+                return; // already timed out or resolved by another path
+            };
+            let socket = agentpact_socket_for(&state);
+            if let Err(e) = send_permission_response(socket, &claim.approval_token, decision).await
+            {
+                tracing::warn!(pending_id = %dialog_id, %e, "failed to send approval dialog response");
+                state.pending.abandon_claim(claim);
+                return;
+            }
+            state
+                .pending
+                .complete_claim(claim, decision.allows_execution());
+        });
+    }
+
     StatusCode::OK
 }
 
@@ -632,16 +689,16 @@ async fn operator_session_token(
 }
 
 #[derive(Serialize)]
-struct ReadyzResponse {
+struct HealthzResponse {
     ready: bool,
     providers: usize,
     dropped_events: u64,
     db_writable: bool,
 }
 
-async fn readyz(
+async fn healthz(
     State(state): State<Arc<AppState>>,
-) -> (axum::http::StatusCode, Json<ReadyzResponse>) {
+) -> (axum::http::StatusCode, Json<HealthzResponse>) {
     let config = state.config.load();
     let dropped = storage::dropped_count();
     let providers = config.providers.len();
@@ -654,22 +711,13 @@ async fn readyz(
     };
     (
         status,
-        Json(ReadyzResponse {
+        Json(HealthzResponse {
             ready,
             providers,
             dropped_events: dropped,
             db_writable,
         }),
     )
-}
-
-#[derive(Serialize)]
-struct HealthzResponse {
-    status: &'static str,
-}
-
-async fn healthz() -> Json<HealthzResponse> {
-    Json(HealthzResponse { status: "ok" })
 }
 
 fn provider_configs_match(old: &ProviderConfig, new: &ProviderConfig) -> bool {
@@ -737,59 +785,165 @@ async fn reload_loop<F, Fut>(
     }
 }
 
-async fn sighup_reload(state: Arc<AppState>) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
-        let (reload_tx, reload_rx) = mpsc::channel(8);
-
-        tokio::spawn(async move {
-            loop {
-                hup.recv().await;
-                if reload_tx.send(()).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        reload_loop(state, reload_rx, || async { config::try_load_config() }).await;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = state;
-        // SIGHUP is not available on non-unix platforms.
-        std::future::pending::<()>().await;
-    }
+/// Owned bundle of signal streams installed BEFORE the listener binds.
+/// Creating the streams up front means tokio installs its OS-level
+/// signal handlers immediately; signals delivered during the rest of
+/// startup are queued internally rather than killing the process via
+/// Rust's default handler. See `run()` for why this matters.
+#[cfg(unix)]
+pub(crate) struct ShutdownSignals {
+    pub sighup: tokio::signal::unix::Signal,
+    pub sigusr1: tokio::signal::unix::Signal,
+    pub shutdown: ShutdownStreams,
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
+#[cfg(not(unix))]
+pub(crate) struct ShutdownSignals {
+    pub sighup: (),
+    pub sigusr1: (),
+    pub shutdown: ShutdownStreams,
+}
 
-        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let ctrl_c = tokio::signal::ctrl_c();
+#[cfg(unix)]
+pub(crate) struct ShutdownStreams {
+    pub sigterm: tokio::signal::unix::Signal,
+    pub sigint: tokio::signal::unix::Signal,
+}
 
-        tokio::select! {
-            _ = ctrl_c => {
-                tracing::info!("ctrl+c received, shutting down");
+#[cfg(not(unix))]
+pub(crate) struct ShutdownStreams;
+
+impl ShutdownSignals {
+    pub fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                sighup: signal(SignalKind::hangup()).expect("install SIGHUP handler"),
+                sigusr1: signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler"),
+                shutdown: ShutdownStreams {
+                    sigterm: signal(SignalKind::terminate()).expect("install SIGTERM handler"),
+                    sigint: signal(SignalKind::interrupt()).expect("install SIGINT handler"),
+                },
             }
-            _ = sigterm.recv() => {
-                tracing::info!("SIGTERM received, shutting down");
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                sighup: (),
+                sigusr1: (),
+                shutdown: ShutdownStreams,
             }
         }
     }
+}
 
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install ctrl+c handler");
-        tracing::info!("shutdown signal received");
+/// Periodically push the values the tray menu cares about (pending
+/// approval count, circuit breaker state) into the tray's atomic
+/// state holders. The tray itself runs on the main thread and reads
+/// those atomics on every poll cycle. This decoupling means the tray
+/// code doesn't need access to `AppState` — it just observes a few
+/// integers — and the daemon code doesn't need to know about the
+/// tray internals.
+///
+/// 1-second cadence balances perceived freshness against lock taxes
+/// on the pending `HashMap` and circuit-breaker `RwLock`.
+async fn tray_state_poller(state: Arc<AppState>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let pending = state.pending.list().len() as i64;
+        let tripped = state.circuit_breaker.any_tripped();
+        crate::tray::set_pending_count(pending);
+        crate::tray::set_circuit_breaker_tripped(tripped);
     }
+}
+
+/// Write a JSON diagnostics dump to
+/// `~/.local/state/kyris/diagnostics/` (see
+/// [`kyris_core::paths::diagnostics_dir`]). Called from the SIGUSR1
+/// handler. Doesn't dump deep daemon state yet — that would require
+/// hold-and-snapshot of various mutexes. For now we emit basic
+/// build/process metadata; richer dumps can be added as the daemon's
+/// internal state surfaces are stabilized.
+#[cfg(unix)]
+fn write_diagnostics_dump() -> std::io::Result<std::path::PathBuf> {
+    let dir = kyris_core::paths::diagnostics_dir();
+    std::fs::create_dir_all(&dir)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let path = dir.join(format!("dump-{ts}.json"));
+
+    let dump = serde_json::json!({
+        "schema_version": 1,
+        "version": crate::build_info::VERSION,
+        "build_date": crate::build_info::BUILD_DATE,
+        "commit": crate::build_info::COMMIT,
+        "features": crate::build_info::FEATURES,
+        "pid": std::process::id(),
+        "tray_state": crate::tray::current_state().to_string(),
+    });
+    let body = serde_json::to_vec_pretty(&dump).expect("serialize diagnostics dump");
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+async fn sigusr1_diagnostics(mut sigusr1: tokio::signal::unix::Signal) {
+    loop {
+        sigusr1.recv().await;
+        match write_diagnostics_dump() {
+            Ok(path) => tracing::info!(dump = %path.display(), "SIGUSR1 diagnostics dump"),
+            Err(e) => tracing::warn!("SIGUSR1 diagnostics dump failed: {e}"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn sigusr1_diagnostics(_sigusr1: ()) {
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+async fn sighup_reload(state: Arc<AppState>, mut hup: tokio::signal::unix::Signal) {
+    let (reload_tx, reload_rx) = mpsc::channel(8);
+
+    tokio::spawn(async move {
+        loop {
+            hup.recv().await;
+            if reload_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    reload_loop(state, reload_rx, || async { config::try_load_config() }).await;
+}
+
+#[cfg(not(unix))]
+async fn sighup_reload(state: Arc<AppState>, _hup: ()) {
+    let _ = state;
+    // SIGHUP is not available on non-unix platforms.
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+async fn shutdown_signal(mut streams: ShutdownStreams) {
+    tokio::select! {
+        _ = streams.sigint.recv() => {
+            tracing::info!("SIGINT received, shutting down");
+        }
+        _ = streams.sigterm.recv() => {
+            tracing::info!("SIGTERM received, shutting down");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal(_streams: ShutdownStreams) {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install ctrl+c handler");
+    tracing::info!("shutdown signal received");
 }
 
 #[cfg(test)]
@@ -935,6 +1089,7 @@ mod tests {
             Arc::new(storage::DuckDbWriter::open(&db_path)),
             circuit_breaker,
             kyris_core::config::StatsConfig::default(),
+            kyris_core::config::SpendConfig::default(),
             30,
         ));
 
@@ -1057,8 +1212,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testHealthzReturnsOk() {
-        let app = Router::new().route("/healthz", axum::routing::get(healthz));
+    async fn testHealthzReadyWithProviders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![make_provider("openai", "key", "http://localhost")];
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route("/healthz", axum::routing::get(healthz).with_state(state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1078,39 +1238,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "ok");
-
-        let _ = shutdown_tx.send(());
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn testReadyzWithProviders() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        config.providers = vec![make_provider("openai", "key", "http://localhost")];
-        let state = make_test_state(config, dir.path());
-
-        let app = Router::new().route("/readyz", axum::routing::get(readyz).with_state(state));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("http://{}", listener.local_addr().unwrap());
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        let resp = reqwest::Client::new()
-            .get(format!("{addr}/readyz"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ready"], true);
         assert_eq!(body["providers"], 1);
         assert_eq!(body["db_writable"], true);
@@ -1120,12 +1247,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testReadyzWithoutProvidersReturnsUnavailable() {
+    async fn testHealthzNotReadyWithoutProviders() {
         let dir = tempfile::tempdir().unwrap();
         let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         let state = make_test_state(config, dir.path());
 
-        let app = Router::new().route("/readyz", axum::routing::get(readyz).with_state(state));
+        let app = Router::new().route("/healthz", axum::routing::get(healthz).with_state(state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1139,7 +1266,7 @@ mod tests {
         });
 
         let resp = reqwest::Client::new()
-            .get(format!("{addr}/readyz"))
+            .get(format!("{addr}/healthz"))
             .send()
             .await
             .unwrap();

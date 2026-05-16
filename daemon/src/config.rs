@@ -69,8 +69,7 @@ pub fn load_config_from(config_path: &Path) -> KyrisdConfig {
 }
 
 fn config_path() -> PathBuf {
-    let home = std::env::var("HOME").map_or_else(|_| PathBuf::from("/"), PathBuf::from);
-    home.join(".kyris").join("kyrisd.yaml")
+    kyris_core::paths::config_path()
 }
 
 fn create_default_config(path: &PathBuf) {

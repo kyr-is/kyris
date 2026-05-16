@@ -7,6 +7,126 @@ use crate::agents::registry;
 
 use super::scanner::{Finding, FindingCategory, FindingLocation, Severity};
 
+// ---------------------------------------------------------------------------
+// Vendor-native governance detection
+// ---------------------------------------------------------------------------
+
+/// An agent that ships with its own vendor-managed governance system (e.g.
+/// Cursor Business admin controls, Windsurf Teams, GitHub org Copilot policy).
+/// These are neither Kyris-governed nor ungoverned — they belong to a third
+/// category that the scan must surface distinctly.
+struct VendorAgent {
+    id: &'static str,
+    display_name: &'static str,
+    /// Describes the vendor governance mechanism available for this agent.
+    governance_note: &'static str,
+    /// Phase roadmap note (Phase 2 target vs permanently out of scope).
+    phase_note: &'static str,
+}
+
+const VENDOR_AGENTS: &[VendorAgent] = &[
+    VendorAgent {
+        id: "cursor",
+        display_name: "Cursor",
+        governance_note: "Cursor Business/Enterprise provides admin-level usage controls and audit \
+             export (CSV). These controls are vendor-managed and invisible to Kyris.",
+        phase_note: "Kyris does not govern Cursor in Phase 1.",
+    },
+    VendorAgent {
+        id: "windsurf",
+        display_name: "Windsurf",
+        governance_note: "Windsurf Teams provides some admin controls. Kyris Phase 2 plans live \
+             native hook integration for Windsurf.",
+        phase_note: "Kyris support for Windsurf is a Phase 2 target.",
+    },
+    VendorAgent {
+        id: "github-copilot",
+        display_name: "GitHub Copilot",
+        governance_note: "GitHub Copilot governance is configured via GitHub organisation settings \
+             (policy controls, allowed models, seat management). Activity is audited \
+             through GitHub's own audit log, not through Kyris.",
+        phase_note: "Kyris does not govern GitHub Copilot in Phase 1.",
+    },
+];
+
+fn is_vendor_agent_installed(agent: &VendorAgent) -> bool {
+    match agent.id {
+        "cursor" => {
+            std::path::Path::new("/Applications/Cursor.app").exists()
+                || crate::state::find_in_path("cursor").is_some()
+        }
+        "windsurf" => {
+            std::path::Path::new("/Applications/Windsurf.app").exists()
+                || crate::state::find_in_path("windsurf").is_some()
+        }
+        "github-copilot" => {
+            let home = std::env::var("HOME").unwrap_or_default();
+            // Copilot CLI via gh extension
+            std::path::Path::new(&format!("{home}/.config/gh/extensions/gh-copilot")).exists()
+            // Copilot IDE via VS Code extension directory
+            || copilot_vscode_extension_exists(&home)
+        }
+        _ => false,
+    }
+}
+
+fn copilot_vscode_extension_exists(home: &str) -> bool {
+    let ext_dir = std::path::PathBuf::from(format!("{home}/.vscode/extensions"));
+    std::fs::read_dir(ext_dir).ok().is_some_and(|entries| {
+        entries.flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("github.copilot")
+        })
+    })
+}
+
+fn build_vendor_finding(agent: &VendorAgent) -> Finding {
+    Finding {
+        category: FindingCategory::VendorNativeAgent,
+        // Info: the agent has SOME governance — it is not ungoverned. The gap
+        // is that Kyris cannot audit or enforce policy for it.
+        severity: Severity::Info,
+        title: format!("{} is not governed by Kyris", agent.display_name),
+        description: format!(
+            "{} is installed but operates outside Kyris governance. {}",
+            agent.display_name, agent.governance_note,
+        ),
+        location: FindingLocation {
+            path: agent.id.to_string(),
+            line: None,
+        },
+        evidence: None,
+        remediation: format!(
+            "{} For full Kyris audit coverage, use a Kyris-compatible agent \
+             (claude-code, codex-cli, gemini-cli, cline, opencode).",
+            agent.phase_note,
+        ),
+    }
+}
+
+/// Scans for installed agents that use vendor-native governance.
+/// Separated from the main detection loop so it can be called with
+/// injected detection results in tests.
+fn scan_vendor_native_impl<F>(detect: F, findings: &mut Vec<Finding>)
+where
+    F: Fn(&VendorAgent) -> bool,
+{
+    for agent in VENDOR_AGENTS {
+        if detect(agent) {
+            findings.push(build_vendor_finding(agent));
+        }
+    }
+}
+
+fn scan_vendor_native(findings: &mut Vec<Finding>) {
+    scan_vendor_native_impl(is_vendor_agent_installed, findings);
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
 pub fn scan() -> Vec<Finding> {
     let mut findings = Vec::new();
 
@@ -60,6 +180,8 @@ pub fn scan() -> Vec<Finding> {
         scan_degraded_surfaces(agent.as_ref(), &probe, &mut findings);
     }
 
+    scan_vendor_native(&mut findings);
+
     findings
 }
 
@@ -93,7 +215,13 @@ fn scan_degraded_surfaces(
     let labels: Vec<String> = static_surfaces
         .iter()
         .map(|(name, s)| {
-            let mech = s.mechanism.as_ref().unwrap();
+            // is_static_mechanism (above) returns true only when mechanism is
+            // Some(CompiledPolicy | ConfigRewrite); the filter above guarantees
+            // this branch's mechanism is non-None.
+            let mech = s
+                .mechanism
+                .as_ref()
+                .expect("static_surfaces filtered by is_static_mechanism");
             format!("{name}:{mech}")
         })
         .collect();
@@ -188,4 +316,113 @@ fn check_ask_dropped(agent_id: &str) -> u32 {
     compiler
         .and_then(|c| c(None).ok())
         .map_or(0, |(_, dropped)| dropped)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn first_vendor_agent() -> &'static VendorAgent {
+        &VENDOR_AGENTS[0]
+    }
+
+    #[test]
+    fn testVendorAgentsListIsNonEmpty() {
+        assert!(!VENDOR_AGENTS.is_empty());
+    }
+
+    #[test]
+    fn testVendorAgentsIncludeCursorWindsurfCopilot() {
+        let ids: Vec<&str> = VENDOR_AGENTS.iter().map(|a| a.id).collect();
+        assert!(ids.contains(&"cursor"));
+        assert!(ids.contains(&"windsurf"));
+        assert!(ids.contains(&"github-copilot"));
+    }
+
+    #[test]
+    fn testBuildVendorFindingCategory() {
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert_eq!(finding.category, FindingCategory::VendorNativeAgent);
+    }
+
+    #[test]
+    fn testBuildVendorFindingSeverityIsInfo() {
+        // Vendor-native agents have some governance — not Critical or High.
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert_eq!(finding.severity, Severity::Info);
+    }
+
+    #[test]
+    fn testBuildVendorFindingTitleMentionsAgentName() {
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert!(finding.title.contains("Cursor"));
+        assert!(finding.title.contains("Kyris"));
+    }
+
+    #[test]
+    fn testBuildVendorFindingDescriptionMentionsGovernanceNote() {
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert!(finding.description.contains("Cursor Business"));
+    }
+
+    #[test]
+    fn testBuildVendorFindingRemediationMentionsPhaseNote() {
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert!(finding.remediation.contains("Phase 1"));
+    }
+
+    #[test]
+    fn testBuildVendorFindingRemediationMentionsCompatibleAgents() {
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert!(finding.remediation.contains("claude-code"));
+    }
+
+    #[test]
+    fn testBuildVendorFindingLocationIsAgentId() {
+        let finding = build_vendor_finding(first_vendor_agent());
+        assert_eq!(finding.location.path, "cursor");
+        assert!(finding.location.line.is_none());
+    }
+
+    #[test]
+    fn testScanVendorNativeImplNoneDetected() {
+        let mut findings = Vec::new();
+        scan_vendor_native_impl(|_| false, &mut findings);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn testScanVendorNativeImplAllDetected() {
+        let mut findings = Vec::new();
+        scan_vendor_native_impl(|_| true, &mut findings);
+        assert_eq!(findings.len(), VENDOR_AGENTS.len());
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.category == FindingCategory::VendorNativeAgent)
+        );
+    }
+
+    #[test]
+    fn testScanVendorNativeImplSingleDetected() {
+        let mut findings = Vec::new();
+        // Only detect Windsurf.
+        scan_vendor_native_impl(|a| a.id == "windsurf", &mut findings);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].location.path, "windsurf");
+    }
+
+    #[test]
+    fn testAllVendorAgentsHaveNonEmptyFields() {
+        for agent in VENDOR_AGENTS {
+            assert!(!agent.id.is_empty(), "empty id");
+            assert!(!agent.display_name.is_empty(), "empty display_name");
+            assert!(!agent.governance_note.is_empty(), "empty governance_note");
+            assert!(!agent.phase_note.is_empty(), "empty phase_note");
+        }
+    }
 }

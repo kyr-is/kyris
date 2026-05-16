@@ -8,7 +8,7 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::post,
 };
 use bytes::Bytes;
@@ -71,10 +71,7 @@ async fn handle_messages(
     {
         let count = state.circuit_breaker.get_token_count(&session_id);
         crate::notify::circuit_breaker_toast(count);
-        if is_stream {
-            return Ok(circuit_breaker_sse_error(&trace_id, count));
-        }
-        return Ok(circuit_breaker_error(&trace_id, count).into_response());
+        return Ok(circuit_breaker_response(&trace_id, count));
     }
 
     let config = state.config.load();
@@ -183,26 +180,32 @@ async fn handle_messages(
         None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
-    let _ = state.stats_tx.try_send(StatsEvent {
-        trace_id: trace_id.clone(),
-        provider: provider_name,
-        model: model.clone(),
-        tokens,
-        cache_create: cache_creation,
-        cache_read,
-        cost,
-        latency_ms,
-        status: if status.is_success() {
-            "success".to_string()
-        } else {
-            "error".to_string()
-        },
-        session_id: Some(session_id.clone()),
-        mcp_server: None,
-        mcp_tool: None,
-        metering,
-        working_dir,
-    });
+    if state
+        .stats_tx
+        .try_send(StatsEvent {
+            trace_id: trace_id.clone(),
+            provider: provider_name,
+            model: model.clone(),
+            tokens,
+            cache_create: cache_creation,
+            cache_read,
+            cost,
+            latency_ms,
+            status: if status.is_success() {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            },
+            session_id: Some(session_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            metering,
+            working_dir,
+        })
+        .is_err()
+    {
+        crate::storage::record_dropped(1);
+    }
 
     let mut builder = Response::builder().status(status);
     for (key, value) in &resp_headers {
@@ -382,22 +385,28 @@ fn relay_sse_stream(
                 None => super::resolve_peer_working_dir_sync(peer_addr),
             };
 
-            let _ = state.stats_tx.try_send(StatsEvent {
-                trace_id: trace_id_for_stream.clone(),
-                provider: provider_name_for_stream.clone(),
-                model: model_for_stream.clone(),
-                tokens,
-                cache_create: stream_tokens.cache_creation_input,
-                cache_read: stream_tokens.cache_read_input,
-                cost,
-                latency_ms,
-                status: status.to_string(),
-                session_id: Some(session_id_for_stream.clone()),
-                mcp_server: None,
-                mcp_tool: None,
-                metering: stream_metering,
-                working_dir,
-            });
+            if state
+                .stats_tx
+                .try_send(StatsEvent {
+                    trace_id: trace_id_for_stream.clone(),
+                    provider: provider_name_for_stream.clone(),
+                    model: model_for_stream.clone(),
+                    tokens,
+                    cache_create: stream_tokens.cache_creation_input,
+                    cache_read: stream_tokens.cache_read_input,
+                    cost,
+                    latency_ms,
+                    status: status.to_string(),
+                    session_id: Some(session_id_for_stream.clone()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    metering: stream_metering,
+                    working_dir,
+                })
+                .is_err()
+            {
+                crate::storage::record_dropped(1);
+            }
 
             breaker_chunk
         };
@@ -558,34 +567,26 @@ fn circuit_breaker_message(token_count: i64) -> String {
     )
 }
 
-fn circuit_breaker_error(trace_id: &str, token_count: i64) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "circuit_breaker",
-            "message": circuit_breaker_message(token_count),
-        },
-        "x-kyris-trace-id": trace_id,
-    }))
-}
-
-fn circuit_breaker_sse_error(trace_id: &str, token_count: i64) -> Response {
-    let payload = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "circuit_breaker",
-            "message": circuit_breaker_message(token_count),
-        },
-        "x-kyris-trace-id": trace_id,
-    });
-    let chunk = format!("event: error\ndata: {payload}\n\n");
-
+/// Pre-request circuit breaker response (429). Used for both streaming and
+/// non-streaming requests: the SSE connection has not been established yet,
+/// so a plain HTTP 429 is the correct response regardless of stream mode.
+/// Mid-stream circuit breaker injection (once SSE is active) remains 200.
+fn circuit_breaker_response(trace_id: &str, token_count: i64) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
         .header("x-kyris-trace-id", trace_id)
-        .body(Body::from(chunk))
-        .expect("build circuit breaker SSE response")
+        .body(Body::from(
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "circuit_breaker",
+                    "message": circuit_breaker_message(token_count),
+                },
+            })
+            .to_string(),
+        ))
+        .expect("build circuit breaker response")
 }
 
 #[cfg(test)]
@@ -876,6 +877,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn testAnthropicNonStreamRouteReturns429WhenBreakerTripped() {
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            api_key: "anthropic-secret".to_string(),
+            upstream: "http://127.0.0.1:9".to_string(), // unreachable — breaker fires first
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        state
+            .circuit_breaker
+            .record_tokens("sess-anthropic-nonstream-tripped", 1, 1);
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .header("x-kyris-session-id", "sess-anthropic-nonstream-tripped")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "circuit_breaker");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("kyris continue")
+        );
+
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn testAnthropicStreamRouteReturnsSseBreakerErrorWhenSessionIsTripped() {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
@@ -911,19 +968,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        // Pre-request circuit breaker: SSE connection not yet established,
+        // so the response is a plain 429 JSON (not a 200 SSE stream).
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             response
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("text/event-stream")
+            Some("application/json")
         );
-        let streamed_body = response.text().await.unwrap();
-        assert!(streamed_body.contains("event: error"), "{streamed_body}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "circuit_breaker");
         assert!(
-            streamed_body.contains("\"type\":\"circuit_breaker\""),
-            "{streamed_body}"
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("kyris continue"),
+            "{body}"
         );
 
         let _ = router_shutdown.send(());

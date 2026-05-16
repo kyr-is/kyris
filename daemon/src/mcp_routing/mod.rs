@@ -210,10 +210,18 @@ async fn forward_mcp_post(
     let config = state.config.load();
     let server = resolve_server(&config, &server_name)?;
 
-    let working_dir = server
+    // Per-request working_dir from X-Working-Dir header takes precedence
+    // over static config so agents can scope policy to the current project
+    // without requiring a fixed server config entry.
+    let working_dir_header = headers
+        .get("x-working-dir")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty());
+    let working_dir_config = server
         .working_dir
         .as_deref()
         .filter(|dir| !dir.trim().is_empty());
+    let working_dir = working_dir_header.or(working_dir_config);
 
     if policy::is_tools_call_request(&path, &body) && working_dir.is_none() {
         return Response::builder()
@@ -223,10 +231,12 @@ async fn forward_mcp_post(
                 serde_json::json!({
                     "error": "mcp_working_dir_required",
                     "detail": format!(
-                        "MCP server '{server_name}' requires mcp.servers[].working_dir for tools/call policy evaluation."
+                        "MCP server '{server_name}' requires either the X-Working-Dir request \
+                         header or mcp.servers[].working_dir in kyrisd.yaml for tools/call \
+                         policy evaluation."
                     )
                 })
-                    .to_string(),
+                .to_string(),
             ))
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -931,17 +941,132 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value = response.json().await.unwrap();
+        let detail = body["detail"].as_str().unwrap();
         assert!(
-            body["detail"]
-                .as_str()
-                .unwrap()
-                .contains("requires mcp.servers[].working_dir"),
-            "expected explicit config error message, got: {}",
-            body["detail"]
+            detail.contains("X-Working-Dir") && detail.contains("mcp.servers"),
+            "expected error to mention both header and config, got: {detail}"
         );
 
         let _ = router_shutdown.send(());
         router_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteAcceptsWorkingDirFromHeader() {
+        let _guard = lock_mcp_route_tests();
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("agentpact.sock");
+        let daemon_recorded = Arc::new(Mutex::new(None));
+        let daemon_handle = spawn_agentpact_stub(
+            &sock_path,
+            serde_json::json!({"code": "PACT_OK"}),
+            daemon_recorded.clone(),
+        );
+        policy::set_test_agentpact_socket(Some(sock_path.clone()));
+
+        // Server has no static working_dir — relies on X-Working-Dir header.
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: None,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        // With X-Working-Dir header, should NOT get 400.
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote/tools/call"))
+            .header("content-type", "application/json")
+            .header("x-working-dir", "/home/user/project")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        assert_ne!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "X-Working-Dir header should satisfy working_dir requirement"
+        );
+
+        // Verify the agentpactd received a permission request (policy was evaluated).
+        let recorded = daemon_recorded.lock().unwrap().clone();
+        assert!(
+            recorded.is_some(),
+            "agentpactd should have received a permission request"
+        );
+        let req = recorded.unwrap();
+        assert_eq!(
+            req["context"]["working_dir"].as_str(),
+            Some("/home/user/project"),
+            "working_dir from header should reach agentpactd"
+        );
+
+        let _ = response.bytes().await.unwrap();
+
+        policy::set_test_agentpact_socket(None);
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+        daemon_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn testMcpRouteHeaderOverridesStaticWorkingDir() {
+        let _guard = lock_mcp_route_tests();
+        let sock_dir = tempfile::tempdir().unwrap();
+        let sock_path = sock_dir.path().join("agentpact.sock");
+        let daemon_recorded = Arc::new(Mutex::new(None));
+        let daemon_handle = spawn_agentpact_stub(
+            &sock_path,
+            serde_json::json!({"code": "PACT_OK"}),
+            daemon_recorded.clone(),
+        );
+        policy::set_test_agentpact_socket(Some(sock_path.clone()));
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".to_string(),
+            upstream: "http://127.0.0.1:1".to_string(),
+            working_dir: Some("/static/config/dir".to_string()),
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let state = make_test_state(config, temp_dir.path());
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/mcp/remote/tools/call"))
+            .header("content-type", "application/json")
+            .header("x-working-dir", "/dynamic/per-request/dir")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file"}}"#)
+            .send()
+            .await
+            .unwrap();
+
+        let _ = response.bytes().await.unwrap();
+
+        let recorded = daemon_recorded.lock().unwrap().clone();
+        assert!(recorded.is_some());
+        let req = recorded.unwrap();
+        assert_eq!(
+            req["context"]["working_dir"].as_str(),
+            Some("/dynamic/per-request/dir"),
+            "header working_dir should take precedence over static config"
+        );
+
+        policy::set_test_agentpact_socket(None);
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+        daemon_handle.await.unwrap();
     }
 
     #[derive(Clone, Debug)]

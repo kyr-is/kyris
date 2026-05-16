@@ -1,31 +1,63 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-use std::collections::HashSet;
-use std::path::PathBuf;
-
 use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{
     ensure_json_command_hook, read_json_value, set_json_string_path, write_json_value,
 };
-use crate::state::{
-    discard_manifest_entry, ensure_parent, env_dir, load_manifest, load_or_init_config,
-    write_managed_file,
-};
+use crate::lifecycle::log::InstallLog;
+use crate::state::{load_or_init_config, write_managed_file};
 
 use super::registry;
 
 pub(super) fn hook_script_source(agent_id: &str) -> String {
-    format!(
-        "#!/usr/bin/env bash\n\
-         # SPDX-FileCopyrightText: Copyright 2026 Kyris\n\
-         # SPDX-License-Identifier: Apache-2.0\n\
-         set -euo pipefail\n\n\
-         \"$HOME/.kyris/bin/kyris\" hook check --agent {agent_id}\n"
-    )
+    // Discover the kyris binary at runtime instead of hardcoding a single
+    // path. Preserves the original design's preference for the managed copy
+    // at ~/.kyris/bin/kyris (writeable by `kyris install`, stable across
+    // PATH changes) but falls back to common install locations when the
+    // managed copy doesn't exist — covers install.sh-only users who never
+    // ran `kyris install`, brew installs, and post-cleanup re-installs.
+    //
+    // PATH lookup is last because PATH could be attacker-influenced in
+    // some hook-invocation contexts; a real kyris binary at a well-known
+    // absolute path is preferred to whatever PATH resolves to.
+    //
+    // Fail-open with a stderr warning when no kyris is reachable: matches
+    // AgentPact §11.1's "not installed" state (agent runs ungoverned).
+    let template = r#"#!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+KYRIS_BIN=""
+for candidate in \
+  "$HOME/.kyris/bin/kyris" \
+  "$HOME/.local/bin/kyris" \
+  "/opt/homebrew/bin/kyris" \
+  "/usr/local/bin/kyris"; do
+  if [ -x "$candidate" ]; then
+    KYRIS_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$KYRIS_BIN" ] && command -v kyris >/dev/null 2>&1; then
+  KYRIS_BIN="$(command -v kyris)"
+fi
+if [ -z "$KYRIS_BIN" ]; then
+  echo "[agentpact-hook] kyris binary not found; skipping governance check" >&2
+  exit 0
+fi
+
+exec "$KYRIS_BIN" hook check --agent __AGENT_ID__
+"#;
+    template.replace("__AGENT_ID__", agent_id)
 }
 
 pub(super) fn shell_command(path: &std::path::Path) -> String {
-    format!("bash \"{}\"", path.display())
+    // POSIX single-quote escaping: the only character that cannot appear
+    // inside single-quoted strings is the single-quote itself, which we
+    // escape by ending the quote, inserting a literal \', and reopening.
+    let escaped = path.display().to_string().replace('\'', "'\\''");
+    format!("bash '{escaped}'")
 }
 
 pub(super) fn install_live_hook_adapter(
@@ -79,51 +111,22 @@ pub fn setup_agent(
     let base_url = config.base_url();
     let inbound_key = &config.server.inbound_key;
 
-    let env_tx =
-        SetupTransaction::capture_paths(burn_control_env_paths(agent_id, &base_url, inbound_key)?)?;
-
     let mut changes = super::prestage::prestage_agent(agent_id)?;
 
     if agent.is_installed() {
         changes.extend(agent.configure_execution(&base_url, inbound_key, agent_specific)?);
-
-        let config_tx = SetupTransaction::capture_paths(agent.burn_control_config_paths())?;
-
         changes.extend(agent.configure_burn_control(&base_url, inbound_key, agent_specific)?);
 
         if let Err(error) = verify_kyrisd_health(&base_url) {
-            let mut rollback_errors = Vec::new();
-            if let Err(e) = config_tx.rollback() {
-                rollback_errors.push(e);
-            }
-            if let Err(e) = env_tx.rollback() {
-                rollback_errors.push(e);
-            }
-            if !rollback_errors.is_empty() {
-                return Err(format!(
-                    "kyrisd unreachable for {agent_id}: {error}. \
-                     Burn-control rollback also failed: {}",
-                    rollback_errors.join("; ")
-                ));
-            }
-            clear_disabled_flag(agent_id)?;
             return Err(format!(
                 "kyrisd unreachable ({error}). \
-                 Execution-surface governance is active (hooks/adapters committed). \
-                 Burn-control and MCP routing rolled back — will apply when kyrisd starts."
+                 Start it with `kyris daemon start`, then re-run `kyris agents setup {agent_id}`."
             ));
         }
     } else if let Err(error) = verify_kyrisd_health(&base_url) {
-        if let Err(rollback_error) = env_tx.rollback() {
-            return Err(format!(
-                "kyrisd unreachable for {agent_id}: {error}. \
-                 Burn-control rollback also failed: {rollback_error}"
-            ));
-        }
-        clear_disabled_flag(agent_id)?;
         return Err(format!(
             "kyrisd unreachable ({error}). \
-             Burn-control rolled back — will apply when kyrisd starts."
+             Start it with `kyris daemon start`, then re-run `kyris agents setup {agent_id}`."
         ));
     }
 
@@ -155,8 +158,8 @@ pub fn setup_agent(
 }
 
 /// Configure agent-owned files only. Used by reconcile auto-configure.
-/// Prestage must have already run. Burn-control changes are rolled back if
-/// kyrisd health check fails, same as `setup_agent`.
+/// Prestage must have already run. If kyrisd is unreachable, returns an
+/// error — the caller must ensure kyrisd is ready before calling this.
 ///
 /// When `skip_burn_control` is true, only execution-surface configuration
 /// runs. Used after native promotion removes burn-control artifacts.
@@ -164,6 +167,7 @@ pub fn configure_agent(
     agent_id: &str,
     agent_specific: &std::collections::HashMap<String, String>,
     skip_burn_control: bool,
+    log: Option<&InstallLog>,
 ) -> Result<(), String> {
     let agent =
         registry::agent_by_id(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
@@ -179,30 +183,31 @@ pub fn configure_agent(
     let mut changes = agent.configure_execution(&base_url, inbound_key, agent_specific)?;
 
     if !skip_burn_control {
-        let config_tx = SetupTransaction::capture_paths(agent.burn_control_config_paths())?;
-
         changes.extend(agent.configure_burn_control(&base_url, inbound_key, agent_specific)?);
 
         if let Err(error) = verify_kyrisd_health(&base_url) {
-            if let Err(rollback_error) = config_tx.rollback() {
-                return Err(format!(
-                    "kyrisd unreachable for {agent_id}: {error}. \
-                     Burn-control rollback also failed: {rollback_error}"
-                ));
-            }
             return Err(format!(
                 "kyrisd unreachable ({error}). \
-                 Burn-control and MCP routing rolled back."
+                 Start it with `kyris daemon start`, then re-run `kyris agents setup {agent_id}`."
             ));
         }
     }
 
     if changes.is_empty() {
         println!("No changes needed for {agent_id}.");
+        if let Some(l) = log {
+            l.info(&format!("{agent_id}: no changes needed"));
+        }
     } else {
         println!("Configured {agent_id}:");
+        if let Some(l) = log {
+            l.info(&format!("configured {agent_id}"));
+        }
         for change in &changes {
             println!("  {change}");
+            if let Some(l) = log {
+                l.info(&format!("  {agent_id} {change}"));
+            }
         }
     }
 
@@ -261,6 +266,66 @@ impl McpRewriteResult {
     fn unchanged() -> Self {
         Self::default()
     }
+}
+
+/// Collect the MCP server names currently registered in an agent's config.
+///
+/// Called at the START of each agent's `undo()` / `undo_burn_control()`,
+/// before `restore_manifest_entry` restores the file to its pre-kyris state,
+/// so we can identify which upstream entries to remove from `kyrisd.yaml`.
+pub fn mcp_server_names_from_agent(agent: &dyn super::registry::AgentDescriptor) -> Vec<String> {
+    let Some(mcp_cfg) = agent.mcp_config() else {
+        return Vec::new();
+    };
+    match mcp_cfg.format {
+        super::registry::McpConfigFormat::Json { servers_path } => {
+            let Ok(val) = crate::integration::read_json_value(&mcp_cfg.path) else {
+                return Vec::new();
+            };
+            let mut cur = &val;
+            for key in &servers_path {
+                match cur.get(key) {
+                    Some(v) => cur = v,
+                    None => return Vec::new(),
+                }
+            }
+            cur.as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+        super::registry::McpConfigFormat::Toml { servers_key } => {
+            let Ok(val) = crate::integration::read_toml_value(&mcp_cfg.path) else {
+                return Vec::new();
+            };
+            val.get(servers_key)
+                .and_then(|v| v.as_table())
+                .map(|t| t.keys().cloned().collect())
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// Remove named MCP upstream entries from `kyrisd.yaml`.
+///
+/// Called during agent `undo()` to reverse the `upsert_mcp_upstreams` call
+/// that happened during `configure_burn_control`. Server names not present in
+/// `kyrisd.yaml` are silently skipped (idempotent).
+pub fn remove_mcp_upstreams(names: &[String]) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let Ok(mut config) = crate::state::load_config() else {
+        return Ok(()); // config absent — nothing to clean
+    };
+    let before = config.mcp.servers.len();
+    config.mcp.servers.retain(|s| !names.contains(&s.name));
+    if config.mcp.servers.len() == before {
+        return Ok(()); // no matching entries found
+    }
+    if config.mcp.servers.is_empty() {
+        config.mcp.enabled = false;
+    }
+    crate::state::save_config(&config)
 }
 
 pub fn upsert_mcp_upstreams(rewrites: &[(String, String)]) -> Result<bool, String> {
@@ -563,6 +628,21 @@ pub(super) fn apply_json_tool_filters(
     changed
 }
 
+/// Poll `/healthz` until kyrisd responds successfully or `timeout_secs` elapses.
+/// Returns `true` if kyrisd became healthy within the timeout.
+pub fn wait_for_kyrisd_ready(base_url: &str, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if verify_kyrisd_health(base_url).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 fn verify_kyrisd_health(base_url: &str) -> Result<(), String> {
     let url = format!("{base_url}/healthz");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -583,112 +663,6 @@ fn verify_kyrisd_health(base_url: &str) -> Result<(), String> {
             ))
         }
     })
-}
-
-/// Env files and shell RC files that redirect LLM traffic through kyrisd.
-/// Snapshotted before prestage runs, rolled back if kyrisd is unreachable.
-fn burn_control_env_paths(
-    agent_id: &str,
-    base_url: &str,
-    inbound_key: &str,
-) -> Result<Vec<PathBuf>, String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    let home = PathBuf::from(home);
-    let mut paths = Vec::new();
-
-    let agent =
-        registry::agent_by_id(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
-    let exports = agent.env_exports(base_url, inbound_key);
-
-    if !exports.is_empty() {
-        paths.push(env_dir()?.join("load.sh"));
-        paths.push(env_dir()?.join(format!("{agent_id}.sh")));
-        paths.push(home.join(".zshrc"));
-        paths.push(home.join(".bashrc"));
-    }
-
-    Ok(paths)
-}
-
-#[derive(Debug)]
-struct FileSnapshot {
-    path: PathBuf,
-    original_contents: Option<Vec<u8>>,
-    had_manifest_entry: bool,
-}
-
-struct SetupTransaction {
-    snapshots: Vec<FileSnapshot>,
-}
-
-impl SetupTransaction {
-    fn capture_paths(paths: Vec<PathBuf>) -> Result<Self, String> {
-        let manifest_paths: HashSet<String> = load_manifest()?
-            .into_iter()
-            .map(|entry| entry.path)
-            .collect();
-        let mut seen = HashSet::new();
-        let mut snapshots = Vec::new();
-
-        for path in paths {
-            let key = path.to_string_lossy().to_string();
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let original_contents = if path.exists() {
-                Some(
-                    std::fs::read(&path)
-                        .map_err(|e| format!("Cannot snapshot {}: {e}", path.display()))?,
-                )
-            } else {
-                None
-            };
-            snapshots.push(FileSnapshot {
-                path,
-                original_contents,
-                had_manifest_entry: manifest_paths.contains(&key),
-            });
-        }
-
-        Ok(Self { snapshots })
-    }
-
-    fn rollback(&self) -> Result<(), String> {
-        let mut errors = Vec::new();
-        for snapshot in self.snapshots.iter().rev() {
-            if let Err(error) = restore_snapshot(snapshot) {
-                errors.push(error);
-            }
-            if !snapshot.had_manifest_entry
-                && let Err(error) = discard_manifest_entry(&snapshot.path)
-            {
-                errors.push(error);
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        }
-    }
-}
-
-fn restore_snapshot(snapshot: &FileSnapshot) -> Result<(), String> {
-    match &snapshot.original_contents {
-        Some(contents) => {
-            ensure_parent(&snapshot.path)?;
-            std::fs::write(&snapshot.path, contents)
-                .map_err(|e| format!("Cannot restore {}: {e}", snapshot.path.display()))?;
-        }
-        None => {
-            if snapshot.path.exists() {
-                std::fs::remove_file(&snapshot.path)
-                    .map_err(|e| format!("Cannot remove {}: {e}", snapshot.path.display()))?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -823,38 +797,6 @@ mod tests {
         );
         assert!(!result.changed);
         assert!(result.http_rewrites.is_empty());
-    }
-
-    #[test]
-    fn testRestoreSnapshotRestoresOriginal() {
-        let temp_dir = tempfile::TempDir::new().expect("tempdir");
-        let path = temp_dir.path().join("settings.json");
-        std::fs::write(&path, "after").expect("write");
-
-        let snapshot = FileSnapshot {
-            path: path.clone(),
-            original_contents: Some(b"before".to_vec()),
-            had_manifest_entry: false,
-        };
-
-        restore_snapshot(&snapshot).expect("restore");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), "before");
-    }
-
-    #[test]
-    fn testRestoreSnapshotRemovesCreatedFile() {
-        let temp_dir = tempfile::TempDir::new().expect("tempdir");
-        let path = temp_dir.path().join("settings.json");
-        std::fs::write(&path, "created").expect("write");
-
-        let snapshot = FileSnapshot {
-            path: path.clone(),
-            original_contents: None,
-            had_manifest_entry: false,
-        };
-
-        restore_snapshot(&snapshot).expect("restore");
-        assert!(!path.exists());
     }
 
     #[test]

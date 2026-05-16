@@ -4,7 +4,6 @@ use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::config_writer::ConfigValidator;
-use crate::state::write_managed_file;
 
 pub fn read_json_value(path: &Path) -> Result<Value, String> {
     if !path.exists() {
@@ -15,15 +14,33 @@ pub fn read_json_value(path: &Path) -> Result<Value, String> {
     serde_json::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
 }
 
+/// Write a JSON config file and record the structural diff in the manifest.
+///
+/// Serializes `value` once, validates the result, then passes the string
+/// directly to [`crate::state::write_managed_json`] — no second serialization.
 pub fn write_json_value(
     path: &Path,
     value: &Value,
     component: &str,
     validator: &dyn ConfigValidator,
 ) -> Result<bool, String> {
-    let contents = serde_json::to_string_pretty(value)
+    let mut serialized = serde_json::to_string_pretty(value)
         .map_err(|e| format!("Cannot serialize {}: {e}", path.display()))?;
-    write_managed_file(path, &contents, component, Some(0o600), validator)
+    serialized.push('\n');
+    validator
+        .validate(&serialized)
+        .map_err(|e| format!("validation failed for {}: {e}", path.display()))?;
+    let file_existed = path.exists();
+    let old = read_json_value(path)?;
+    crate::state::write_managed_json(
+        path,
+        &old,
+        value,
+        &serialized,
+        file_existed,
+        component,
+        Some(0o600),
+    )
 }
 
 pub fn read_toml_value(path: &Path) -> Result<toml::Value, String> {
@@ -35,15 +52,33 @@ pub fn read_toml_value(path: &Path) -> Result<toml::Value, String> {
     toml::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))
 }
 
+/// Write a TOML config file and record the structural diff in the manifest.
+///
+/// Serializes `value` once, validates the result, then passes the string
+/// directly to [`crate::state::write_managed_toml`] — no second serialization.
 pub fn write_toml_value(
     path: &Path,
     value: &toml::Value,
     component: &str,
     validator: &dyn ConfigValidator,
 ) -> Result<bool, String> {
-    let contents = toml::to_string_pretty(value)
+    let mut serialized = toml::to_string_pretty(value)
         .map_err(|e| format!("Cannot serialize {}: {e}", path.display()))?;
-    write_managed_file(path, &contents, component, Some(0o600), validator)
+    serialized.push('\n');
+    validator
+        .validate(&serialized)
+        .map_err(|e| format!("validation failed for {}: {e}", path.display()))?;
+    let file_existed = path.exists();
+    let old = read_toml_value(path)?;
+    crate::state::write_managed_toml(
+        path,
+        &old,
+        value,
+        &serialized,
+        file_existed,
+        component,
+        Some(0o600),
+    )
 }
 
 pub fn ensure_json_command_hook(
@@ -217,6 +252,77 @@ pub fn ensure_toml_bool_path(root: &mut toml::Value, path: &[&str], value: bool)
     }
     table.insert(leaf, toml::Value::Boolean(value));
     true
+}
+
+/// Navigate to the TOML table at `table_path` (creating intermediate tables
+/// as needed), then insert every entry from `entries` as a string value.
+/// Returns `true` if any value was inserted or changed.
+pub fn merge_toml_string_entries(
+    root: &mut toml::Value,
+    table_path: &[&str],
+    entries: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    let mut cursor = root;
+    for key in table_path {
+        let table = as_toml_table(cursor);
+        cursor = table
+            .entry((*key).to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    }
+    let table = as_toml_table(cursor);
+    let mut changed = false;
+    for (key, value) in entries {
+        if table.get(key).and_then(toml::Value::as_str) != Some(value.as_str()) {
+            table.insert(key.clone(), toml::Value::String(value.clone()));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Remove all entries whose keys are in `keys` from the TOML table at
+/// `table_path`. Removes the table itself (and any now-empty parent tables
+/// in `table_path`) when it becomes empty. Returns `true` if anything changed.
+pub fn remove_toml_table_entries(
+    root: &mut toml::Value,
+    table_path: &[&str],
+    keys: Option<&[&str]>,
+) -> bool {
+    if table_path.is_empty() {
+        return false;
+    }
+    // Navigate to the parent of the target table so we can prune upward.
+    let mut cursor = root;
+    for key in &table_path[..table_path.len() - 1] {
+        let Some(next) = as_toml_table(cursor).get_mut(*key) else {
+            return false;
+        };
+        cursor = next;
+    }
+    let leaf = table_path[table_path.len() - 1];
+    let table = as_toml_table(cursor);
+    let Some(target) = table.get_mut(leaf) else {
+        return false;
+    };
+    match keys {
+        Some(remove_keys) => {
+            let t = as_toml_table(target);
+            let mut changed = false;
+            for k in remove_keys {
+                if t.remove(*k).is_some() {
+                    changed = true;
+                }
+            }
+            if t.is_empty() {
+                table.remove(leaf);
+            }
+            changed
+        }
+        None => table.remove(leaf).is_some(),
+    }
 }
 
 pub fn find_upwards(relative_path: &str) -> Option<PathBuf> {

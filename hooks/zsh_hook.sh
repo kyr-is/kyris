@@ -28,7 +28,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         }
     fi
@@ -62,7 +62,7 @@ __kyris_preexec() {
             return 0
         fi
         __kyris_write_sentinel "$sentinel"
-        printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+        printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
         return 1
     fi
 
@@ -90,8 +90,24 @@ __kyris_preexec() {
     esac
 }
 
+__kyris_have_tty() {
+    [[ -e /dev/tty ]] && { exec 3</dev/tty } 2>/dev/null && exec 3>&-
+}
+
 __kyris_circuit_breaker_prompt() {
     local cmd="$1" sock="$2" req_id="$3" token="$4" count="$5"
+    if ! __kyris_have_tty; then
+        if (( $+commands[kyris] )); then
+            kyris hook hold --req-id "$req_id" --token "$token" \
+                --display "circuit-breaker (${count} commands): $cmd" \
+                --socket "$sock" 2>/dev/null
+            return $?
+        else
+            kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                --token "$token" --response denied 2>/dev/null
+            return 1
+        fi
+    fi
     local answer
     print -Pn "%F{yellow}[kyris] circuit breaker:%f ${count} commands without human input. Review: kyris timeline --last 10. [y/n] " >&2
     read -r answer < /dev/tty
@@ -112,6 +128,17 @@ __kyris_circuit_breaker_prompt() {
 
 __kyris_prompt_user() {
     local cmd="$1" sock="$2" req_id="$3" token="$4"
+    if ! __kyris_have_tty; then
+        if (( $+commands[kyris] )); then
+            kyris hook hold --req-id "$req_id" --token "$token" \
+                --display "$cmd" --socket "$sock" 2>/dev/null
+            return $?
+        else
+            kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                --token "$token" --response denied 2>/dev/null
+            return 1
+        fi
+    fi
     local answer
     print -Pn "%F{yellow}[kyris] allow?%f $cmd [y/n/always] " >&2
     read -r answer < /dev/tty
@@ -139,7 +166,12 @@ __kyris_prompt_user() {
 
 __kyris_record_fail_open() {
     local cmd="$1"
-    local log="$HOME/.kyris/fail-open.jsonl"
+    # fail-open log lives under $XDG_STATE_HOME/kyris/ after the XDG
+    # migration (default $HOME/.local/state/kyris/fail-open.jsonl). The
+    # daemon's reader resolves the same path, so writer and reader agree.
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/kyris"
+    local log="$log_dir/fail-open.jsonl"
+    mkdir -p "$log_dir" 2>/dev/null
     local id ts esc_cmd esc_pwd
     id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || return
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -278,6 +310,40 @@ else
 
         case $exit_code in
             0|11) return 0 ;;
+            1) return 1 ;;
+            2)
+                # PACT_ASK in non-interactive shell: delegate to kyrisd
+                # pending-approval system (same path as kyris-mcp no-TTY).
+                local req_id="${output%%$'\t'*}"
+                local token="${output#*$'\t'}"
+                if (( $+commands[kyris] )); then
+                    kyris hook hold --req-id "$req_id" --token "$token" \
+                        --display "$cmd" --socket "$sock" 2>/dev/null
+                    return $?
+                else
+                    # kyris not on PATH — deny and resolve agentpactd state.
+                    kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                        --token "$token" --response denied 2>/dev/null
+                    return 1
+                fi
+                ;;
+            3)
+                # Circuit breaker in non-interactive shell: same delegation.
+                local req_id="${output%%$'\t'*}"
+                local rest="${output#*$'\t'}"
+                local token="${rest%%$'\t'*}"
+                local count="${rest#*$'\t'}"
+                if (( $+commands[kyris] )); then
+                    kyris hook hold --req-id "$req_id" --token "$token" \
+                        --display "circuit-breaker (${count} commands): $cmd" \
+                        --socket "$sock" 2>/dev/null
+                    return $?
+                else
+                    kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                        --token "$token" --response denied 2>/dev/null
+                    return 1
+                fi
+                ;;
             *) return 1 ;;
         esac
     }

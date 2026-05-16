@@ -2,10 +2,28 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
+/// Machine-readable cause code for a governance denial (I-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyCode {
+    /// `PACT_DENIED` — tool blocked by policy.
+    PolicyDenied,
+    /// `PACT_CAP_EXCEEDED` — spend / rate cap exceeded.
+    CapExceeded,
+    /// `PACT_POLICY_ERROR` / `PACT_PROTOCOL_ERROR` — policy or protocol misconfiguration.
+    PolicyError,
+    /// Daemon unreachable (connection error, not a daemon response code).
+    DaemonUnreachable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpPermissionDecision {
     Allow,
-    Deny(String),
+    Deny {
+        code: DenyCode,
+        reason: String,
+        /// Daemon-supplied recovery hint. `None` → caller uses static I-05 table.
+        hint: Option<String>,
+    },
     Ask {
         approval_id: String,
         approval_token: String,
@@ -143,7 +161,11 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
                 .and_then(|value| value.as_str())
                 .unwrap_or("denied by policy")
                 .to_string();
-            McpPermissionDecision::Deny(reason)
+            McpPermissionDecision::Deny {
+                code: DenyCode::PolicyDenied,
+                reason,
+                hint: None,
+            }
         }
         Some("PACT_ASK") => {
             let approval_id = response
@@ -157,7 +179,11 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
                 .unwrap_or_default()
                 .to_string();
             if approval_id.is_empty() || approval_token.is_empty() {
-                McpPermissionDecision::Deny("invalid approval response from agentpactd".to_string())
+                McpPermissionDecision::Deny {
+                    code: DenyCode::PolicyError,
+                    reason: "invalid approval response from agentpactd".to_string(),
+                    hint: None,
+                }
             } else {
                 McpPermissionDecision::Ask {
                     approval_id,
@@ -165,19 +191,43 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
                 }
             }
         }
-        Some("PACT_POLICY_ERROR" | "PACT_PROTOCOL_ERROR" | "PACT_CAP_EXCEEDED") => {
-            let error = response
+        Some("PACT_POLICY_ERROR" | "PACT_PROTOCOL_ERROR") => {
+            let reason = response
                 .get("error")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            let hint = response.get("recovery_hint").and_then(|v| v.as_str());
-            let reason = match hint {
-                Some(h) => format!("{error} ({h})"),
-                None => error.to_string(),
-            };
-            McpPermissionDecision::Deny(reason)
+                .unwrap_or("unknown error")
+                .to_string();
+            let hint = response
+                .get("recovery_hint")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            McpPermissionDecision::Deny {
+                code: DenyCode::PolicyError,
+                reason,
+                hint,
+            }
         }
-        _ => McpPermissionDecision::Deny("invalid response from agentpactd".to_string()),
+        Some("PACT_CAP_EXCEEDED") => {
+            let reason = response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            let hint = response
+                .get("recovery_hint")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            McpPermissionDecision::Deny {
+                code: DenyCode::CapExceeded,
+                reason,
+                hint,
+            }
+        }
+        _ => McpPermissionDecision::Deny {
+            code: DenyCode::PolicyError,
+            reason: "invalid response from agentpactd".to_string(),
+            hint: None,
+        },
     }
 }
 
@@ -284,7 +334,11 @@ mod tests {
         let response = serde_json::json!({"code": "PACT_DENIED", "reason": "blocked by policy"});
         assert_eq!(
             parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny("blocked by policy".to_string())
+            McpPermissionDecision::Deny {
+                code: DenyCode::PolicyDenied,
+                reason: "blocked by policy".to_string(),
+                hint: None,
+            }
         );
     }
 
@@ -313,10 +367,11 @@ mod tests {
         });
         assert_eq!(
             parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny(
-                "malformed pact.yaml (Fix policy files: run agentpactd schema to validate)"
-                    .to_string()
-            )
+            McpPermissionDecision::Deny {
+                code: DenyCode::PolicyError,
+                reason: "malformed pact.yaml".to_string(),
+                hint: Some("Fix policy files: run agentpactd schema to validate".to_string()),
+            }
         );
     }
 
@@ -328,7 +383,11 @@ mod tests {
         });
         assert_eq!(
             parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny("missing method field".to_string())
+            McpPermissionDecision::Deny {
+                code: DenyCode::PolicyError,
+                reason: "missing method field".to_string(),
+                hint: None,
+            }
         );
     }
 
@@ -341,10 +400,11 @@ mod tests {
         });
         assert_eq!(
             parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny(
-                "daily premium cap reached (Wait until 2026-01-02T00:00:00Z or adjust caps policy)"
-                    .to_string()
-            )
+            McpPermissionDecision::Deny {
+                code: DenyCode::CapExceeded,
+                reason: "daily premium cap reached".to_string(),
+                hint: Some("Wait until 2026-01-02T00:00:00Z or adjust caps policy".to_string()),
+            }
         );
     }
 

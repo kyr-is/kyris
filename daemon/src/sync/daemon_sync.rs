@@ -20,8 +20,7 @@ fn load_credentials() -> Option<Credentials> {
     let path = if let Ok(p) = std::env::var("KYRIS_CREDENTIALS_PATH") {
         PathBuf::from(p)
     } else {
-        let home = std::env::var("HOME").ok()?;
-        PathBuf::from(format!("{home}/.kyris/credentials.json"))
+        kyris_core::paths::credentials_path()
     };
     let contents = std::fs::read_to_string(path).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
@@ -34,11 +33,15 @@ fn load_credentials() -> Option<Credentials> {
 }
 
 fn agentpact_log_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("AGENTPACT_HOME") {
-        return PathBuf::from(home).join("log");
+    // agentpact moved its rotating log dir to $XDG_STATE_HOME/agentpact/log
+    // per the agentpact XDG migration. AGENTPACT_HOME no longer relocates
+    // log/ — it only overrides the runtime ephemera dir. We mirror that
+    // here so kyris sync reads from the same place agentpact writes.
+    if let Ok(explicit) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(explicit).join("agentpact").join("log");
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.agentpact/log"))
+    PathBuf::from(format!("{home}/.local/state/agentpact/log"))
 }
 
 pub async fn run_sync_loop(state: Arc<AppState>) {
@@ -258,7 +261,6 @@ fn filter_records_in_scope(
 mod tests {
     use super::*;
     use kyris_core::record::{GatewayRecord, Metering, RecordStatus};
-    use std::io::Write;
 
     fn sample_gateway_record(id: &str, working_dir: Option<&str>) -> GatewayRecord {
         GatewayRecord {
@@ -283,22 +285,43 @@ mod tests {
         }
     }
 
+    fn write_credentials(base: &std::path::Path, body: &str) {
+        // After the XDG migration, credentials live in
+        // $XDG_DATA_HOME/kyris/credentials.json (default
+        // ~/.local/share/kyris/). Mirror that under the tempdir.
+        let creds_dir = base.join(".local").join("share").join("kyris");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join("credentials.json"), body).unwrap();
+    }
+
     #[test]
     fn testAgentpactLogDir() {
+        // agentpact's log dir moved under XDG_STATE_HOME with its own XDG
+        // migration; agentpact_log_dir() should resolve there.
+        unsafe {
+            std::env::remove_var("XDG_STATE_HOME");
+            std::env::set_var("HOME", "/tmp/test-home");
+        }
         let dir = agentpact_log_dir();
-        assert!(dir.to_string_lossy().ends_with(".agentpact/log"));
+        assert_eq!(
+            dir,
+            PathBuf::from("/tmp/test-home/.local/state/agentpact/log")
+        );
     }
 
     #[test]
     fn testLoadCredentialsValidFile() {
         let dir = tempfile::tempdir().unwrap();
-        let kyris_dir = dir.path().join(".kyris");
-        std::fs::create_dir_all(&kyris_dir).unwrap();
-        let cred_path = kyris_dir.join("credentials.json");
-        let mut f = std::fs::File::create(&cred_path).unwrap();
-        writeln!(f, r#"{{"machine_id":"m-123","machine_token":"tok-abc"}}"#).unwrap();
+        write_credentials(
+            dir.path(),
+            r#"{"machine_id":"m-123","machine_token":"tok-abc"}"#,
+        );
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
+        }
         let creds = load_credentials().unwrap();
         assert_eq!(creds.machine_id, "m-123");
         assert_eq!(creds.machine_token, "tok-abc");
@@ -307,43 +330,50 @@ mod tests {
     #[test]
     fn testLoadCredentialsMissingMachineId() {
         let dir = tempfile::tempdir().unwrap();
-        let kyris_dir = dir.path().join(".kyris");
-        std::fs::create_dir_all(&kyris_dir).unwrap();
-        let cred_path = kyris_dir.join("credentials.json");
-        std::fs::write(&cred_path, r#"{"machine_token":"tok-abc"}"#).unwrap();
+        write_credentials(dir.path(), r#"{"machine_token":"tok-abc"}"#);
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
+        }
         assert!(load_credentials().is_none());
     }
 
     #[test]
     fn testLoadCredentialsMissingFile() {
         let dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
+        }
         assert!(load_credentials().is_none());
     }
 
     #[test]
     fn testLoadCredentialsInvalidJson() {
         let dir = tempfile::tempdir().unwrap();
-        let kyris_dir = dir.path().join(".kyris");
-        std::fs::create_dir_all(&kyris_dir).unwrap();
-        let cred_path = kyris_dir.join("credentials.json");
-        std::fs::write(&cred_path, "not valid json {{{").unwrap();
+        write_credentials(dir.path(), "not valid json {{{");
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
+        }
         assert!(load_credentials().is_none());
     }
 
     #[test]
     fn testLoadCredentialsNonStringValues() {
         let dir = tempfile::tempdir().unwrap();
-        let kyris_dir = dir.path().join(".kyris");
-        std::fs::create_dir_all(&kyris_dir).unwrap();
-        let cred_path = kyris_dir.join("credentials.json");
-        std::fs::write(&cred_path, r#"{"machine_id":123,"machine_token":"tok"}"#).unwrap();
+        write_credentials(dir.path(), r#"{"machine_id":123,"machine_token":"tok"}"#);
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
+        }
         assert!(load_credentials().is_none());
     }
 

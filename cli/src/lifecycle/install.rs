@@ -4,6 +4,7 @@ use clap::Args;
 use std::path::PathBuf;
 
 use crate::config_writer::NoopValidator;
+use crate::lifecycle::log::InstallLog;
 use crate::service::{ServiceKind, service_state, start_service};
 use crate::state::{
     bin_dir, ensure_line, ensure_parent, hooks_dir, load_or_init_config, write_managed_bytes,
@@ -19,21 +20,35 @@ const ZSH_HOOK_SOURCE: &str = include_str!("../../../hooks/zsh_hook.sh");
 const ZSHENV_HOOK_SOURCE: &str = include_str!("../../../hooks/zshenv_hook.sh");
 const BASH_HOOK_SOURCE: &str = include_str!("../../../hooks/bash_hook.sh");
 const BASH_ENV_SOURCE: &str = include_str!("../../../hooks/bash_env.sh");
+// BASH_ENV chaining: when the user already has a BASH_ENV set, install captures
+// it in _KYRIS_ORIG_BASH_ENV so bash_env.sh can source both scripts.
+const KYRIS_BASH_ENV_MARKER: &str = "/.kyris/hooks/bash_env.sh";
+const KYRIS_BASH_ENV_LINE: &str = "export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\"";
+const KYRIS_ORIG_CAPTURE: &str = "export _KYRIS_ORIG_BASH_ENV=\"${BASH_ENV:-}\"";
 
 #[derive(Args)]
 pub struct InstallArgs;
 
+// `run` is a top-to-bottom narrative of the install sequence — service plist,
+// shell hooks, agent integrations, manifest writes, post-install verify.
+// Splitting it into helpers would obscure the install transcript (which is
+// the user-facing artifact) without making the logic easier to follow.
+#[allow(clippy::too_many_lines)]
 pub fn run(_args: InstallArgs) {
+    let log = InstallLog::open_install();
+    log.info("=== kyris install started ===");
+
     if let Err(error) = load_or_init_config() {
+        log.error(&format!("load_or_init_config: {error}"));
         eprintln!("{error}");
         std::process::exit(1);
     }
 
     if !check_agentpactd_available() {
-        eprintln!(
-            "agentpactd not found. Kyris requires AgentPact — install it first via AgentPact's \
-             own installer, then re-run `kyris install`."
-        );
+        let msg = "agentpactd not found. Kyris requires AgentPact — install it first via \
+                   AgentPact's own installer, then re-run `kyris install`.";
+        log.error(msg);
+        eprintln!("{msg}");
         std::process::exit(1);
     }
 
@@ -43,16 +58,18 @@ pub fn run(_args: InstallArgs) {
     for (component, installer) in [
         (
             HOOKS_COMPONENT,
-            install_shell_hooks as fn() -> Result<Vec<String>, String>,
+            install_shell_hooks as fn(&InstallLog) -> Result<Vec<String>, String>,
         ),
         (KYRIS_COMPONENT, install_kyris_binary),
         (KYRISD_COMPONENT, install_kyrisd_binary),
         (KYRIS_MCP_COMPONENT, install_kyris_mcp_binary),
         (KYRIS_HOOK_COMPONENT, install_kyris_hook_binary),
     ] {
-        match installer() {
+        log.info(&format!("--- component: {component} ---"));
+        match installer(&log) {
             Ok(changes) => {
                 if changes.is_empty() {
+                    log.info(&format!("{component}: already configured"));
                     println!("{component}: already configured.");
                 } else {
                     println!("Installed {component}:");
@@ -62,6 +79,7 @@ pub fn run(_args: InstallArgs) {
                 }
             }
             Err(error) => {
+                log.error(&format!("{component}: {error}"));
                 eprintln!("{component}: {error}");
                 std::process::exit(1);
             }
@@ -76,23 +94,32 @@ pub fn run(_args: InstallArgs) {
     let bash_env_ok = check_bash_env();
     let agents_ok = check_agent_surfaces();
 
-    if kyrisd_ok && kyris_mcp_ok && kyris_hook_ok && agentpactd_ok && bash_env_ok && agents_ok {
+    let core_ok = kyrisd_ok && kyris_mcp_ok && kyris_hook_ok && agentpactd_ok && bash_env_ok;
+    if core_ok && agents_ok {
+        log.info("all known components detected");
         println!("All known components detected.");
-    } else {
+    } else if !core_ok {
+        // Agent surfaces are probed pre-config; missing entries get fixed by
+        // prestage/reconcile below. Only flag core (binary/BASH_ENV) gaps here.
         println!("Missing components:");
         if !kyrisd_ok {
+            log.warn("kyrisd not found on PATH");
             println!("  kyrisd     - Install via: curl -fsSL https://kyr.is/install | sh");
         }
         if !kyris_mcp_ok {
+            log.warn("kyris-mcp not found on PATH");
             println!("  kyris-mcp  - Install via: curl -fsSL https://kyr.is/install | sh");
         }
         if !kyris_hook_ok {
+            log.warn("kyris-hook not found on PATH");
             println!("  kyris-hook - Install via: curl -fsSL https://kyr.is/install | sh");
         }
         if !agentpactd_ok {
+            log.warn("agentpactd not found on PATH");
             println!("  agentpactd - Install separately via AgentPact's own installer.");
         }
         if !bash_env_ok {
+            log.warn("BASH_ENV not configured");
             println!(
                 "  BASH_ENV   - Run `kyris install` to configure non-interactive shell hooks."
             );
@@ -100,21 +127,46 @@ pub fn run(_args: InstallArgs) {
     }
 
     println!("\nPrestaging agent integrations...");
-    if let Err(e) = crate::agents::prestage::prestage_all() {
+    log.info("--- prestage_all ---");
+    if let Err(e) = crate::agents::prestage::prestage_all(Some(&log)) {
+        log.error(&format!("prestage_all: {e}"));
         eprintln!("Agent prestage: {e}");
     }
 
+    // Wait for kyrisd to be fully ready before reconciling agents. The
+    // component installer started kyrisd moments ago; without a wait,
+    // the health check inside configure_burn_control races the daemon's
+    // startup and may fail even though the daemon is healthy.
+    if let Ok(config) = load_or_init_config() {
+        let base_url = config.base_url();
+        if !crate::agents::configure::wait_for_kyrisd_ready(&base_url, 10) {
+            log.warn("kyrisd did not become ready within 10s — agent burn-control setup may fail");
+            eprintln!(
+                "Warning: kyrisd is not responding at {base_url}/healthz. \
+                 Run `kyris daemon start` if it is not running."
+            );
+        }
+    }
+
     println!("\nReconciling agent integrations...");
-    if let Err(e) = crate::agents::reconcile::reconcile_all(false) {
+    log.info("--- reconcile_all ---");
+    if let Err(e) = crate::agents::reconcile::reconcile_all(false, Some(&log)) {
+        log.error(&format!("reconcile_all: {e}"));
         eprintln!("Reconciliation: {e}");
     }
 
     if !super::verify::verify_post_install() {
+        log.error("post-install verification failed");
         std::process::exit(1);
+    }
+
+    log.info("=== kyris install complete ===");
+    if !log.path().as_os_str().is_empty() {
+        println!("\nInstall log: {}", log.path().display());
     }
 }
 
-fn install_shell_hooks() -> Result<Vec<String>, String> {
+fn install_shell_hooks(log: &InstallLog) -> Result<Vec<String>, String> {
     let hooks_dir = hooks_dir()?;
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let mut changes = Vec::new();
@@ -126,9 +178,19 @@ fn install_shell_hooks() -> Result<Vec<String>, String> {
         ("bash_env.sh", BASH_ENV_SOURCE),
     ] {
         let path = hooks_dir.join(name);
+        let existed = path.exists();
         // Shell hook scripts — opaque text.
         if write_managed_file(&path, contents, "hooks", Some(0o755), &NoopValidator)? {
-            changes.push(format!("wrote {}", path.display()));
+            let display = path.display().to_string();
+            if existed {
+                log.updated(&display);
+                changes.push(format!("updated {display}"));
+            } else {
+                log.created(&display);
+                changes.push(format!("created {display}"));
+            }
+        } else {
+            log.skipped(&path.display().to_string(), "unchanged");
         }
     }
 
@@ -148,28 +210,54 @@ fn install_shell_hooks() -> Result<Vec<String>, String> {
             "source \"$HOME/.kyris/hooks/bash_hook.sh\"",
             "~/.bashrc",
         ),
-        (
-            PathBuf::from(&home).join(".bashrc"),
-            "export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\"",
-            "~/.bashrc",
-        ),
-        (
-            PathBuf::from(&home).join(".bash_profile"),
-            "export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\"",
-            "~/.bash_profile",
-        ),
     ] {
         if ensure_line(&path, line, "hooks")? {
+            log.appended(&path.display().to_string(), line);
             changes.push(format!("updated {label}"));
+        } else {
+            log.skipped(&path.display().to_string(), "line already present");
         }
     }
 
-    install_bash_env_launchd(&home, &mut changes)?;
+    // BASH_ENV can only hold one value; if the user already has a non-kyris
+    // BASH_ENV, capture it in _KYRIS_ORIG_BASH_ENV so bash_env.sh can chain
+    // both scripts in every non-interactive shell.
+    for (path, label) in [
+        (PathBuf::from(&home).join(".bashrc"), "~/.bashrc"),
+        (
+            PathBuf::from(&home).join(".bash_profile"),
+            "~/.bash_profile",
+        ),
+    ] {
+        let has_other_bash_env = std::fs::read_to_string(&path).is_ok_and(|c| {
+            c.lines().any(|l| {
+                let t = l.trim();
+                (t.starts_with("BASH_ENV=") || t.starts_with("export BASH_ENV="))
+                    && !t.contains(KYRIS_BASH_ENV_MARKER)
+            })
+        });
+        if has_other_bash_env && ensure_line(&path, KYRIS_ORIG_CAPTURE, "hooks")? {
+            log.appended(&path.display().to_string(), KYRIS_ORIG_CAPTURE);
+            changes.push(format!("captured original BASH_ENV in {label}"));
+        }
+        if ensure_line(&path, KYRIS_BASH_ENV_LINE, "hooks")? {
+            log.appended(&path.display().to_string(), KYRIS_BASH_ENV_LINE);
+            changes.push(format!("updated {label}"));
+        } else {
+            log.skipped(&path.display().to_string(), "BASH_ENV line already present");
+        }
+    }
+
+    install_bash_env_launchd(&home, &mut changes, log)?;
 
     Ok(changes)
 }
 
-fn install_bash_env_launchd(home: &str, changes: &mut Vec<String>) -> Result<(), String> {
+fn install_bash_env_launchd(
+    home: &str,
+    changes: &mut Vec<String>,
+    log: &InstallLog,
+) -> Result<(), String> {
     let bash_env_value = format!("{home}/.kyris/hooks/bash_env.sh");
     let plist_path = PathBuf::from(home)
         .join("Library")
@@ -197,6 +285,7 @@ fn install_bash_env_launchd(home: &str, changes: &mut Vec<String>) -> Result<(),
 "#
     );
 
+    let existed = plist_path.exists();
     // launchd plist (XML) — no XML validator wired yet; safe to skip.
     if write_managed_file(
         &plist_path,
@@ -205,7 +294,16 @@ fn install_bash_env_launchd(home: &str, changes: &mut Vec<String>) -> Result<(),
         Some(0o644),
         &NoopValidator,
     )? {
-        changes.push(format!("wrote {}", plist_path.display()));
+        let display = plist_path.display().to_string();
+        if existed {
+            log.updated(&display);
+            changes.push(format!("updated {display}"));
+        } else {
+            log.created(&display);
+            changes.push(format!("created {display}"));
+        }
+    } else {
+        log.skipped(&plist_path.display().to_string(), "unchanged");
     }
 
     // Set immediately for the current session
@@ -214,36 +312,52 @@ fn install_bash_env_launchd(home: &str, changes: &mut Vec<String>) -> Result<(),
         .status()
         .map_err(|e| format!("Failed to run launchctl setenv: {e}"))?;
     if status.success() {
+        log.info("set BASH_ENV in launchd session");
         changes.push("set BASH_ENV in launchd session".to_string());
+    } else {
+        log.warn("launchctl setenv BASH_ENV exited non-zero");
     }
 
     // Bootstrap the plist so it runs at next login
     let domain = format!("gui/{}", crate::service::uid());
-    let _ = std::process::Command::new("launchctl")
+    let boot_status = std::process::Command::new("launchctl")
         .args(["bootstrap", &domain, &plist_path.to_string_lossy()])
         .status();
+    match boot_status {
+        Ok(s) if !s.success() => {
+            log.warn(&format!(
+                "launchctl bootstrap {domain} is.kyr.env exited non-zero (may already be loaded)"
+            ));
+        }
+        Err(e) => {
+            log.warn(&format!("launchctl bootstrap failed to run: {e}"));
+        }
+        _ => {}
+    }
 
     Ok(())
 }
 
-fn install_kyrisd_binary() -> Result<Vec<String>, String> {
+fn install_kyrisd_binary(log: &InstallLog) -> Result<Vec<String>, String> {
     install_release_binary(
         "kyr-is",
         "kyris",
         "kyris",
         "kyrisd",
         Some(ServiceKind::Kyrisd),
+        log,
     )
 }
 
-fn install_kyris_binary() -> Result<Vec<String>, String> {
+fn install_kyris_binary(log: &InstallLog) -> Result<Vec<String>, String> {
     let current_exe =
         std::env::current_exe().map_err(|e| format!("Cannot locate running kyris binary: {e}"))?;
     let binary_bytes = std::fs::read(&current_exe)
         .map_err(|e| format!("Cannot read {}: {e}", current_exe.display()))?;
     let install_path = bin_dir()?.join("kyris");
 
-    let mut changes = ensure_bin_path(KYRIS_COMPONENT)?;
+    let mut changes = ensure_bin_path(KYRIS_COMPONENT, log)?;
+    let existed = install_path.exists();
     // Compiled binary — no schema check applies.
     if write_managed_bytes(
         &install_path,
@@ -252,17 +366,26 @@ fn install_kyris_binary() -> Result<Vec<String>, String> {
         Some(0o755),
         &NoopValidator,
     )? {
-        changes.push(format!("wrote {}", install_path.display()));
+        let display = install_path.display().to_string();
+        if existed {
+            log.updated(&display);
+            changes.push(format!("updated {display}"));
+        } else {
+            log.created(&display);
+            changes.push(format!("created {display}"));
+        }
+    } else {
+        log.skipped(&install_path.display().to_string(), "unchanged");
     }
     Ok(changes)
 }
 
-fn install_kyris_mcp_binary() -> Result<Vec<String>, String> {
-    install_release_binary("kyr-is", "kyris", "kyris", "kyris-mcp", None)
+fn install_kyris_mcp_binary(log: &InstallLog) -> Result<Vec<String>, String> {
+    install_release_binary("kyr-is", "kyris", "kyris", "kyris-mcp", None, log)
 }
 
-fn install_kyris_hook_binary() -> Result<Vec<String>, String> {
-    install_release_binary("kyr-is", "kyris", "kyris", "kyris-hook", None)
+fn install_kyris_hook_binary(log: &InstallLog) -> Result<Vec<String>, String> {
+    install_release_binary("kyr-is", "kyris", "kyris", "kyris-hook", None, log)
 }
 
 fn install_release_binary(
@@ -271,17 +394,20 @@ fn install_release_binary(
     formula: &str,
     binary: &str,
     service: Option<ServiceKind>,
+    log: &InstallLog,
 ) -> Result<Vec<String>, String> {
     if super::release::brew_formula_installed(formula) {
-        return Ok(vec![format!(
-            "detected Homebrew-managed {formula}; skipped local {binary} install"
-        )]);
+        let msg = format!("detected Homebrew-managed {formula}; skipped local {binary} install");
+        log.info(&msg);
+        return Ok(vec![msg]);
     }
 
     if crate::state::find_in_path(binary).is_some()
         || bin_dir().is_ok_and(|dir| dir.join(binary).exists())
     {
-        return Ok(vec![format!("{binary}: already on PATH")]);
+        let msg = format!("{binary}: already on PATH");
+        log.skipped(binary, "already on PATH");
+        return Ok(vec![msg]);
     }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -294,7 +420,8 @@ fn install_release_binary(
         .map_err(|e| format!("Cannot read {}: {e}", binary_path.display()))?;
     let install_path = bin_dir()?.join(binary);
 
-    let mut changes = ensure_bin_path("install")?;
+    let mut changes = ensure_bin_path("install", log)?;
+    let existed = install_path.exists();
     // Compiled binary — no schema check applies.
     if write_managed_bytes(
         &install_path,
@@ -303,11 +430,20 @@ fn install_release_binary(
         Some(0o755),
         &NoopValidator,
     )? {
-        changes.push(format!("wrote {}", install_path.display()));
+        let display = install_path.display().to_string();
+        if existed {
+            log.updated(&display);
+            changes.push(format!("updated {display}"));
+        } else {
+            log.created(&display);
+            changes.push(format!("created {display}"));
+        }
+    } else {
+        log.skipped(&install_path.display().to_string(), "unchanged");
     }
 
     if let Some(kind) = service {
-        changes.extend(install_launchd_service(kind, &install_path, binary)?);
+        changes.extend(install_launchd_service(kind, &install_path, binary, log)?);
     }
 
     let _ = std::fs::remove_dir_all(&bundle_dir);
@@ -328,7 +464,7 @@ async fn download_verified_bundle(owner: &str, repo: &str) -> Result<PathBuf, St
     super::release::extract_tarball(&verified_bytes, &asset_name)
 }
 
-fn ensure_bin_path(component: &str) -> Result<Vec<String>, String> {
+fn ensure_bin_path(component: &str, log: &InstallLog) -> Result<Vec<String>, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     let mut changes = Vec::new();
     for (path, label) in [
@@ -336,7 +472,13 @@ fn ensure_bin_path(component: &str) -> Result<Vec<String>, String> {
         (PathBuf::from(&home).join(".bashrc"), "~/.bashrc"),
     ] {
         if ensure_line(&path, "export PATH=\"$HOME/.kyris/bin:$PATH\"", component)? {
+            log.appended(
+                &path.display().to_string(),
+                "export PATH=\"$HOME/.kyris/bin:$PATH\"",
+            );
             changes.push(format!("updated {label}"));
+        } else {
+            log.skipped(&path.display().to_string(), "PATH line already present");
         }
     }
     Ok(changes)
@@ -346,13 +488,13 @@ fn install_launchd_service(
     kind: ServiceKind,
     binary_path: &std::path::Path,
     component: &str,
+    log: &InstallLog,
 ) -> Result<Vec<String>, String> {
     let state = service_state(kind);
     if state.managed_by_homebrew {
-        return Ok(vec![format!(
-            "detected Homebrew-managed {:?} service",
-            kind
-        )]);
+        let msg = format!("detected Homebrew-managed {kind:?} service");
+        log.info(&msg);
+        return Ok(vec![msg]);
     }
 
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
@@ -367,6 +509,7 @@ fn install_launchd_service(
     let mut changes = Vec::new();
     ensure_parent(&log_path)?;
     let plist_contents = launchd_plist(launchd_label(kind), binary_path, &log_path);
+    let existed = plist_path.exists();
     // launchd plist (XML) — no XML validator wired yet.
     if write_managed_file(
         &plist_path,
@@ -375,11 +518,21 @@ fn install_launchd_service(
         Some(0o644),
         &NoopValidator,
     )? {
-        changes.push(format!("wrote {}", plist_path.display()));
+        let display = plist_path.display().to_string();
+        if existed {
+            log.updated(&display);
+            changes.push(format!("updated {display}"));
+        } else {
+            log.created(&display);
+            changes.push(format!("created {display}"));
+        }
+    } else {
+        log.skipped(&plist_path.display().to_string(), "unchanged");
     }
 
     if !state.launchd_loaded {
         start_service(kind)?;
+        log.info(&format!("started {kind:?}"));
         changes.push(format!("started {kind:?}"));
     }
 

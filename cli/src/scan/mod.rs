@@ -78,15 +78,36 @@ fn run_scan(args: ScanRunArgs) {
     }
 
     match args.format.as_str() {
-        "json" => report::json::render(&findings),
-        "html" => report::html::render(&findings),
-        _ => report::terminal::render(&findings),
+        format if format != "json" && format != "html" => {
+            if args.output.is_some() {
+                eprintln!("warning: --output is ignored for terminal format");
+            }
+            report::terminal::render(&findings);
+        }
+        format => {
+            let content = match format {
+                "json" => report::json::build(&findings),
+                _ => report::html::build_html(&findings), // "html"
+            };
+            match args.output.as_deref() {
+                Some(path) => {
+                    if let Err(e) = std::fs::write(path, &content) {
+                        eprintln!("error: could not write to {path}: {e}");
+                        std::process::exit(1);
+                    }
+                    eprintln!("Report written to {path}");
+                }
+                None => print!("{content}"),
+            }
+        }
     }
 }
 
 fn list_patterns() {
     println!("Available scanners:");
-    println!("  keys      - API key detection in source files");
+    println!(
+        "  keys      - API key detection in source files, environment variables, and cloud SDK configs"
+    );
     println!("  agents    - Ungoverned AI agent detection");
     println!("  mcp       - Unwrapped MCP server detection");
     println!("  traffic   - Direct LLM traffic detection");

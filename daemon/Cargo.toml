@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "kyrisd"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -24,6 +24,9 @@ tower-http = { workspace = true }
 reqwest = { workspace = true, features = ["rustls", "json", "stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Explicitly authorized GA exception per forest/03-architecture.md §0.4 #1.
+# serde-saphyr is still 0.0.x; no GA alternative provides the same YAML+serde
+# integration. Used for kyrisd.yaml hot-reload parsing in the daemon.
 serde-saphyr = { workspace = true }
 duckdb = { workspace = true }
 aws-lc-rs = { workspace = true }
@@ -35,8 +38,6 @@ arc-swap = { workspace = true }
 chrono = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-mini = { workspace = true }
-tray-icon = { workspace = true }
-notify-rust = { workspace = true }
 futures-util = { workspace = true }
 const-hex = { workspace = true }
 rustls = { workspace = true }
@@ -44,11 +45,76 @@ tokio-rustls = "0.26"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 
+[features]
+# Tray icon is ON by default for kyris because the menubar is the
+# primary surface users interact with the daemon through (status,
+# pending approvals, continue-after-breaker, quit). Headless builds
+# (CI, server deployments) opt out via --no-default-features.
+default = ["tray"]
+# Native per-platform implementation — no crate deps.
+# macOS: objc2 NSStatusItem + NSApplication (in macos target-deps below).
+# Windows: stub (Win32 Shell_NotifyIcon — add when Windows is targeted).
+# Linux: stub (GTK4/ksni — add when Linux desktop is targeted).
+tray = []
+# Opt-in macOS native log integration via os_log / unified logging.
+oslog = ["dep:tracing-oslog"]
+# Opt-in Linux systemd journal integration via tracing-journald.
+journald = ["dep:tracing-journald"]
+
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }
+tracing-oslog = { version = "0.3.0", optional = true }
+# Direct UNUserNotificationCenter bindings. macOS only honors UN
+# center calls from a process that LaunchServices recognizes as a
+# foreground-eligible app — kyrisd qualifies (launchctl loads it as
+# Kyrisd.app's CFBundleExecutable), but a subprocess spawned from
+# kyrisd does NOT inherit that identity. So the request/check/post
+# calls live in-process here rather than going through a helper
+# binary. See Apple Forums thread 679326.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSBundle",
+    "NSData",
+    "NSDate",
+    "NSError",
+    "NSRunLoop",
+    "NSString",
+    "NSTimer",
+    "NSUUID",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSAlert",
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSButton",
+    "NSControl",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+] }
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "UNNotificationSettings",
+    "UNError",
+    "block2",
+] }
+block2 = "0.6"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald = { version = "0.3.1", optional = true }
 
 [build-dependencies]
 resvg = "0.47"

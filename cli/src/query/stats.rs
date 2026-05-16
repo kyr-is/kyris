@@ -31,6 +31,7 @@ pub fn run(args: StatsArgs) {
     let interval = parse_interval(&args.since);
 
     print_action_stats(&db, &interval);
+    print_agent_stats(&db, &interval);
     print_coverage_stats(&db, &interval, has_gw);
 
     if has_gw {
@@ -61,6 +62,48 @@ fn print_action_stats(db: &duckdb::Connection, interval: &str) {
         let decision: String = row.get(1).unwrap_or_default();
         let count: i64 = row.get(2).unwrap_or(0);
         println!("  {action:<10} {decision:<8} {count}");
+    }
+}
+
+fn build_agent_stats_query(interval: &str) -> String {
+    format!(
+        "SELECT \
+           agent, \
+           COUNT(*) as total, \
+           SUM(CASE WHEN decision = 'auto'   THEN 1 ELSE 0 END) as auto_cnt, \
+           SUM(CASE WHEN decision = 'ask'    THEN 1 ELSE 0 END) as ask_cnt, \
+           SUM(CASE WHEN decision = 'denied' THEN 1 ELSE 0 END) as denied_cnt \
+         FROM events \
+         WHERE timestamp >= now() - INTERVAL '{interval}' \
+         GROUP BY agent \
+         ORDER BY total DESC"
+    )
+}
+
+fn print_agent_stats(db: &duckdb::Connection, interval: &str) {
+    println!("\nAgents by activity:");
+    let query = build_agent_stats_query(interval);
+    let Ok(mut stmt) = db.prepare(&query) else {
+        return;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return;
+    };
+    let mut any = false;
+    while let Some(row) = rows.next().expect("read row") {
+        let agent: String = row.get(0).unwrap_or_default();
+        let total: i64 = row.get(1).unwrap_or(0);
+        let auto_cnt: i64 = row.get(2).unwrap_or(0);
+        let ask_cnt: i64 = row.get(3).unwrap_or(0);
+        let denied_cnt: i64 = row.get(4).unwrap_or(0);
+        println!(
+            "  {agent:<15} {total:>5} commands  \
+             ({auto_cnt} auto, {ask_cnt} ask, {denied_cnt} denied)"
+        );
+        any = true;
+    }
+    if !any {
+        println!("  (no activity)");
     }
 }
 
@@ -236,13 +279,17 @@ fn parse_interval(since: &str) -> String {
 }
 
 fn event_log_dir() -> String {
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        return format!("{state}/agentpact/log");
+    }
     let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.agentpact/log")
+    format!("{home}/.local/state/agentpact/log")
 }
 
 fn kyrisd_db_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.kyris/kyrisd.duckdb")
+    kyris_core::paths::storage_path()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -263,5 +310,43 @@ mod tests {
     #[test]
     fn testParseIntervalInvalid() {
         assert_eq!(parse_interval("abc"), "7 days");
+    }
+
+    #[test]
+    fn testBuildAgentStatsQuerySelectsAgent() {
+        let q = build_agent_stats_query("7 days");
+        assert!(q.contains("agent"));
+        assert!(q.contains("GROUP BY agent"));
+        assert!(q.contains("ORDER BY total DESC"));
+    }
+
+    #[test]
+    fn testBuildAgentStatsQueryCountsAllDecisions() {
+        let q = build_agent_stats_query("7 days");
+        assert!(q.contains("decision = 'auto'"));
+        assert!(q.contains("decision = 'ask'"));
+        assert!(q.contains("decision = 'denied'"));
+    }
+
+    #[test]
+    fn testBuildAgentStatsQueryUsesInterval() {
+        let q = build_agent_stats_query("30 days");
+        assert!(q.contains("30 days"), "interval not in query: {q}");
+    }
+
+    #[test]
+    fn testBuildAgentStatsQueryQueriesEventsTable() {
+        let q = build_agent_stats_query("7 days");
+        assert!(q.contains("FROM events"));
+    }
+
+    #[test]
+    fn testAgentStatsQuerySelectsCountAndDecisionColumns() {
+        // Verify all five projected columns are present in the query.
+        let q = build_agent_stats_query("7 days");
+        assert!(q.contains("COUNT(*) as total"));
+        assert!(q.contains("auto_cnt"));
+        assert!(q.contains("ask_cnt"));
+        assert!(q.contains("denied_cnt"));
     }
 }

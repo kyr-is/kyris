@@ -173,6 +173,11 @@ impl AgentDescriptor for ClaudeCode {
         Ok(changes)
     }
     fn undo(&self) -> Result<(), String> {
+        // Remove MCP upstreams before restoring settings.json to its
+        // pre-kyris state (server names become unreadable after restore).
+        let mcp_names = super::configure::mcp_server_names_from_agent(self);
+        super::configure::remove_mcp_upstreams(&mcp_names)?;
+
         let settings_path = claude_settings_path()?;
         if crate::state::restore_manifest_entry(&settings_path)? {
             println!("Reverted {}", settings_path.display());
@@ -182,6 +187,8 @@ impl AgentDescriptor for ClaudeCode {
         Ok(())
     }
     fn undo_burn_control(&self) -> Result<(), String> {
+        // MCP cleanup is handled in undo(); undo_burn_control handles
+        // the remaining burn-control artifacts.
         for path in self.burn_control_config_paths() {
             if crate::state::restore_manifest_entry(&path)? {
                 println!("Reverted {}", path.display());

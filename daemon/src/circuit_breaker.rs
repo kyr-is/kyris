@@ -84,6 +84,14 @@ impl CircuitBreaker {
         }
     }
 
+    /// True if any session has hit its token cap. Used by the tray
+    /// menu to gate the "Continue Routing" item — it's only
+    /// actionable when at least one session is currently held up.
+    pub fn any_tripped(&self) -> bool {
+        let sessions = self.sessions.read().expect("lock sessions");
+        sessions.values().any(|s| s.total_tokens >= s.max_tokens)
+    }
+
     pub fn session_totals(&self) -> Vec<(String, i64)> {
         let sessions = self.sessions.read().expect("lock sessions");
         sessions

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Stable identity. Every modern macOS subsystem (notifications, TCC,
+         keychain, SMAppService) keys off this. Must be unique across the
+         system and must not change between versions. -->
+    <key>CFBundleIdentifier</key>
+    <string>is.kyr.kyrisd</string>
+
+    <!-- The binary inside Contents/MacOS that macOS invokes when the app
+         is launched. Matches the file name we drop into MacOS/. -->
+    <key>CFBundleExecutable</key>
+    <string>kyrisd</string>
+
+    <!-- Display name (e.g. in System Settings → Notifications, Activity
+         Monitor). User-facing; can be changed. -->
+    <key>CFBundleName</key>
+    <string>Kyris</string>
+    <key>CFBundleDisplayName</key>
+    <string>Kyris</string>
+
+    <!-- Version metadata. Apple expects both: ShortVersionString is the
+         marketing version ("0.1.2"); Version is the build number, which
+         we encode as the short commit. -->
+    <key>CFBundleShortVersionString</key>
+    <string>{{VERSION}}</string>
+    <key>CFBundleVersion</key>
+    <string>{{COMMIT}}</string>
+
+    <!-- Standard bundle metadata. APPL signature is legacy but expected. -->
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+
+    <!-- macOS minimum. Aligned with the Homebrew cask's
+         `depends_on macos: ">= :sonoma"` so a bundle installed by either
+         channel refuses to launch on an unsupported OS rather than
+         crashing later in an obscure way. Bump in lockstep with the
+         cask if you ever change the floor. -->
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+
+    <!-- LSUIElement=true: the app has no dock icon and does not appear in
+         Cmd-Tab, but is allowed to display UI (status bar items, dialogs,
+         notifications). This is the right setting for a daemon that may
+         compile in a menubar tray icon via `--features tray` once that
+         migration is in. Strictly headless builds (no UI at all) would
+         use LSBackgroundOnly=true; we keep LSUIElement for flexibility. -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Copyright / human credit. Surfaced in Finder's Get Info pane. -->
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Kyris. Apache-2.0 licensed.</string>
+
+    <!-- Tell macOS this app may run as a background service (and is allowed
+         to keep running after its UI is gone). The launchd plist still does
+         the actual lifecycle management; this is just metadata. -->
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+</dict>
+</plist>

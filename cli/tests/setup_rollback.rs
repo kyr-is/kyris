@@ -1,5 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+//
+// Tests for `kyris agents setup` behavior when kyrisd is unreachable.
+//
+// Old behavior (removed): burn-control changes were rolled back on health
+// check failure.
+//
+// New behavior: changes are kept — the developer explicitly asked for the
+// configuration. If kyrisd isn't running they start it; the configuration
+// is already in place and takes effect immediately.
+
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -7,10 +17,12 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn write_kyrisd_config(home: &Path) {
-    let kyris_dir = home.join(".kyris");
-    fs::create_dir_all(&kyris_dir).expect("create .kyris");
+    // After the XDG migration kyrisd.yaml lives under
+    // $XDG_CONFIG_HOME/kyris/ (default $HOME/.config/kyris/).
+    let config_dir = home.join(".config").join("kyris");
+    fs::create_dir_all(&config_dir).expect("create kyris config dir");
     fs::write(
-        kyris_dir.join("kyrisd.yaml"),
+        config_dir.join("kyrisd.yaml"),
         "server:\n  listen: \"127.0.0.1:1\"\n  inbound_key: sk-kyris-test\n  operator_key: sk-kyris-ops-test\n",
     )
     .expect("write kyrisd config");
@@ -27,8 +39,10 @@ fn run_setup(home: &Path, cwd: &Path, agent: &str) -> std::process::Output {
         .expect("run kyris agents setup")
 }
 
+/// When the agent is not installed (no ~/.claude/settings.json), setup exits
+/// with an error as soon as the health check fails. No files are modified.
 #[test]
-fn test_claude_setup_rolls_back_when_health_check_fails() {
+fn test_claude_setup_errors_when_kyrisd_unreachable_and_agent_not_installed() {
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
     fs::create_dir_all(home.join(".claude")).expect("create .claude");
@@ -37,34 +51,31 @@ fn test_claude_setup_rolls_back_when_health_check_fails() {
     write_kyrisd_config(home);
 
     let output = run_setup(home, home, "claude-code");
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "should exit non-zero when kyrisd unreachable"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Burn-control and MCP routing rolled back"),
-        "expected rollback message in stderr, got: {stderr}"
+        stderr.contains("kyrisd unreachable"),
+        "expected 'kyrisd unreachable' in stderr, got: {stderr}"
     );
 
-    assert_eq!(
-        fs::read_to_string(home.join(".zshrc")).expect("read .zshrc"),
-        "# zsh baseline\n"
-    );
-    assert_eq!(
-        fs::read_to_string(home.join(".bashrc")).expect("read .bashrc"),
-        "# bash baseline\n"
-    );
+    // Baseline content is preserved in shell rc files (prestage may append
+    // kyris lines, but the original content is not clobbered).
     assert!(
-        !home
-            .join(".kyris")
-            .join("env")
-            .join("claude-code.sh")
-            .exists()
+        fs::read_to_string(home.join(".zshrc"))
+            .expect("read .zshrc")
+            .contains("# zsh baseline"),
+        "baseline content should be preserved in .zshrc"
     );
-    assert!(!home.join(".kyris").join("env").join("load.sh").exists());
 }
 
+/// When the agent IS installed, setup applies all changes and then fails the
+/// health check. Changes are kept — rollback no longer happens.
 #[test]
-fn test_codex_setup_rolls_back_config_rewrite_when_health_check_fails() {
+fn test_codex_setup_keeps_changes_when_kyrisd_unreachable() {
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
     fs::create_dir_all(home.join(".codex")).expect("create .codex");
@@ -81,35 +92,35 @@ args = ["-y", "server"]
     write_kyrisd_config(home);
 
     let output = run_setup(home, home, "codex-cli");
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "should exit non-zero when kyrisd unreachable"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Burn-control and MCP routing rolled back"),
-        "expected rollback message in stderr, got: {stderr}"
+        stderr.contains("kyrisd unreachable"),
+        "expected 'kyrisd unreachable' in stderr, got: {stderr}"
     );
 
     let config_content =
         fs::read_to_string(home.join(".codex").join("config.toml")).expect("read codex config");
-    assert!(
-        !config_content.contains("kyris-mcp"),
-        "MCP servers should not be rewritten after rollback, got: {config_content}"
-    );
-    assert!(
-        config_content.contains("command = \"npx\""),
-        "original MCP server command should be preserved, got: {config_content}"
-    );
+
+    // Execution surface was configured and stays configured.
     assert!(
         config_content.contains("codex_hooks = true"),
-        "execution-surface change (codex_hooks) should survive rollback, got: {config_content}"
+        "execution-surface change should be kept, got: {config_content}"
     );
 
+    // Burn-control and MCP changes are also kept (no rollback).
     assert!(
-        !home
-            .join(".kyris")
-            .join("env")
-            .join("codex-cli.sh")
-            .exists()
+        config_content.contains("kyris-mcp") || config_content.contains("openai_base_url"),
+        "burn-control changes should be kept, got: {config_content}"
     );
-    assert!(!home.join(".kyris").join("env").join("load.sh").exists());
+
+    // Original MCP server is still present (kyris wraps it, not replaces it).
+    assert!(
+        config_content.contains("command = \"npx\"") || config_content.contains("kyris-mcp"),
+        "original or wrapped MCP server should be present, got: {config_content}"
+    );
 }

@@ -215,6 +215,10 @@ impl AgentDescriptor for GeminiCli {
         Ok(changes)
     }
     fn undo(&self) -> Result<(), String> {
+        // Remove MCP upstreams before restoring settings.json.
+        let mcp_names = super::configure::mcp_server_names_from_agent(self);
+        super::configure::remove_mcp_upstreams(&mcp_names)?;
+
         let settings_path = gemini_settings_path()?;
         if crate::state::restore_manifest_entry(&settings_path)? {
             println!("Reverted {}", settings_path.display());

@@ -19,10 +19,18 @@
     </dict>
     <key>ThrottleInterval</key>
     <integer>30</integer>
+    <!--
+        launchd waits this long for kyrisd to exit after SIGTERM before
+        sending SIGKILL. Matches design/kyris.md §5.2's 30-second drain
+        timeout — gives the daemon room to finish in-flight HTTP requests
+        and persist the session-token table before forced termination.
+    -->
     <key>ExitTimeOut</key>
-    <integer>20</integer>
+    <integer>30</integer>
     <key>ProcessType</key>
     <string>Background</string>
+    <key>Nice</key>
+    <integer>5</integer>
     <key>WorkingDirectory</key>
     <string>{{HOME}}/.kyris</string>
     <key>EnvironmentVariables</key>
@@ -37,9 +45,13 @@
         <key>NumberOfFiles</key>
         <integer>4096</integer>
     </dict>
+    <!-- Std{Out,Err}Path follow XDG_STATE_HOME so launchd's daemon logs
+         survive uninstall alongside the daemon's own rotating log.
+         install.sh creates ~/.local/state/kyris/log/ before launchd loads
+         this plist; if the dir is missing, launchd silently drops output. -->
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.kyris/kyrisd.stdout.log</string>
+    <string>{{HOME}}/.local/state/kyris/log/kyrisd.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.kyris/kyrisd.stderr.log</string>
+    <string>{{HOME}}/.local/state/kyris/log/kyrisd.stderr.log</string>
 </dict>
 </plist>

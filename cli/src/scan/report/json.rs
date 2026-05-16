@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::scan::scanner::{Finding, Severity, risk_level};
 
-pub fn render(findings: &[Finding]) {
+pub fn build(findings: &[Finding]) -> String {
     let total_score: u32 = findings.iter().map(|f| f.severity as u32).sum();
     let level = risk_level(total_score);
 
@@ -32,10 +32,7 @@ pub fn render(findings: &[Finding]) {
         "findings": findings_json,
     });
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).expect("serialize scan report")
-    );
+    serde_json::to_string_pretty(&output).expect("serialize scan report")
 }
 
 fn severity_str(severity: Severity) -> &'static str {

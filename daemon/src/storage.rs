@@ -15,6 +15,24 @@ pub fn dropped_count() -> u64 {
     DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Atomically counts a stats-pipeline drop. Called from two paths:
+///   1. `flush_batch` when a `DuckDB` insert fails (already counted via
+///      `fetch_add(batch.len())` in that path).
+///   2. Adapter `try_send` failures (channel full): each event becomes
+///      one drop. Per `design/kyris.md` §5.5: "first dropped record
+///      increments `AtomicU64` counter, emits `tracing::warn!`, exposed
+///      via `GET /readyz` as degraded". We log on the first drop of a
+///      daemon session to avoid log spam under sustained overload.
+pub fn record_dropped(n: u64) {
+    let prev = DROP_COUNT.fetch_add(n, Ordering::Relaxed);
+    if prev == 0 {
+        tracing::warn!(
+            "stats channel full — first event dropped. /readyz will report degraded. \
+             Increase stats.channel_capacity or stats.flush_interval_ms in kyrisd.yaml."
+        );
+    }
+}
+
 /// Filters for `query_gateway_records` (operator API).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GatewayRecordFilter<'a> {
@@ -346,6 +364,25 @@ impl DuckDbWriter {
         .is_ok()
     }
 
+    /// Total cost in USD for all completed requests in the last `window_hours`.
+    /// Returns `None` if the query fails or no cost data exists.
+    pub fn query_spend_usd(&self, window_hours: u64) -> Option<f64> {
+        let conn = self.conn.lock().expect("lock db");
+        let mut stmt = conn
+            .prepare(
+                "SELECT COALESCE(SUM(cost_usd), 0.0) \
+                 FROM gateway_records \
+                 WHERE timestamp >= now()::TIMESTAMP - (INTERVAL '1 hour' * ?::INTEGER) \
+                   AND cost_usd IS NOT NULL \
+                   AND status NOT IN ('error', 'circuit_breaker')",
+            )
+            .ok()?;
+        stmt.query_row(duckdb::params![window_hours as i64], |row| {
+            row.get::<_, f64>(0)
+        })
+        .ok()
+    }
+
     pub fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Connection) -> R,
@@ -359,12 +396,13 @@ pub fn open_db() -> DuckDbWriter {
     let path = if let Ok(p) = std::env::var("KYRIS_DB_PATH") {
         PathBuf::from(p)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| {
-            tracing::error!("HOME not set — cannot locate database directory");
-            std::process::exit(1);
-        });
-        PathBuf::from(format!("{home}/.kyris/kyrisd.duckdb"))
+        kyris_core::paths::storage_path()
     };
+    // Make sure the parent dir exists — first run on a fresh XDG layout
+    // would otherwise fail to create the duckdb file.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     DuckDbWriter::try_open(&path).unwrap_or_else(|e| {
         tracing::error!(error = %e, "failed to open database");
         std::process::exit(1);
@@ -376,6 +414,7 @@ pub async fn stats_writer(
     writer: Arc<DuckDbWriter>,
     circuit_breaker: Arc<crate::circuit_breaker::CircuitBreaker>,
     stats_config: kyris_core::config::StatsConfig,
+    spend_config: kyris_core::config::SpendConfig,
     session_idle_minutes: u64,
 ) {
     let batch_size = stats_config.flush_batch_size;
@@ -385,6 +424,10 @@ pub async fn stats_writer(
         stats_config.flush_interval_ms,
     ));
     let mut prune_interval = tokio::time::interval(std::time::Duration::from_hours(1));
+    // Thresholds (as microdollars) that have already fired a toast this
+    // daemon session. Cleared when spend drops back below the threshold so
+    // a new crossing fires again.
+    let mut notified: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     loop {
         tokio::select! {
@@ -394,6 +437,7 @@ pub async fn stats_writer(
                     if batch.len() >= batch_size {
                         flush_batch(&writer, &mut batch);
                         persist_session_tokens(&writer, &circuit_breaker);
+                        check_spend_thresholds(&writer, &spend_config, &mut notified);
                     }
                 } else {
                     if !batch.is_empty() {
@@ -407,6 +451,7 @@ pub async fn stats_writer(
                 if !batch.is_empty() {
                     flush_batch(&writer, &mut batch);
                     persist_session_tokens(&writer, &circuit_breaker);
+                    check_spend_thresholds(&writer, &spend_config, &mut notified);
                 }
             }
             _ = prune_interval.tick() => {
@@ -417,7 +462,38 @@ pub async fn stats_writer(
                     tracing::warn!(error = %e, "prune session_tokens failed");
                 }
                 circuit_breaker.prune_idle(std::time::Duration::from_secs(session_idle_minutes * 60));
+                // Re-check thresholds after prune so crossing-down resets are caught.
+                check_spend_thresholds(&writer, &spend_config, &mut notified);
             }
+        }
+    }
+}
+
+/// Check each spend threshold and fire a toast the first time spend crosses
+/// it upward. Removes from `notified` when spend drops back below so a
+/// future crossing fires again (e.g. after the rolling window moves forward).
+fn check_spend_thresholds(
+    writer: &DuckDbWriter,
+    config: &kyris_core::config::SpendConfig,
+    notified: &mut std::collections::HashSet<u64>,
+) {
+    if config.warn_thresholds_usd.is_empty() {
+        return;
+    }
+    let Some(total) = writer.query_spend_usd(config.window_hours) else {
+        return;
+    };
+    for &threshold in &config.warn_thresholds_usd {
+        if threshold <= 0.0 {
+            continue;
+        }
+        let key = (threshold * 1_000_000.0) as u64;
+        if total >= threshold {
+            if notified.insert(key) {
+                crate::notify::spend_warning_toast(total, threshold, config.window_hours);
+            }
+        } else {
+            notified.remove(&key);
         }
     }
 }
@@ -826,5 +902,160 @@ mod tests {
         let scope: Vec<String> = serde_json::from_str(&scope_json).expect("parse scope_json");
         assert_eq!(scope, vec!["/work/*", "/new/*"]);
         assert_eq!(last_synced_at, "2026-04-29T13:00:00Z");
+    }
+
+    fn event_with_cost(trace_id: &str, cost: Option<f64>, status: &str) -> StatsEvent {
+        StatsEvent {
+            trace_id: trace_id.to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-4-opus".to_string(),
+            tokens: TokenCounts {
+                input: 100,
+                output: 50,
+            },
+            cache_create: 0,
+            cache_read: 0,
+            cost,
+            latency_ms: 100,
+            status: status.to_string(),
+            session_id: None,
+            mcp_server: None,
+            mcp_tool: None,
+            metering: kyris_core::record::Metering::Available,
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn testQuerySpendUsdSumsRecentCosts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = DuckDbWriter::open(&dir.path().join("test.duckdb"));
+
+        let events = vec![
+            event_with_cost("t1", Some(5.00), "success"),
+            event_with_cost("t2", Some(3.50), "success"),
+            event_with_cost("t3", Some(1.00), "error"), // excluded
+            event_with_cost("t4", Some(0.50), "circuit_breaker"), // excluded
+            event_with_cost("t5", None, "success"),     // NULL cost, excluded
+        ];
+        writer.insert_batch(&events).expect("insert");
+
+        let total = writer.query_spend_usd(24).expect("query_spend_usd");
+        // Only t1 ($5.00) and t2 ($3.50) are included.
+        assert!(
+            (total - 8.50).abs() < 0.01,
+            "expected $8.50, got ${total:.4}"
+        );
+    }
+
+    #[test]
+    fn testQuerySpendUsdReturnsZeroWhenNoRecords() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = DuckDbWriter::open(&dir.path().join("test.duckdb"));
+
+        let total = writer.query_spend_usd(24).expect("query returns Some");
+        // Empty-table case — exact 0.0 is the contract (no records → no spend).
+        #[allow(clippy::float_cmp)]
+        let is_zero = total == 0.0;
+        assert!(is_zero, "expected exactly 0.0 with no records, got {total}");
+    }
+
+    #[test]
+    fn testCheckSpendThresholdsFiresOnCrossing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = DuckDbWriter::open(&dir.path().join("test.duckdb"));
+
+        // Insert $12 of spend.
+        let events = vec![
+            event_with_cost("t1", Some(7.00), "success"),
+            event_with_cost("t2", Some(5.00), "success"),
+        ];
+        writer.insert_batch(&events).expect("insert");
+
+        let config = kyris_core::config::SpendConfig {
+            warn_thresholds_usd: vec![10.0, 50.0],
+            window_hours: 24,
+        };
+        let mut notified = std::collections::HashSet::new();
+
+        // First check: $12 > $10 threshold → inserts into notified.
+        check_spend_thresholds(&writer, &config, &mut notified);
+        let key_10 = (10.0_f64 * 1_000_000.0) as u64;
+        let key_50 = (50.0_f64 * 1_000_000.0) as u64;
+        assert!(
+            notified.contains(&key_10),
+            "$10 threshold should be in notified"
+        );
+        assert!(
+            !notified.contains(&key_50),
+            "$50 threshold should not fire yet"
+        );
+
+        // Second check with same data: already notified, no double-fire.
+        check_spend_thresholds(&writer, &config, &mut notified);
+        assert!(
+            notified.contains(&key_10),
+            "still notified after second check"
+        );
+    }
+
+    #[test]
+    fn testCheckSpendThresholdsResetsWhenDropsBelowThreshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = DuckDbWriter::open(&dir.path().join("test.duckdb"));
+
+        let config = kyris_core::config::SpendConfig {
+            warn_thresholds_usd: vec![10.0],
+            window_hours: 24,
+        };
+        let mut notified = std::collections::HashSet::new();
+        let key_10 = (10.0_f64 * 1_000_000.0) as u64;
+
+        // Pre-seed notified as if it had fired before.
+        notified.insert(key_10);
+
+        // Zero spend in DB → below threshold → should be removed from notified.
+        check_spend_thresholds(&writer, &config, &mut notified);
+        assert!(
+            !notified.contains(&key_10),
+            "should be removed from notified when below threshold"
+        );
+    }
+
+    #[test]
+    fn testCheckSpendThresholdsNoOpWhenEmpty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = DuckDbWriter::open(&dir.path().join("test.duckdb"));
+
+        let config = kyris_core::config::SpendConfig {
+            warn_thresholds_usd: vec![],
+            window_hours: 24,
+        };
+        let mut notified = std::collections::HashSet::new();
+        // Should not panic or query the DB.
+        check_spend_thresholds(&writer, &config, &mut notified);
+        assert!(notified.is_empty());
+    }
+
+    #[test]
+    fn testRecordDroppedIncrementsCounter() {
+        // DROP_COUNT is a process-global static, so this test asserts a
+        // monotonic delta rather than a specific value (other tests in the
+        // same process may also exercise the counter).
+        let before = dropped_count();
+        record_dropped(3);
+        let after = dropped_count();
+        assert!(
+            after >= before + 3,
+            "record_dropped(3) should increment counter by >= 3 (before={before}, after={after})"
+        );
+        // Subsequent increments still accumulate, just without the
+        // first-drop warning. Confirm the count keeps moving.
+        record_dropped(2);
+        let after2 = dropped_count();
+        assert!(
+            after2 >= after + 2,
+            "record_dropped(2) should increment counter by >= 2 (after={after}, after2={after2})"
+        );
     }
 }

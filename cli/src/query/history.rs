@@ -198,13 +198,18 @@ fn build_sync_state_query(args: &HistoryArgs) -> (String, Vec<String>) {
 }
 
 fn event_log_dir() -> String {
+    // agentpact log moved under XDG_STATE_HOME with its own XDG migration.
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        return format!("{state}/agentpact/log");
+    }
     let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.agentpact/log")
+    format!("{home}/.local/state/agentpact/log")
 }
 
 fn kyrisd_db_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.kyris/kyrisd.duckdb")
+    kyris_core::paths::storage_path()
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]

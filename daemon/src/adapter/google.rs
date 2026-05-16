@@ -153,26 +153,32 @@ async fn handle_generate_content(
         None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
-    let _ = state.stats_tx.try_send(StatsEvent {
-        trace_id: trace_id.clone(),
-        provider: provider_name,
-        model: model.clone(),
-        tokens,
-        cache_create: 0,
-        cache_read: 0,
-        cost,
-        latency_ms,
-        status: if status.is_success() {
-            "success".to_string()
-        } else {
-            "error".to_string()
-        },
-        session_id: Some(session_id.clone()),
-        mcp_server: None,
-        mcp_tool: None,
-        metering,
-        working_dir,
-    });
+    if state
+        .stats_tx
+        .try_send(StatsEvent {
+            trace_id: trace_id.clone(),
+            provider: provider_name,
+            model: model.clone(),
+            tokens,
+            cache_create: 0,
+            cache_read: 0,
+            cost,
+            latency_ms,
+            status: if status.is_success() {
+                "success".to_string()
+            } else {
+                "error".to_string()
+            },
+            session_id: Some(session_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            metering,
+            working_dir,
+        })
+        .is_err()
+    {
+        crate::storage::record_dropped(1);
+    }
 
     Response::builder()
         .status(status)
@@ -417,22 +423,28 @@ fn relay_ndjson_stream(
                 None => super::resolve_peer_working_dir_sync(peer_addr),
             };
 
-            let _ = state.stats_tx.try_send(StatsEvent {
-                trace_id: trace_id_for_stream.clone(),
-                provider: provider_name_for_stream.clone(),
-                model: model_for_stream.clone(),
-                tokens,
-                cache_create: 0,
-                cache_read: 0,
-                cost,
-                latency_ms,
-                status: status.to_string(),
-                session_id: Some(session_id_for_stream.clone()),
-                mcp_server: None,
-                mcp_tool: None,
-                metering: stream_metering,
-                working_dir,
-            });
+            if state
+                .stats_tx
+                .try_send(StatsEvent {
+                    trace_id: trace_id_for_stream.clone(),
+                    provider: provider_name_for_stream.clone(),
+                    model: model_for_stream.clone(),
+                    tokens,
+                    cache_create: 0,
+                    cache_read: 0,
+                    cost,
+                    latency_ms,
+                    status: status.to_string(),
+                    session_id: Some(session_id_for_stream.clone()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    metering: stream_metering,
+                    working_dir,
+                })
+                .is_err()
+            {
+                crate::storage::record_dropped(1);
+            }
 
             breaker_chunk
         };

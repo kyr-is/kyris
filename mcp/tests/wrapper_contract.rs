@@ -152,9 +152,18 @@ fn test_wrapper_blocks_tools_call_when_daemon_denies() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(r#""error""#), "{stdout}");
+    // I-05 format: [AgentPact PACT_DENIED] {reason}. {recovery_hint}
     assert!(
-        stdout.contains("Blocked by policy: blocked by policy"),
-        "{stdout}"
+        stdout.contains("[AgentPact PACT_DENIED]"),
+        "missing I-05 code prefix: {stdout}"
+    );
+    assert!(
+        stdout.contains("blocked by policy"),
+        "missing reason: {stdout}"
+    );
+    assert!(
+        stdout.contains("Change policy or contact admin"),
+        "missing recovery hint: {stdout}"
     );
     assert!(!stdout.contains(r#""name":"read_file""#), "{stdout}");
 

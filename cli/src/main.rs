@@ -6,6 +6,19 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
+// Crate-level allows. These are deliberate trade-offs for a CLI binary
+// rather than a general-purpose library:
+// - needless_pass_by_value: every `run(args: XArgs)` handler consumes its
+//   Args struct top-to-bottom; passing by reference would force lifetime
+//   annotations everywhere with no ergonomic gain.
+// - missing_errors_doc / missing_panics_doc: pedantic lints intended for
+//   library APIs that downstream crates document. `kyris` is a binary; the
+//   public-ish `pub fn run(...)` surface is internal to this crate and is
+//   only invoked from `main`. Adding `# Errors` / `# Panics` sections to
+//   every internal entry point would be docs-cargo-culting.
+// - must_use_candidate: `Result`-returning helpers are always consumed by
+//   `?` or explicit match in the same crate; tagging them `#[must_use]`
+//   adds noise without catching real bugs.
 #![allow(
     clippy::needless_pass_by_value,
     clippy::missing_errors_doc,
@@ -22,6 +35,7 @@ mod config_writer;
 mod continue_cmd;
 mod hook_cmd;
 mod integration;
+mod json_patch_ops;
 mod lifecycle;
 mod mcp_cmd;
 mod pending;
@@ -30,6 +44,7 @@ mod scan;
 mod service;
 mod state;
 mod status;
+mod toml_patch;
 mod version;
 
 use clap::{Parser, Subcommand};

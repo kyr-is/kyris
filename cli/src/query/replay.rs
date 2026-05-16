@@ -172,11 +172,15 @@ pub fn run(args: ReplayArgs) {
 }
 
 fn event_log_dir() -> String {
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        return format!("{state}/agentpact/log");
+    }
     let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.agentpact/log")
+    format!("{home}/.local/state/agentpact/log")
 }
 
 fn kyrisd_db_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.kyris/kyrisd.duckdb")
+    kyris_core::paths::storage_path()
+        .to_string_lossy()
+        .into_owned()
 }

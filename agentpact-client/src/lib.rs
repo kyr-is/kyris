@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use kyris_core::agentpact::{
-    ApprovalResponse, McpContext, McpPermissionDecision, ToolAnnotations,
+    ApprovalResponse, DenyCode, McpContext, McpPermissionDecision, ToolAnnotations,
     build_hook_permission_request, build_mcp_permission_request, build_permission_respond_request,
     daemon_unavailable_message, default_socket_path, parse_mcp_permission_response,
 };
@@ -129,8 +129,8 @@ pub fn send_permission_response(
     let response_value = send_daemon_request_to_socket(socket_path, &request, socket_timeout)?;
     match parse_mcp_permission_response(&response_value) {
         McpPermissionDecision::Allow => Ok(()),
-        McpPermissionDecision::Deny(_) if response == ApprovalResponse::Denied => Ok(()),
-        McpPermissionDecision::Deny(reason) => {
+        McpPermissionDecision::Deny { .. } if response == ApprovalResponse::Denied => Ok(()),
+        McpPermissionDecision::Deny { reason, .. } => {
             Err(format!("agentpactd rejected approval response: {reason}"))
         }
         McpPermissionDecision::Ask { .. } => {
@@ -200,13 +200,26 @@ fn read_daemon_state() -> Option<serde_json::Value> {
 }
 
 fn daemon_state_path() -> Option<PathBuf> {
+    // Override 1: explicit socket path → daemon.state is in the same dir.
+    // Useful for test harnesses that point everything at a tempdir.
     if let Ok(sock) = std::env::var("AGENTPACT_SOCK") {
         return std::path::Path::new(&sock)
             .parent()
             .map(|dir| dir.join("daemon.state"));
     }
+    // Override 2: XDG_STATE_HOME — agentpact moved daemon.state under
+    // XDG_STATE_HOME with its XDG migration. Honor it directly.
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        return Some(PathBuf::from(state).join("agentpact").join("daemon.state"));
+    }
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".agentpact").join("daemon.state"))
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("agentpact")
+            .join("daemon.state"),
+    )
 }
 
 fn send_daemon_request_with_retry(
@@ -284,7 +297,7 @@ fn restart_agentpactd() -> Result<(), String> {
         .and_then(|stdout| stdout.trim().parse::<u32>().ok())
         .unwrap_or(0);
     std::process::Command::new("launchctl")
-        .args(["kickstart", "-k", &format!("gui/{uid}/is.kyr.agentpactd")])
+        .args(["kickstart", &format!("gui/{uid}/is.kyr.agentpactd")])
         .status()
         .map_err(|e| format!("failed to restart agentpactd: {e}"))
         .map(|_| ())

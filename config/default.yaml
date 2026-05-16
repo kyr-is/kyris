@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
-# Default kyrisd configuration. Copied to ~/.kyris/kyrisd.yaml on first run.
+# Default kyrisd configuration. Copied to $XDG_CONFIG_HOME/kyris/kyrisd.yaml
+# on first run (default $HOME/.config/kyris/kyrisd.yaml). See
+# kyris-core/src/paths.rs for the full XDG-aware layout.
 
 server:
   listen: "127.0.0.1:4710"

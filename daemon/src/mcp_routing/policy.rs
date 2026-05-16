@@ -124,7 +124,7 @@ async fn request_permission(
 fn map_permission_decision(decision: agentpact::McpPermissionDecision) -> PolicyDecision {
     match decision {
         agentpact::McpPermissionDecision::Allow => PolicyDecision::Allow,
-        agentpact::McpPermissionDecision::Deny(reason) => PolicyDecision::Deny(reason),
+        agentpact::McpPermissionDecision::Deny { reason, .. } => PolicyDecision::Deny(reason),
         agentpact::McpPermissionDecision::Ask {
             approval_id,
             approval_token,

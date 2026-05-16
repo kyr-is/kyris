@@ -2,6 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 name: CI
 
+# Runs on every PR and on every push to main. Both triggers run the
+# same job so a commit that lands via PR is re-validated after merge
+# (belt-and-suspenders against branch-protection misconfig or commits
+# pushed directly to main).
+#
+# release.yml handles release-mode compilation + .app bundling +
+# notarization + GitHub Release upload on tagged builds. CI doesn't
+# touch release artifacts.
 on:
   pull_request:
   push:
@@ -33,15 +41,67 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      # Clippy and cargo-llvm-cov use different rustc drivers (clippy
+      # has its own driver; llvm-cov sets coverage RUSTFLAGS), so the
+      # two cannot share build artifacts. We pay for both compiles
+      # because each catches things the other can't:
+      #   - clippy catches lint regressions on every PR (style + perf
+      #     + correctness lints that tests don't cover)
+      #   - cargo-llvm-cov runs tests AND produces coverage data in
+      #     one go, so coverage data is available on every PR
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Deny check
         run: cargo deny check
 
-      - name: Test with coverage
+      - name: Tests with coverage
         run: cargo llvm-cov --all-features --all-targets
 
+      # Run criterion benches in `--test` mode (one iteration, no
+      # measurement). Catches bench-build regressions and any compile
+      # error inside #[bench] gates without paying for a full
+      # measurement run on every PR. Required by design/kyris.md §12.1.
+      - name: Benchmarks (smoke)
+        run: cargo bench -p kyrisd -- --test
+
+      # Verifies build-app-bundle.sh + Info.plist.template produce a
+      # structurally valid Kyrisd.app. Uses the kyrisd binary that
+      # cargo-llvm-cov just built — no extra compile. The instrumented
+      # binary is a normal Mach-O as far as codesign + Info.plist
+      # lookup are concerned.
+      - name: Bundle smoke test
+        env:
+          BINARY: target/llvm-cov-target/debug/kyrisd
+          VERSION: "0.0.0-ci"
+          COMMIT: ${{ github.sha }}
+          OUT_DIR: target/bundle-smoke
+        run: |
+          set -euo pipefail
+          mkdir -p target/bundle-smoke
+          bash scripts/build-app-bundle.sh
+          APP=target/bundle-smoke/Kyrisd.app
+          test -d "$APP" || { echo "::error::bundle directory missing"; exit 1; }
+          test -f "$APP/Contents/Info.plist" || { echo "::error::Info.plist missing"; exit 1; }
+          test -x "$APP/Contents/MacOS/kyrisd" || { echo "::error::binary missing or non-executable"; exit 1; }
+          test -f "$APP/Contents/Resources/is.kyr.kyrisd.plist" || { echo "::error::launchd template missing from Resources"; exit 1; }
+          test -f "$APP/Contents/Resources/Cargo.toml" || { echo "::error::Cargo.toml missing from Resources"; exit 1; }
+          grep -qE '^agentpact\s*=' "$APP/Contents/Resources/Cargo.toml" \
+            || { echo "::error::bundled Cargo.toml is missing the agentpact dependency entry"; exit 1; }
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")
+          test "$BUNDLE_ID" = "is.kyr.kyrisd" || { echo "::error::CFBundleIdentifier wrong: $BUNDLE_ID"; exit 1; }
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+          test "$VER" = "0.0.0-ci" || { echo "::error::version substitution failed: $VER"; exit 1; }
+          LSUI=$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")
+          test "$LSUI" = "true" || { echo "::error::LSUIElement not set"; exit 1; }
+          codesign --verify --strict --verbose=2 "$APP"
+          "$APP/Contents/MacOS/kyrisd" --version
+          echo "bundle validation OK"
+
+      # Coverage gist only updates on pushes to main, never on PR
+      # builds. PR coverage runs but doesn't write — the gist reflects
+      # the coverage of the latest merged code, not whatever a PR
+      # happened to land.
       - name: Update coverage gist
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:

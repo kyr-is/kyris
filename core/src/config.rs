@@ -60,8 +60,7 @@ where
 }
 
 pub fn load_mcp_config() -> McpConfig {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = std::path::PathBuf::from(format!("{home}/.kyris/kyrisd.yaml"));
+    let path = crate::paths::config_path();
     std::fs::read_to_string(&path)
         .ok()
         .and_then(|contents| serde_saphyr::from_str::<KyrisdConfig>(&contents).ok())
@@ -75,8 +74,7 @@ pub struct KyrisdConnection {
 
 #[must_use]
 pub fn load_kyrisd_connection() -> Option<KyrisdConnection> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = std::path::PathBuf::from(format!("{home}/.kyris/kyrisd.yaml"));
+    let path = crate::paths::config_path();
     let config: KyrisdConfig = std::fs::read_to_string(&path)
         .ok()
         .and_then(|contents| serde_saphyr::from_str(&contents).ok())?;

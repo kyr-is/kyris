@@ -8,10 +8,14 @@ use std::process::Command;
 use tempfile::TempDir;
 
 fn write_kyrisd_config(home: &Path, listen: &str) {
-    let kyris_dir = home.join(".kyris");
-    fs::create_dir_all(&kyris_dir).expect("create .kyris");
+    // After the XDG migration kyrisd.yaml lives under
+    // $XDG_CONFIG_HOME/kyris/ (default $HOME/.config/kyris/). The test
+    // only sets HOME, so the daemon resolves config to
+    // tempdir/.config/kyris/kyrisd.yaml.
+    let config_dir = home.join(".config").join("kyris");
+    fs::create_dir_all(&config_dir).expect("create kyris config dir");
     fs::write(
-        kyris_dir.join("kyrisd.yaml"),
+        config_dir.join("kyrisd.yaml"),
         format!(
             "server:\n  listen: \"{listen}\"\n  inbound_key: sk-kyris-test\n  operator_key: sk-kyris-ops-test\n"
         ),
