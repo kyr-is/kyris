@@ -127,6 +127,7 @@ pub async fn run(config: KyrisdConfig) {
     tokio::spawn(crate::sync::daemon_sync::run_sync_loop(state.clone()));
     tokio::spawn(crate::pricing_fetch::run_pricing_fetch(state.clone()));
     tokio::spawn(run_pending_prune(state.pending.clone()));
+    tokio::spawn(run_pending_tray_broadcast(state.pending.clone()));
     tokio::spawn(crate::reconcile_watcher::run_reconcile_loop(state.clone()));
 
     let inbound_auth_config = state.config.clone();
@@ -288,6 +289,22 @@ async fn run_pending_prune(pending: Arc<PendingStore>) {
     loop {
         interval.tick().await;
         pending.prune_resolved();
+    }
+}
+
+// Push the count of held pending approvals to the tray atomic so the
+// menu-bar refresh (250ms cadence) can show an attention state. Polling
+// rather than wiring every transition point keeps the contract simple —
+// the source of truth stays in PendingStore.list_held(); the tray sees
+// the current count within at most 750ms of any change.
+async fn run_pending_tray_broadcast(pending: Arc<PendingStore>) {
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
+    loop {
+        interval.tick().await;
+        #[cfg(feature = "tray")]
+        crate::tray::set_pending_approval_count(pending.list_held().len());
+        #[cfg(not(feature = "tray"))]
+        let _ = &pending;
     }
 }
 
@@ -573,6 +590,13 @@ async fn hold_pending(
     #[cfg(feature = "tray")]
     {
         let state = state.clone();
+        tracing::info!(
+            target: "kyris::approval",
+            pending_id = %body.id,
+            server = %dialog_server,
+            tool = ?dialog_tool,
+            "dispatching approval dialog"
+        );
         tokio::spawn(async move {
             let tool_label = dialog_tool.as_deref().unwrap_or("unknown tool");
             // Title/body kept lean: the window titlebar already says
@@ -585,16 +609,31 @@ async fn hold_pending(
             } else {
                 format!("Agent wants to run {tool_label}. Allow?")
             };
-            let response = crate::notify::ask_approval(
+            let outcome = crate::notify::ask_approval(
                 &format!("Allow {dialog_server}"),
                 &body_line,
                 dialog_code.as_deref(),
             )
             .await;
-            let decision = match response {
-                "yes" => ResolveDecision::Approved,
-                "always" => ResolveDecision::Always,
-                _ => ResolveDecision::Denied,
+            // CouldNotShow means the panel never became visible to the user
+            // — treat as "no answer yet" and leave the request pending so
+            // the menu-bar attention path (or `kyris pending`) can pick it
+            // up. Treating CouldNotShow as Denied would silently reject
+            // every request whenever the user is in a fullscreen app or on
+            // a different Space — the exact failure mode this design fixes.
+            let Some(decision) = (match outcome {
+                crate::notify::ApprovalOutcome::Yes => Some(ResolveDecision::Approved),
+                crate::notify::ApprovalOutcome::Always => Some(ResolveDecision::Always),
+                crate::notify::ApprovalOutcome::No => Some(ResolveDecision::Denied),
+                crate::notify::ApprovalOutcome::CouldNotShow => {
+                    tracing::warn!(
+                        pending_id = %dialog_id,
+                        "approval panel could not be shown — leaving request pending"
+                    );
+                    None
+                }
+            }) else {
+                return;
             };
             // Best-effort log of the user's answer for `kyris approvals`
             // recall and offline catalog mining. Records the verbatim command
@@ -741,7 +780,7 @@ async fn healthz(
     let dropped = storage::dropped_count();
     let providers = config.providers.len();
     let db_writable = state.db.probe_writable();
-    let ready = providers > 0 && dropped == 0 && db_writable;
+    let ready = dropped == 0 && db_writable;
     let status = if ready {
         axum::http::StatusCode::OK
     } else {
@@ -1283,7 +1322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testHealthzNotReadyWithoutProviders() {
+    async fn testHealthzReadyWithoutProviders() {
         let dir = tempfile::tempdir().unwrap();
         let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         let state = make_test_state(config, dir.path());
@@ -1306,9 +1345,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ready"], false);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["providers"], 0);
+        assert_eq!(body["db_writable"], true);
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();

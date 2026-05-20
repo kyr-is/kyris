@@ -7,7 +7,8 @@ use crate::integration::{read_json_value, set_json_string_path, write_json_value
 use crate::state::restore_manifest_entry;
 
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_mcp_wrap, not_detected,
+    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
+    json_has_mcp_wrap, not_detected,
 };
 use super::registry::{AgentDescriptor, McpConfigFormat, McpConfigLocation};
 
@@ -204,8 +205,13 @@ impl AgentDescriptor for Cline {
         let has_mcp_wrap = mcp_path
             .as_deref()
             .is_some_and(|p| json_has_mcp_wrap(p, "mcpServers"));
+        let has_any_mcp_servers = mcp_path
+            .as_deref()
+            .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
         let tool = if has_mcp_wrap {
             SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+        } else if !has_any_mcp_servers {
+            SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
@@ -245,6 +251,21 @@ impl AgentDescriptor for Cline {
     }
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
+    }
+    fn surface_design_ceilings(
+        &self,
+    ) -> (
+        Option<super::profile::CoverageCeiling>,
+        Option<super::profile::CoverageCeiling>,
+        Option<super::profile::CoverageCeiling>,
+    ) {
+        // cline has no live-hook path — compiled policy is the maximum
+        // achievable command-control coverage.
+        (
+            Some(super::profile::CoverageCeiling::Compiled),
+            None,
+            None,
+        )
     }
     fn configure_execution(
         &self,

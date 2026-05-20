@@ -16,7 +16,7 @@ fn codex_config_validator() -> TomlShapeValidator<CodexConfigShape> {
     TomlShapeValidator::new()
 }
 
-use super::probe::{ProbeResult, fingerprint, not_detected};
+use super::probe::{ProbeResult, fingerprint, not_detected, toml_has_any_mcp_servers};
 use super::registry::{
     AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation, ToolMapping,
 };
@@ -137,6 +137,9 @@ impl AgentDescriptor for CodexCli {
                 serialized.contains("kyris-mcp")
             })
         });
+        let has_any_mcp_servers = config_path
+            .as_deref()
+            .is_some_and(|p| toml_has_any_mcp_servers(p, "mcp_servers"));
 
         let has_compiled_policy = codex_dir()
             .ok()
@@ -153,6 +156,8 @@ impl AgentDescriptor for CodexCli {
         };
         let tool = if has_mcp_wrap {
             SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+        } else if !has_any_mcp_servers {
+            SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };

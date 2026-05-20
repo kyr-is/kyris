@@ -83,6 +83,31 @@ pub(super) fn json_has_mcp_wrap(path: &std::path::Path, servers_key: &str) -> bo
         })
 }
 
+/// Returns true iff `path` has at least one entry under `servers_key`. Used
+/// to distinguish "no MCP servers to wrap" (N/A) from "MCP servers exist but
+/// aren't wrapped" (real gap).
+pub(super) fn json_has_any_mcp_servers(path: &std::path::Path, servers_key: &str) -> bool {
+    let Ok(value) = read_json_value(path) else {
+        return false;
+    };
+    value
+        .get(servers_key)
+        .and_then(|s| s.as_object())
+        .is_some_and(|servers| !servers.is_empty())
+}
+
+/// TOML analog of [`json_has_any_mcp_servers`]. Used for agents (e.g.,
+/// codex-cli) whose MCP server registry lives in a TOML table.
+pub(super) fn toml_has_any_mcp_servers(path: &std::path::Path, servers_key: &str) -> bool {
+    let Ok(value) = crate::integration::read_toml_value(path) else {
+        return false;
+    };
+    value
+        .get(servers_key)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|servers| !servers.is_empty())
+}
+
 pub(super) fn env_file_has_var(agent_id: &str, var_name: &str) -> bool {
     let Ok(dir) = env_dir() else {
         return false;

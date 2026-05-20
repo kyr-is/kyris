@@ -148,6 +148,10 @@ pub fn run(_args: InstallArgs) {
         }
     }
 
+    if let Err(e) = seed_user_policy_if_missing(&log) {
+        log.warn(&format!("seed_user_policy: {e}"));
+    }
+
     println!("\nReconciling agent integrations...");
     log.info("--- reconcile_all ---");
     if let Err(e) = crate::agents::reconcile::reconcile_all(false, Some(&log)) {
@@ -638,4 +642,41 @@ fn check_agent_surfaces() -> bool {
         }
     }
     all_ok
+}
+
+// Seed a minimal user-level Pact at ~/.agentpact/policy/pact.yaml so that
+// kyris compile_policy's walk-up (which always lands at $HOME/.agentpact/
+// policy/ for the home level) has something to merge. Without this, agents
+// whose only command-control mechanism is compiled policy (e.g., cline)
+// can never finish setup on a fresh machine. Idempotent: skips if any
+// *.yaml is already present in the user policy dir.
+fn seed_user_policy_if_missing(log: &InstallLog) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
+    let policy_dir = PathBuf::from(home).join(".agentpact").join("policy");
+    if let Ok(entries) = std::fs::read_dir(&policy_dir)
+        && entries.flatten().any(|e| {
+            e.path()
+                .extension()
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
+        })
+    {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&policy_dir)
+        .map_err(|e| format!("create {}: {e}", policy_dir.display()))?;
+    let seed_path = policy_dir.join("pact.yaml");
+    let body = "# SPDX-License-Identifier: Apache-2.0\n\
+                # Minimal starter policy seeded by `kyris install`. Mode `log`\n\
+                # records command attribution without blocking — replace with\n\
+                # `enforce` and add `commands:` rules to start mediating. Delete\n\
+                # this file to opt out; the installer will not re-seed if any\n\
+                # *.yaml is present.\n\
+                apiVersion: agentpact/v1\n\
+                kind: Pact\n\
+                metadata:\n  name: user-default\n\
+                spec:\n  mode: log\n";
+    std::fs::write(&seed_path, body).map_err(|e| format!("write {}: {e}", seed_path.display()))?;
+    log.info(&format!("seeded starter policy: {}", seed_path.display()));
+    println!("Seeded starter policy: {}", seed_path.display());
+    Ok(())
 }

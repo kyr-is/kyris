@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::probe::ProbeResult;
+use super::profile::CoverageCeiling;
 
 pub trait AgentDescriptor {
     fn id(&self) -> &'static str;
@@ -14,6 +15,19 @@ pub trait AgentDescriptor {
     fn kyris_content_markers(&self) -> &'static [&'static str];
     fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)>;
     fn expected_surfaces(&self) -> (bool, bool, bool);
+    /// Per-surface design ceiling (exec, tool, burn). `Some(Compiled)` means
+    /// the agent has no path beyond compiled-policy for that surface — so
+    /// realizing Compiled is `ok`, not a degradation. Default: `None` for all
+    /// surfaces (any Compiled outcome is treated as a degradation).
+    fn surface_design_ceilings(
+        &self,
+    ) -> (
+        Option<CoverageCeiling>,
+        Option<CoverageCeiling>,
+        Option<CoverageCeiling>,
+    ) {
+        (None, None, None)
+    }
     fn configure_execution(
         &self,
         _base_url: &str,

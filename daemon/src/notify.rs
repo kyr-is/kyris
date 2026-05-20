@@ -31,16 +31,30 @@ pub fn request_authorization_if_needed() {
     crate::notify_macos::request_authorization_if_needed();
 }
 
+/// User-facing approval outcomes. `Yes`/`No`/`Always` come from the user
+/// clicking a button. `CouldNotShow` is the structural signal that the
+/// dialog never became visible to the user (occluded, off-active-space,
+/// off-screen, or otherwise undeliverable) and the caller should fall
+/// back to another channel (menu-bar attention, TTY prompt, web UI)
+/// rather than treating the absence of an answer as a denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Yes,
+    No,
+    Always,
+    CouldNotShow,
+}
+
 /// Show a modal Yes / No / Always dialog and return the user's choice.
 /// On macOS with the tray feature this dispatches to the main thread via
-/// the tao event loop; on other platforms it falls back to `"yes"`.
+/// the tao event loop; on other platforms it falls back to `Yes`.
 ///
 /// `code`, when `Some`, is rendered in the popup's accessoryView as
 /// monospaced text — the right surface for shell commands and file paths
 /// (whose readability suffers in the standard `informativeText` font).
 /// When `None`, the popup uses `body` alone.
 #[cfg(feature = "tray")]
-pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> &'static str {
+pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> ApprovalOutcome {
     #[cfg(target_os = "macos")]
     {
         crate::tray::ask_approval(title, body, code).await
@@ -48,7 +62,7 @@ pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> &'stat
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (title, body, code);
-        "yes"
+        ApprovalOutcome::Yes
     }
 }
 

@@ -32,7 +32,7 @@
 //! and polled by a 250ms `NSTimer` on the main thread (macOS).  The
 //! daemon's main thread calls [`run_event_loop`] while Tokio runs on a
 //! background thread; see `kyrisd::main`.
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -83,6 +83,12 @@ impl TrayState {
 
 static CURRENT_STATE: AtomicU8 = AtomicU8::new(0);
 static CIRCUIT_BREAKER_TRIPPED: AtomicBool = AtomicBool::new(false);
+// Number of approval requests currently held in kyrisd's pending queue
+// that the user hasn't responded to. When > 0, the menu-bar tray switches
+// to an attention state (status label shows the count, tooltip changes,
+// icon becomes the degraded/amber variant) so the user has a persistent
+// visual signal even when an NSAlert popup failed to surface.
+static PENDING_APPROVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_state(state: TrayState) {
     CURRENT_STATE.store(state as u8, Ordering::Relaxed);
@@ -100,6 +106,13 @@ pub fn current_state() -> TrayState {
 /// poller in `server::run` reads `state.circuit_breaker.any_tripped()`.
 pub fn set_circuit_breaker_tripped(tripped: bool) {
     CIRCUIT_BREAKER_TRIPPED.store(tripped, Ordering::Relaxed);
+}
+
+/// Push the current count of held pending approvals. Called by the
+/// permission/hold paths in `server.rs` after every transition so the
+/// menu-bar tray's 250ms refresh picks up the change.
+pub fn set_pending_approval_count(count: usize) {
+    PENDING_APPROVAL_COUNT.store(count, Ordering::Relaxed);
 }
 
 // --- Feature-gated GUI plumbing -------------------------------------------
@@ -122,9 +135,13 @@ mod gui {
     use std::thread::JoinHandle;
 
     /// Ask the user to approve an action.
-    /// TODO: Windows notification/dialog — returns "yes" for now.
-    pub async fn ask_approval(_title: &str, _body: &str, _code: Option<&str>) -> &'static str {
-        "yes"
+    /// TODO: Windows notification/dialog — returns `Yes` for now.
+    pub async fn ask_approval(
+        _title: &str,
+        _body: &str,
+        _code: Option<&str>,
+    ) -> crate::notify::ApprovalOutcome {
+        crate::notify::ApprovalOutcome::Yes
     }
 
     /// Run the UI event loop. TODO: Win32 Shell_NotifyIcon tray icon.
@@ -144,9 +161,13 @@ mod gui {
     use std::thread::JoinHandle;
 
     /// Ask the user to approve an action.
-    /// TODO: Linux desktop notification/dialog — returns "yes" for now.
-    pub async fn ask_approval(_title: &str, _body: &str, _code: Option<&str>) -> &'static str {
-        "yes"
+    /// TODO: Linux desktop notification/dialog — returns `Yes` for now.
+    pub async fn ask_approval(
+        _title: &str,
+        _body: &str,
+        _code: Option<&str>,
+    ) -> crate::notify::ApprovalOutcome {
+        crate::notify::ApprovalOutcome::Yes
     }
 
     /// Run the UI event loop. TODO: GTK4 / ksni tray icon for Linux.
@@ -164,7 +185,7 @@ mod gui {
 #[cfg(all(feature = "tray", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod gui {
-    use super::{CIRCUIT_BREAKER_TRIPPED, TrayState, current_state};
+    use super::{CIRCUIT_BREAKER_TRIPPED, PENDING_APPROVAL_COUNT, TrayState, current_state};
     use block2::RcBlock;
     use core::ffi::c_uchar;
     use objc2::rc::Retained;
@@ -233,6 +254,7 @@ mod gui {
     struct Snapshot {
         tray_state: TrayState,
         circuit_breaker_tripped: bool,
+        pending_approval_count: usize,
     }
 
     impl Snapshot {
@@ -240,6 +262,7 @@ mod gui {
             Self {
                 tray_state: current_state(),
                 circuit_breaker_tripped: CIRCUIT_BREAKER_TRIPPED.load(Ordering::Relaxed),
+                pending_approval_count: PENDING_APPROVAL_COUNT.load(Ordering::Relaxed),
             }
         }
     }
@@ -313,13 +336,19 @@ mod gui {
     /// Dispatch an `NSAlert` approval dialog to the main thread and await
     /// the user's response.  The work queue delivers the call within 250ms
     /// (next timer tick); `wake_main_run_loop` reduces that to the next
-    /// run-loop iteration.  Falls back to `"yes"` if the channel is dropped.
+    /// run-loop iteration.  Returns `CouldNotShow` if the channel is dropped
+    /// (sender panicked / main run loop ended), so the caller can route to
+    /// another channel instead of treating the silence as a denial.
     ///
     /// `code`, when `Some`, is rendered in the popup's accessoryView as
     /// monospaced text — for shell commands and file paths the user needs
     /// to read clearly to make the decision.
-    pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> &'static str {
-        let (tx, rx) = tokio::sync::oneshot::channel::<&'static str>();
+    pub async fn ask_approval(
+        title: &str,
+        body: &str,
+        code: Option<&str>,
+    ) -> crate::notify::ApprovalOutcome {
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::notify::ApprovalOutcome>();
         let title = title.to_string();
         let body = body.to_string();
         let code = code.map(str::to_string);
@@ -328,7 +357,10 @@ mod gui {
             let _ = tx.send(result);
         });
         wake_main_run_loop();
-        rx.await.unwrap_or("yes")
+        // If the channel is dropped (sender panicked / main loop ended),
+        // surface that as CouldNotShow rather than a silent Yes — the
+        // caller can then escalate to another channel.
+        rx.await.unwrap_or(crate::notify::ApprovalOutcome::CouldNotShow)
     }
 
     /// Run the `AppKit` event loop on the calling thread (must be the process
@@ -510,24 +542,49 @@ mod gui {
             }
             ui.needs_initial_paint = false;
 
-            // Status label text.
+            // Pending approvals override the normal status display — the
+            // user needs to know there's something waiting for them, even
+            // if the daemon itself is healthy. Falls back to tray_state's
+            // label/tooltip when no approvals are pending.
+            let needs_attention = now.pending_approval_count > 0
+                || !matches!(now.tray_state, TrayState::Normal);
+
+            let status_text: String = if now.pending_approval_count > 0 {
+                format!(
+                    "Pending Approvals: {} (run `kyris pending` to resolve)",
+                    now.pending_approval_count
+                )
+            } else {
+                now.tray_state.status_label().to_string()
+            };
+            let tooltip_text: String = if now.pending_approval_count > 0 {
+                format!(
+                    "Kyris: {} pending approval{}",
+                    now.pending_approval_count,
+                    if now.pending_approval_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )
+            } else {
+                now.tray_state.tooltip().to_string()
+            };
+
             unsafe {
-                let t = NSString::from_str(now.tray_state.status_label());
+                let t = NSString::from_str(&status_text);
                 let _: () = msg_send![&*ui.status_label, setTitle: &*t];
             }
-
-            // Tooltip.
             unsafe {
-                let t = NSString::from_str(now.tray_state.tooltip());
+                let t = NSString::from_str(&tooltip_text);
                 let _: () = msg_send![&*ui.status_item, setToolTip: &*t];
             }
 
-            // Icon: template (auto-tint) for normal, amber tint for degraded.
-            set_status_item_icon(
-                &ui.status_item,
-                mtm,
-                !matches!(now.tray_state, TrayState::Normal),
-            );
+            // Icon: template (auto-tint) only when nothing needs attention.
+            // Pending approvals reuse the existing amber/degraded variant —
+            // a separate "pending" art asset can come later; for now the
+            // status-label text + tooltip carry the specifics.
+            set_status_item_icon(&ui.status_item, mtm, needs_attention);
 
             // Continue routing.
             unsafe {

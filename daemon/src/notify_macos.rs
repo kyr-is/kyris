@@ -79,7 +79,11 @@ pub fn request_authorization_if_needed() {
 }
 
 /// Show a modal Yes / No / Always approval dialog on the main thread.
-/// Returns one of the string literals `"yes"`, `"no"`, or `"always"`.
+/// Returns an [`crate::notify::ApprovalOutcome`] reflecting the user's
+/// choice, or `CouldNotShow` if the panel never became visible to the
+/// user (occluded, off-active-space, off-screen) within the visibility
+/// poll window — callers should treat that as a signal to escalate to
+/// another channel rather than a denial.
 /// Must be called from the main thread (asserted via `MainThreadMarker`).
 ///
 /// Renders a custom `NSPanel` rather than `NSAlert` because `NSAlert`
@@ -95,7 +99,27 @@ pub fn request_authorization_if_needed() {
 /// display a modal — without this, focus stays stuck on `Kyrisd.app` after
 /// the user clicks a button.
 #[cfg(feature = "tray")]
-pub fn show_approval_alert(title: &str, body: &str, code: Option<&str>) -> &'static str {
+pub fn show_approval_alert(
+    title: &str,
+    body: &str,
+    code: Option<&str>,
+) -> crate::notify::ApprovalOutcome {
+    use crate::notify::ApprovalOutcome;
+
+    tracing::info!(
+        target: "kyris::approval",
+        %title,
+        body_len = body.len(),
+        code_len = code.map(str::len).unwrap_or(0),
+        "show_approval_alert: entry"
+    );
+
+    // AppKit wire codes for stopModalWithCode:. Kept local — the public
+    // API surfaces ApprovalOutcome, never these integers.
+    const MODAL_CODE_YES: isize = 1;
+    const MODAL_CODE_NO: isize = 2;
+    const MODAL_CODE_ALWAYS: isize = 3;
+    const MODAL_CODE_COULD_NOT_SHOW: isize = 99;
     use core::ffi::c_uchar;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -379,10 +403,10 @@ pub fn show_approval_alert(title: &str, body: &str, code: Option<&str>) -> &'sta
         btn
     };
 
-    // Tags must match the `match` arm below.
-    let yes_btn = make_button("Yes", yes_x, 1, "\r"); // Return: default
-    let no_btn = make_button("No", no_x, 2, "\u{1b}"); // Escape: cancel
-    let always_btn = make_button("Always", always_x, 3, "");
+    // Tag = MODAL_CODE_*; ApprovalAction calls stopModalWithCode:tag.
+    let yes_btn = make_button("Yes", yes_x, MODAL_CODE_YES, "\r"); // Return: default
+    let no_btn = make_button("No", no_x, MODAL_CODE_NO, "\u{1b}"); // Escape: cancel
+    let always_btn = make_button("Always", always_x, MODAL_CODE_ALWAYS, "");
     content_view.addSubview(&yes_btn);
     content_view.addSubview(&no_btn);
     content_view.addSubview(&always_btn);
@@ -397,7 +421,89 @@ pub fn show_approval_alert(title: &str, body: &str, code: Option<&str>) -> &'sta
     #[allow(deprecated)] // activate() requires entitlements we don't ship
     app.activateIgnoringOtherApps(true);
 
+    // Strong-display flags: bump z-order above normal windows, follow the
+    // user across Spaces, order-front even if another app didn't relinquish
+    // focus. Cheap-strong combo — does NOT change activation policy, so the
+    // Dock icon doesn't flash into existence on every prompt (which would
+    // be a worse user disruption than the prompt itself).
+    const NS_POPUP_MENU_WINDOW_LEVEL: isize = 101;
+    const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1;
+    unsafe {
+        let _: () = msg_send![&*panel, setLevel: NS_POPUP_MENU_WINDOW_LEVEL];
+        let _: () = msg_send![
+            &*panel,
+            setCollectionBehavior: NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        ];
+        let _: () = msg_send![&*panel, orderFrontRegardless];
+    }
+
+    // Visibility poll: confirm the OS actually displayed the panel to the
+    // user before we block on runModal. A panel can be "ordered front"
+    // while the user is in a fullscreen app, on another Space, or with
+    // the screen off — none of which gets the pixels in front of them.
+    // If the panel hasn't passed all four checks (isVisible, isOnActiveSpace,
+    // screen != nil, occlusionState contains the Visible bit) within
+    // ~500ms, stop the modal with sentinel code 99 so the caller knows
+    // the prompt was undeliverable and can fall back to another channel.
+    const VISIBILITY_POLL_MAX_MS: u128 = 500;
+    let panel_raw: usize = Retained::as_ptr(&panel) as usize;
+    let app_raw: usize = Retained::as_ptr(&app) as usize;
+    let start_time = std::time::Instant::now();
+
+    let poll_block = block2::RcBlock::new(
+        move |timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+            let panel_ptr = panel_raw as *mut AnyObject;
+            let app_ptr = app_raw as *mut AnyObject;
+            let visible_to_user = unsafe {
+                let visible: bool = msg_send![panel_ptr, isVisible];
+                let on_active_space: bool = msg_send![panel_ptr, isOnActiveSpace];
+                let screen: *mut AnyObject = msg_send![panel_ptr, screen];
+                let occlusion: u64 = msg_send![panel_ptr, occlusionState];
+                // NSWindowOcclusionStateVisible = 1 << 1
+                let occlusion_visible = (occlusion & 0x2) != 0;
+                visible && on_active_space && !screen.is_null() && occlusion_visible
+            };
+            let elapsed_ms = start_time.elapsed().as_millis();
+            if visible_to_user {
+                unsafe {
+                    let _: () = msg_send![timer.as_ref(), invalidate];
+                }
+                tracing::info!(
+                    target: "kyris::approval",
+                    elapsed_ms = elapsed_ms as u64,
+                    "approval panel visible to user"
+                );
+            } else if elapsed_ms >= VISIBILITY_POLL_MAX_MS {
+                unsafe {
+                    let _: () = msg_send![timer.as_ref(), invalidate];
+                    let _: () = msg_send![app_ptr, stopModalWithCode: MODAL_CODE_COULD_NOT_SHOW];
+                }
+                tracing::warn!(
+                    target: "kyris::approval",
+                    "approval panel never became visible — aborting modal"
+                );
+            }
+        },
+    );
+    let poll_timer = unsafe {
+        objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+            0.05,
+            true,
+            &poll_block,
+        )
+    };
+
+    tracing::info!(target: "kyris::approval", "runModal: starting");
     let response: isize = unsafe { msg_send![&*app, runModalForWindow: &*panel] };
+    tracing::info!(target: "kyris::approval", response, "runModal: returned");
+
+    // CRITICAL: invalidate the poll timer before any of the local Retained<>
+    // values go out of scope. The timer's block captures the panel pointer
+    // as a raw usize; without explicit invalidate, a tick fired after this
+    // function returns would dereference freed memory.
+    unsafe {
+        let _: () = msg_send![&*poll_timer, invalidate];
+    }
 
     panel.orderOut(None);
 
@@ -413,15 +519,26 @@ pub fn show_approval_alert(title: &str, body: &str, code: Option<&str>) -> &'sta
     // we don't want any drop-order surprises during a future refactor.
     let _ = (&handler, &yes_btn, &no_btn, &always_btn);
 
-    match response {
-        1 => "yes",
-        2 => "no",
-        3 => "always",
-        _ => {
-            tracing::warn!(response = ?response, "unexpected modal response; defaulting to deny");
-            "no"
+    let outcome = match response {
+        MODAL_CODE_YES => ApprovalOutcome::Yes,
+        MODAL_CODE_NO => ApprovalOutcome::No,
+        MODAL_CODE_ALWAYS => ApprovalOutcome::Always,
+        MODAL_CODE_COULD_NOT_SHOW => ApprovalOutcome::CouldNotShow,
+        other => {
+            tracing::warn!(
+                target: "kyris::approval",
+                ?other,
+                "unexpected modal response; defaulting to No"
+            );
+            ApprovalOutcome::No
         }
-    }
+    };
+    tracing::info!(
+        target: "kyris::approval",
+        ?outcome,
+        "show_approval_alert: exit"
+    );
+    outcome
 }
 
 // ApprovalAction: an objc target object whose `decide:` selector reads

@@ -6,7 +6,8 @@ use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{read_json_value, write_json_value};
 
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_mcp_wrap, not_detected,
+    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
+    json_has_mcp_wrap, not_detected,
 };
 use super::registry::{
     AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation,
@@ -61,6 +62,9 @@ impl AgentDescriptor for GeminiCli {
         let has_mcp_wrap = settings_path
             .as_deref()
             .is_some_and(|p| json_has_mcp_wrap(p, "mcpServers"));
+        let has_any_mcp_servers = settings_path
+            .as_deref()
+            .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
 
         let has_compiled_policy = gemini_policies_dir()
             .ok()
@@ -77,6 +81,8 @@ impl AgentDescriptor for GeminiCli {
         };
         let tool = if has_mcp_wrap {
             SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+        } else if !has_any_mcp_servers {
+            SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
