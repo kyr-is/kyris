@@ -14,6 +14,16 @@ use super::registry::{
 
 pub struct ClaudeCode;
 
+/// True iff the installed hook-launcher script at `path` matches what
+/// `super::configure::hook_script_source(agent_id)` would write today.
+/// Missing file or read error → `false` (drift).
+fn script_matches_template(path: &std::path::Path, agent_id: &str) -> bool {
+    let Ok(actual) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    actual == super::configure::hook_script_source(agent_id)
+}
+
 pub fn claude_settings_path() -> Result<PathBuf, String> {
     let home = crate::integration::home_dir()?;
     Ok(home.join(".claude").join("settings.json"))
@@ -74,6 +84,19 @@ impl AgentDescriptor for ClaudeCode {
                 serialized.contains("agentpact_pretooluse")
             })
         });
+
+        // Drift check: if the hook is registered in settings.json but the
+        // on-disk script differs from what the current kyris would write,
+        // treat the surface as not-adapted so `kyris status` flags it and
+        // the user knows to re-run `kyris install` / `kyris agents reconcile`.
+        // Without this, an older kyris version's hook script (which may have
+        // emitted empty stdout, causing the double-prompt symptom) stays in
+        // place silently forever.
+        let hook_script_drifted = has_hook
+            && claude_hooks_dir().is_ok_and(|d| {
+                !script_matches_template(&d.join("agentpact_pretooluse.sh"), "claude-code")
+            });
+        let has_hook = has_hook && !hook_script_drifted;
         let has_mcp_wrap = settings_path
             .as_deref()
             .is_some_and(|p| json_has_mcp_wrap(p, "mcpServers"));
@@ -255,8 +278,47 @@ impl AgentDescriptor for ClaudeCode {
                     detail_key: Some("file_path".to_string()),
                 },
             ],
+            // LLM coordination primitives and read-only views. These have no
+            // governable side effect; skip the agentpactd round-trip entirely
+            // (the daemon contract for action=call requires context.mcp_server,
+            // which built-ins cannot supply). New Claude built-ins not listed
+            // here will warn-and-allow at run time — see hook_cmd.rs.
+            pass_through_tools: vec![
+                "AskUserQuestion".to_string(),
+                "TodoWrite".to_string(),
+                "ExitPlanMode".to_string(),
+                "EnterPlanMode".to_string(),
+                "Task".to_string(),
+                "Agent".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string(),
+                "NotebookEdit".to_string(),
+                "BashOutput".to_string(),
+                "KillShell".to_string(),
+                "KillBash".to_string(),
+                "ToolSearch".to_string(),
+                "Skill".to_string(),
+                "Monitor".to_string(),
+                "ScheduleWakeup".to_string(),
+                "WebFetch".to_string(),
+                "WebSearch".to_string(),
+                "ShareOnboardingGuide".to_string(),
+            ],
             default_action: "call".to_string(),
-            allow_response: AllowResponse::EmptyStdout,
+            // Claude Code's PreToolUse hook treats exit-0 with empty stdout as
+            // "no decision" and falls back to its own permission prompt — which
+            // double-prompts after AgentPact already approved. Emitting the
+            // hookSpecificOutput shape with permissionDecision=allow suppresses
+            // Claude's prompt entirely.
+            allow_response: AllowResponse::Json {
+                body: serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": "approved by AgentPact policy"
+                    }
+                }),
+            },
         })
     }
 }
@@ -264,6 +326,61 @@ impl AgentDescriptor for ClaudeCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn testClaudeCodeAllowEmitsHookSpecificOutput() {
+        // Regression test: Claude Code's PreToolUse hook ignores exit-0 with
+        // empty stdout and falls back to its own permission prompt, causing a
+        // double-prompt after AgentPact already approved. The allow response
+        // must use the hookSpecificOutput shape with permissionDecision=allow.
+        let proto = ClaudeCode
+            .hook_protocol()
+            .expect("claude-code hook protocol");
+        match proto.allow_response {
+            AllowResponse::Json { body } => {
+                let hso = body
+                    .get("hookSpecificOutput")
+                    .expect("hookSpecificOutput present");
+                assert_eq!(
+                    hso.get("hookEventName").and_then(|v| v.as_str()),
+                    Some("PreToolUse")
+                );
+                assert_eq!(
+                    hso.get("permissionDecision").and_then(|v| v.as_str()),
+                    Some("allow")
+                );
+            }
+            AllowResponse::EmptyStdout => {
+                panic!(
+                    "Claude Code allow must emit JSON, not empty stdout — would cause double prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn testScriptMatchesTemplateMatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.sh");
+        let expected = super::super::configure::hook_script_source("claude-code");
+        std::fs::write(&path, &expected).unwrap();
+        assert!(script_matches_template(&path, "claude-code"));
+    }
+
+    #[test]
+    fn testScriptMatchesTemplateDriftDetected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.sh");
+        std::fs::write(&path, "#!/bin/bash\n# stale older script\nexit 0\n").unwrap();
+        assert!(!script_matches_template(&path, "claude-code"));
+    }
+
+    #[test]
+    fn testScriptMatchesTemplateMissingFileIsDrift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.sh");
+        assert!(!script_matches_template(&path, "claude-code"));
+    }
 
     #[test]
     fn testClaudeCodeExportsMultiBackend() {

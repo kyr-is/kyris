@@ -8,7 +8,22 @@ set -euo pipefail
 #
 # Uninstall is intentionally broader than install: it clears any residue from
 # prior installs (including the legacy system-mode layout under /usr/local/bin
-# and /etc/kyris) so upgrades from older releases leave no trace.
+# and /etc/kyris) so upgrades from older releases leave no trace. It also
+# cascade-removes agentpact when kyris was its last dependent — same
+# version reconciliation that a fresh `install.sh` would apply on the next
+# install, so the user never ends up with a stale orphan agentpact.
+# Cascade is gated on the kyr-packages registry: if any other manifest
+# declares `depends_on: ["agentpact"]`, agentpact is preserved.
+#
+# MODES (see usage() for full flag reference and file layout):
+#   install.sh                              install (user mode, default)
+#   install.sh --local <dir>                install from a local build (e.g. target/release/)
+#   install.sh --no-brew                    install via script even when brew is present
+#   install.sh --no-agentpact               install without the agentpact dependency check
+#   install.sh --uninstall                  uninstall, preserve user data (config/data/state)
+#   install.sh --uninstall --reset-data     uninstall, also wipe XDG dirs (true clean slate)
+#   install.sh --uninstall --no-brew        force script-path uninstall even if brew installed it
+#   install.sh --help                       full usage including file layout and examples
 
 REPO="kyr-is/kyris"
 AGENTPACT_REPO="kyr-is/agentpact"
@@ -373,6 +388,126 @@ uninstall_agentpact_remote() {
   fi
 }
 
+# Return 0 if any OTHER kyr-package in the registry declares agentpact as
+# a dependency. Called after kyris's own manifest is removed so the only
+# matches should be non-kyris dependents. Used to gate the cascade
+# uninstall of agentpact: keep it if anything else still needs it.
+#
+# Skips `agentpact.json` itself — its own `"name": "agentpact"` line would
+# falsely match a naive grep and make the check always claim there's a
+# dependent. Skips `kyris.json` defensively too (it's already removed at
+# call time). Uses python3 to inspect the `depends_on` array specifically
+# so other JSON fields containing the substring "agentpact" can't
+# false-positive either.
+agentpact_has_other_dependents() {
+  [ -d "$REGISTRY_DIR" ] || return 1
+  command -v python3 >/dev/null 2>&1 || {
+    info "WARN: python3 missing; conservatively assuming agentpact has other dependents."
+    return 0
+  }
+  python3 - "$REGISTRY_DIR" <<'PY'
+import json, os, sys
+registry = sys.argv[1]
+for name in os.listdir(registry):
+    if name in ("agentpact.json", "kyris.json"):
+        continue
+    if not name.endswith(".json"):
+        continue
+    path = os.path.join(registry, name)
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        continue
+    deps = data.get("depends_on")
+    if isinstance(deps, list) and "agentpact" in deps:
+        sys.exit(0)  # found a dependent
+sys.exit(1)  # no dependents
+PY
+}
+
+# Cascade-remove agentpact when kyris is its last dependent.
+#
+# When: called from uninstall_all AFTER kyris's manifest is unregistered.
+# Skips if --no-agentpact was passed (SKIP_AGENTPACT=1), or if any other
+# kyr-package still declares depends_on on agentpact.
+#
+# Channel detection: reads agentpact.json's install_method. brew installs
+# delegate to `brew uninstall --cask` (+ --zap on --reset-data). Script
+# installs use agentpact's cached installer first (~/.agentpact/installer.sh)
+# and fall back to the existing network-fetch path in
+# uninstall_agentpact_remote.
+#
+# --reset-data propagation: passed through to agentpact's uninstaller as
+# `--reset-data` (script) or `--zap` (brew) so a "full wipe" of kyris is
+# also a full wipe of agentpact.
+cascade_remove_agentpact() {
+  if [ "$SKIP_AGENTPACT" -eq 1 ]; then
+    info "Skipping agentpact cascade-uninstall (--no-agentpact)."
+    return 0
+  fi
+  if agentpact_has_other_dependents; then
+    info "Leaving agentpact installed: still required by another kyr-package."
+    return 0
+  fi
+
+  local manifest="${REGISTRY_DIR}/agentpact.json"
+  local install_method=""
+  if [ -f "$manifest" ]; then
+    install_method="$(manifest_field "$manifest" install_method)"
+  fi
+
+  # Brew-installed agentpact: delegate to brew so its receipts stay consistent.
+  # We do this even if `--no-brew` was passed for KYRIS, because the channel
+  # choice is per-package and agentpact's channel is what governs its removal.
+  if [ "$install_method" = "brew" ] && brew_available; then
+    if brew list --cask "${TAP}/agentpact" >/dev/null 2>&1; then
+      if [ "$RESET_DATA" -eq 1 ]; then
+        info "Cascade: removing brew-installed agentpact via 'brew uninstall --cask --zap ${TAP}/agentpact'..."
+        brew uninstall --cask --zap "${TAP}/agentpact" \
+          || info "WARN: brew uninstall of agentpact exited non-zero; please run it manually."
+      else
+        info "Cascade: removing brew-installed agentpact via 'brew uninstall --cask ${TAP}/agentpact'..."
+        brew uninstall --cask "${TAP}/agentpact" \
+          || info "WARN: brew uninstall of agentpact exited non-zero; please run it manually."
+      fi
+      return 0
+    fi
+    info "agentpact manifest claims brew install but cask not present; falling through to script path."
+  fi
+
+  # Script-installed agentpact: prefer the cached installer at
+  # ~/.agentpact/installer.sh. uninstall_agentpact_remote already handles
+  # cached-first-then-network; we just need to thread --reset-data through.
+  local cached
+  if cached="$(agentpact_cached_installer 2>/dev/null)"; then
+    info "Cascade: removing agentpact via its cached installer ($cached)..."
+    if [ "$RESET_DATA" -eq 1 ]; then
+      "$cached" --uninstall --reset-data \
+        || info "WARN: agentpact --uninstall --reset-data exited non-zero; please run it manually."
+    else
+      "$cached" --uninstall \
+        || info "WARN: agentpact --uninstall exited non-zero; please run it manually."
+    fi
+    return 0
+  fi
+
+  # No cached installer — fall back to the network path. Pull the version
+  # from the manifest if we have it so the URL is version-matched.
+  local installed_version=""
+  if [ -f "$manifest" ]; then
+    installed_version="$(manifest_field "$manifest" version)"
+  fi
+  info "Cascade: removing agentpact via network fetch (no cached installer found)..."
+  # uninstall_agentpact_remote doesn't support --reset-data today; when set,
+  # warn so the user knows the data dirs may linger and how to finish the job.
+  uninstall_agentpact_remote "$installed_version"
+  if [ "$RESET_DATA" -eq 1 ]; then
+    info "WARN: network-fallback uninstall of agentpact ran without --reset-data; XDG dirs may remain."
+    info "      Run agentpact's own installer with --uninstall --reset-data to finish the wipe."
+  fi
+}
+
 # Install or update agentpact to the exact version this kyris build requires.
 # If agentpact is missing → install. If installed at the correct version →
 # skip. If installed at a different version → uninstall + install. Mirrors
@@ -467,28 +602,63 @@ Usage: install.sh [--user] [--local <dir>] [--no-agentpact] [--no-brew]
   --local <dir>  Copy binaries from local directory instead of downloading.
                  <dir> should contain kyris, kyrisd, kyris-mcp, kyris-hook binaries
                  (e.g. target/release/).
-  --no-agentpact Skip the agentpact dependency check (script install path only;
-                 brew handles depends_on natively). Use if agentpact is installed
-                 via a channel kyris cannot detect. kyris will not function until
-                 agentpact is available at runtime.
   --no-brew      Skip brew detection and install via the script path even when
                  Homebrew is available. Symmetric on --uninstall.
   --uninstall    Stop kyrisd and remove install-managed files (binary bundle,
                  launchd plist, ~/.kyris/ runtime dir, package receipt). User
                  data under ~/.config/kyris/, ~/.local/share/kyris/, and
-                 ~/.local/state/kyris/ is PRESERVED. Does NOT remove agentpact
-                 (kyris is the dependent, not the dependency). If brew
+                 ~/.local/state/kyris/ is PRESERVED. Cascades to agentpact:
+                 if no other kyr-package in ~/.local/share/kyr-packages/
+                 declares depends_on agentpact, agentpact is removed too
+                 (preferred via its own cached installer, then network
+                 fallback; brew-installed agentpact uses brew). Pass
+                 --no-agentpact to keep agentpact installed. If brew
                  installed kyris, delegates to 'brew uninstall --cask'.
+  --no-agentpact On install: skip the agentpact dependency check (script path
+                 only; brew handles depends_on natively). Use if agentpact is
+                 installed via a channel kyris cannot detect — kyris will not
+                 function until agentpact is available at runtime.
+                 On --uninstall: skip the cascade-remove of agentpact, leaving
+                 it installed regardless of dependent count.
   --reset-data   Only with --uninstall: also wipe the XDG dirs (config, data,
                  state). For brew installs, adds --zap. For script installs,
-                 removes them directly. Use this when you want a true clean
-                 slate, e.g. before re-enrolling on a new machine.
+                 removes them directly. Propagates to agentpact's cascaded
+                 uninstall too (script path: --reset-data; brew path: --zap)
+                 so a full wipe of kyris is a full wipe of agentpact.
 
 File layout (XDG Base Directory):
   ~/.kyris/                      install-managed runtime (manifest, hooks, env)
   ~/.config/kyris/               kyrisd.yaml
   ~/.local/share/kyris/          credentials.json, kyrisd.duckdb (event log)
-  ~/.local/state/kyris/          log/, crash/, diagnostics/, fail-open.jsonl
+  ~/.local/state/kyris/          log/, crash/, diagnostics/, fail-open.jsonl,
+                                 approvals.jsonl
+
+What --uninstall removes (default):
+  binaries (kyris, kyrisd, kyris-mcp, kyris-hook), Kyrisd.app bundle, launchd
+  plist, ~/.kyris/ runtime dir, package receipt.
+What --uninstall keeps (use --reset-data to also wipe):
+  ~/.config/kyris/  ~/.local/share/kyris/  ~/.local/state/kyris/
+
+Examples (install):
+  install.sh                                  # standard install (auto-detects brew)
+  install.sh --local target/release/          # dev install from a local build dir
+  install.sh --no-brew                        # force script path even if brew is present
+
+Examples (uninstall — prefer the cached installer for a version-matched run):
+  ~/.kyris/installer.sh --uninstall              # remove binaries; preserve config/data/state
+  ~/.kyris/installer.sh --uninstall --reset-data # remove everything, including user data
+  brew uninstall --cask kyr-is/tap/kyris         # brew equivalent of --uninstall
+  brew uninstall --cask --zap kyr-is/tap/kyris   # brew equivalent of --uninstall --reset-data
+
+  # Network fallback only if ~/.kyris/installer.sh is missing (not version-matched):
+  curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --uninstall
+
+Notes:
+  * Install caches a copy of this script at ~/.kyris/installer.sh; uninstall should
+    run from there so the same code that placed the files removes them.
+  * Uninstall cascades to agentpact when kyris is its last dependent (registry-gated).
+    Pass --no-agentpact to keep agentpact installed.
+  * Mixing channels (brew + script across kyris and agentpact) is unsupported; pick one.
 
 Enterprise mode (root LaunchDaemon, tamper-proof logs, /var/run/kyrisd.sock,
 /etc/kyris/-managed policy) is planned for phase 2 and is not yet available.
@@ -519,6 +689,9 @@ parse_args() {
   done
   if [ "$RESET_DATA" -eq 1 ] && [ "$ACTION" != "uninstall" ]; then
     err "--reset-data only makes sense with --uninstall"
+  fi
+  if [ "$ACTION" = "uninstall" ] && [ -n "$LOCAL_DIR" ]; then
+    err "--local has no effect with --uninstall; remove one"
   fi
 }
 
@@ -648,7 +821,12 @@ PY
 # (e.g. an unrelated plugin or extension) don't false-positive.
 #
 # kept centralized so verify_uninstall and clean_agent_json_config agree.
-KYRIS_MARKER_REGEX='/\.kyris/|kyris-mcp|kyris-hook|kyris_pretooluse|agentpact_pretooluse'
+#
+# Hook script names vary per agent: Claude/Codex use `*_pretooluse.sh`;
+# Gemini uses `*_beforetool.sh` because its hook phase is named `BeforeTool`.
+# Both naming conventions must be matched so neither agent leaves an entry
+# pointing at a deleted hook script after uninstall.
+KYRIS_MARKER_REGEX='/\.kyris/|kyris-mcp|kyris-hook|kyris_pretooluse|kyris_beforetool|agentpact_pretooluse|agentpact_beforetool'
 
 # Surgically remove kyris entries from a JSON config file (like ~/.codex/hooks.json
 # or ~/.claude/settings.json). If the file becomes empty after cleanup, delete it.
@@ -676,7 +854,15 @@ except Exception as exc:
     sys.exit(0)
 
 # Narrow markers — must match the bash regex above so behavior stays in sync.
-KYRIS_MARKERS = ("/.kyris/", "kyris-mcp", "kyris-hook", "kyris_pretooluse", "agentpact_pretooluse")
+KYRIS_MARKERS = (
+    "/.kyris/",
+    "kyris-mcp",
+    "kyris-hook",
+    "kyris_pretooluse",
+    "kyris_beforetool",
+    "agentpact_pretooluse",
+    "agentpact_beforetool",
+)
 
 def contains_kyris(node):
     if isinstance(node, str):
@@ -754,12 +940,24 @@ scorched_earth_cleanup() {
   done
 
   # Well-known agent hook script paths — kyris install writes these directly,
-  # so remove them outright.
+  # so remove them outright. Also sweep the `.disabled` siblings: `kyris
+  # uninstall` (Level 1, CLI) intentionally renames these for reversibility
+  # rather than deleting them. install.sh --uninstall is the full wipe so
+  # the renamed versions must go too. Gemini's hook lives at
+  # `agentpact_beforetool.sh` (its hook phase is `BeforeTool`), not the
+  # `_pretooluse` name pattern.
   local hook
   for hook in \
     "$HOME/.claude/hooks/agentpact_pretooluse.sh" \
+    "$HOME/.claude/hooks/agentpact_pretooluse.sh.disabled" \
     "$HOME/.codex/kyris_pretooluse.sh" \
-    "$HOME/.gemini/kyris_pretooluse.sh"
+    "$HOME/.codex/kyris_pretooluse.sh.disabled" \
+    "$HOME/.codex/hooks/agentpact_pretooluse.sh" \
+    "$HOME/.codex/hooks/agentpact_pretooluse.sh.disabled" \
+    "$HOME/.gemini/kyris_pretooluse.sh" \
+    "$HOME/.gemini/kyris_pretooluse.sh.disabled" \
+    "$HOME/.gemini/hooks/agentpact_beforetool.sh" \
+    "$HOME/.gemini/hooks/agentpact_beforetool.sh.disabled"
   do
     if [ -f "$hook" ]; then
       rm -f "$hook"
@@ -768,7 +966,10 @@ scorched_earth_cleanup() {
   done
 
   # Agent JSON configs — surgically remove kyris entries (preserves any non-
-  # kyris content the user or other tools added).
+  # kyris content the user or other tools added). Also sweep the
+  # `.kyris-uninstall.bak` backups clean_agent_json_config writes before any
+  # mutation: they're a Level-1 safety net, no longer needed once we're
+  # doing a full uninstall.
   local cfg
   for cfg in \
     "$HOME/.codex/hooks.json" \
@@ -776,6 +977,22 @@ scorched_earth_cleanup() {
     "$HOME/.gemini/settings.json"
   do
     clean_agent_json_config "$cfg"
+    if [ -f "${cfg}.kyris-uninstall.bak" ]; then
+      rm -f "${cfg}.kyris-uninstall.bak"
+      info "Removed ${cfg}.kyris-uninstall.bak"
+    fi
+  done
+
+  # Best-effort rmdir of agent-owned hook directories kyris install created.
+  # `rmdir` fails silently if the directory has any non-kyris contents (or
+  # is gone already) — exactly the behavior we want.
+  local hookdir
+  for hookdir in \
+    "$HOME/.claude/hooks" \
+    "$HOME/.codex/hooks" \
+    "$HOME/.gemini/hooks"
+  do
+    rmdir "$hookdir" 2>/dev/null && info "Removed empty $hookdir" || true
   done
 }
 
@@ -818,6 +1035,7 @@ uninstall_all() {
         || err "brew uninstall failed; resolve manually before re-running."
     fi
     unregister_package
+    cascade_remove_agentpact
     verify_uninstall
     echo ""
     if [ "$RESET_DATA" -eq 1 ]; then
@@ -904,6 +1122,7 @@ uninstall_all() {
   fi
 
   unregister_package
+  cascade_remove_agentpact
 
   if [ "$RESET_DATA" -eq 1 ]; then
     reset_data

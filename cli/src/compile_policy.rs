@@ -5,10 +5,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use agentpact::catalog::commands::id_to_shell;
+use agentpact::policy::Permission;
 use agentpact::policy::loader::{
     PolicyLevel, load_policy_dir, parse_policy_level, resolve_walk_up,
 };
-use agentpact::protocol::types::Permission;
 
 /// Filesystem access mode for a single path glob, modeled after Codex CLI's
 /// `FileSystemAccessMode` (`codex-rs/protocol/src/permissions.rs`). Lives in

@@ -23,6 +23,14 @@ Define success criteria. Loop until verified.
 Don't follow steps. Define success and iterate.
 Strong success criteria let you loop independently.
 
+### Rule 5 — Configs Live in YAML
+Defaults, knobs, and pattern lists belong in YAML (under `config/` here,
+or `defaults/` in agentpact), not as hardcoded constants in Rust. Catalogs
+and operator-tunable lists follow the same pattern: a YAML file plus a
+loader that materializes it into a typed struct. When adding a new
+pattern list, ask first whether it should be operator-tunable — if yes,
+it goes in YAML, not in code.
+
 ## Build & Test
 
 ```bash

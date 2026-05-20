@@ -37,15 +37,25 @@ kyris install                          # configure shell hooks and agent integra
 
 Both paths install the same four binaries (`kyris`, `kyrisd`, `kyris-mcp`, `kyris-hook`) and the same hardened `launchd` plist. The script auto-installs agentpact if it's missing (chained `curl ... | bash` of agentpact's install.sh) and auto-detects `brew` to delegate when present; pass `--no-brew` to force the script path or `--no-agentpact` to skip the dependency check. No `sudo` required. The daemon runs as the developer; state lives under `~/.kyris/`.
 
-**Uninstall** (works regardless of how it was installed):
+**Uninstall** — three levels, pick the one that matches how clean a slate you want. All three work regardless of install channel.
 
+Run the cached installer (`~/.kyris/installer.sh`) rather than `curl … | bash` against `main`. Install cached a version-matched copy of `install.sh` exactly so uninstall uses the same code that placed the files; pulling `main` can drift if the on-disk layout has changed since you installed.
+
+| Level | Command | What gets removed | What stays |
+| --- | --- | --- | --- |
+| **1. Integrations only** | `kyris uninstall` | Shell hooks (`~/.zshrc`/`~/.bashrc` edits), per-agent config edits (Claude Code `settings.json`, etc.), `~/.kyris/` runtime scaffolding | Binaries, `launchd` plist (`kyrisd` keeps running until you stop it), config (`~/.config/kyris/`), data (`~/.local/share/kyris/`), state/logs (`~/.local/state/kyris/`) |
+| **2. Default uninstall** (preserves user data) | `~/.kyris/installer.sh --uninstall`<br>or `brew uninstall --cask kyr-is/tap/kyris` | Everything in Level 1 plus binaries (`kyris`, `kyrisd`, `kyris-mcp`, `kyris-hook`), `launchd` plist, `~/.kyris/`, package receipt | Config (`~/.config/kyris/kyrisd.yaml`), data (`~/.local/share/kyris/credentials.json`, `kyrisd.duckdb`), state (`~/.local/state/kyris/log/`, `fail-open.jsonl`, `approvals.jsonl`) — so a reinstall picks up where you left off |
+| **3. Full wipe** (clean slate) | `~/.kyris/installer.sh --uninstall --reset-data`<br>or `brew uninstall --cask --zap kyr-is/tap/kyris` | Everything in Level 2 plus the three XDG dirs (`~/.config/kyris/`, `~/.local/share/kyris/`, `~/.local/state/kyris/`) | Nothing kyris-related |
+
+How the script chooses: `~/.kyris/installer.sh --uninstall` runs `kyris uninstall` first (Level 1 cleanup), then either delegates to `brew uninstall --cask` if it detects a brew-managed install (adding `--zap` when `--reset-data` is passed), or removes the binaries / plist / `~/.kyris/` itself. `--reset-data` adds the XDG-dir wipe in either path. Pass `--no-brew` to force the script path when both are available.
+
+**If `~/.kyris/installer.sh` is missing** (e.g. the runtime dir was deleted manually), fall back to:
 ```sh
-curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --uninstall
-# or, if installed via brew:
-brew uninstall --cask --zap kyr-is/tap/kyris
+curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --uninstall [--reset-data]
 ```
+The network fallback works in practice but isn't version-matched.
 
-The script's `--uninstall` runs `kyris uninstall` first to clean up shell hooks and agent integrations, detects brew-installed kyris and delegates to `brew uninstall --cask --zap`, and finally removes binaries, the launchd plist, and `~/.kyris/`. Does **not** remove agentpact (kyris is the dependent, not the dependency).
+**Agentpact cascade.** All three levels also remove agentpact when kyris was its last dependent. The check reads `~/.local/share/kyr-packages/*.json` — if any other manifest declares `depends_on: ["agentpact"]`, agentpact is preserved with a `leaving agentpact installed: still required by …` log line. Pass `--no-agentpact` to keep agentpact regardless. `--reset-data` / `--zap` propagates: script-installed agentpact gets `--reset-data`, brew-installed agentpact gets `--zap`, so a full kyris wipe is a full agentpact wipe too. The cascade chose this direction because new kyris versions reconcile the agentpact version on install — there's no reason to leave a stale agentpact behind.
 
 **Mixing channels is unsupported.** If you install kyris via brew but agentpact via the script (or vice versa), dependency tracking is incomplete — brew won't refuse to uninstall a script-installed agentpact while kyris still needs it. Pick one channel per machine and stick with it.
 

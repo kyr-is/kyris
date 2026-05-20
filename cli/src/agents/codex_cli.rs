@@ -494,6 +494,9 @@ impl AgentDescriptor for CodexCli {
                     detail_key: Some("command".to_string()),
                 },
             ],
+            // Codex CLI internal coordination tools: skip the daemon. See
+            // claude_code.rs and hook_cmd.rs for the design rationale.
+            pass_through_tools: vec!["update_plan".to_string(), "view_image".to_string()],
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         })

@@ -25,6 +25,7 @@
 #![cfg_attr(test, allow(non_snake_case))]
 
 pub mod adapter;
+pub mod approvals_log;
 pub mod auth;
 pub mod build_info;
 pub mod circuit_breaker;
@@ -38,6 +39,8 @@ pub mod metering;
 pub mod notify;
 #[cfg(target_os = "macos")]
 pub mod notify_macos;
+#[cfg(target_os = "macos")]
+pub mod notify_macos_highlight;
 pub mod pending;
 pub mod pricing_fetch;
 pub mod reconcile_watcher;

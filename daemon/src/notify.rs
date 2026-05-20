@@ -34,15 +34,20 @@ pub fn request_authorization_if_needed() {
 /// Show a modal Yes / No / Always dialog and return the user's choice.
 /// On macOS with the tray feature this dispatches to the main thread via
 /// the tao event loop; on other platforms it falls back to `"yes"`.
+///
+/// `code`, when `Some`, is rendered in the popup's accessoryView as
+/// monospaced text — the right surface for shell commands and file paths
+/// (whose readability suffers in the standard `informativeText` font).
+/// When `None`, the popup uses `body` alone.
 #[cfg(feature = "tray")]
-pub async fn ask_approval(title: &str, body: &str) -> &'static str {
+pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        crate::tray::ask_approval(title, body).await
+        crate::tray::ask_approval(title, body, code).await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (title, body);
+        let _ = (title, body, code);
         "yes"
     }
 }

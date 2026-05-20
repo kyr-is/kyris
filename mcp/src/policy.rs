@@ -304,10 +304,16 @@ async fn resolve_ask_via_kyrisd(
     let resolution = kyris_core::pending::hold_poll_resolve(
         &client,
         &conn,
-        approval_id,
-        approval_token,
-        server_name,
-        tool_name,
+        kyris_core::pending::PendingApproval {
+            approval_id,
+            approval_token,
+            server: server_name,
+            tool: tool_name,
+            // MCP tool calls don't carry a verbatim "code" payload here;
+            // the daemon falls back to plain-text informativeText. Adding
+            // the serialized args is a follow-up.
+            code: None,
+        },
     )
     .await;
 

@@ -68,7 +68,17 @@ pub struct ToolMapping {
 pub struct HookProtocol {
     pub tool_name_field: String,
     pub detail_fields: Vec<String>,
+    /// Tools that route through `agentpactd` for policy enforcement
+    /// (Bash → execute, Read → read, MCP servers → call, …).
     pub tool_mappings: Vec<ToolMapping>,
+    /// Tools that are allowed without contacting `agentpactd` — LLM
+    /// coordination primitives with no governable side effect
+    /// (`AskUserQuestion`, `TodoWrite`, `ExitPlanMode`, etc.). Skipping the
+    /// daemon is required because the daemon contract for `action=call`
+    /// demands `context.mcp_server`, which these tools cannot supply.
+    /// Unmapped tools not in this list emit a stderr warning and are
+    /// allowed (fail-open) so a new agent built-in doesn't lock the user out.
+    pub pass_through_tools: Vec<String>,
     pub default_action: String,
     pub allow_response: AllowResponse,
 }

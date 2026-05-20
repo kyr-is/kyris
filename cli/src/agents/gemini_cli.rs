@@ -280,6 +280,16 @@ impl AgentDescriptor for GeminiCli {
                     detail_key: Some("file_path".to_string()),
                 },
             ],
+            // Gemini CLI internal coordination tools: skip the daemon. See
+            // claude_code.rs and hook_cmd.rs for the design rationale.
+            pass_through_tools: vec![
+                "google_search".to_string(),
+                "save_memory".to_string(),
+                "list_directory".to_string(),
+                "glob".to_string(),
+                "search_file_content".to_string(),
+                "web_fetch".to_string(),
+            ],
             default_action: "call".to_string(),
             allow_response: AllowResponse::Json {
                 body: serde_json::json!({"decision": "allow"}),

@@ -60,6 +60,7 @@ struct Cli {
 enum Command {
     Agents(agents::AgentsArgs),
     Always(always_cmd::AlwaysArgs),
+    Approvals(query::approvals::ApprovalsArgs),
     Timeline(query::timeline::TimelineArgs),
     Replay(query::replay::ReplayArgs),
     Stats(query::stats::StatsArgs),
@@ -87,6 +88,7 @@ fn main() {
     match cli.command {
         Command::Agents(args) => agents::run(args),
         Command::Always(args) => always_cmd::run(args),
+        Command::Approvals(args) => query::approvals::run(args),
         Command::Timeline(args) => query::timeline::run(args),
         Command::Replay(args) => query::replay::run(args),
         Command::Stats(args) => query::stats::run(args),

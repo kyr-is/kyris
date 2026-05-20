@@ -16,17 +16,23 @@
 //!
 //!   Status: Running                ← disabled, dynamic
 //!   ─────────────────────
-//!   Pending Approvals (3)          ← greyed when zero, opens ~/.kyris
 //!   Continue Routing               ← greyed unless circuit breaker tripped
 //!   Open Logs                      ← always enabled
 //!   ─────────────────────
 //!   Quit Kyris                     ← always enabled, runs launchctl bootout
 //!
-//! Status/count/tripped state is pushed from the tokio side via atomics
+//! There is no "Pending Approvals" menu entry: with the always-on-top
+//! approval popup (`notify_macos::show_approval_alert`) handling each ask
+//! synchronously, the user never needs a separate queue surface in the
+//! tray. The internal pending queue still exists (it backs the async
+//! popup lifecycle, timeouts, and the `kyris pending` CLI fallback for
+//! no-TTY shell-hook flows) — it just isn't a tray-visible concept.
+//!
+//! Status/tripped state is pushed from the tokio side via atomics
 //! and polled by a 250ms `NSTimer` on the main thread (macOS).  The
 //! daemon's main thread calls [`run_event_loop`] while Tokio runs on a
 //! background thread; see `kyrisd::main`.
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -76,7 +82,6 @@ impl TrayState {
 }
 
 static CURRENT_STATE: AtomicU8 = AtomicU8::new(0);
-static PENDING_COUNT: AtomicI64 = AtomicI64::new(0);
 static CIRCUIT_BREAKER_TRIPPED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_state(state: TrayState) {
@@ -89,13 +94,6 @@ pub fn current_state() -> TrayState {
         2 => TrayState::RelayDisconnected,
         _ => TrayState::Normal,
     }
-}
-
-/// Push the current pending-approvals count to the tray menu. Called
-/// from a tokio task in `server::run` that periodically samples
-/// `state.pending.list().len()`.
-pub fn set_pending_count(count: i64) {
-    PENDING_COUNT.store(count, Ordering::Relaxed);
 }
 
 /// Push whether any session has tripped the circuit breaker. Same
@@ -125,7 +123,7 @@ mod gui {
 
     /// Ask the user to approve an action.
     /// TODO: Windows notification/dialog — returns "yes" for now.
-    pub async fn ask_approval(_title: &str, _body: &str) -> &'static str {
+    pub async fn ask_approval(_title: &str, _body: &str, _code: Option<&str>) -> &'static str {
         "yes"
     }
 
@@ -147,7 +145,7 @@ mod gui {
 
     /// Ask the user to approve an action.
     /// TODO: Linux desktop notification/dialog — returns "yes" for now.
-    pub async fn ask_approval(_title: &str, _body: &str) -> &'static str {
+    pub async fn ask_approval(_title: &str, _body: &str, _code: Option<&str>) -> &'static str {
         "yes"
     }
 
@@ -166,7 +164,7 @@ mod gui {
 #[cfg(all(feature = "tray", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod gui {
-    use super::{CIRCUIT_BREAKER_TRIPPED, PENDING_COUNT, TrayState, current_state};
+    use super::{CIRCUIT_BREAKER_TRIPPED, TrayState, current_state};
     use block2::RcBlock;
     use core::ffi::c_uchar;
     use objc2::rc::Retained;
@@ -234,7 +232,6 @@ mod gui {
     #[derive(PartialEq, Eq, Clone, Copy)]
     struct Snapshot {
         tray_state: TrayState,
-        pending_count: i64,
         circuit_breaker_tripped: bool,
     }
 
@@ -242,7 +239,6 @@ mod gui {
         fn read() -> Self {
             Self {
                 tray_state: current_state(),
-                pending_count: PENDING_COUNT.load(Ordering::Relaxed).max(0),
                 circuit_breaker_tripped: CIRCUIT_BREAKER_TRIPPED.load(Ordering::Relaxed),
             }
         }
@@ -262,7 +258,6 @@ mod gui {
         /// alive ourselves for the lifetime of the menu.
         _handler: Retained<MenuActionHandler>,
         status_label: Retained<NSMenuItem>,
-        pending_item: Retained<NSMenuItem>,
         continue_item: Retained<NSMenuItem>,
         last_snapshot: Snapshot,
         // The icon set in build_tray_ui runs before [NSApp run] — at that
@@ -294,11 +289,6 @@ mod gui {
         struct MenuActionHandler;
 
         impl MenuActionHandler {
-            #[unsafe(method(openPending:))]
-            fn open_pending_action(&self, _: Option<&AnyObject>) {
-                open_pending();
-            }
-
             #[unsafe(method(continueRouting:))]
             fn continue_routing_action(&self, _: Option<&AnyObject>) {
                 continue_routing();
@@ -324,12 +314,17 @@ mod gui {
     /// the user's response.  The work queue delivers the call within 250ms
     /// (next timer tick); `wake_main_run_loop` reduces that to the next
     /// run-loop iteration.  Falls back to `"yes"` if the channel is dropped.
-    pub async fn ask_approval(title: &str, body: &str) -> &'static str {
+    ///
+    /// `code`, when `Some`, is rendered in the popup's accessoryView as
+    /// monospaced text — for shell commands and file paths the user needs
+    /// to read clearly to make the decision.
+    pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> &'static str {
         let (tx, rx) = tokio::sync::oneshot::channel::<&'static str>();
         let title = title.to_string();
         let body = body.to_string();
+        let code = code.map(str::to_string);
         push_main_work(move || {
-            let result = crate::notify_macos::show_approval_alert(&title, &body);
+            let result = crate::notify_macos::show_approval_alert(&title, &body, code.as_deref());
             let _ = tx.send(result);
         });
         wake_main_run_loop();
@@ -422,17 +417,7 @@ mod gui {
         menu.addItem(&status_label);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // 2. Pending approvals — enabled when count > 0.
-        let pending_item = make_item(
-            mtm,
-            "Pending Approvals (0)",
-            false,
-            Some(&handler),
-            Some(sel!(openPending:)),
-        );
-        menu.addItem(&pending_item);
-
-        // 3. Continue routing — enabled only when circuit breaker is tripped.
+        // 2. Continue routing — enabled only when circuit breaker is tripped.
         let continue_item = make_item(
             mtm,
             "Continue Routing",
@@ -442,7 +427,7 @@ mod gui {
         );
         menu.addItem(&continue_item);
 
-        // 4. Open logs — always enabled.
+        // 3. Open logs — always enabled.
         menu.addItem(&make_item(
             mtm,
             "Open Logs",
@@ -453,7 +438,7 @@ mod gui {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // 5. Quit — always enabled.
+        // 4. Quit — always enabled.
         menu.addItem(&make_item(
             mtm,
             "Quit Kyris",
@@ -481,7 +466,6 @@ mod gui {
             status_item,
             _handler: handler,
             status_label,
-            pending_item,
             continue_item,
             last_snapshot: Snapshot::read(),
             needs_initial_paint: true,
@@ -544,14 +528,6 @@ mod gui {
                 mtm,
                 !matches!(now.tray_state, TrayState::Normal),
             );
-
-            // Pending count + enabled.
-            let pending_text = format!("Pending Approvals ({})", now.pending_count);
-            unsafe {
-                let t = NSString::from_str(&pending_text);
-                let _: () = msg_send![&*ui.pending_item, setTitle: &*t];
-                let _: () = msg_send![&*ui.pending_item, setEnabled: now.pending_count > 0];
-            }
 
             // Continue routing.
             unsafe {
@@ -660,21 +636,6 @@ mod gui {
         use std::process::{Child, Command};
 
         #[cfg(target_os = "macos")]
-        pub fn open_directory(path: &str) -> std::io::Result<Child> {
-            Command::new("open").arg(path).spawn()
-        }
-        #[cfg(target_os = "linux")]
-        pub fn open_directory(path: &str) -> std::io::Result<Child> {
-            Command::new("xdg-open").arg(path).spawn()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        pub fn open_directory(_path: &str) -> std::io::Result<Child> {
-            Err(std::io::Error::other(
-                "open_directory: unsupported platform",
-            ))
-        }
-
-        #[cfg(target_os = "macos")]
         pub fn open_log_file(path: &str) -> std::io::Result<Child> {
             Command::new("open").args(["-a", "Console", path]).spawn()
         }
@@ -704,17 +665,6 @@ mod gui {
             Err(std::io::Error::other(
                 "stop_daemon_service: unsupported platform",
             ))
-        }
-    }
-
-    fn open_pending() {
-        // "Pending" surfaces the install-managed runtime dir, which holds
-        // the manifest + any human-inspectable scaffolding. Precious user
-        // data lives elsewhere (XDG dirs) and isn't user-facing here.
-        let path = kyris_core::paths::runtime_dir();
-        let path_str = path.to_string_lossy();
-        if let Err(e) = platform::open_directory(&path_str) {
-            tracing::warn!(error = %e, path = %path_str, "failed to open pending dir");
         }
     }
 
@@ -838,14 +788,6 @@ mod tests {
         assert_ne!(normal, degraded);
         assert_ne!(normal, relay);
         assert_ne!(degraded, relay);
-    }
-
-    #[test]
-    fn testSetPendingCountIsObservable() {
-        set_pending_count(7);
-        assert_eq!(PENDING_COUNT.load(Ordering::Relaxed), 7);
-        set_pending_count(0);
-        assert_eq!(PENDING_COUNT.load(Ordering::Relaxed), 0);
     }
 
     #[test]

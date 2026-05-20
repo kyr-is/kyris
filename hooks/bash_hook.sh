@@ -10,6 +10,46 @@
 # file with a shebang that would mislead "is this script executable?"
 # tooling.
 
+# Skip the trap entirely when this shell is a subprocess of a governed
+# agent (Claude Code, Codex CLI, Gemini CLI, OpenCode, Cline). The
+# agent's PreToolUse hook already approved the parent command — letting
+# the DEBUG trap re-fire on every line of /etc/profile and every
+# sub-command inside the approved compound triggered ~10x redundant
+# popups. See kyris/daemon/src/approvals_log.rs for empirical evidence.
+__kyris_running_under_governed_agent() {
+    # Fast path: env vars known to be injected by specific agents.
+    # CLAUDECODE=1 is the canonical Claude Code marker (verified via
+    # `env | grep CLAUDE` inside a Claude-spawned subprocess).
+    # KYRIS_GOVERNED_SUBPROCESS is the universal override for agents
+    # we don't auto-detect.
+    [ -n "${CLAUDECODE:-}" ] && return 0
+    [ -n "${KYRIS_GOVERNED_SUBPROCESS:-}" ] && return 0
+
+    # Slow path (only reached when env vars don't match): walk the
+    # parent process chain looking for known agent binaries. Bounded
+    # to 32 hops so we don't loop on a degenerate ancestry. One-time
+    # cost at trap-install time, NOT per command.
+    local _kyris_pid _kyris_comm _kyris_hops=0
+    _kyris_pid="${PPID:-0}"
+    while [ "$_kyris_pid" -gt 1 ] && [ "$_kyris_hops" -lt 32 ]; do
+        _kyris_comm=$(ps -p "$_kyris_pid" -o comm= 2>/dev/null | tr -d ' ')
+        _kyris_comm="${_kyris_comm##*/}"
+        case "$_kyris_comm" in
+            claude|claude-code|codex|gemini|opencode|cline)
+                return 0
+                ;;
+        esac
+        _kyris_pid=$(ps -p "$_kyris_pid" -o ppid= 2>/dev/null | tr -d ' ')
+        [ -z "$_kyris_pid" ] && return 1
+        _kyris_hops=$((_kyris_hops + 1))
+    done
+    return 1
+}
+
+if __kyris_running_under_governed_agent; then
+    return 0 2>/dev/null || exit 0
+fi
+
 if command -v kyris >/dev/null 2>&1; then
     kyris agents reconcile --auto >/dev/null 2>&1 &
     disown 2>/dev/null

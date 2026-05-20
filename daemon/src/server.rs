@@ -537,6 +537,13 @@ struct HoldRequest {
     approval_token: String,
     server: String,
     tool: Option<String>,
+    /// Optional verbatim code/command/path to render in the popup's
+    /// accessoryView. Distinct from `tool` because `tool` is a short
+    /// label ("Bash", "Read"); `code` is what the user actually needs
+    /// to read to decide ("git push --force origin main"). Older
+    /// callers omit it — the popup falls back to plain body text.
+    #[serde(default)]
+    code: Option<String>,
 }
 
 async fn hold_pending(
@@ -551,6 +558,7 @@ async fn hold_pending(
     let dialog_id = body.id.clone();
     let dialog_server = body.server.clone();
     let dialog_tool = body.tool.clone();
+    let dialog_code = body.code.clone();
 
     let _rx = state
         .pending
@@ -567,9 +575,20 @@ async fn hold_pending(
         let state = state.clone();
         tokio::spawn(async move {
             let tool_label = dialog_tool.as_deref().unwrap_or("unknown tool");
+            // Title/body kept lean: the window titlebar already says
+            // "Kyris", and when a code block is present it speaks for
+            // itself — no need for a "Review and approve:" prompt. The
+            // no-code path keeps prose because there's nothing else to
+            // show the user.
+            let body_line = if dialog_code.is_some() {
+                String::new()
+            } else {
+                format!("Agent wants to run {tool_label}. Allow?")
+            };
             let response = crate::notify::ask_approval(
-                &format!("Kyris: Allow {dialog_server}"),
-                &format!("Agent wants to run {tool_label}. Allow?"),
+                &format!("Allow {dialog_server}"),
+                &body_line,
+                dialog_code.as_deref(),
             )
             .await;
             let decision = match response {
@@ -577,6 +596,25 @@ async fn hold_pending(
                 "always" => ResolveDecision::Always,
                 _ => ResolveDecision::Denied,
             };
+            // Best-effort log of the user's answer for `kyris approvals`
+            // recall and offline catalog mining. Records the verbatim command
+            // (multi-line preserved via JSON `\n` escaping); the agent's tool
+            // label is intentionally not recorded. Falls back to dialog_tool
+            // when no verbatim payload was carried in the hold request (older
+            // callers that only sent the short label).
+            let command = dialog_code.as_deref().or(dialog_tool.as_deref());
+            crate::approvals_log::record(&crate::approvals_log::ApprovalRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                pending_id: &dialog_id,
+                server: &dialog_server,
+                command,
+                agent: "unknown",
+                decision: match decision {
+                    ResolveDecision::Approved => "approved",
+                    ResolveDecision::Always => "always",
+                    ResolveDecision::Denied => "denied",
+                },
+            });
             let Ok(claim) = state.pending.claim(&dialog_id) else {
                 return; // already timed out or resolved by another path
             };
@@ -852,9 +890,7 @@ async fn tray_state_poller(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let pending = state.pending.list().len() as i64;
         let tripped = state.circuit_breaker.any_tripped();
-        crate::tray::set_pending_count(pending);
         crate::tray::set_circuit_breaker_tripped(tripped);
     }
 }
@@ -1792,10 +1828,13 @@ mod tests {
             kyris_core::pending::hold_poll_resolve(
                 &client,
                 &task_conn,
-                "e2e-approve-1",
-                "test-token",
-                "github",
-                "read_file",
+                kyris_core::pending::PendingApproval {
+                    approval_id: "e2e-approve-1",
+                    approval_token: "test-token",
+                    server: "github",
+                    tool: "read_file",
+                    code: None,
+                },
             )
             .await
         });
@@ -1849,10 +1888,13 @@ mod tests {
             kyris_core::pending::hold_poll_resolve(
                 &client,
                 &task_conn,
-                "e2e-deny-1",
-                "test-token",
-                "github",
-                "write_file",
+                kyris_core::pending::PendingApproval {
+                    approval_id: "e2e-deny-1",
+                    approval_token: "test-token",
+                    server: "github",
+                    tool: "write_file",
+                    code: None,
+                },
             )
             .await
         });

@@ -81,32 +81,145 @@ pub fn request_authorization_if_needed() {
 /// Show a modal Yes / No / Always approval dialog on the main thread.
 /// Returns one of the string literals `"yes"`, `"no"`, or `"always"`.
 /// Must be called from the main thread (asserted via `MainThreadMarker`).
+///
+/// Renders a custom `NSPanel` rather than `NSAlert` because `NSAlert`
+/// stacks 3 buttons vertically once the dialog is short — we always
+/// want horizontal `[Always] [No] [Yes]` for muscle-memory consistency.
+///
+/// `code`, when `Some`, is rendered below the body in a scrollable
+/// monospaced view with syntect colorization.
+///
+/// Captures the frontmost app before showing and reactivates it after the
+/// modal dismisses. macOS doesn't auto-restore the previous frontmost app
+/// when an `Accessory`-policy process (`kyrisd`) transiently activates to
+/// display a modal — without this, focus stays stuck on `Kyrisd.app` after
+/// the user clicks a button.
 #[cfg(feature = "tray")]
-pub fn show_approval_alert(title: &str, body: &str) -> &'static str {
+pub fn show_approval_alert(title: &str, body: &str, code: Option<&str>) -> &'static str {
     use core::ffi::c_uchar;
-    use objc2::{AnyThread as _, MainThreadMarker};
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly, msg_send, sel};
     use objc2_app_kit::{
-        NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSAlertThirdButtonReturn,
-        NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage,
+        NSApplication, NSApplicationActivationOptions, NSBackingStoreType, NSBezelStyle,
+        NSBitmapImageRep, NSBorderType, NSButton, NSDeviceRGBColorSpace, NSFont, NSImage,
+        NSImageView, NSPanel, NSScreen, NSScrollView, NSTextField, NSTextView, NSView,
+        NSWindowStyleMask, NSWorkspace,
     };
-    use objc2_foundation::{NSSize, NSString};
+    use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-    // Reuse the same 44×44 RGBA the tray icon already compiled in.
     const ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray_icon_44.rgba"));
-    const PX: isize = 44;
+    const ICON_PX: isize = 44;
+
+    // Layout constants. NSView coords are bottom-left origin, so y values
+    // count up from the window's bottom edge.
+    const PADDING: f64 = 20.0;
+    const ICON_SIZE: f64 = 44.0;
+    const HEADER_GAP: f64 = 12.0;
+    const TITLE_H: f64 = 20.0;
+    const TITLE_BODY_GAP: f64 = 4.0;
+    const BODY_H: f64 = 18.0;
+    const HEADER_CODE_GAP: f64 = 16.0;
+    const CODE_BUTTON_GAP: f64 = 16.0;
+    const BUTTON_W: f64 = 100.0;
+    const BUTTON_H: f64 = 32.0;
+    const BUTTON_SPACING: f64 = 10.0;
+    const MIN_W: f64 = 460.0;
+    const MIN_TEXT_COL_W: f64 = 320.0;
 
     let mtm = MainThreadMarker::new().expect("must be called from main thread");
-    NSApplication::sharedApplication(mtm);
+    let app = NSApplication::sharedApplication(mtm);
 
-    let alert = NSAlert::new(mtm);
-    alert.setMessageText(&NSString::from_str(title));
-    alert.setInformativeText(&NSString::from_str(body));
-    let yes_btn = alert.addButtonWithTitle(&NSString::from_str("Yes"));
-    yes_btn.setKeyEquivalent(&NSString::from_str(""));
-    alert.addButtonWithTitle(&NSString::from_str("No"));
-    alert.addButtonWithTitle(&NSString::from_str("Always"));
+    // --- Code area dimensions ---
+    let (screen_w, screen_h) = NSScreen::mainScreen(mtm).map_or((1280.0, 800.0), |s| {
+        let f = s.visibleFrame();
+        (f.size.width, f.size.height)
+    });
 
-    // Build NSImage from the pre-rasterized RGBA bytes (same data as tray icon).
+    let (code_w, code_h) = if let Some(c) = code {
+        const CHAR_WIDTH: f64 = 7.2; // 12pt monospaced advance, empirical
+        const LINE_HEIGHT: f64 = 16.0;
+        const H_PAD: f64 = 32.0; // scroll bar + bezel + breathing room
+        const V_PAD: f64 = 12.0;
+        const MIN_H: f64 = 56.0;
+        const MIN_CODE_W: f64 = 380.0;
+
+        let max_w = (screen_w * 0.70).max(MIN_CODE_W);
+        let max_h = (screen_h * 0.65).max(MIN_H);
+
+        #[allow(clippy::cast_precision_loss)] // line lengths stay modest
+        let longest = c.lines().map(str::len).max().unwrap_or(0) as f64;
+        let w = ((longest * CHAR_WIDTH) + H_PAD).clamp(MIN_CODE_W, max_w);
+
+        #[allow(clippy::cast_precision_loss)] // line counts stay modest
+        let lines = c.lines().count().max(1) as f64;
+        let h = ((lines * LINE_HEIGHT) + V_PAD).clamp(MIN_H, max_h);
+        (w, h)
+    } else {
+        (0.0, 0.0)
+    };
+
+    // --- Window dimensions ---
+    // Width is whichever is wider: the code area + padding, or the
+    // header (icon + text column) + padding. Clamped to MIN_W so a
+    // bare "Allow X?" without a code block doesn't render a tiny panel.
+    let header_min_w = PADDING + ICON_SIZE + HEADER_GAP + MIN_TEXT_COL_W + PADDING;
+    let code_min_w = code_w + PADDING * 2.0;
+    let content_w = code_min_w.max(header_min_w).max(MIN_W);
+
+    let has_body = !body.is_empty();
+    let text_block_h = if has_body {
+        TITLE_H + TITLE_BODY_GAP + BODY_H
+    } else {
+        TITLE_H
+    };
+    let header_h = ICON_SIZE.max(text_block_h);
+    let code_block_h = if code.is_some() {
+        code_h + HEADER_CODE_GAP
+    } else {
+        0.0
+    };
+    let content_h = PADDING + header_h + code_block_h + CODE_BUTTON_GAP + BUTTON_H + PADDING;
+
+    // --- Build panel ---
+    let rect = NSRect {
+        origin: NSPoint { x: 0.0, y: 0.0 },
+        size: NSSize {
+            width: content_w,
+            height: content_h,
+        },
+    };
+    let style_mask = NSWindowStyleMask::Titled;
+    let panel: Retained<NSPanel> = unsafe {
+        msg_send![
+            NSPanel::alloc(mtm),
+            initWithContentRect: rect,
+            styleMask: style_mask,
+            backing: NSBackingStoreType::Buffered,
+            defer: false,
+        ]
+    };
+    panel.setTitle(&NSString::from_str("Kyris"));
+    unsafe { panel.setReleasedWhenClosed(false) };
+    // Default for NSPanel is true, which can starve key equivalents
+    // (Return/Escape) of keyboard events even after runModal makes the
+    // window key. Forcing false guarantees the panel receives keystrokes.
+    panel.setBecomesKeyOnlyIfNeeded(false);
+    panel.center();
+    let content_view: Retained<NSView> = panel.contentView().expect("contentView");
+
+    // --- Icon ---
+    let icon_y = content_h - PADDING - ICON_SIZE;
+    let icon_rect = NSRect {
+        origin: NSPoint {
+            x: PADDING,
+            y: icon_y,
+        },
+        size: NSSize {
+            width: ICON_SIZE,
+            height: ICON_SIZE,
+        },
+    };
     let mut rgba = ICON_RGBA.to_vec();
     let rep = unsafe {
         let mut planes = [
@@ -119,41 +232,241 @@ pub fn show_approval_alert(title: &str, body: &str) -> &'static str {
         NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
             NSBitmapImageRep::alloc(),
             planes.as_mut_ptr(),
-            PX, PX,
+            ICON_PX, ICON_PX,
             8, 4,
             true,
             false,
             NSDeviceRGBColorSpace,
-            PX * 4,
+            ICON_PX * 4,
             32,
         )
     };
     if let Some(rep) = rep {
-        #[allow(clippy::cast_precision_loss)] // PX is 44; exact in f64
         let image = NSImage::initWithSize(
             NSImage::alloc(),
             NSSize {
-                width: PX as f64,
-                height: PX as f64,
+                width: ICON_SIZE,
+                height: ICON_SIZE,
             },
         );
         image.addRepresentation(&rep);
-        unsafe { alert.setIcon(Some(&image)) };
+        let image_view = NSImageView::new(mtm);
+        image_view.setFrame(icon_rect);
+        image_view.setImage(Some(&image));
+        content_view.addSubview(&image_view);
     }
 
-    let response = alert.runModal();
-    if response == NSAlertFirstButtonReturn {
-        "yes"
-    } else if response == NSAlertSecondButtonReturn {
-        "no"
-    } else if response == NSAlertThirdButtonReturn {
-        "always"
-    } else {
-        // NSAlertErrorReturn (-1) if the sheet couldn't be shown; deny safely.
-        tracing::warn!(response = ?response, "unexpected NSAlert response; defaulting to deny");
-        "no"
+    // --- Title label ---
+    let text_col_x = PADDING + ICON_SIZE + HEADER_GAP;
+    let text_col_w = content_w - text_col_x - PADDING;
+    let title_y = content_h - PADDING - TITLE_H;
+    let title_rect = NSRect {
+        origin: NSPoint {
+            x: text_col_x,
+            y: title_y,
+        },
+        size: NSSize {
+            width: text_col_w,
+            height: TITLE_H,
+        },
+    };
+    let title_label = NSTextField::labelWithString(&NSString::from_str(title), mtm);
+    title_label.setFrame(title_rect);
+    title_label.setFont(Some(&NSFont::boldSystemFontOfSize(13.0)));
+    content_view.addSubview(&title_label);
+
+    // --- Body label (skipped when caller passes an empty string) ---
+    if has_body {
+        let body_y = title_y - TITLE_BODY_GAP - BODY_H;
+        let body_rect = NSRect {
+            origin: NSPoint {
+                x: text_col_x,
+                y: body_y,
+            },
+            size: NSSize {
+                width: text_col_w,
+                height: BODY_H,
+            },
+        };
+        let body_label = NSTextField::labelWithString(&NSString::from_str(body), mtm);
+        body_label.setFrame(body_rect);
+        body_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        content_view.addSubview(&body_label);
+    }
+
+    // --- Code area ---
+    if let Some(code_text) = code {
+        // Stretch the code block to fill the available width — when the
+        // header sets the panel width (server name longer than the code
+        // line), centering the narrow code looks like an alignment bug.
+        let code_y = PADDING + BUTTON_H + CODE_BUTTON_GAP;
+        let code_x = PADDING;
+        let code_render_w = content_w - PADDING * 2.0;
+        let code_rect = NSRect {
+            origin: NSPoint {
+                x: code_x,
+                y: code_y,
+            },
+            size: NSSize {
+                width: code_render_w,
+                height: code_h,
+            },
+        };
+        let _ = code_w; // sizing input only; rendered width is code_render_w
+
+        let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm), code_rect);
+        scroll.setHasVerticalScroller(true);
+        scroll.setHasHorizontalScroller(false);
+        scroll.setAutohidesScrollers(true);
+        scroll.setBorderType(NSBorderType::BezelBorder);
+
+        let text_view = NSTextView::initWithFrame(NSTextView::alloc(mtm), code_rect);
+        text_view.setEditable(false);
+        text_view.setSelectable(true);
+        text_view.setDrawsBackground(true);
+        // Rich text MUST be on for per-range attributed-string colors to
+        // render — syntect's per-token coloring goes through addAttribute_
+        // value_range on the text storage's attributed string, which is
+        // ignored when the view is in plain-text mode.
+        text_view.setRichText(true);
+
+        let dark = crate::notify_macos_highlight::dark_mode_active(mtm);
+        let attr = crate::notify_macos_highlight::build_attributed_string(code_text, dark, mtm);
+        if let Some(storage) = unsafe { text_view.textStorage() } {
+            storage.setAttributedString(&attr);
+        } else {
+            // Defensive fallback: NSTextView always vends a textStorage in
+            // practice, but if it somehow doesn't we show plain monospace.
+            let mono = NSFont::monospacedSystemFontOfSize_weight(12.0, 0.0);
+            text_view.setFont(Some(&mono));
+            let ns = NSString::from_str(code_text);
+            text_view.setString(&ns);
+        }
+        scroll.setDocumentView(Some(&text_view));
+        content_view.addSubview(&scroll);
+    }
+
+    // --- Buttons: [Always]   [No] [Yes]  (Yes is default, rightmost) ---
+    let handler = ApprovalAction::new(mtm);
+    let target: &AnyObject = &handler;
+
+    let row_y = PADDING;
+    let yes_x = content_w - PADDING - BUTTON_W;
+    let no_x = yes_x - BUTTON_SPACING - BUTTON_W;
+    let always_x = no_x - BUTTON_SPACING - BUTTON_W;
+
+    let make_button = |label: &str, x: f64, tag: isize, key_eq: &str| -> Retained<NSButton> {
+        let btn = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                &NSString::from_str(label),
+                Some(target),
+                Some(sel!(decide:)),
+                mtm,
+            )
+        };
+        btn.setFrame(NSRect {
+            origin: NSPoint { x, y: row_y },
+            size: NSSize {
+                width: BUTTON_W,
+                height: BUTTON_H,
+            },
+        });
+        btn.setBezelStyle(NSBezelStyle::Push);
+        btn.setTag(tag);
+        if !key_eq.is_empty() {
+            btn.setKeyEquivalent(&NSString::from_str(key_eq));
+        }
+        btn
+    };
+
+    // Tags must match the `match` arm below.
+    let yes_btn = make_button("Yes", yes_x, 1, "\r"); // Return: default
+    let no_btn = make_button("No", no_x, 2, "\u{1b}"); // Escape: cancel
+    let always_btn = make_button("Always", always_x, 3, "");
+    content_view.addSubview(&yes_btn);
+    content_view.addSubview(&no_btn);
+    content_view.addSubview(&always_btn);
+
+    // --- Activate, run modal, restore focus ---
+    let prev_app = NSWorkspace::sharedWorkspace().frontmostApplication();
+    #[allow(clippy::cast_possible_wrap)]
+    let my_pid = std::process::id() as i32;
+
+    // Bring kyrisd to the foreground so the panel actually surfaces.
+    // Accessory-policy processes don't auto-activate when a window opens.
+    #[allow(deprecated)] // activate() requires entitlements we don't ship
+    app.activateIgnoringOtherApps(true);
+
+    let response: isize = unsafe { msg_send![&*app, runModalForWindow: &*panel] };
+
+    panel.orderOut(None);
+
+    if let Some(app) = prev_app
+        && app.processIdentifier() != my_pid
+    {
+        let _ = app.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows);
+    }
+
+    // `handler` and the button Retained<…> values stay in scope until end
+    // of function — needed because NSButton holds a *weak* reference to its
+    // target, and the buttons themselves are retained by content_view but
+    // we don't want any drop-order surprises during a future refactor.
+    let _ = (&handler, &yes_btn, &no_btn, &always_btn);
+
+    match response {
+        1 => "yes",
+        2 => "no",
+        3 => "always",
+        _ => {
+            tracing::warn!(response = ?response, "unexpected modal response; defaulting to deny");
+            "no"
+        }
     }
 }
+
+// ApprovalAction: an objc target object whose `decide:` selector reads
+// the sender NSButton's tag and calls `[NSApp stopModalWithCode:tag]`.
+// This is what makes each button dismiss the modal with the right
+// decision code. Defined at module scope (not inside the function)
+// because `define_class!` registers a global Objective-C class.
+#[cfg(feature = "tray")]
+mod approval_action {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSObject;
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "KyrisApprovalAction"]
+        pub(super) struct ApprovalAction;
+
+        impl ApprovalAction {
+            #[unsafe(method(decide:))]
+            fn decide(&self, sender: Option<&AnyObject>) {
+                let mtm = MainThreadMarker::new()
+                    .expect("decide: invoked off the main thread");
+                let app = NSApplication::sharedApplication(mtm);
+                let tag: isize = match sender {
+                    Some(s) => unsafe { msg_send![s, tag] },
+                    None => 0,
+                };
+                app.stopModalWithCode(tag);
+            }
+        }
+    );
+
+    impl ApprovalAction {
+        pub(super) fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            unsafe { msg_send![Self::alloc(mtm), init] }
+        }
+    }
+}
+
+#[cfg(feature = "tray")]
+use approval_action::ApprovalAction;
 
 /// Fire-and-forget notification delivery. Returns immediately.
 /// Delivery errors surface in the completion handler, which we log

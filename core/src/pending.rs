@@ -9,6 +9,12 @@ use crate::config::KyrisdConnection;
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// Stay under Claude Code's 60s `PreToolUse` hook timeout. If we let the
+/// poll run to its full 60s ceiling, Claude Code's timeout fires first and
+/// falls back to its native permission prompt — producing the double-prompt
+/// symptom even when kyris would have resolved the request cleanly.
+pub const NATIVE_HOOK_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(55);
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resolution {
     Approved,
@@ -16,19 +22,63 @@ pub enum Resolution {
     Failed(String),
 }
 
+/// Identity + display payload for a `PACT_ASK` request held in kyrisd.
+///
+/// Bundles the five name-shaped strings that always travel together so
+/// `hold_poll_resolve` and `hold_poll_resolve_with_timeout` keep a tight
+/// signature. Borrowed for the lifetime of the call — no allocation; the
+/// fields are typically slices of caller-owned `String`s already on the
+/// stack.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingApproval<'a> {
+    /// Approval ID from agentpactd's `PACT_ASK` response. kyrisd keys its
+    /// pending-store on this.
+    pub approval_id: &'a str,
+    /// Single-use token from agentpactd that authorises the follow-up
+    /// `permission.respond` once the user resolves.
+    pub approval_token: &'a str,
+    /// Popup title slot ("Kyris: Allow <server>"). For MCP it's the MCP
+    /// server name; for native hooks it's a category like "shell".
+    pub server: &'a str,
+    /// Popup body fallback (typically a tool name like "Bash", "Read").
+    pub tool: &'a str,
+    /// Optional verbatim payload (shell command, file path, serialized
+    /// MCP args) for the popup's syntect-highlighted accessoryView. `None`
+    /// lets the daemon fall back to plain-text informativeText.
+    pub code: Option<&'a str>,
+}
+
+/// Hold a `PACT_ASK` request in kyrisd and poll until the user resolves it
+/// (or the default 60s timeout fires). Used by `kyris-mcp` and other surfaces
+/// that do not race against an external hook timeout.
 pub async fn hold_poll_resolve(
     client: &reqwest::Client,
     conn: &KyrisdConnection,
-    approval_id: &str,
-    approval_token: &str,
-    server: &str,
-    tool: &str,
+    approval: PendingApproval<'_>,
 ) -> Resolution {
+    hold_poll_resolve_with_timeout(client, conn, approval, POLL_TIMEOUT).await
+}
+
+/// Variant of `hold_poll_resolve` with a caller-specified deadline. Native
+/// agent hooks (Claude Code, Codex CLI, Gemini CLI) must pass
+/// `NATIVE_HOOK_POLL_TIMEOUT` so the resolver returns before the agent's
+/// own hook timeout fires.
+pub async fn hold_poll_resolve_with_timeout(
+    client: &reqwest::Client,
+    conn: &KyrisdConnection,
+    approval: PendingApproval<'_>,
+    max_wait: std::time::Duration,
+) -> Resolution {
+    // `approval.code` is the verbatim payload (shell command, file path,
+    // MCP args) — kyrisd uses it as the accessoryView text and runs syntect
+    // coloring over it. Shell hooks always have a verbatim payload; if
+    // `code` is None the daemon falls back to plain-text informativeText.
     let hold_body = serde_json::json!({
-        "id": approval_id,
-        "approval_token": approval_token,
-        "server": server,
-        "tool": tool,
+        "id": approval.approval_id,
+        "approval_token": approval.approval_token,
+        "server": approval.server,
+        "tool": approval.tool,
+        "code": approval.code,
     });
 
     let hold_result = client
@@ -45,18 +95,18 @@ pub async fn hold_poll_resolve(
         }
     }
 
-    let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + max_wait;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         if tokio::time::Instant::now() >= deadline {
-            cancel(client, conn, approval_id).await;
+            cancel(client, conn, approval.approval_id).await;
             return Resolution::Failed("approval timed out".to_string());
         }
 
         let status_result = client
             .get(format!(
                 "{}/api/pending/{}/status",
-                conn.base_url, approval_id
+                conn.base_url, approval.approval_id
             ))
             .header("authorization", format!("Bearer {}", conn.operator_key))
             .send()
@@ -74,7 +124,7 @@ pub async fn hold_poll_resolve(
             Some("approved") => return Resolution::Approved,
             Some("denied") => return Resolution::Denied,
             _ => {
-                cancel(client, conn, approval_id).await;
+                cancel(client, conn, approval.approval_id).await;
                 return Resolution::Failed("unexpected pending state".to_string());
             }
         }

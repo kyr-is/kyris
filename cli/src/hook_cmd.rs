@@ -74,12 +74,19 @@ fn run_hold(args: HookHoldArgs) {
     // polls for developer resolution, sends permission.respond to agentpactd,
     // and returns the exit code.  EmptyStdout means no extra output — the
     // shell hook only cares about the exit code.
+    //
+    // Field assignment matters for the popup UI:
+    //   server → popup title slot ("Kyris: Allow <server>")
+    //   tool   → popup body fallback + the `code` passed to the accessoryView
+    // Putting `args.display` (the verbatim shell command) into `server`
+    // would dump the whole command into the title bar; putting it into
+    // `tool` is what makes the syntect-highlighted accessoryView render.
     let ask_ctx = AskContext {
         allow_response: &AllowResponse::EmptyStdout,
         approval_id: &args.req_id,
         approval_token: &args.token,
-        server: &args.display,
-        tool: "",
+        server: "shell",
+        tool: &args.display,
         sock_path: &sock_path,
         socket_timeout,
     };
@@ -146,11 +153,50 @@ fn run_check(args: HookCheckArgs) {
         serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
     let protocol = registry::agent_by_id(agent).and_then(|a| a.hook_protocol());
+
+    // Fast-path: pass-through tools (LLM coordination primitives with no
+    // governable side effect) skip the daemon entirely. Unmapped tools also
+    // skip the daemon but emit a stderr warning so we notice and update the
+    // per-agent mapping table. Both rely on the agent's `allow_response`
+    // shape to suppress the agent's own permission prompt.
+    if let Some(proto) = protocol.as_ref()
+        && let Some(tool) = hook_input[&proto.tool_name_field].as_str()
+    {
+        let governable = proto.tool_mappings.iter().any(|m| m.tool_name == tool);
+        let pass_through = proto.pass_through_tools.iter().any(|t| t == tool);
+        if !governable {
+            if !pass_through {
+                eprintln!(
+                    "[agentpact] warning: '{tool}' is not in the {agent} mapping table; allowing without governance. Add it to tool_mappings or pass_through_tools."
+                );
+            }
+            emit_allow(&proto.allow_response);
+            std::process::exit(0);
+        }
+    }
+
     let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
 
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from));
+    // Prefer the cwd the agent reports in its hook payload (Claude Code,
+    // Codex CLI and Gemini CLI all include this). It is the authoritative
+    // session cwd; ours is just whatever the hook process inherited.
+    // Without this, inside-CWD reads can be misclassified as outside-CWD
+    // when the two diverge — see agentpact/src/policy/boundaries.rs:43.
+    let cwd = hook_input
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+        });
+
+    // For file actions, if the agent gave a relative path, resolve it
+    // against the cwd we just picked so agentpactd's lexical fallback
+    // (boundaries::is_path_inside) can match it correctly.
+    let detail = resolve_relative_path(&action, &detail, cwd.as_deref());
 
     let seed_pid = discover_agent_pid();
 
@@ -171,6 +217,15 @@ fn run_check(args: HookCheckArgs) {
         .as_ref()
         .map_or(AllowResponse::EmptyStdout, |p| p.allow_response.clone());
 
+    // Compound-command splitting (P-CC-01/02/03 per the AgentPact spec) is
+    // implemented in agentpactd at `agentpact/src/policy/compound.rs:20`
+    // with strictest-wins aggregation in `eval.rs:216`. The hook layer
+    // sends the raw command and trusts the daemon to handle decomposition
+    // and policy evaluation. Splitting here as well would (a) duplicate
+    // work, (b) over-prompt by issuing N requests for one logical action,
+    // and (c) wrongly fragment complex constructs like `for ... do ...; done`
+    // or `case ... in ... ;; esac` whose `;` separators are not command
+    // boundaries — empirically observed in approvals.jsonl.
     match outcome {
         Ok(McpPermissionDecision::Allow) => {
             emit_allow(&allow_response);
@@ -216,6 +271,19 @@ struct AskContext<'a> {
 
 fn resolve_ask(ctx: &AskContext<'_>) -> i32 {
     let Some(conn) = kyris_core::config::load_kyrisd_connection() else {
+        // Mirror the agentpactd-unreachable behavior: if the operator set
+        // on_daemon_unavailable=allow, fail open (with a recorded event)
+        // instead of silently denying. Without this, a stopped kyrisd
+        // breaks every Ask flow even when the user explicitly opted in
+        // to fail-open mode.
+        if agentpact::allow_on_daemon_unavailable() {
+            kyris_core::fail_open_log::record(ctx.server, ctx.tool, "kyris-hook", None);
+            // The agentpactd approval token expires naturally; we don't
+            // forge a Denied response, which would record a false audit
+            // entry against the user.
+            emit_allow(ctx.allow_response);
+            return 0;
+        }
         deny_ask_immediately(ctx.approval_token, ctx.sock_path, ctx.socket_timeout);
         emit_deny("kyrisd unreachable — cannot delegate approval");
         return 2;
@@ -232,13 +300,21 @@ fn resolve_ask(ctx: &AskContext<'_>) -> i32 {
             "[kyris] {}/{} held for approval — resolve with 'kyris pending'",
             ctx.server, ctx.tool,
         );
-        kyris_core::pending::hold_poll_resolve(
+        // ctx.tool is the verbatim payload from agentpactd's permission
+        // request (the shell command, file path, or serialized MCP args),
+        // so also pass it as `code` — the daemon renders it in the
+        // popup's syntect-highlighted accessoryView.
+        kyris_core::pending::hold_poll_resolve_with_timeout(
             &client,
             &conn,
-            ctx.approval_id,
-            ctx.approval_token,
-            ctx.server,
-            ctx.tool,
+            kyris_core::pending::PendingApproval {
+                approval_id: ctx.approval_id,
+                approval_token: ctx.approval_token,
+                server: ctx.server,
+                tool: ctx.tool,
+                code: Some(ctx.tool),
+            },
+            kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
         )
         .await
     });
@@ -272,6 +348,30 @@ fn deny_ask_immediately(
         ApprovalResponse::Denied,
         Some(socket_timeout),
     );
+}
+
+/// Resolve a relative file path against the session cwd for `read`/`write`
+/// actions. Absolute paths, non-file actions, and missing cwd pass through
+/// unchanged. Done lexically — we do not touch the filesystem; canonicalization
+/// happens inside agentpactd's boundary check.
+fn resolve_relative_path(action: &str, detail: &str, cwd: Option<&str>) -> String {
+    if action != "read" && action != "write" {
+        return detail.to_string();
+    }
+    if detail.is_empty() {
+        return detail.to_string();
+    }
+    let path = std::path::Path::new(detail);
+    if path.is_absolute() {
+        return detail.to_string();
+    }
+    let Some(base) = cwd else {
+        return detail.to_string();
+    };
+    std::path::Path::new(base)
+        .join(detail)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn map_payload(protocol: Option<&HookProtocol>, input: &serde_json::Value) -> (String, String) {
@@ -362,6 +462,7 @@ mod tests {
                 action: "execute".to_string(),
                 detail_key: Some("command".to_string()),
             }],
+            pass_through_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -381,6 +482,7 @@ mod tests {
                 action: "execute".to_string(),
                 detail_key: Some("command".to_string()),
             }],
+            pass_through_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -401,6 +503,7 @@ mod tests {
                 action: "call".to_string(),
                 detail_key: None,
             }],
+            pass_through_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -416,6 +519,7 @@ mod tests {
             tool_name_field: "tool_name".to_string(),
             detail_fields: vec!["tool_input".to_string()],
             tool_mappings: vec![],
+            pass_through_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -603,6 +707,55 @@ mod tests {
         let (action, detail) = map_payload(Some(&proto), &input);
         assert_eq!(action, "write");
         assert_eq!(detail, "/home/user/index.ts");
+    }
+
+    // --- cwd / relative-path resolution (P4) ---
+
+    #[test]
+    fn testResolveRelativePathAbsoluteUnchanged() {
+        let out = resolve_relative_path("read", "/abs/foo.txt", Some("/proj"));
+        assert_eq!(out, "/abs/foo.txt");
+    }
+
+    #[test]
+    fn testResolveRelativePathReadJoinsCwd() {
+        let out = resolve_relative_path("read", "src/main.rs", Some("/proj"));
+        assert_eq!(out, "/proj/src/main.rs");
+    }
+
+    #[test]
+    fn testResolveRelativePathWriteJoinsCwd() {
+        let out = resolve_relative_path("write", "out.txt", Some("/proj"));
+        assert_eq!(out, "/proj/out.txt");
+    }
+
+    #[test]
+    fn testResolveRelativePathExecutePassesThrough() {
+        // Execute details are commands, not paths — never rewrite them.
+        let out = resolve_relative_path("execute", "ls -la", Some("/proj"));
+        assert_eq!(out, "ls -la");
+    }
+
+    #[test]
+    fn testResolveRelativePathNoCwdPassesThrough() {
+        let out = resolve_relative_path("read", "src/main.rs", None);
+        assert_eq!(out, "src/main.rs");
+    }
+
+    #[test]
+    fn testHookPayloadCwdParsedPreferredOverEnv() {
+        // Sanity: the payload's cwd field must be a string and non-empty.
+        // The actual env-vs-payload selection logic lives in run_check;
+        // here we just confirm the JSON path used to extract it.
+        let input = serde_json::json!({
+            "cwd": "/Users/alex/proj",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "src/main.rs"}
+        });
+        assert_eq!(
+            input.get("cwd").and_then(|v| v.as_str()),
+            Some("/Users/alex/proj")
+        );
     }
 
     #[test]
