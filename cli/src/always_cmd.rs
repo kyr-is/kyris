@@ -51,7 +51,9 @@ pub fn run(args: AlwaysArgs) {
 
 fn run_list() -> Result<(), String> {
     let (working_dir, home_dir) = resolve_dirs()?;
-    let overrides = always::list_overrides(&working_dir, &home_dir).map_err(|e| e.to_string())?;
+    let user_policy_dir = agentpact::config::default_user_policy_dir(&home_dir);
+    let overrides = always::list_overrides(&working_dir, &home_dir, &user_policy_dir)
+        .map_err(|e| e.to_string())?;
     if overrides.is_empty() {
         println!("No active overrides.");
         return Ok(());
@@ -84,7 +86,8 @@ fn run_revoke(args: RevokeArgs) -> Result<(), String> {
         (RevokeTarget::Named(selector.clone()), selector)
     };
 
-    let written_path = always::revoke_override(&working_dir, target, &home_dir)
+    let user_policy_dir = agentpact::config::default_user_policy_dir(&home_dir);
+    let written_path = always::revoke_override(&working_dir, target, &home_dir, &user_policy_dir)
         .map_err(|e: AlwaysError| e.to_string())?;
     println!("Revoked {target_label} in {}", written_path.display());
     Ok(())

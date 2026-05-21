@@ -165,13 +165,20 @@ fn load_merged_policy(policy_dir: Option<&Path>) -> Result<PolicyLevel, String> 
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot determine working directory: {e}"))?;
 
-    let levels = resolve_walk_up(Some(cwd.to_str().unwrap_or(".")), &home, Some(30))?;
+    let user_policy_dir = agentpact::config::default_user_policy_dir(&home);
+    let levels = resolve_walk_up(
+        Some(cwd.to_str().unwrap_or(".")),
+        &home,
+        &user_policy_dir,
+        Some(30),
+    )?;
 
     if levels.is_empty() {
         return Err(format!(
-            "No policy files found. Looked for .agentpact/policy/ from {} up to {}",
+            "No policy files found. Looked for .agentpact/policy/ from {} up through {} and {}",
             cwd.display(),
-            home.display()
+            home.display(),
+            user_policy_dir.display()
         ));
     }
 

@@ -644,15 +644,19 @@ fn check_agent_surfaces() -> bool {
     all_ok
 }
 
-// Seed a minimal user-level Pact at ~/.agentpact/policy/pact.yaml so that
-// kyris compile_policy's walk-up (which always lands at $HOME/.agentpact/
-// policy/ for the home level) has something to merge. Without this, agents
+// Seed a minimal user-level Pact at the canonical XDG path
+// `$XDG_CONFIG_HOME/agentpact/policy/pact.yaml` so that both the
+// agentpactd runtime and the kyris compile-policy walk-up have something
+// to read. The single canonical path is provided by
+// `agentpact::config::default_user_policy_dir`, which mirrors the daemon's
+// `DaemonConfig.user_policy_dir`. XDG dirs are preserved across uninstall,
+// so user customizations survive upgrade. Without this seed, agents
 // whose only command-control mechanism is compiled policy (e.g., cline)
 // can never finish setup on a fresh machine. Idempotent: skips if any
 // *.yaml is already present in the user policy dir.
 fn seed_user_policy_if_missing(log: &InstallLog) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
-    let policy_dir = PathBuf::from(home).join(".agentpact").join("policy");
+    let policy_dir = agentpact::config::default_user_policy_dir(&PathBuf::from(&home));
     if let Ok(entries) = std::fs::read_dir(&policy_dir)
         && entries.flatten().any(|e| {
             e.path()
