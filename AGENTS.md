@@ -107,8 +107,7 @@ single source of truth; honors `KYRIS_HOME`, `XDG_CONFIG_HOME`,
 - `~/.local/share/kyris/kyrisd.duckdb`: DuckDB event store (audit history; survives uninstall)
 - `~/.local/share/kyris/credentials.json`: sync credentials (survives uninstall)
 - `~/.local/state/kyris/log/kyris.log`: daemon's in-process log
-- `~/.local/state/kyris/log/kyrisd.stdout.log`: `launchd` stdout
-- `~/.local/state/kyris/log/kyrisd.stderr.log`: `launchd` stderr
+- `~/.local/state/kyris/log/kyrisd.log`: `launchd`-captured daemon output (stdout+stderr merged; kyrisd writes through tracing→stderr, stdout is unused but merged for safety)
 - `~/.local/state/kyris/crash/`: panic reports
 - `~/.local/state/kyris/diagnostics/`: SIGUSR1 JSON dumps
 - `~/.local/state/kyris/fail-open.jsonl`: shell-hook spool when daemon unreachable

@@ -18,7 +18,7 @@
 //!
 //! Every call also emits a `tracing::info!` line at
 //! `target = "kyris::toast"`, so operators tailing
-//! `kyrisd.stderr.log` see the content even when GUI delivery is
+//! `kyrisd.log` see the content even when GUI delivery is
 //! disabled, denied, or silently dropping.
 
 /// Daemon-startup permission request. Idempotent. Has to run on the
@@ -67,7 +67,7 @@ pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> Approv
 }
 
 pub fn send_toast(title: &str, body: &str) {
-    tracing::info!(target: "kyris::toast", %title, %body, "toast");
+    tracing::info!(target: "kyrisd::toast", %title, %body, "toast");
 
     #[cfg(target_os = "macos")]
     crate::notify_macos::post(title, body);

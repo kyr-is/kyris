@@ -462,7 +462,7 @@ pub fn show_approval_alert(
                     let _: () = msg_send![timer.as_ref(), invalidate];
                 }
                 tracing::info!(
-                    target: "kyris::approval",
+                    target: "kyrisd::approval",
                     elapsed_ms = elapsed_ms as u64,
                     "approval panel visible to user"
                 );
@@ -472,7 +472,7 @@ pub fn show_approval_alert(
                     let _: () = msg_send![app_ptr, stopModalWithCode: MODAL_CODE_COULD_NOT_SHOW];
                 }
                 tracing::warn!(
-                    target: "kyris::approval",
+                    target: "kyrisd::approval",
                     "approval panel never became visible — aborting modal"
                 );
             }
@@ -517,7 +517,7 @@ pub fn show_approval_alert(
         MODAL_CODE_COULD_NOT_SHOW => ApprovalOutcome::CouldNotShow,
         other => {
             tracing::warn!(
-                target: "kyris::approval",
+                target: "kyrisd::approval",
                 ?other,
                 "unexpected modal response; defaulting to No"
             );

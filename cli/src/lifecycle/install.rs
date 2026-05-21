@@ -506,9 +506,7 @@ fn install_launchd_service(
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{}.plist", launchd_label(kind)));
-    let log_path = PathBuf::from(&home)
-        .join(".kyris")
-        .join("kyrisd.stderr.log");
+    let log_path = PathBuf::from(&home).join(".kyris").join("kyrisd.log");
 
     let mut changes = Vec::new();
     ensure_parent(&log_path)?;

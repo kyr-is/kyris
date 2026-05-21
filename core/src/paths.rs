@@ -157,10 +157,12 @@ pub fn log_path() -> PathBuf {
     log_dir().join("kyris.log")
 }
 
-/// `~/.local/state/kyris/log/kyrisd.stderr.log` — launchd-captured stderr.
+/// `~/.local/state/kyris/log/kyrisd.log` — launchd-captured stdout+stderr.
+/// kyrisd writes through tracing (stderr); stdout is merged so stray
+/// dependency output is also captured.
 #[must_use]
-pub fn stderr_log_path() -> PathBuf {
-    log_dir().join("kyrisd.stderr.log")
+pub fn launchd_log_path() -> PathBuf {
+    log_dir().join("kyrisd.log")
 }
 
 /// `~/.local/state/kyris/crash/` — panic reports.

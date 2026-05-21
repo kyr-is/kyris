@@ -86,7 +86,7 @@ pub fn candidate_log_paths(kind: ServiceKind) -> Vec<PathBuf> {
             paths.push(kyris_core::paths::log_path());
             // Launchd-captured stderr fallback (full tracing output
             // including DEBUG; exists when kyrisd runs under launchd).
-            paths.push(kyris_core::paths::stderr_log_path());
+            paths.push(kyris_core::paths::launchd_log_path());
             if let Ok(home) = std::env::var("HOME") {
                 paths.push(
                     PathBuf::from(home)
@@ -111,8 +111,7 @@ pub fn candidate_log_paths(kind: ServiceKind) -> Vec<PathBuf> {
             } else {
                 PathBuf::from("/tmp/agentpact/log")
             };
-            paths.push(agentpact_log.join("daemon.stderr.log"));
-            paths.push(agentpact_log.join("daemon.stdout.log"));
+            paths.push(agentpact_log.join("agentpactd.log"));
             if let Ok(home) = std::env::var("HOME") {
                 paths.push(
                     PathBuf::from(home)

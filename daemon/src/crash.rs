@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Crash reporting. On panic, writes a sanitized text report into the
 //! configured crash directory and logs an error line so launchd
-//! captures it in `kyrisd.stderr.log`. Does not swallow the panic —
+//! captures it in `kyrisd.log`. Does not swallow the panic —
 //! the process still aborts and launchd's `KeepAlive.Crashed = true`
 //! restarts the daemon.
 

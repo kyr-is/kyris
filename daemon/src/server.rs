@@ -592,7 +592,7 @@ async fn hold_pending(
     {
         let state = state.clone();
         tracing::info!(
-            target: "kyris::approval",
+            target: "kyrisd::approval",
             pending_id = %body.id,
             server = %dialog_server,
             tool = ?dialog_tool,
@@ -743,7 +743,7 @@ async fn hook_log(
     // and serves as the "hook resolved" marker. Both share `hook_id`
     // for correlation.
     tracing::info!(
-        target: "kyris::hook",
+        target: "kyrisd::hook",
         phase = "start",
         hook_id = %body.hook_id,
         agent = %body.agent,
@@ -752,7 +752,7 @@ async fn hook_log(
         "hook fired"
     );
     tracing::info!(
-        target: "kyris::hook",
+        target: "kyrisd::hook",
         phase = "outcome",
         hook_id = %body.hook_id,
         agent = %body.agent,

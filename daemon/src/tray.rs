@@ -732,7 +732,7 @@ mod gui {
     }
 
     fn open_logs() {
-        let path = kyris_core::paths::stderr_log_path();
+        let path = kyris_core::paths::launchd_log_path();
         let path_str = path.to_string_lossy();
         if let Err(e) = platform::open_log_file(&path_str) {
             tracing::warn!(error = %e, path = %path_str, "failed to open logs");
