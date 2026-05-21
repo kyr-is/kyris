@@ -99,6 +99,17 @@ fn run_zsh_trapdebug(
         .env("AGENTPACT_SOCK", socket_path)
         .env("PATH", path_env)
         .env("HOOK_PATH", hook_path("zsh_hook.sh"))
+        // The hook bails out of its own setup when it detects it is
+        // running inside a governed agent (env vars CLAUDECODE /
+        // KYRIS_GOVERNED_SUBPROCESS, or `claude`/`codex`/… anywhere
+        // in the parent process chain). The test environment can match
+        // any of those — clearing the env vars isn't enough because
+        // the parent process walk still finds the agent that spawned
+        // `cargo test`. `KYRIS_HOOK_FORCE=1` is the dedicated test
+        // escape hatch that bypasses the entire guard.
+        .env_remove("CLAUDECODE")
+        .env_remove("KYRIS_GOVERNED_SUBPROCESS")
+        .env("KYRIS_HOOK_FORCE", "1")
         .arg("-fc")
         .arg(format!("source \"$HOOK_PATH\"; {command}"))
         .output()

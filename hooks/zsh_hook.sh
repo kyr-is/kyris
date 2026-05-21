@@ -40,7 +40,7 @@ __kyris_running_under_governed_agent() {
     return 1
 }
 
-if __kyris_running_under_governed_agent; then
+if [[ "${KYRIS_HOOK_FORCE:-0}" != "1" ]] && __kyris_running_under_governed_agent; then
     return 0 2>/dev/null || exit 0
 fi
 

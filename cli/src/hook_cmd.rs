@@ -90,7 +90,7 @@ fn run_hold(args: HookHoldArgs) {
         sock_path: &sock_path,
         socket_timeout,
     };
-    let exit_code = resolve_ask(&ask_ctx);
+    let (exit_code, _source) = resolve_ask(&ask_ctx);
     std::process::exit(exit_code);
 }
 
@@ -140,8 +140,31 @@ fn discover_agent_pid() -> Option<u32> {
 
 fn run_check(args: HookCheckArgs) {
     let agent = &args.agent;
+    let hook_id = generate_hook_id();
+    let started_at = std::time::Instant::now();
+
+    // Pre-load the kyrisd audit connection once. Used for the
+    // best-effort start + outcome log lines that this function emits at
+    // every exit. None when kyrisd is unreachable / not configured —
+    // audit silently no-ops then, the actual policy decision still
+    // works via agentpactd directly.
+    let audit_conn = kyris_core::config::load_kyrisd_connection();
 
     if let Err(msg) = agentpact::check_protocol_compatibility() {
+        // No action/detail known yet — protocol mismatch happens
+        // before payload-mapping. Audit anyway so the log shows the
+        // hook tried to fire and was rejected at the protocol layer.
+        audit_log_hook(
+            audit_conn.as_ref(),
+            &hook_id,
+            agent,
+            "unknown",
+            "",
+            "deny",
+            "protocol_mismatch",
+            None,
+            started_at.elapsed(),
+        );
         emit_deny(&msg);
         std::process::exit(2);
     }
@@ -153,29 +176,43 @@ fn run_check(args: HookCheckArgs) {
         serde_json::from_str(&payload).unwrap_or(serde_json::Value::Null);
 
     let protocol = registry::agent_by_id(agent).and_then(|a| a.hook_protocol());
+    let tool_name = protocol
+        .as_ref()
+        .and_then(|p| hook_input[&p.tool_name_field].as_str())
+        .map(str::to_string);
+
+    let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
 
     // Fast-path: pass-through tools (LLM coordination primitives with no
     // governable side effect) skip the daemon entirely. Unmapped tools also
     // skip the daemon but emit a stderr warning so we notice and update the
     // per-agent mapping table. Both rely on the agent's `allow_response`
     // shape to suppress the agent's own permission prompt.
-    if let Some(proto) = protocol.as_ref()
-        && let Some(tool) = hook_input[&proto.tool_name_field].as_str()
-    {
+    if let (Some(proto), Some(tool)) = (protocol.as_ref(), tool_name.as_deref()) {
         let governable = proto.tool_mappings.iter().any(|m| m.tool_name == tool);
         let pass_through = proto.pass_through_tools.iter().any(|t| t == tool);
         if !governable {
+            let source = if pass_through { "passthrough" } else { "unmapped" };
             if !pass_through {
                 eprintln!(
                     "[agentpact] warning: '{tool}' is not in the {agent} mapping table; allowing without governance. Add it to tool_mappings or pass_through_tools."
                 );
             }
+            audit_log_hook(
+                audit_conn.as_ref(),
+                &hook_id,
+                agent,
+                &action,
+                &detail,
+                "allow",
+                source,
+                None,
+                started_at.elapsed(),
+            );
             emit_allow(&proto.allow_response);
             std::process::exit(0);
         }
     }
-
-    let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
 
     // Prefer the cwd the agent reports in its hook payload (Claude Code,
     // Codex CLI and Gemini CLI all include this). It is the authoritative
@@ -228,6 +265,17 @@ fn run_check(args: HookCheckArgs) {
     // boundaries — empirically observed in approvals.jsonl.
     match outcome {
         Ok(McpPermissionDecision::Allow) => {
+            audit_log_hook(
+                audit_conn.as_ref(),
+                &hook_id,
+                agent,
+                &action,
+                &detail,
+                "allow",
+                "agentpact_auto",
+                None,
+                started_at.elapsed(),
+            );
             emit_allow(&allow_response);
             std::process::exit(0);
         }
@@ -244,15 +292,69 @@ fn run_check(args: HookCheckArgs) {
                 sock_path: &sock_path,
                 socket_timeout,
             };
-            let exit_code = resolve_ask(&ask_ctx);
+            let (exit_code, source) = resolve_ask(&ask_ctx);
+            let decision = match exit_code {
+                0 => "allow",
+                _ => "deny",
+            };
+            audit_log_hook(
+                audit_conn.as_ref(),
+                &hook_id,
+                agent,
+                &action,
+                &detail,
+                decision,
+                source,
+                Some(&approval_id),
+                started_at.elapsed(),
+            );
             std::process::exit(exit_code);
         }
         Err(_) if agentpact::allow_on_daemon_unavailable() => {
             kyris_core::fail_open_log::record(&action, &detail, agent, cwd.as_deref());
+            audit_log_hook(
+                audit_conn.as_ref(),
+                &hook_id,
+                agent,
+                &action,
+                &detail,
+                "allow",
+                "agentpact_unreachable",
+                None,
+                started_at.elapsed(),
+            );
             emit_allow(&allow_response);
             std::process::exit(0);
         }
-        Ok(McpPermissionDecision::Deny { reason, .. }) | Err(reason) => {
+        Ok(McpPermissionDecision::Deny { reason, .. }) => {
+            audit_log_hook(
+                audit_conn.as_ref(),
+                &hook_id,
+                agent,
+                &action,
+                &detail,
+                "deny",
+                "agentpact_deny",
+                None,
+                started_at.elapsed(),
+            );
+            emit_deny(&reason);
+            std::process::exit(2);
+        }
+        Err(reason) => {
+            // `agentpact::allow_on_daemon_unavailable()` is the guarded
+            // arm above; if we land here it's the fail-closed branch.
+            audit_log_hook(
+                audit_conn.as_ref(),
+                &hook_id,
+                agent,
+                &action,
+                &detail,
+                "deny",
+                "agentpact_unreachable",
+                None,
+                started_at.elapsed(),
+            );
             emit_deny(&reason);
             std::process::exit(2);
         }
@@ -269,7 +371,13 @@ struct AskContext<'a> {
     socket_timeout: std::time::Duration,
 }
 
-fn resolve_ask(ctx: &AskContext<'_>) -> i32 {
+/// Resolve an Ask outcome — drive the kyrisd-side approval flow (popup
+/// + pending queue) and emit the hook's stdout/stderr response. Returns
+/// `(exit_code, source)` where `source` is one of the kyris::hook
+/// audit attribution strings (`user_approved`, `user_denied`,
+/// `user_timeout`, `kyrisd_unreachable`, `agentpact_unreachable`),
+/// telling the caller exactly who/what produced the decision.
+fn resolve_ask(ctx: &AskContext<'_>) -> (i32, &'static str) {
     let Some(conn) = kyris_core::config::load_kyrisd_connection() else {
         // Mirror the agentpactd-unreachable behavior: if the operator set
         // on_daemon_unavailable=allow, fail open (with a recorded event)
@@ -282,11 +390,11 @@ fn resolve_ask(ctx: &AskContext<'_>) -> i32 {
             // forge a Denied response, which would record a false audit
             // entry against the user.
             emit_allow(ctx.allow_response);
-            return 0;
+            return (0, "kyrisd_unreachable");
         }
         deny_ask_immediately(ctx.approval_token, ctx.sock_path, ctx.socket_timeout);
         emit_deny("kyrisd unreachable — cannot delegate approval");
-        return 2;
+        return (2, "kyrisd_unreachable");
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -322,16 +430,21 @@ fn resolve_ask(ctx: &AskContext<'_>) -> i32 {
     match resolution {
         kyris_core::pending::Resolution::Approved => {
             emit_allow(ctx.allow_response);
-            0
+            (0, "user_approved")
         }
         kyris_core::pending::Resolution::Denied => {
             emit_deny("denied by developer via kyris pending");
-            2
+            (2, "user_denied")
         }
         kyris_core::pending::Resolution::Failed(reason) => {
             deny_ask_immediately(ctx.approval_token, ctx.sock_path, ctx.socket_timeout);
+            let source = if reason.contains("timeout") || reason.contains("timed out") {
+                "user_timeout"
+            } else {
+                "kyrisd_unreachable"
+            };
             emit_deny(&reason);
-            2
+            (2, source)
         }
     }
 }
@@ -372,6 +485,87 @@ fn resolve_relative_path(action: &str, detail: &str, cwd: Option<&str>) -> Strin
         .join(detail)
         .to_string_lossy()
         .into_owned()
+}
+
+/// 32-bit hex identifier shared by the `phase=start` / `phase=outcome`
+/// audit pair for a single hook invocation. Derived from nanoseconds
+/// since the epoch XOR'd with the process id; collision risk inside
+/// one user's session is nil and the resulting log is grep-friendly.
+fn generate_hook_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |d| d.as_nanos());
+    #[allow(clippy::cast_possible_truncation)]
+    let id = (nanos as u32) ^ std::process::id();
+    format!("{id:08x}")
+}
+
+/// Fire-and-forget POST of a single hook log entry to kyrisd's
+/// `/api/hook/log` endpoint. Short timeout — kyrisd is local; if it
+/// can't respond in 100ms the audit entry is lost but the hook's
+/// actual policy decision (via agentpactd, separate socket) is
+/// unaffected. Returns nothing; all errors are swallowed.
+fn post_hook_log_blocking(
+    conn: &kyris_core::config::KyrisdConnection,
+    body: serde_json::Value,
+) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    let base_url = conn.base_url.clone();
+    let token = conn.operator_key.clone();
+    let _ = rt.block_on(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .ok()?;
+        client
+            .post(format!("{base_url}/api/hook/log"))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .ok()
+    });
+}
+
+/// Single audit call per hook. Sends the combined start + outcome
+/// payload to kyrisd's `/api/hook/log`; kyrisd emits two log lines
+/// (`phase=start`, `phase=outcome`) from this one request. No-op when
+/// kyrisd isn't configured/reachable — audit is best-effort, the
+/// actual policy decision (via agentpactd, separate socket) is
+/// unaffected.
+#[allow(clippy::too_many_arguments)]
+fn audit_log_hook(
+    conn: Option<&kyris_core::config::KyrisdConnection>,
+    hook_id: &str,
+    agent: &str,
+    action: &str,
+    detail: &str,
+    decision: &str,
+    source: &str,
+    pending_id: Option<&str>,
+    elapsed: std::time::Duration,
+) {
+    let Some(conn) = conn else { return };
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_ms = elapsed.as_millis() as u64;
+    post_hook_log_blocking(
+        conn,
+        serde_json::json!({
+            "hook_id": hook_id,
+            "agent": agent,
+            "action": action,
+            "detail": detail,
+            "decision": decision,
+            "source": source,
+            "pending_id": pending_id,
+            "elapsed_ms": elapsed_ms,
+        }),
+    );
 }
 
 fn map_payload(protocol: Option<&HookProtocol>, input: &serde_json::Value) -> (String, String) {

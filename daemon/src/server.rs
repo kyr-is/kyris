@@ -390,6 +390,7 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
             "/api/circuit-breaker/reset",
             post(circuit_breaker_reset).with_state(state.clone()),
         )
+        .route("/api/hook/log", post(hook_log).with_state(state.clone()))
         .route("/api/pending", get(list_pending).with_state(state.clone()))
         .route(
             "/api/pending/{id}/resolve",
@@ -692,6 +693,78 @@ async fn pending_status(
             Json(serde_json::json!({ "error": "not found" })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /api/hook/log — best-effort audit endpoint, called once per hook
+// invocation at exit. The CLI captures `phase=start` info before doing
+// any work, runs the agentpactd permission check, then sends ONE payload
+// carrying both the start info and the outcome. This endpoint emits
+// two tracing lines from that single call — `phase=start` then
+// `phase=outcome` — giving operators a grep-friendly before/after pair
+// in the kyrisd log without a second network round-trip per hook.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct HookLogBody {
+    /// Correlation id shared between the start and outcome lines.
+    /// Lets operators group entries and spot duplicate asks (same
+    /// agent+action+detail, different hook_id).
+    hook_id: String,
+    /// Agent that triggered the hook (e.g. `claude-code`, `codex-cli`).
+    agent: String,
+    /// AgentPact action (`execute`, `read`, `write`, `call`).
+    action: String,
+    /// Verbatim payload from the agent — shell command, file path, MCP
+    /// tool args. Free-form; not parsed.
+    detail: String,
+    /// Final decision routed back to the agent (`allow`, `deny`).
+    decision: String,
+    /// Who/what decided. See `cli/src/hook_cmd.rs` for the canonical
+    /// set (`agentpact_auto`, `agentpact_deny`, `user_approved`,
+    /// `user_denied`, `user_timeout`, `kyrisd_unreachable`,
+    /// `agentpact_unreachable`, `passthrough`, `unmapped`,
+    /// `protocol_mismatch`).
+    source: String,
+    /// AgentPact pending id when the decision went through an ask
+    /// path; lets operators correlate hook records with approval-
+    /// dialog lifecycle in `kyris::approval`.
+    pending_id: Option<String>,
+    /// Wall-clock time from hook entry to outcome, in milliseconds.
+    elapsed_ms: u64,
+}
+
+async fn hook_log(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<HookLogBody>,
+) -> StatusCode {
+    // Two log lines from one payload: `start` carries the inputs and
+    // serves as the "hook fired" marker; `outcome` carries the decision
+    // and serves as the "hook resolved" marker. Both share `hook_id`
+    // for correlation.
+    tracing::info!(
+        target: "kyris::hook",
+        phase = "start",
+        hook_id = %body.hook_id,
+        agent = %body.agent,
+        action = %body.action,
+        detail = %body.detail,
+        "hook fired"
+    );
+    tracing::info!(
+        target: "kyris::hook",
+        phase = "outcome",
+        hook_id = %body.hook_id,
+        agent = %body.agent,
+        action = %body.action,
+        detail = %body.detail,
+        decision = %body.decision,
+        source = %body.source,
+        pending_id = body.pending_id.as_deref().unwrap_or("-"),
+        elapsed_ms = body.elapsed_ms,
+        "hook resolved"
+    );
+    StatusCode::NO_CONTENT
 }
 
 // ---------------------------------------------------------------------------

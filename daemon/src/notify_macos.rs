@@ -106,13 +106,6 @@ pub fn show_approval_alert(
 ) -> crate::notify::ApprovalOutcome {
     use crate::notify::ApprovalOutcome;
 
-    tracing::info!(
-        target: "kyris::approval",
-        %title,
-        body_len = body.len(),
-        code_len = code.map(str::len).unwrap_or(0),
-        "show_approval_alert: entry"
-    );
 
     // AppKit wire codes for stopModalWithCode:. Kept local — the public
     // API surfaces ApprovalOutcome, never these integers.
@@ -493,9 +486,7 @@ pub fn show_approval_alert(
         )
     };
 
-    tracing::info!(target: "kyris::approval", "runModal: starting");
     let response: isize = unsafe { msg_send![&*app, runModalForWindow: &*panel] };
-    tracing::info!(target: "kyris::approval", response, "runModal: returned");
 
     // CRITICAL: invalidate the poll timer before any of the local Retained<>
     // values go out of scope. The timer's block captures the panel pointer
@@ -519,7 +510,7 @@ pub fn show_approval_alert(
     // we don't want any drop-order surprises during a future refactor.
     let _ = (&handler, &yes_btn, &no_btn, &always_btn);
 
-    let outcome = match response {
+    match response {
         MODAL_CODE_YES => ApprovalOutcome::Yes,
         MODAL_CODE_NO => ApprovalOutcome::No,
         MODAL_CODE_ALWAYS => ApprovalOutcome::Always,
@@ -532,13 +523,7 @@ pub fn show_approval_alert(
             );
             ApprovalOutcome::No
         }
-    };
-    tracing::info!(
-        target: "kyris::approval",
-        ?outcome,
-        "show_approval_alert: exit"
-    );
-    outcome
+    }
 }
 
 // ApprovalAction: an objc target object whose `decide:` selector reads

@@ -21,6 +21,7 @@ dependencies = [
  "nix",
  "notify",
  "notify-debouncer-mini",
+ "rable",
  "security-framework",
  "serde",
  "serde-saphyr",
@@ -3032,6 +3033,15 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "rable"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e88e6468e3cd3895afe217023d6320ffd1a9d308bd6d3a3ab3f618ef08e11d6"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "radium"
