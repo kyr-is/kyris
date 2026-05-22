@@ -106,13 +106,18 @@ pub fn show_approval_alert(
 ) -> crate::notify::ApprovalOutcome {
     use crate::notify::ApprovalOutcome;
 
-
     // AppKit wire codes for stopModalWithCode:. Kept local — the public
     // API surfaces ApprovalOutcome, never these integers.
     const MODAL_CODE_YES: isize = 1;
     const MODAL_CODE_NO: isize = 2;
     const MODAL_CODE_ALWAYS: isize = 3;
     const MODAL_CODE_COULD_NOT_SHOW: isize = 99;
+    // Strong-display window flags (applied after the panel is built). See
+    // the `setLevel` / `setCollectionBehavior` block below for rationale.
+    const NS_POPUP_MENU_WINDOW_LEVEL: isize = 101;
+    const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1;
+    // Visibility-poll budget (see the polling block below).
+    const VISIBILITY_POLL_MAX_MS: u128 = 500;
     use core::ffi::c_uchar;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
@@ -418,9 +423,8 @@ pub fn show_approval_alert(
     // user across Spaces, order-front even if another app didn't relinquish
     // focus. Cheap-strong combo — does NOT change activation policy, so the
     // Dock icon doesn't flash into existence on every prompt (which would
-    // be a worse user disruption than the prompt itself).
-    const NS_POPUP_MENU_WINDOW_LEVEL: isize = 101;
-    const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1;
+    // be a worse user disruption than the prompt itself). Constants are
+    // defined at the top of this function.
     unsafe {
         let _: () = msg_send![&*panel, setLevel: NS_POPUP_MENU_WINDOW_LEVEL];
         let _: () = msg_send![
@@ -436,15 +440,16 @@ pub fn show_approval_alert(
     // the screen off — none of which gets the pixels in front of them.
     // If the panel hasn't passed all four checks (isVisible, isOnActiveSpace,
     // screen != nil, occlusionState contains the Visible bit) within
-    // ~500ms, stop the modal with sentinel code 99 so the caller knows
-    // the prompt was undeliverable and can fall back to another channel.
-    const VISIBILITY_POLL_MAX_MS: u128 = 500;
+    // VISIBILITY_POLL_MAX_MS, stop the modal with sentinel code 99 so the
+    // caller knows the prompt was undeliverable and can fall back to
+    // another channel. The budget constant is defined at the top of this
+    // function.
     let panel_raw: usize = Retained::as_ptr(&panel) as usize;
     let app_raw: usize = Retained::as_ptr(&app) as usize;
     let start_time = std::time::Instant::now();
 
-    let poll_block = block2::RcBlock::new(
-        move |timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
+    let poll_block =
+        block2::RcBlock::new(move |timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
             let panel_ptr = panel_raw as *mut AnyObject;
             let app_ptr = app_raw as *mut AnyObject;
             let visible_to_user = unsafe {
@@ -476,8 +481,7 @@ pub fn show_approval_alert(
                     "approval panel never became visible — aborting modal"
                 );
             }
-        },
-    );
+        });
     let poll_timer = unsafe {
         objc2_foundation::NSTimer::scheduledTimerWithTimeInterval_repeats_block(
             0.05,

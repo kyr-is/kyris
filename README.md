@@ -465,6 +465,16 @@ flowchart TD
   duckdb --> kyrisCli
 ```
 
+**Native hook response contract.** `kyris hook check` (the PreToolUse / BeforeTool adapter for live native hooks) always fires before the agent applies its own permission rules. The agent's reaction is determined purely by the hook's response shape, not by its allowlist or approval mode — the agent only consults its built-in rules when the hook explicitly stays silent.
+
+| Hook response | Agent reaction |
+| --- | --- |
+| Exit 2 + stderr message | Block. Tool is denied; the message surfaces to the LLM. No prompt. |
+| Exit 0 + empty stdout | No decision. Agent falls back to its built-in permission rules — allowlist, approval mode, or its own prompt. |
+| Exit 0 + JSON body in the agent's expected shape | Allow. Agent treats the hook as authoritative and skips its own permission flow. No prompt. |
+
+Per-agent allow shape lives on `HookProtocol::allow_response` in `cli/src/agents/registry.rs`. Today: Claude Code and Gemini CLI return the JSON shape (`hookSpecificOutput.permissionDecision=allow` and the Gemini equivalent), so when kyris allows, the only approval surface the developer ever sees is kyris's own popup. Codex CLI uses empty stdout, so on an allow Codex still applies its own sandbox / approval-mode rules and may or may not prompt — kyris can't tell from outside. The JSON shape exists because Claude Code's hook ignores exit-0+empty-stdout and falls back to its built-in prompt, which would double-prompt after kyris already approved; the regression test guarding this is `testClaudeCodeAllowEmitsHookSpecificOutput` in `cli/src/agents/claude_code.rs`.
+
 ### 3.4 Design Decisions That Matter
 Several decisions are intentional enough that contributors should treat them as constraints, not suggestions.
 

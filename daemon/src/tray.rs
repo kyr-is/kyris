@@ -360,7 +360,8 @@ mod gui {
         // If the channel is dropped (sender panicked / main loop ended),
         // surface that as CouldNotShow rather than a silent Yes — the
         // caller can then escalate to another channel.
-        rx.await.unwrap_or(crate::notify::ApprovalOutcome::CouldNotShow)
+        rx.await
+            .unwrap_or(crate::notify::ApprovalOutcome::CouldNotShow)
     }
 
     /// Run the `AppKit` event loop on the calling thread (must be the process
@@ -546,8 +547,8 @@ mod gui {
             // user needs to know there's something waiting for them, even
             // if the daemon itself is healthy. Falls back to tray_state's
             // label/tooltip when no approvals are pending.
-            let needs_attention = now.pending_approval_count > 0
-                || !matches!(now.tray_state, TrayState::Normal);
+            let needs_attention =
+                now.pending_approval_count > 0 || !matches!(now.tray_state, TrayState::Normal);
 
             let status_text: String = if now.pending_approval_count > 0 {
                 format!(

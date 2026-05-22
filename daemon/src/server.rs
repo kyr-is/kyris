@@ -697,27 +697,28 @@ async fn pending_status(
 
 // ---------------------------------------------------------------------------
 // /api/hook/log — best-effort audit endpoint, called once per hook
-// invocation at exit. The CLI captures `phase=start` info before doing
-// any work, runs the agentpactd permission check, then sends ONE payload
-// carrying both the start info and the outcome. This endpoint emits
-// two tracing lines from that single call — `phase=start` then
-// `phase=outcome` — giving operators a grep-friendly before/after pair
-// in the kyrisd log without a second network round-trip per hook.
+// invocation at exit. The CLI sends one payload carrying inputs, the
+// daemon's decision, and timing; this endpoint emits a single
+// `hook resolved` tracing line. Optional fields (segments, approval_id)
+// are omitted from the line when absent rather than serialized as null.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct HookLogBody {
-    /// Correlation id shared between the start and outcome lines.
-    /// Lets operators group entries and spot duplicate asks (same
-    /// agent+action+detail, different hook_id).
+    /// Correlation id for one hook invocation. Lets operators group
+    /// related entries and spot duplicate asks (same
+    /// agent+action+detail, different `hook_id`).
     hook_id: String,
     /// Agent that triggered the hook (e.g. `claude-code`, `codex-cli`).
     agent: String,
-    /// AgentPact action (`execute`, `read`, `write`, `call`).
+    /// `AgentPact` action (`execute`, `read`, `write`, `call`).
     action: String,
     /// Verbatim payload from the agent — shell command, file path, MCP
     /// tool args. Free-form; not parsed.
     detail: String,
+    /// Compound segments the daemon split `detail` into, when more than
+    /// one. Only populated for `action=execute` compound commands.
+    segments: Option<Vec<String>>,
     /// Final decision routed back to the agent (`allow`, `deny`).
     decision: String,
     /// Who/what decided. See `cli/src/hook_cmd.rs` for the canonical
@@ -726,10 +727,17 @@ struct HookLogBody {
     /// `agentpact_unreachable`, `passthrough`, `unmapped`,
     /// `protocol_mismatch`).
     source: String,
-    /// AgentPact pending id when the decision went through an ask
+    /// `AgentPact` approval id when the decision went through an ask
     /// path; lets operators correlate hook records with approval-
-    /// dialog lifecycle in `kyris::approval`.
-    pending_id: Option<String>,
+    /// dialog lifecycle in `kyris::approval`. Absent for auto-decide
+    /// paths.
+    approval_id: Option<String>,
+    /// Whether the agent will get another say after kyris's response.
+    /// `"none"` — kyris denied (exit 2) or returned a definitive
+    /// allow-shape that suppresses the agent's prompt. `"agent_decides"`
+    /// — kyris allowed silently (empty stdout) and the agent applies
+    /// its own permission rules, which may or may not prompt.
+    agent_prompt: String,
     /// Wall-clock time from hook entry to outcome, in milliseconds.
     elapsed_ms: u64,
 }
@@ -738,29 +746,23 @@ async fn hook_log(
     State(_state): State<Arc<AppState>>,
     Json(body): Json<HookLogBody>,
 ) -> StatusCode {
-    // Two log lines from one payload: `start` carries the inputs and
-    // serves as the "hook fired" marker; `outcome` carries the decision
-    // and serves as the "hook resolved" marker. Both share `hook_id`
-    // for correlation.
+    // Single line per hook. `segments` and `approval_id` are tracing
+    // fields only when present; when absent the line simply omits them.
+    let segments_json = body
+        .segments
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
     tracing::info!(
         target: "kyrisd::hook",
-        phase = "start",
         hook_id = %body.hook_id,
         agent = %body.agent,
         action = %body.action,
         detail = %body.detail,
-        "hook fired"
-    );
-    tracing::info!(
-        target: "kyrisd::hook",
-        phase = "outcome",
-        hook_id = %body.hook_id,
-        agent = %body.agent,
-        action = %body.action,
-        detail = %body.detail,
+        segments = segments_json.as_deref(),
         decision = %body.decision,
         source = %body.source,
-        pending_id = body.pending_id.as_deref().unwrap_or("-"),
+        approval_id = body.approval_id.as_deref(),
+        agent_prompt = %body.agent_prompt,
         elapsed_ms = body.elapsed_ms,
         "hook resolved"
     );
@@ -1808,6 +1810,50 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn testHookLogBodyDeserializesFullShape() {
+        let raw = serde_json::json!({
+            "hook_id": "76ce3727",
+            "agent": "claude-code",
+            "action": "execute",
+            "detail": "ls && echo hi",
+            "segments": ["ls", "echo hi"],
+            "decision": "allow",
+            "source": "agentpact_auto",
+            "approval_id": "apr_42",
+            "agent_prompt": "none",
+            "elapsed_ms": 12
+        });
+        let body: HookLogBody = serde_json::from_value(raw).unwrap();
+        assert_eq!(body.hook_id, "76ce3727");
+        assert_eq!(
+            body.segments.as_deref(),
+            Some(&["ls".to_string(), "echo hi".to_string()][..])
+        );
+        assert_eq!(body.approval_id.as_deref(), Some("apr_42"));
+        assert_eq!(body.agent_prompt, "none");
+    }
+
+    #[test]
+    fn testHookLogBodyDeserializesWithoutOptionals() {
+        // segments and approval_id are absent on auto-decide non-compound
+        // calls; the body must still parse.
+        let raw = serde_json::json!({
+            "hook_id": "abcd",
+            "agent": "codex-cli",
+            "action": "execute",
+            "detail": "ls",
+            "decision": "allow",
+            "source": "agentpact_auto",
+            "agent_prompt": "agent_decides",
+            "elapsed_ms": 3
+        });
+        let body: HookLogBody = serde_json::from_value(raw).unwrap();
+        assert!(body.segments.is_none());
+        assert!(body.approval_id.is_none());
+        assert_eq!(body.agent_prompt, "agent_decides");
     }
 
     #[tokio::test]

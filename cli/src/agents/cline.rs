@@ -261,11 +261,7 @@ impl AgentDescriptor for Cline {
     ) {
         // cline has no live-hook path — compiled policy is the maximum
         // achievable command-control coverage.
-        (
-            Some(super::profile::CoverageCeiling::Compiled),
-            None,
-            None,
-        )
+        (Some(super::profile::CoverageCeiling::Compiled), None, None)
     }
     fn configure_execution(
         &self,

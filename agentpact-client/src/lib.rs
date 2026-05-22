@@ -215,6 +215,10 @@ pub fn request_mcp_tool_permission(
 /// attempt to register the given PID as a boundary anchor after validating
 /// ancestry and signature table match.
 ///
+/// Returns the decision plus the daemon-reported compound `segments` (Some only
+/// when the daemon split a compound shell command into more than one segment).
+/// Callers that don't care about segments can ignore the second tuple element.
+///
 /// # Errors
 ///
 /// Returns an error when the request cannot be sent to `agentpactd` or when the daemon
@@ -227,7 +231,7 @@ pub fn request_hook_permission(
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
     socket_timeout: Duration,
-) -> Result<McpPermissionDecision, String> {
+) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     let request = build_hook_permission_request(
         request_id_prefix,
         action,
@@ -235,8 +239,25 @@ pub fn request_hook_permission(
         working_dir,
         seed_boundary_pid,
     );
-    send_daemon_request_with_retry(socket_path, &request, socket_timeout)
-        .map(|response| parse_mcp_permission_response(&response))
+    send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
+        let decision = parse_mcp_permission_response(&response);
+        let segments = parse_response_segments(&response);
+        (decision, segments)
+    })
+}
+
+/// Extracts the `segments` array from an agentpactd permission response, if
+/// present. Returns `None` for non-execute actions, single-segment commands,
+/// and fail-closed parses — i.e. whenever the daemon decided segmentation
+/// added no information beyond `detail` itself.
+#[must_use]
+pub fn parse_response_segments(response: &serde_json::Value) -> Option<Vec<String>> {
+    response
+        .get("segments")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// Sends a `trace.attach` request to `agentpactd`, binding a `trace_token`
@@ -714,6 +735,24 @@ mod tests {
                 hint: None,
             }
         );
+    }
+
+    #[test]
+    fn testParseResponseSegmentsPresent() {
+        let response = serde_json::json!({
+            "code": "PACT_OK",
+            "segments": ["ls /tmp", "echo hi"]
+        });
+        assert_eq!(
+            parse_response_segments(&response),
+            Some(vec!["ls /tmp".to_string(), "echo hi".to_string()])
+        );
+    }
+
+    #[test]
+    fn testParseResponseSegmentsAbsent() {
+        let response = serde_json::json!({"code": "PACT_OK"});
+        assert_eq!(parse_response_segments(&response), None);
     }
 
     #[test]

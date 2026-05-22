@@ -127,11 +127,7 @@ impl AgentDescriptor for OpenCode {
     ) {
         // opencode has no live-hook path — compiled policy is the maximum
         // achievable command-control coverage.
-        (
-            Some(super::profile::CoverageCeiling::Compiled),
-            None,
-            None,
-        )
+        (Some(super::profile::CoverageCeiling::Compiled), None, None)
     }
     fn mcp_config(&self) -> Option<McpConfigLocation> {
         opencode_config_path().ok().map(|path| McpConfigLocation {
