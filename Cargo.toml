@@ -27,6 +27,7 @@ kyris-core = { path = "core" }
 kyris-agentpact-client = { path = "agentpact-client" }
 kyris-peer-cwd = { path = "peer-cwd" }
 agentpact = { git = "https://github.com/kyr-is/agentpact.git", tag = "v0.1.4", version = "0.1.4" }
+agentpact-types = { git = "https://github.com/kyr-is/agentpact.git", tag = "v0.1.4", version = "0.1.4" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value", "preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
