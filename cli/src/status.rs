@@ -15,6 +15,18 @@ pub fn run(_args: StatusArgs) {
     println!("Kyris Status");
     println!("============");
 
+    if kyris_core::paths::is_disabled() {
+        // Banner-style early line so the rest of the report is read in
+        // the right frame: daemons are *intentionally* down, hooks are
+        // bypassed, and the missing health checks below are expected
+        // rather than a system fault.
+        println!(
+            "  [!] DISABLED via {} — run `kyris start` to re-enable",
+            kyris_core::paths::disabled_marker_path().display()
+        );
+        println!();
+    }
+
     check_agentpactd();
     check_kyrisd();
     check_native_integrations();

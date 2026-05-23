@@ -166,104 +166,13 @@ fn test_install_skips_local_kyrisd_when_homebrew_managed() {
     assert!(brew_log_contents.contains("list kyris"));
 }
 
-#[test]
-fn test_daemon_start_uses_brew_services_for_homebrew_managed_kyrisd() {
-    let temp_home = TempDir::new().expect("temp home");
-    let shim_bin = TempDir::new().expect("shim bin");
-    let brew_log = temp_home.path().join("brew.log");
-    let launchctl_log = temp_home.path().join("launchctl.log");
-    let which_log = temp_home.path().join("which.log");
-    fs::write(&brew_log, "").expect("write brew log");
-    fs::write(&launchctl_log, "").expect("write launchctl log");
-    fs::write(&which_log, "").expect("write which log");
-    write_fake_brew(shim_bin.path());
-    write_fake_launchctl(shim_bin.path());
-    write_fake_which(shim_bin.path());
-
-    let output = run_kyris(
-        temp_home.path(),
-        shim_bin.path(),
-        &[
-            (
-                "KYRIS_TEST_BREW_LOG",
-                brew_log.to_str().expect("brew log path"),
-            ),
-            (
-                "KYRIS_TEST_LAUNCHCTL_LOG",
-                launchctl_log.to_str().expect("launchctl log path"),
-            ),
-            (
-                "KYRIS_TEST_WHICH_LOG",
-                which_log.to_str().expect("which log path"),
-            ),
-            ("KYRIS_TEST_BREW_LIST_KYRIS", "1"),
-        ],
-        &["daemon", "start"],
-    );
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("kyrisd started."), "{stdout}");
-
-    let brew_log_contents = fs::read_to_string(&brew_log).expect("read brew log");
-    assert!(brew_log_contents.contains("list kyris"));
-    assert!(brew_log_contents.contains("--prefix"));
-    assert!(brew_log_contents.contains("services start kyris"));
-    let launchctl_log_contents = fs::read_to_string(&launchctl_log).expect("read launchctl log");
-    assert!(
-        launchctl_log_contents.trim().is_empty(),
-        "{launchctl_log_contents}"
-    );
-}
-
-#[test]
-fn test_daemon_stop_uses_launchctl_for_launchd_managed_kyrisd() {
-    let temp_home = TempDir::new().expect("temp home");
-    let shim_bin = TempDir::new().expect("shim bin");
-    let brew_log = temp_home.path().join("brew.log");
-    let launchctl_log = temp_home.path().join("launchctl.log");
-    let which_log = temp_home.path().join("which.log");
-    fs::write(&brew_log, "").expect("write brew log");
-    fs::write(&launchctl_log, "").expect("write launchctl log");
-    fs::write(&which_log, "").expect("write which log");
-    write_fake_brew(shim_bin.path());
-    write_fake_launchctl(shim_bin.path());
-    write_fake_which(shim_bin.path());
-
-    let output = run_kyris(
-        temp_home.path(),
-        shim_bin.path(),
-        &[
-            (
-                "KYRIS_TEST_BREW_LOG",
-                brew_log.to_str().expect("brew log path"),
-            ),
-            (
-                "KYRIS_TEST_LAUNCHCTL_LOG",
-                launchctl_log.to_str().expect("launchctl log path"),
-            ),
-            (
-                "KYRIS_TEST_WHICH_LOG",
-                which_log.to_str().expect("which log path"),
-            ),
-        ],
-        &["daemon", "stop"],
-    );
-
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("kyrisd stopped."), "{stdout}");
-
-    let launchctl_log_contents = fs::read_to_string(&launchctl_log).expect("read launchctl log");
-    assert!(
-        launchctl_log_contents.contains("bootout gui/"),
-        "{launchctl_log_contents}"
-    );
-    assert!(
-        launchctl_log_contents.contains("is.kyr.kyrisd"),
-        "{launchctl_log_contents}"
-    );
-}
+// `kyris daemon start` / `kyris daemon stop` were removed when the
+// top-level `kyris stop` / `kyris start` commands took over; those
+// new commands manage both daemons together plus the disabled-hooks
+// sentinel, which doesn't fit this single-daemon shim harness. The
+// surface is now covered by `cli/src/main.rs` parser tests plus the
+// run_state unit tests; integration coverage will come back once we
+// have a launchctl-aware test fixture.
 
 #[test]
 fn test_update_check_warns_when_homebrew_manages_kyris() {

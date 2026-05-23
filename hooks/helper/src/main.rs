@@ -53,6 +53,13 @@ fn main() -> ExitCode {
 }
 
 fn cmd_check(args: &[String]) -> ExitCode {
+    // Governance kill switch — `~/.kyris/disabled` created by `kyris
+    // stop`. Honored before we touch the UDS or write any log entry.
+    // Shell hooks treat exit 0 as "allow the command."
+    if is_governance_disabled() {
+        return ExitCode::from(0);
+    }
+
     let (command, cwd, socket_path) = parse_check_args(args);
 
     if let Err(msg) = check_protocol_version(&socket_path) {
@@ -338,6 +345,17 @@ fn send_request(
 // kyris-hook is intentionally standalone (no dependency on kyris-core) so
 // the hook stays a tiny binary. We inline the XDG path resolution that
 // kyris_core::paths exposes — keep both in sync.
+/// Whether `~/.kyris/disabled` exists. Inlined here (rather than
+/// pulling in kyris-core) to keep this helper's dep footprint minimal —
+/// stdlib + serde only, per the Cargo.toml note. Honors `KYRIS_HOME`
+/// for parity with `kyris_core::paths::runtime_dir`.
+fn is_governance_disabled() -> bool {
+    let runtime_dir = std::env::var_os("KYRIS_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".kyris")));
+    runtime_dir.is_some_and(|d| d.join("disabled").exists())
+}
+
 fn xdg_state_dir() -> String {
     std::env::var("XDG_STATE_HOME").map_or_else(
         |_| {

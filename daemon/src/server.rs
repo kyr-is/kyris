@@ -159,7 +159,7 @@ pub async fn run(config: KyrisdConfig) {
 
     tokio::spawn(sighup_reload(state.clone(), signals.sighup));
     tokio::spawn(sigusr1_diagnostics(signals.sigusr1));
-    tokio::spawn(tray_state_poller(state.clone()));
+    tokio::spawn(agentpactd_health_poller());
 
     if tls_enabled {
         serve_tls_with_graceful_shutdown(
@@ -390,6 +390,10 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
             "/api/circuit-breaker/reset",
             post(circuit_breaker_reset).with_state(state.clone()),
         )
+        .route(
+            "/api/circuit-breaker/reset-all",
+            post(circuit_breaker_reset_all).with_state(state.clone()),
+        )
         .route("/api/hook/log", post(hook_log).with_state(state.clone()))
         .route("/api/pending", get(list_pending).with_state(state.clone()))
         .route(
@@ -443,6 +447,20 @@ async fn circuit_breaker_reset(
         tracing::warn!(session_id = %body.session_id, "circuit breaker reset: unknown session");
         axum::http::StatusCode::NOT_FOUND
     }
+}
+
+/// Reset every session that's currently sitting at or above its token
+/// cap. Returns the list of session IDs that were cleared so the CLI
+/// can show the operator exactly which sessions resumed. Empty list
+/// is a valid success — no sessions were tripped.
+async fn circuit_breaker_reset_all(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cleared = state.circuit_breaker.reset_all_tripped();
+    if cleared.is_empty() {
+        tracing::info!("circuit breaker reset-all: no sessions were tripped");
+    } else {
+        tracing::info!(count = cleared.len(), "circuit breaker reset-all");
+    }
+    Json(serde_json::json!({ "cleared": cleared }))
 }
 
 async fn list_pending(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -990,22 +1008,28 @@ impl ShutdownSignals {
     }
 }
 
-/// Periodically push the values the tray menu cares about (pending
-/// approval count, circuit breaker state) into the tray's atomic
-/// state holders. The tray itself runs on the main thread and reads
-/// those atomics on every poll cycle. This decoupling means the tray
-/// code doesn't need access to `AppState` — it just observes a few
-/// integers — and the daemon code doesn't need to know about the
-/// tray internals.
-///
-/// 1-second cadence balances perceived freshness against lock taxes
-/// on the pending `HashMap` and circuit-breaker `RwLock`.
-async fn tray_state_poller(state: Arc<AppState>) {
+/// Probe agentpactd's UDS every second and reflect reachability into
+/// the tray's issue set. The tray icon goes amber when the policy
+/// daemon stops accepting connections (e.g. crashed, bootout'd, or
+/// kyris-stopped) so the user notices without having to run a check
+/// command.
+async fn agentpactd_health_poller() {
+    let socket_path = std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.agentpact/agentpact.sock")
+    });
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let tripped = state.circuit_breaker.any_tripped();
-        crate::tray::set_circuit_breaker_tripped(tripped);
+        let reachable = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
+        if reachable {
+            crate::tray::clear_issue("agentpactd");
+        } else {
+            crate::tray::report_issue(
+                "agentpactd",
+                format!("policy daemon socket not responding at {socket_path}"),
+            );
+        }
     }
 }
 
@@ -1030,7 +1054,10 @@ fn write_diagnostics_dump() -> std::io::Result<std::path::PathBuf> {
         "commit": crate::build_info::COMMIT,
         "features": crate::build_info::FEATURES,
         "pid": std::process::id(),
-        "tray_state": crate::tray::current_state().to_string(),
+        "tray_issues": crate::tray::list_issues()
+            .into_iter()
+            .map(|(k, v)| serde_json::json!({"key": k, "reason": v}))
+            .collect::<Vec<_>>(),
     });
     let body = serde_json::to_vec_pretty(&dump).expect("serialize diagnostics dump");
     std::fs::write(&path, body)?;

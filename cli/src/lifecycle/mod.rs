@@ -8,6 +8,7 @@ pub mod enroll;
 pub mod install;
 pub mod log;
 pub mod release;
+pub mod run_state;
 pub mod uninstall;
 pub mod update;
 pub mod verify;

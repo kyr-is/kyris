@@ -59,6 +59,23 @@ impl CircuitBreaker {
         }
     }
 
+    /// Clear every session that's at or above its token cap. Returns
+    /// the IDs that were actually tripped (and are now reset) so the
+    /// caller can report which sessions resumed.
+    pub fn reset_all_tripped(&self) -> Vec<String> {
+        let mut sessions = self.sessions.write().expect("lock sessions");
+        let now = Instant::now();
+        let mut cleared = Vec::new();
+        for (id, state) in sessions.iter_mut() {
+            if state.total_tokens >= state.max_tokens {
+                state.total_tokens = 0;
+                state.last_activity = now;
+                cleared.push(id.clone());
+            }
+        }
+        cleared
+    }
+
     pub fn prune_idle(&self, idle_timeout: std::time::Duration) {
         let mut sessions = self.sessions.write().expect("lock sessions");
         sessions.retain(|_, state| state.last_activity.elapsed() < idle_timeout);
@@ -82,14 +99,6 @@ impl CircuitBreaker {
                 },
             );
         }
-    }
-
-    /// True if any session has hit its token cap. Used by the tray
-    /// menu to gate the "Continue Routing" item — it's only
-    /// actionable when at least one session is currently held up.
-    pub fn any_tripped(&self) -> bool {
-        let sessions = self.sessions.read().expect("lock sessions");
-        sessions.values().any(|s| s.total_tokens >= s.max_tokens)
     }
 
     pub fn session_totals(&self) -> Vec<(String, i64)> {

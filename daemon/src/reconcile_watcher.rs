@@ -129,9 +129,12 @@ pub async fn run_reconcile_loop(state: Arc<AppState>) {
 
         if repaired {
             crate::notify::agent_drift_repaired_toast();
-            crate::tray::set_state(crate::tray::TrayState::Degraded);
+            // Surface the drift in the tray for a brief observation
+            // window. The repair already happened — this is just a
+            // "we did something you should know about" signal.
+            crate::tray::report_issue("agent_drift_repaired", "agent integration was repaired");
             tokio::time::sleep(Duration::from_secs(30)).await;
-            crate::tray::set_state(crate::tray::TrayState::Normal);
+            crate::tray::clear_issue("agent_drift_repaired");
         }
     }
 }

@@ -38,6 +38,22 @@ pub fn run(_args: InstallArgs) {
     let log = InstallLog::open_install();
     log.info("=== kyris install started ===");
 
+    // Install implies "I want governance on" — clear any leftover
+    // `kyris stop` sentinel so the freshly-installed hooks don't
+    // immediately bypass themselves. Quiet best-effort: the file may
+    // not exist (common), and a remove failure shouldn't block the
+    // install.
+    let sentinel = kyris_core::paths::disabled_marker_path();
+    if sentinel.exists() {
+        match std::fs::remove_file(&sentinel) {
+            Ok(()) => log.info(&format!("cleared sentinel {}", sentinel.display())),
+            Err(e) => log.warn(&format!(
+                "could not clear sentinel {}: {e}",
+                sentinel.display()
+            )),
+        }
+    }
+
     if let Err(error) = load_or_init_config() {
         log.error(&format!("load_or_init_config: {error}"));
         eprintln!("{error}");
@@ -143,7 +159,7 @@ pub fn run(_args: InstallArgs) {
             log.warn("kyrisd did not become ready within 10s — agent burn-control setup may fail");
             eprintln!(
                 "Warning: kyrisd is not responding at {base_url}/healthz. \
-                 Run `kyris daemon start` if it is not running."
+                 Run `kyris start` if it is not running."
             );
         }
     }

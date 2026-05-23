@@ -167,11 +167,13 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
                     kyrisd_records = synced_record_ids.len(),
                     "sync batch sent"
                 );
+                // Recovered: drop the relay issue from the tray.
+                crate::tray::clear_issue("sync_relay");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "relay sync failed — will retry from same offset");
                 crate::notify::relay_sync_error_toast(&e);
-                crate::tray::set_state(crate::tray::TrayState::RelayDisconnected);
+                crate::tray::report_issue("sync_relay", format!("relay unreachable: {e}"));
             }
         }
     }

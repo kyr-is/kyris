@@ -62,6 +62,127 @@ pub fn restart_service(kind: ServiceKind) -> Result<(), String> {
     }
 }
 
+/// `launchctl disable gui/<uid>/<label>` — persistent disable. Survives
+/// reboot: launchd refuses to load the service until a matching `enable`
+/// is issued. Used by `kyris stop` to keep daemons down across logins.
+///
+/// Already-disabled or unknown-target launchctl errors are treated as
+/// success — the goal is "service is disabled," and it already is.
+pub fn disable_service(kind: ServiceKind) -> Result<(), String> {
+    let target = format!("gui/{}/{}", uid(), kind.launchd_label());
+    run_launchctl_soft(&["disable", &target])
+}
+
+/// `launchctl enable` — inverse of `disable`. Idempotent against
+/// already-enabled targets.
+pub fn enable_service(kind: ServiceKind) -> Result<(), String> {
+    let target = format!("gui/{}/{}", uid(), kind.launchd_label());
+    run_launchctl_soft(&["enable", &target])
+}
+
+/// `launchctl kill TERM` — send SIGTERM to the running instance. The
+/// plist's `KeepAlive: { SuccessfulExit: false }` means clean exits
+/// don't auto-restart, so a graceful TERM is enough. A
+/// `no-such-process` error means the daemon was already stopped, which
+/// is the desired end state — treated as success.
+pub fn kill_service(kind: ServiceKind) -> Result<(), String> {
+    let target = format!("gui/{}/{}", uid(), kind.launchd_label());
+    run_launchctl_soft(&["kill", "TERM", &target])
+}
+
+/// `launchctl kickstart` (no `-k`) — start a loaded but stopped
+/// service. Used by `kyris start` after `enable` to bring the daemon
+/// back up.
+pub fn kickstart_service(kind: ServiceKind) -> Result<(), String> {
+    let target = format!("gui/{}/{}", uid(), kind.launchd_label());
+    run_command("launchctl", &["kickstart", &target], None)
+}
+
+/// Block until agentpactd's UDS socket accepts a connection, polling
+/// every 250ms. Returns `true` if the socket came up before `timeout`,
+/// `false` otherwise. Mirrors the responsiveness check in
+/// `lifecycle/verify.rs` — a connect roundtrip is the truth, not
+/// merely the socket file's existence.
+#[must_use]
+pub fn wait_for_agentpactd(timeout: std::time::Duration) -> bool {
+    let socket_path = std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.agentpact/agentpact.sock")
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// Block until kyrisd's `/healthz` returns 2xx, polling every 250ms.
+/// Returns `true` if healthy before `timeout`, `false` otherwise.
+#[must_use]
+pub fn wait_for_kyrisd(timeout: std::time::Duration) -> bool {
+    let base_url = crate::state::load_config()
+        .map_or_else(|_| "http://127.0.0.1:4710".to_string(), |c| c.base_url());
+    let url = format!("{base_url}/healthz");
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .ok();
+        loop {
+            if let Some(c) = &client
+                && c.get(&url)
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    })
+}
+
+/// Run launchctl, treating "already in the desired state" stderr
+/// messages as success. Real failures still propagate.
+fn run_launchctl_soft(args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to run launchctl: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let benign = stderr.contains("could not find service")
+        || stderr.contains("No such process")
+        || stderr.contains("Service is disabled")
+        || stderr.contains("Operation already in progress")
+        || stderr.contains("Already disabled")
+        || stderr.contains("Already enabled");
+    if benign {
+        Ok(())
+    } else if stderr.is_empty() {
+        Err(format!("launchctl failed with status {}", output.status))
+    } else {
+        Err(stderr)
+    }
+}
+
 pub fn service_state(kind: ServiceKind) -> ServiceState {
     let homebrew_status = brew_service_status(kind);
     let launchd_loaded = std::process::Command::new("launchctl")
@@ -74,63 +195,6 @@ pub fn service_state(kind: ServiceKind) -> ServiceState {
         homebrew_status,
         launchd_loaded,
     }
-}
-
-pub fn candidate_log_paths(kind: ServiceKind) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    match kind {
-        ServiceKind::Kyrisd => {
-            // Unified log — all components write here; preferred for
-            // human diagnostics. Lives under XDG_STATE_HOME after the
-            // XDG migration.
-            paths.push(kyris_core::paths::log_path());
-            // Launchd-captured stderr fallback (full tracing output
-            // including DEBUG; exists when kyrisd runs under launchd).
-            paths.push(kyris_core::paths::launchd_log_path());
-            if let Ok(home) = std::env::var("HOME") {
-                paths.push(
-                    PathBuf::from(home)
-                        .join("Library")
-                        .join("Logs")
-                        .join("kyrisd.log"),
-                );
-            }
-        }
-        ServiceKind::Agentpactd => {
-            // agentpact moved its log dir under XDG_STATE_HOME with its
-            // own XDG migration. Honor the same env var; fall back to
-            // the default location under HOME.
-            let agentpact_log = if let Ok(state) = std::env::var("XDG_STATE_HOME") {
-                PathBuf::from(state).join("agentpact").join("log")
-            } else if let Ok(home) = std::env::var("HOME") {
-                PathBuf::from(home)
-                    .join(".local")
-                    .join("state")
-                    .join("agentpact")
-                    .join("log")
-            } else {
-                PathBuf::from("/tmp/agentpact/log")
-            };
-            paths.push(agentpact_log.join("agentpactd.log"));
-            if let Ok(home) = std::env::var("HOME") {
-                paths.push(
-                    PathBuf::from(home)
-                        .join("Library")
-                        .join("Logs")
-                        .join("agentpactd.log"),
-                );
-            }
-        }
-    }
-
-    for prefix in ["/opt/homebrew", "/usr/local"] {
-        let prefix = PathBuf::from(prefix);
-        if prefix.exists() {
-            paths.push(prefix.join("var").join("log").join(kind.log_filename()));
-        }
-    }
-
-    paths
 }
 
 fn homebrew_prefix_for(kind: ServiceKind) -> Option<String> {
@@ -222,17 +286,10 @@ impl ServiceKind {
         }
     }
 
-    fn launchd_label(self) -> &'static str {
+    pub fn launchd_label(self) -> &'static str {
         match self {
             Self::Kyrisd => "is.kyr.kyrisd",
             Self::Agentpactd => "is.kyr.agentpactd",
-        }
-    }
-
-    fn log_filename(self) -> &'static str {
-        match self {
-            Self::Kyrisd => "kyrisd.log",
-            Self::Agentpactd => "agentpact.log",
         }
     }
 }

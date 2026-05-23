@@ -2,127 +2,100 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Menu-bar (tray) icon for `kyrisd`.
 //!
-//! The `TrayState` enum + the three `set_*` setters are compiled
-//! unconditionally so callers in `server.rs`, `reconcile_watcher.rs`,
-//! `sync/daemon_sync.rs`, and the server poller can push status updates
-//! without cfg-attribute noise. The actual GUI plumbing is gated behind
+//! The tray is intentionally a passive indicator: no clickable menu, no
+//! tooltip, no per-action affordances. Subsystems report problems to it
+//! via [`report_issue`] / [`clear_issue`]; when the issue set is
+//! non-empty the icon shows a warning overlay, otherwise the normal
+//! kyris template glyph. All actionable surfaces (logs, doctor,
+//! continue, stop/start) live in the `kyris` CLI.
+//!
+//! The issue-set API + helper accessors are compiled unconditionally
+//! so callers in `server.rs`, `reconcile_watcher.rs`, and
+//! `sync/daemon_sync.rs` can push status updates without
+//! cfg-attribute noise. The actual GUI plumbing is gated behind
 //! `--features tray` (on by default) and split by target OS:
 //!
-//!   macOS   — native objc2: `NSApplication` + `NSStatusItem` + `NSMenu`
+//!   macOS   — native objc2: `NSApplication` + `NSStatusItem`
 //!   Windows — stub (Win32 `Shell_NotifyIcon` planned for phase 2)
 //!   Linux   — stub (GTK4 / ksni planned for phase 2)
 //!
-//! Menu layout (small footprint, mirrors Docker/1Password/BTT):
-//!
-//!   Status: Running                ← disabled, dynamic
-//!   ─────────────────────
-//!   Continue Routing               ← greyed unless circuit breaker tripped
-//!   Open Logs                      ← always enabled
-//!   ─────────────────────
-//!   Quit Kyris                     ← always enabled, runs launchctl bootout
-//!
-//! There is no "Pending Approvals" menu entry: with the always-on-top
-//! approval popup (`notify_macos::show_approval_alert`) handling each ask
-//! synchronously, the user never needs a separate queue surface in the
-//! tray. The internal pending queue still exists (it backs the async
-//! popup lifecycle, timeouts, and the `kyris pending` CLI fallback for
-//! no-TTY shell-hook flows) — it just isn't a tray-visible concept.
-//!
-//! Status/tripped state is pushed from the tokio side via atomics
-//! and polled by a 250ms `NSTimer` on the main thread (macOS).  The
-//! daemon's main thread calls [`run_event_loop`] while Tokio runs on a
-//! background thread; see `kyrisd::main`.
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+//! Issue state is mutated from tokio tasks (e.g. the health poller)
+//! and read by a 250ms `NSTimer` on the main thread. The daemon's main
+//! thread calls [`run_event_loop`] while Tokio runs on a background
+//! thread; see `kyrisd::main`.
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TrayState {
-    Normal = 0,
-    Degraded = 1,
-    RelayDisconnected = 2,
+/// Subsystem -> human-readable reason. Empty map means "all good"; a
+/// non-empty map means the tray shows the warning overlay. Keys are
+/// `&'static str` so callers don't allocate on every report; values
+/// are owned strings so a subsystem can describe its current failure
+/// in detail (e.g. "socket not accepting connections at /foo/bar").
+static ISSUES: Mutex<BTreeMap<&'static str, String>> = Mutex::new(BTreeMap::new());
+
+/// Record a problem from a subsystem. Idempotent — repeated calls with
+/// the same key just update the reason. Cleared by [`clear_issue`].
+pub fn report_issue(key: &'static str, reason: impl Into<String>) {
+    let mut issues = ISSUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issues.insert(key, reason.into());
 }
 
-impl std::fmt::Display for TrayState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Normal => f.write_str("normal"),
-            Self::Degraded => f.write_str("degraded"),
-            Self::RelayDisconnected => f.write_str("relay_disconnected"),
-        }
-    }
+/// Clear a previously-reported issue. No-op if the key isn't present
+/// — every health poller can call `clear_issue` unconditionally after
+/// a successful probe.
+pub fn clear_issue(key: &'static str) {
+    let mut issues = ISSUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issues.remove(key);
 }
 
-impl TrayState {
-    #[cfg(any(feature = "tray", test))]
-    fn tooltip(self) -> &'static str {
-        match self {
-            Self::Normal => "Kyris daemon: running",
-            Self::Degraded => "Kyris daemon: degraded",
-            Self::RelayDisconnected => "Kyris daemon: relay disconnected",
-        }
-    }
-
-    #[cfg(any(feature = "tray", test))]
-    fn status_label(self) -> &'static str {
-        match self {
-            Self::Normal => "Status: Running",
-            Self::Degraded => "Status: Degraded",
-            Self::RelayDisconnected => "Status: Relay disconnected",
-        }
-    }
-
-    #[cfg(test)]
-    fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "Kyris ●",
-            Self::Degraded => "Kyris ◐",
-            Self::RelayDisconnected => "Kyris ○",
-        }
-    }
+/// Snapshot of the current issue set, suitable for `kyris doctor`
+/// rendering. Returns key/reason pairs in deterministic order.
+#[must_use]
+pub fn list_issues() -> Vec<(&'static str, String)> {
+    let issues = ISSUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issues.iter().map(|(k, v)| (*k, v.clone())).collect()
 }
 
-static CURRENT_STATE: AtomicU8 = AtomicU8::new(0);
-static CIRCUIT_BREAKER_TRIPPED: AtomicBool = AtomicBool::new(false);
-// Number of approval requests currently held in kyrisd's pending queue
-// that the user hasn't responded to. When > 0, the menu-bar tray switches
-// to an attention state (status label shows the count, tooltip changes,
-// icon becomes the degraded/amber variant) so the user has a persistent
-// visual signal even when an NSAlert popup failed to surface.
-static PENDING_APPROVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-pub fn set_state(state: TrayState) {
-    CURRENT_STATE.store(state as u8, Ordering::Relaxed);
+/// Count of currently-reported issues. Used by the tray refresh to
+/// decide between normal vs. warning icon.
+#[must_use]
+pub fn issue_count() -> usize {
+    let issues = ISSUES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    issues.len()
 }
 
-pub fn current_state() -> TrayState {
-    match CURRENT_STATE.load(Ordering::Relaxed) {
-        1 => TrayState::Degraded,
-        2 => TrayState::RelayDisconnected,
-        _ => TrayState::Normal,
-    }
-}
-
-/// Push whether any session has tripped the circuit breaker. Same
-/// poller in `server::run` reads `state.circuit_breaker.any_tripped()`.
-pub fn set_circuit_breaker_tripped(tripped: bool) {
-    CIRCUIT_BREAKER_TRIPPED.store(tripped, Ordering::Relaxed);
-}
-
-/// Push the current count of held pending approvals. Called by the
-/// permission/hold paths in `server.rs` after every transition so the
-/// menu-bar tray's 250ms refresh picks up the change.
+/// Fold the held-pending-approvals counter into the issue set. The
+/// permission/hold paths in `server.rs` call this after every queue
+/// transition; the tray then shows the warning overlay when the user
+/// has prompts waiting.
 pub fn set_pending_approval_count(count: usize) {
-    PENDING_APPROVAL_COUNT.store(count, Ordering::Relaxed);
+    if count == 0 {
+        clear_issue("pending_approvals");
+    } else {
+        let suffix = if count == 1 { "" } else { "s" };
+        report_issue(
+            "pending_approvals",
+            format!("{count} approval prompt{suffix} waiting"),
+        );
+    }
 }
 
 // --- Feature-gated GUI plumbing -------------------------------------------
 //
 // The native icon + event loop are only compiled when the `tray` feature is
-// enabled. With the feature off the daemon updates the atomics for free but
+// enabled. With the feature off the daemon updates the issue set for free but
 // no UI is drawn and no main-thread run loop is needed.
 //
 // Platform split:
-//   macOS   — native objc2: NSApplication + NSStatusItem + NSMenu
+//   macOS   — native objc2: NSApplication + NSStatusItem
 //   Windows — stub (Win32 Shell_NotifyIcon planned for phase 2)
 //   Linux   — stub (GTK4 / ksni planned for phase 2)
 
@@ -185,59 +158,95 @@ mod gui {
 #[cfg(all(feature = "tray", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod gui {
-    use super::{CIRCUIT_BREAKER_TRIPPED, PENDING_APPROVAL_COUNT, TrayState, current_state};
+    use super::issue_count;
     use block2::RcBlock;
     use core::ffi::c_uchar;
     use objc2::rc::Retained;
-    use objc2::runtime::AnyObject;
+    use objc2::runtime::{AnyObject, Bool};
     // AnyThread as _ brings the `alloc()` method into scope for AnyThread classes
     // (NSBitmapImageRep, NSImage).  MainThreadOnly brings `alloc(mtm)` for
-    // MainThreadOnly classes (our MenuActionHandler, NSStatusItem, etc.).
-    use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
+    // MainThreadOnly classes (e.g. NSStatusItem).
+    use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly, Message as _, msg_send};
     use objc2_app_kit::{
-        NSApplication, NSBitmapImageRep, NSDeviceRGBColorSpace, NSImage, NSMenu, NSMenuItem,
-        NSStatusBar,
+        NSApplication, NSBitmapImageRep, NSColor, NSCompositingOperation, NSDeviceRGBColorSpace,
+        NSImage, NSImageSymbolConfiguration, NSStatusBar,
     };
-    use objc2_foundation::{NSObject, NSSize, NSString, NSTimer};
+    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString, NSTimer};
     use std::cell::RefCell;
-    use std::process::Command;
-    use std::ptr::NonNull;
     use std::sync::Mutex;
-    use std::sync::atomic::Ordering;
     use std::thread::JoinHandle;
 
     const TRAY_ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray_icon_44.rgba"));
     // Pixel dimensions of the rasterized RGBA buffer.
     const TRAY_ICON_PIXEL_SIZE: isize = 44;
     // Logical point size for NSImage — half the pixel size so macOS treats
-    // this as a @2x Retina representation of a 22×22-point menu-bar icon.
+    // the buffer as @2x Retina representation of a 22-point icon (the menu
+    // bar's actual logical point size).
     const TRAY_ICON_LOGICAL_PTS: f64 = 22.0;
 
     // -----------------------------------------------------------------------
-    // Cross-thread work queue — replaces tao's EventLoopProxy
+    // ObjC class: drives the approval popup queue
     //
-    // Background threads push `FnOnce` closures into this queue; the 250ms
-    // NSTimer drains it on the main thread.  `wake_main_run_loop()` signals
-    // the run loop to break its wait immediately so the timer fires within a
-    // single quantum rather than at the next 250ms boundary.
+    // Held on the heap so timer callbacks can borrow it across iterations
+    // of the run loop.  Approvals are dispatched onto the main thread by
+    // `ask_approval`; the popup itself runs inline in this class's method.
+    // -----------------------------------------------------------------------
+
+    objc2::define_class!(
+        // SAFETY: NSObject has no subclassing requirements; this class
+        // has no Drop impl that would conflict with the generated dealloc.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        struct TimerCallbackTarget;
+
+        impl TimerCallbackTarget {
+            #[unsafe(method(refreshTick:))]
+            fn refresh_tick(&self, _: Option<&AnyObject>) {
+                let mtm = MainThreadMarker::new()
+                    .expect("refreshTick: must run on main thread");
+                refresh_snapshot(mtm);
+            }
+        }
+    );
+
+    // -----------------------------------------------------------------------
+    // Cross-thread work queue — background threads push `FnOnce` closures
+    // here; the 250ms `NSTimer` drains them on the main thread.
+    // `wake_main_run_loop()` interrupts the run-loop wait so the drain
+    // happens within one quantum instead of at the next 250ms boundary.
+    //
+    // Why closures instead of (data, sender) tuples: ask_approval's
+    // result channel is `tokio::sync::oneshot`. When a test runtime
+    // tears down, the sender goes out of scope, the closure is dropped,
+    // and `rx.await` resolves to Err → CouldNotShow. With a blocking
+    // `mpsc::Receiver::recv()` + spawn_blocking, the runtime would hang
+    // on shutdown waiting for the blocking task — observed as
+    // `testEndToEndApprovalReturnsApproved` hanging in tokio's
+    // BlockingPool::shutdown.
     // -----------------------------------------------------------------------
 
     static PENDING_MAIN_WORK: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
 
     fn push_main_work(f: impl FnOnce() + Send + 'static) {
-        PENDING_MAIN_WORK.lock().unwrap().push(Box::new(f));
+        PENDING_MAIN_WORK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Box::new(f));
     }
 
     fn drain_main_work() {
-        let work: Vec<_> = PENDING_MAIN_WORK.lock().unwrap().drain(..).collect();
+        let work: Vec<_> = PENDING_MAIN_WORK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
         for f in work {
             f();
         }
     }
 
-    /// Signal the main `CFRunLoop` to break its current wait immediately.
-    /// Two `extern "C"` declarations — both symbols live in CoreFoundation,
-    /// which is always linked on macOS.  No new crate dep required.
+    /// Push a `CFRunLoopWakeUp` on the main run loop so the next timer
+    /// tick fires immediately rather than waiting up to 250ms.
     fn wake_main_run_loop() {
         unsafe extern "C" {
             fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
@@ -247,41 +256,33 @@ mod gui {
     }
 
     // -----------------------------------------------------------------------
-    // Snapshot — same as before, unchanged logic
+    // Snapshot — what the tray refresh cares about reading
     // -----------------------------------------------------------------------
 
     #[derive(PartialEq, Eq, Clone, Copy)]
     struct Snapshot {
-        tray_state: TrayState,
-        circuit_breaker_tripped: bool,
-        pending_approval_count: usize,
+        has_issues: bool,
     }
 
     impl Snapshot {
         fn read() -> Self {
             Self {
-                tray_state: current_state(),
-                circuit_breaker_tripped: CIRCUIT_BREAKER_TRIPPED.load(Ordering::Relaxed),
-                pending_approval_count: PENDING_APPROVAL_COUNT.load(Ordering::Relaxed),
+                has_issues: issue_count() > 0,
             }
         }
     }
 
     // -----------------------------------------------------------------------
-    // Persistent UI state — thread_local because NSStatusItem / NSMenuItem
-    // are MainThreadOnly and cannot be stored in a Mutex (not Send/Sync).
-    // The timer callback and all AppKit calls are on the main thread, so
+    // Persistent UI state — thread_local because NSStatusItem is
+    // MainThreadOnly and cannot be stored in a Mutex (not Send/Sync). The
+    // timer callback and all AppKit calls are on the main thread, so
     // RefCell gives safe interior mutability here.
     // -----------------------------------------------------------------------
 
     struct TrayUi {
         status_item: Retained<objc2_app_kit::NSStatusItem>,
-        /// Retained to prevent deallocation — `NSMenuItem`'s `target` is a
-        /// weak (unretained) reference in `AppKit`; we must keep the handler
-        /// alive ourselves for the lifetime of the menu.
-        _handler: Retained<MenuActionHandler>,
-        status_label: Retained<NSMenuItem>,
-        continue_item: Retained<NSMenuItem>,
+        normal_image: Retained<NSImage>,
+        warning_image: Retained<NSImage>,
         last_snapshot: Snapshot,
         // The icon set in build_tray_ui runs before [NSApp run] — at that
         // point macOS may not have finished resolving the bundle identity
@@ -297,52 +298,15 @@ mod gui {
     }
 
     // -----------------------------------------------------------------------
-    // ObjC class: target for NSMenuItem actions
-    //
-    // Each visible menu item gets `.setTarget(&handler)` + a unique
-    // `.setAction(sel!(name:))`.  NSMenuItem's target is a weak/unretained
-    // reference so `TrayUi._handler` keeps this alive.
-    // -----------------------------------------------------------------------
-
-    define_class!(
-        // SAFETY: NSObject has no subclassing requirements; MenuActionHandler
-        // has no Drop impl that would conflict with the generated dealloc.
-        #[unsafe(super(NSObject))]
-        #[thread_kind = MainThreadOnly]
-        struct MenuActionHandler;
-
-        impl MenuActionHandler {
-            #[unsafe(method(continueRouting:))]
-            fn continue_routing_action(&self, _: Option<&AnyObject>) {
-                continue_routing();
-            }
-
-            #[unsafe(method(openLogs:))]
-            fn open_logs_action(&self, _: Option<&AnyObject>) {
-                open_logs();
-            }
-
-            #[unsafe(method(quitDaemon:))]
-            fn quit_daemon_action(&self, _: Option<&AnyObject>) {
-                quit_daemon();
-            }
-        }
-    );
-
-    // -----------------------------------------------------------------------
     // Public API
     // -----------------------------------------------------------------------
 
     /// Dispatch an `NSAlert` approval dialog to the main thread and await
-    /// the user's response.  The work queue delivers the call within 250ms
+    /// the user's response. The work queue delivers the call within 250ms
     /// (next timer tick); `wake_main_run_loop` reduces that to the next
-    /// run-loop iteration.  Returns `CouldNotShow` if the channel is dropped
+    /// run-loop iteration. Returns `CouldNotShow` if the channel is dropped
     /// (sender panicked / main run loop ended), so the caller can route to
     /// another channel instead of treating the silence as a denial.
-    ///
-    /// `code`, when `Some`, is rendered in the popup's accessoryView as
-    /// monospaced text — for shell commands and file paths the user needs
-    /// to read clearly to make the decision.
     pub async fn ask_approval(
         title: &str,
         body: &str,
@@ -357,176 +321,81 @@ mod gui {
             let _ = tx.send(result);
         });
         wake_main_run_loop();
-        // If the channel is dropped (sender panicked / main loop ended),
-        // surface that as CouldNotShow rather than a silent Yes — the
-        // caller can then escalate to another channel.
+        // Channel drop → CouldNotShow rather than a silent Yes. Tests
+        // that shut down the tokio runtime without a main loop will
+        // drop the sender; `rx.await` resolves to Err and we return a
+        // safe sentinel — no hang.
         rx.await
             .unwrap_or(crate::notify::ApprovalOutcome::CouldNotShow)
     }
 
-    /// Run the `AppKit` event loop on the calling thread (must be the process
-    /// main thread).  Constructs the tray icon and `NSMenu`, then calls
-    /// `[NSApp run]` which never returns.  Tokio runs on a background thread;
-    /// a watchdog thread joins it and schedules `[NSApp terminate]` via the
-    /// work queue so shutdown is clean.
-    ///
-    /// Why `[NSApp run]` and not `CFRunLoop`:
-    /// `AppKit`'s event dispatch (`nextEventMatchingMask:` + `sendEvent:`) is
-    /// required for `NSMenu`, `NSStatusBarButton` mouse events, and `NSAlert` modals.
-    /// `CFRunLoop::run()` alone does not drain the `AppKit` event queue.
-    pub fn run_event_loop(tokio_handle: JoinHandle<()>) -> ! {
-        let mtm = MainThreadMarker::new().expect("must be called from the main thread");
-
-        // LSUIElement=true in Info.plist sets Accessory at bundle load time;
-        // setting it here is belt-and-suspenders for the launchd-spawned case
-        // where the bundle identity may not be resolved before this point.
+    /// Run the macOS event loop. Owns the main thread until `NSApp run`
+    /// returns (it doesn't, except via `NSApp terminate:`); the tokio
+    /// thread is joined when launchd sends SIGTERM and the tray code
+    /// exits via `process::exit`.
+    pub fn run_event_loop(_tokio_handle: JoinHandle<()>) -> ! {
+        let mtm = MainThreadMarker::new()
+            .expect("run_event_loop must be called from the main thread on macOS");
+        // Bring the app to an accessory state so the daemon can host an
+        // NSStatusItem without claiming a Dock icon.
         let app = NSApplication::sharedApplication(mtm);
         unsafe {
-            let _: () = msg_send![
-                &*app,
-                setActivationPolicy:
-                    objc2_app_kit::NSApplicationActivationPolicy::Accessory
-            ];
+            let _: () = msg_send![&*app, setActivationPolicy: 1isize]; // NSApplicationActivationPolicyAccessory
+        }
+        TRAY_UI.with(|cell| {
+            *cell.borrow_mut() = Some(build_tray_ui(mtm));
+        });
+
+        // Periodic refresh: drain the approval queue and paint any tray
+        // changes. 250ms balances responsiveness vs CPU.
+        let target: Retained<TimerCallbackTarget> =
+            unsafe { msg_send![TimerCallbackTarget::alloc(mtm), init] };
+        let interval = 0.25_f64;
+        unsafe {
+            let _ = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                interval,
+                &target,
+                objc2::sel!(refreshTick:),
+                None,
+                true,
+            );
         }
 
-        // Build the tray icon.  Store in thread_local so the timer can update it.
-        TRAY_UI.with(|cell| *cell.borrow_mut() = Some(build_tray_ui(mtm)));
-
-        // Request notification permission on the first timer tick.
-        // UN center only registers from a LaunchServices-recognized app process,
-        // which only holds after [NSApp run] has started. See Apple Forums
-        // thread 679326 and notify_macos::request_authorization_if_needed.
-        push_main_work(crate::notify::request_authorization_if_needed);
-
-        // 250ms repeating timer: drains the work queue + refreshes menu state.
-        let timer_block = RcBlock::new(|_: NonNull<NSTimer>| {
-            drain_main_work();
-            refresh_snapshot(MainThreadMarker::new().expect("timer fires on main thread"));
-        });
-        // `scheduledTimer...` auto-adds to the current run loop in the default
-        // mode.  We keep it in a local so it isn't immediately deallocated.
-        let _timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.25, true, &timer_block)
-        };
-
-        // Watchdog: a separate OS thread blocks on the tokio JoinHandle.
-        // When tokio exits (after graceful shutdown or SIGTERM handling), it
-        // pushes `[NSApp terminate]` to the work queue and wakes the run loop.
-        std::thread::Builder::new()
-            .name("kyrisd-tokio-watchdog".to_string())
-            .spawn(move || {
-                let _ = tokio_handle.join();
-                tracing::info!("tokio thread finished; scheduling NSApplication termination");
-                push_main_work(|| {
-                    let mtm = MainThreadMarker::new().expect("main thread");
-                    let app = NSApplication::sharedApplication(mtm);
-                    // terminate: nil — the standard AppKit quit idiom.
-                    unsafe {
-                        let _: () = msg_send![&*app, terminate: None::<&AnyObject>];
-                    }
-                });
-                wake_main_run_loop();
-            })
-            .expect("spawn watchdog thread");
-
         app.run();
-        unreachable!()
+        std::process::exit(0);
     }
 
     // -----------------------------------------------------------------------
-    // Build the tray icon and menu
+    // Build the tray icon
     // -----------------------------------------------------------------------
 
     fn build_tray_ui(mtm: MainThreadMarker) -> TrayUi {
-        // Instantiate the menu action handler.  We retain it in TrayUi so it
-        // outlives the menu items that hold a weak reference to it as target.
-        let handler: Retained<MenuActionHandler> =
-            unsafe { msg_send![MenuActionHandler::alloc(mtm), init] };
-
-        let menu = NSMenu::new(mtm);
-
-        // 1. Status label — always disabled, text updated by refresh_snapshot.
-        let status_label = make_item(mtm, TrayState::Normal.status_label(), false, None, None);
-        menu.addItem(&status_label);
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-        // 2. Continue routing — enabled only when circuit breaker is tripped.
-        let continue_item = make_item(
-            mtm,
-            "Continue Routing",
-            false,
-            Some(&handler),
-            Some(sel!(continueRouting:)),
-        );
-        menu.addItem(&continue_item);
-
-        // 3. Open logs — always enabled.
-        menu.addItem(&make_item(
-            mtm,
-            "Open Logs",
-            true,
-            Some(&handler),
-            Some(sel!(openLogs:)),
-        ));
-
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
-
-        // 4. Quit — always enabled.
-        menu.addItem(&make_item(
-            mtm,
-            "Quit Kyris",
-            true,
-            Some(&handler),
-            Some(sel!(quitDaemon:)),
-        ));
-
-        // NSStatusItem
+        // NSStatusItem with NO menu. The tray is a passive indicator —
+        // clicking it does nothing. All actions live in the `kyris` CLI.
         let status_bar = NSStatusBar::systemStatusBar();
         // NSVariableStatusItemLength = -1.0
         let status_item = status_bar.statusItemWithLength(-1.0);
-        status_item.setMenu(Some(&menu));
 
-        // Initial icon (normal, template so macOS auto-tints for dark/light).
-        set_status_item_icon(&status_item, mtm, false);
+        let normal_image =
+            build_normal_image().expect("kyris icon RGBA failed to materialize as NSImage");
+        // Primary path: theme-aware overlay composite. Falls back to
+        // the static amber recolor if the SF Symbol isn't available
+        // (pre-macOS-11 — vanishingly rare on the current target).
+        let warning_image = build_warning_image(&normal_image)
+            .or_else(build_warning_image_fallback)
+            .expect("warning icon failed to materialize as NSImage");
 
-        // Initial tooltip.
-        unsafe {
-            let tip = NSString::from_str(TrayState::Normal.tooltip());
-            let _: () = msg_send![&*status_item, setToolTip: &*tip];
-        }
+        // Initial state: assume healthy. The first refresh tick will
+        // correct if the issue set is already populated.
+        apply_icon(&status_item, mtm, &normal_image);
 
         TrayUi {
             status_item,
-            _handler: handler,
-            status_label,
-            continue_item,
+            normal_image,
+            warning_image,
             last_snapshot: Snapshot::read(),
             needs_initial_paint: true,
         }
-    }
-
-    fn make_item(
-        mtm: MainThreadMarker,
-        title: &str,
-        enabled: bool,
-        handler: Option<&MenuActionHandler>,
-        action: Option<objc2::runtime::Sel>,
-    ) -> Retained<NSMenuItem> {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(title),
-                action,
-                &NSString::from_str(""),
-            )
-        };
-        item.setEnabled(enabled);
-        if let Some(h) = handler {
-            unsafe {
-                let _: () = msg_send![&*item, setTarget: h];
-            }
-        }
-        item
     }
 
     // -----------------------------------------------------------------------
@@ -534,6 +403,11 @@ mod gui {
     // -----------------------------------------------------------------------
 
     fn refresh_snapshot(mtm: MainThreadMarker) {
+        // Drain any FnOnce closures queued by background threads
+        // (approval popups, etc.) on the main thread first so prompts
+        // surface promptly.
+        drain_main_work();
+
         TRAY_UI.with(|cell| {
             let mut opt = cell.borrow_mut();
             let Some(ui) = opt.as_mut() else { return };
@@ -543,57 +417,12 @@ mod gui {
             }
             ui.needs_initial_paint = false;
 
-            // Pending approvals override the normal status display — the
-            // user needs to know there's something waiting for them, even
-            // if the daemon itself is healthy. Falls back to tray_state's
-            // label/tooltip when no approvals are pending.
-            let needs_attention =
-                now.pending_approval_count > 0 || !matches!(now.tray_state, TrayState::Normal);
-
-            let status_text: String = if now.pending_approval_count > 0 {
-                format!(
-                    "Pending Approvals: {} (run `kyris pending` to resolve)",
-                    now.pending_approval_count
-                )
+            let image = if now.has_issues {
+                &ui.warning_image
             } else {
-                now.tray_state.status_label().to_string()
+                &ui.normal_image
             };
-            let tooltip_text: String = if now.pending_approval_count > 0 {
-                format!(
-                    "Kyris: {} pending approval{}",
-                    now.pending_approval_count,
-                    if now.pending_approval_count == 1 {
-                        ""
-                    } else {
-                        "s"
-                    }
-                )
-            } else {
-                now.tray_state.tooltip().to_string()
-            };
-
-            unsafe {
-                let t = NSString::from_str(&status_text);
-                let _: () = msg_send![&*ui.status_label, setTitle: &*t];
-            }
-            unsafe {
-                let t = NSString::from_str(&tooltip_text);
-                let _: () = msg_send![&*ui.status_item, setToolTip: &*t];
-            }
-
-            // Icon: template (auto-tint) only when nothing needs attention.
-            // Pending approvals reuse the existing amber/degraded variant —
-            // a separate "pending" art asset can come later; for now the
-            // status-label text + tooltip carry the specifics.
-            set_status_item_icon(&ui.status_item, mtm, needs_attention);
-
-            // Continue routing.
-            unsafe {
-                let _: () = msg_send![
-                    &*ui.continue_item,
-                    setEnabled: now.circuit_breaker_tripped
-                ];
-            }
+            apply_icon(&ui.status_item, mtm, image);
 
             ui.last_snapshot = now;
         });
@@ -603,31 +432,153 @@ mod gui {
     // Icon helpers
     // -----------------------------------------------------------------------
 
-    /// Build an `NSImage` from the rasterized icon RGBA bytes.
-    /// Template = true makes macOS auto-tint for dark/light mode.
-    /// Degraded = true applies an amber overlay to signal status.
-    fn set_status_item_icon(
+    /// Set the status item's image. Splitting this from the build path
+    /// keeps the refresh tick cheap — no `NSImage` allocation per tick.
+    fn apply_icon(
         status_item: &objc2_app_kit::NSStatusItem,
         mtm: MainThreadMarker,
-        degraded: bool,
+        image: &NSImage,
     ) {
-        let rgba = if degraded {
-            degraded_icon_rgba()
-        } else {
-            TRAY_ICON_RGBA.to_vec()
-        };
-        let Some(image) = build_ns_image(&rgba, TRAY_ICON_PIXEL_SIZE, TRAY_ICON_LOGICAL_PTS) else {
-            return;
-        };
-        // Template tinting auto-colours for menu-bar appearance only when NOT degraded.
-        unsafe {
-            let _: () = msg_send![&*image, setTemplate: !degraded];
-        }
         if let Some(btn) = status_item.button(mtm) {
             unsafe {
-                let _: () = msg_send![&*btn, setImage: &*image];
+                let _: () = msg_send![&*btn, setImage: image];
             }
         }
+    }
+
+    /// Normal (healthy) icon: existing kyris RGBA, marked as a template
+    /// so macOS auto-tints to match menu-bar appearance.
+    fn build_normal_image() -> Option<Retained<NSImage>> {
+        let image = build_ns_image(TRAY_ICON_RGBA, TRAY_ICON_PIXEL_SIZE, TRAY_ICON_LOGICAL_PTS)?;
+        unsafe {
+            let _: () = msg_send![&*image, setTemplate: true];
+        }
+        Some(image)
+    }
+
+    /// Warning icon: a true overlay composite drawn at render time so
+    /// it stays theme-aware.
+    ///
+    /// Three layers, drawn into a 22×22 `NSImage` via
+    /// `imageWithSize:flipped:drawingHandler:` (which re-runs the block
+    /// every time the image is composited to a context — so
+    /// `NSColor.labelColor` always reflects the *current* menu-bar
+    /// appearance):
+    ///
+    ///   1. Fill the rect with `labelColor` (white on dark mode, black
+    ///      on light mode — the right "tint" for menu-bar glyphs).
+    ///   2. Draw the kyris template with `DestinationIn` compositing —
+    ///      this keeps the labelColor only where the kyris A has
+    ///      pixels, effectively tinting the glyph.
+    ///   3. Draw the multicolor SF Symbol `exclamationmark.triangle.fill`
+    ///      in the bottom-right corner with `SourceOver`. The symbol
+    ///      renders in its canonical colors (yellow + black) regardless
+    ///      of the menu-bar theme — exactly what a warning glyph should
+    ///      do.
+    ///
+    /// Returns `None` if the SF Symbol API call fails (e.g. running on
+    /// pre-macOS-11 where the symbol name doesn't resolve). The caller
+    /// falls back to the amber recolor in that case.
+    fn build_warning_image(normal_template: &NSImage) -> Option<Retained<NSImage>> {
+        let symbol = build_warning_symbol()?;
+        let base = normal_template.retain();
+        let size = NSSize {
+            width: TRAY_ICON_LOGICAL_PTS,
+            height: TRAY_ICON_LOGICAL_PTS,
+        };
+
+        // The drawing handler must be `'static + Fn` — captured values
+        // (base + symbol) are `Retained<NSImage>` clones, ref-counted so
+        // the originals stay alive as long as the block does. Block is
+        // re-invoked on every draw — labelColor is sampled fresh each
+        // time, so the composite tracks dark/light mode automatically.
+        let block = RcBlock::new(move |rect: NSRect| -> Bool {
+            unsafe {
+                // 1. Fill rect with labelColor (theme-aware).
+                let label_color = NSColor::labelColor();
+                label_color.set();
+                NSRectFill(rect);
+
+                // 2. Mask: keep the fill only where the kyris glyph has
+                //    pixels. Destination-in compositing intersects the
+                //    existing content with the new image's alpha.
+                base.drawInRect_fromRect_operation_fraction(
+                    rect,
+                    NSRect::ZERO,
+                    NSCompositingOperation::DestinationIn,
+                    1.0,
+                );
+
+                // 3. Overlay: multicolor warning glyph in the
+                //    bottom-right corner at ~55% size.
+                let badge_size = rect.size.width * 0.6;
+                let badge_rect = NSRect {
+                    origin: NSPoint {
+                        x: rect.size.width - badge_size,
+                        y: 0.0,
+                    },
+                    size: NSSize {
+                        width: badge_size,
+                        height: badge_size,
+                    },
+                };
+                symbol.drawInRect_fromRect_operation_fraction(
+                    badge_rect,
+                    NSRect::ZERO,
+                    NSCompositingOperation::SourceOver,
+                    1.0,
+                );
+            }
+            Bool::YES
+        });
+
+        let composite = NSImage::imageWithSize_flipped_drawingHandler(size, false, &block);
+        // NOT a template — the multicolor SF Symbol must render in its
+        // own palette, not be auto-tinted to one color by macOS.
+        unsafe {
+            let _: () = msg_send![&*composite, setTemplate: false];
+        }
+        Some(composite)
+    }
+
+    /// Resolve the multicolor warning SF Symbol. Returns `None` on
+    /// older macOS where the API or the symbol name doesn't exist —
+    /// callers should fall back to the recolored RGBA.
+    fn build_warning_symbol() -> Option<Retained<NSImage>> {
+        let name = NSString::from_str("exclamationmark.triangle.fill");
+        let accessibility = NSString::from_str("warning");
+        let base = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &name,
+            Some(&accessibility),
+        )?;
+        // configurationPreferringMulticolor is macOS 12+. If the call
+        // returns a usable configuration, request multicolor rendering;
+        // otherwise fall back to whatever the system gives us (still a
+        // valid symbol image, just monochrome).
+        let multicolor = NSImageSymbolConfiguration::configurationPreferringMulticolor();
+        Some(
+            base.imageWithSymbolConfiguration(&multicolor)
+                .unwrap_or(base),
+        )
+    }
+
+    /// Pre-macOS-11 fallback: the legacy amber recolor. Static (no
+    /// theme awareness) but always available since it's pure pixel
+    /// math on the existing kyris RGBA.
+    fn build_warning_image_fallback() -> Option<Retained<NSImage>> {
+        let rgba = degraded_icon_rgba();
+        let image = build_ns_image(&rgba, TRAY_ICON_PIXEL_SIZE, TRAY_ICON_LOGICAL_PTS)?;
+        unsafe {
+            let _: () = msg_send![&*image, setTemplate: false];
+        }
+        Some(image)
+    }
+
+    // AppKit's NSRectFill is a C function (not a method) — declare its
+    // C signature so the drawing handler can call it. Safe to use inside
+    // a focused drawing context (drawingHandler block runs inside one).
+    unsafe extern "C" {
+        fn NSRectFill(rect: NSRect);
     }
 
     /// Build an `NSImage` from raw RGBA bytes.
@@ -642,18 +593,16 @@ mod gui {
         pixel_size: isize,
         logical_pts: f64,
     ) -> Option<Retained<NSImage>> {
-        let mut owned = rgba.to_vec();
+        // Pass `planes = NULL` so NSBitmapImageRep allocates and owns
+        // the pixel buffer for its own lifetime, then copy the source
+        // RGBA into it. The alternative — handing it a pointer into a
+        // Rust-owned Vec — is a use-after-free: NSBitmapImageRep does
+        // not copy the bytes (Apple: "the bitmap data must remain
+        // valid for the lifetime of the NSBitmapImageRep object").
         let rep = unsafe {
-            let mut planes = [
-                owned.as_mut_ptr().cast::<c_uchar>(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            ];
             NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
                 NSBitmapImageRep::alloc(),
-                planes.as_mut_ptr(),
+                std::ptr::null_mut(),
                 pixel_size, pixel_size,
                 8, 4,
                 true, false,
@@ -662,6 +611,13 @@ mod gui {
                 32,
             )
         }?;
+        unsafe {
+            let dst: *mut c_uchar = rep.bitmapData();
+            if dst.is_null() {
+                return None;
+            }
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), dst, rgba.len());
+        }
         let image = NSImage::initWithSize(
             NSImage::alloc(),
             NSSize {
@@ -684,66 +640,6 @@ mod gui {
             pixel[2] = (u16::from(pixel[2]) / 3) as u8;
         }
         rgba
-    }
-
-    // -----------------------------------------------------------------------
-    // Platform-specific OS operations — same as before, unchanged
-    // -----------------------------------------------------------------------
-
-    mod platform {
-        use std::process::{Child, Command};
-
-        #[cfg(target_os = "macos")]
-        pub fn open_log_file(path: &str) -> std::io::Result<Child> {
-            Command::new("open").args(["-a", "Console", path]).spawn()
-        }
-        #[cfg(target_os = "linux")]
-        pub fn open_log_file(path: &str) -> std::io::Result<Child> {
-            Command::new("xdg-open").arg(path).spawn()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        pub fn open_log_file(_path: &str) -> std::io::Result<Child> {
-            Err(std::io::Error::other("open_log_file: unsupported platform"))
-        }
-
-        #[cfg(target_os = "macos")]
-        pub fn stop_daemon_service() -> std::io::Result<Child> {
-            let uid = nix::unistd::getuid().as_raw();
-            let target = format!("gui/{uid}/is.kyr.kyrisd");
-            Command::new("launchctl").args(["bootout", &target]).spawn()
-        }
-        #[cfg(target_os = "linux")]
-        pub fn stop_daemon_service() -> std::io::Result<Child> {
-            Command::new("systemctl")
-                .args(["--user", "stop", "kyrisd"])
-                .spawn()
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        pub fn stop_daemon_service() -> std::io::Result<Child> {
-            Err(std::io::Error::other(
-                "stop_daemon_service: unsupported platform",
-            ))
-        }
-    }
-
-    fn continue_routing() {
-        if let Err(e) = Command::new("kyris").arg("continue").spawn() {
-            tracing::warn!(error = %e, "failed to invoke `kyris continue`");
-        }
-    }
-
-    fn open_logs() {
-        let path = kyris_core::paths::launchd_log_path();
-        let path_str = path.to_string_lossy();
-        if let Err(e) = platform::open_log_file(&path_str) {
-            tracing::warn!(error = %e, path = %path_str, "failed to open logs");
-        }
-    }
-
-    fn quit_daemon() {
-        if let Err(e) = platform::stop_daemon_service() {
-            tracing::warn!(error = %e, "failed to stop kyrisd service");
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -799,60 +695,73 @@ pub use gui::run_event_loop;
 mod tests {
     use super::*;
 
-    #[test]
-    fn testTrayStateDisplay() {
-        assert_eq!(TrayState::Normal.to_string(), "normal");
-        assert_eq!(TrayState::Degraded.to_string(), "degraded");
-        assert_eq!(
-            TrayState::RelayDisconnected.to_string(),
-            "relay_disconnected"
-        );
+    fn reset_issues() {
+        let mut issues = ISSUES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        issues.clear();
     }
 
     #[test]
-    fn testTrayStateLabel() {
-        assert!(TrayState::Normal.label().contains('●'));
-        assert!(TrayState::Degraded.label().contains('◐'));
-        assert!(TrayState::RelayDisconnected.label().contains('○'));
+    fn testReportAndClearIssue() {
+        reset_issues();
+        assert_eq!(issue_count(), 0);
+        report_issue("agentpactd", "socket unreachable");
+        assert_eq!(issue_count(), 1);
+        let listed = list_issues();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "agentpactd");
+        assert_eq!(listed[0].1, "socket unreachable");
+        clear_issue("agentpactd");
+        assert_eq!(issue_count(), 0);
     }
 
     #[test]
-    fn testSetAndGetState() {
-        set_state(TrayState::Normal);
-        assert_eq!(current_state(), TrayState::Normal);
-        set_state(TrayState::Degraded);
-        assert_eq!(current_state(), TrayState::Degraded);
-        set_state(TrayState::RelayDisconnected);
-        assert_eq!(current_state(), TrayState::RelayDisconnected);
-        set_state(TrayState::Normal);
+    fn testIssueSetIsKeyedSoDuplicatesAreUpdates() {
+        reset_issues();
+        report_issue("sync", "first reason");
+        report_issue("sync", "updated reason");
+        let listed = list_issues();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1, "updated reason");
+        clear_issue("sync");
     }
 
     #[test]
-    fn testTrayStateStatusLabel() {
-        assert!(TrayState::Normal.status_label().contains("Running"));
-        assert!(TrayState::Degraded.status_label().contains("Degraded"));
-        assert!(
-            TrayState::RelayDisconnected
-                .status_label()
-                .contains("Relay")
-        );
+    fn testListIssuesReturnsDeterministicOrder() {
+        reset_issues();
+        report_issue("zulu", "z");
+        report_issue("alpha", "a");
+        report_issue("mike", "m");
+        let listed = list_issues();
+        let keys: Vec<&'static str> = listed.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, vec!["alpha", "mike", "zulu"]);
+        clear_issue("zulu");
+        clear_issue("alpha");
+        clear_issue("mike");
     }
 
     #[test]
-    fn testTrayStateTooltipDistinctPerState() {
-        let normal = TrayState::Normal.tooltip();
-        let degraded = TrayState::Degraded.tooltip();
-        let relay = TrayState::RelayDisconnected.tooltip();
-        assert_ne!(normal, degraded);
-        assert_ne!(normal, relay);
-        assert_ne!(degraded, relay);
+    fn testPendingApprovalCountTogglesIssue() {
+        reset_issues();
+        set_pending_approval_count(0);
+        assert_eq!(issue_count(), 0);
+        set_pending_approval_count(3);
+        assert_eq!(issue_count(), 1);
+        let listed = list_issues();
+        assert!(listed[0].1.contains("3 approval prompts"));
+        set_pending_approval_count(1);
+        let listed = list_issues();
+        assert!(listed[0].1.contains("1 approval prompt"));
+        assert!(!listed[0].1.contains("prompts"));
+        set_pending_approval_count(0);
+        assert_eq!(issue_count(), 0);
     }
 
     #[test]
-    fn testSetCircuitBreakerTrippedIsObservable() {
-        set_circuit_breaker_tripped(true);
-        assert!(CIRCUIT_BREAKER_TRIPPED.load(Ordering::Relaxed));
-        set_circuit_breaker_tripped(false);
-        assert!(!CIRCUIT_BREAKER_TRIPPED.load(Ordering::Relaxed));
+    fn testClearIssueIsIdempotent() {
+        reset_issues();
+        clear_issue("nonexistent");
+        assert_eq!(issue_count(), 0);
     }
 }

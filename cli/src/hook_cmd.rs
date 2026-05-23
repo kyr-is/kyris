@@ -65,6 +65,11 @@ pub fn run(args: HookArgs) {
 }
 
 fn run_hold(args: HookHoldArgs) {
+    if kyris_core::paths::is_disabled() {
+        // `kyris stop` is in effect; agentpactd is gone, kyrisd is gone,
+        // there is nothing to delegate to. Just allow.
+        std::process::exit(0);
+    }
     let sock_path = args
         .socket
         .unwrap_or_else(|| agentpact::default_socket_path().display().to_string());
@@ -142,6 +147,20 @@ fn run_check(args: HookCheckArgs) {
     let agent = &args.agent;
     let hook_id = generate_hook_id();
     let started_at = std::time::Instant::now();
+
+    // Governance kill switch — `~/.kyris/disabled` (created by `kyris
+    // stop`). Honored before we contact agentpactd or audit anything:
+    // user said "disabled means no calls, no log entries." We still
+    // need the agent's allow_response shape so Claude/Gemini don't
+    // fall back to their own permission prompt; Codex's empty-stdout
+    // shape is also fine (Codex applies its own rules).
+    if kyris_core::paths::is_disabled() {
+        let allow_response = registry::agent_by_id(agent)
+            .and_then(|a| a.hook_protocol())
+            .map_or(AllowResponse::EmptyStdout, |p| p.allow_response);
+        emit_allow(&allow_response);
+        std::process::exit(0);
+    }
 
     // Pre-load the kyrisd audit connection once. Used for the single
     // best-effort `hook resolved` log line that this function emits at
