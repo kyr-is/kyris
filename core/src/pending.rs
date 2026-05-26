@@ -46,6 +46,23 @@ pub struct PendingApproval<'a> {
     /// MCP args) for the popup's syntect-highlighted accessoryView. `None`
     /// lets the daemon fall back to plain-text informativeText.
     pub code: Option<&'a str>,
+    /// Whether the popup may offer "Always". `false` (e.g. privilege
+    /// escalation, which agentpactd never persists) greys out the button.
+    /// Defaults to `true` for callers that don't set it via `..Default`.
+    pub allow_always: bool,
+}
+
+impl Default for PendingApproval<'_> {
+    fn default() -> Self {
+        Self {
+            approval_id: "",
+            approval_token: "",
+            server: "",
+            tool: "",
+            code: None,
+            allow_always: true,
+        }
+    }
 }
 
 /// Hold a `PACT_ASK` request in kyrisd and poll until the user resolves it
@@ -79,6 +96,7 @@ pub async fn hold_poll_resolve_with_timeout(
         "server": approval.server,
         "tool": approval.tool,
         "code": approval.code,
+        "allow_always": approval.allow_always,
     });
 
     let hold_result = client

@@ -53,15 +53,22 @@ pub enum ApprovalOutcome {
 /// monospaced text — the right surface for shell commands and file paths
 /// (whose readability suffers in the standard `informativeText` font).
 /// When `None`, the popup uses `body` alone.
+/// `allow_always` controls whether the "Always" button is offered; `false`
+/// greys it out (e.g. privilege escalation, which agentpactd never persists).
 #[cfg(feature = "tray")]
-pub async fn ask_approval(title: &str, body: &str, code: Option<&str>) -> ApprovalOutcome {
+pub async fn ask_approval(
+    title: &str,
+    body: &str,
+    code: Option<&str>,
+    allow_always: bool,
+) -> ApprovalOutcome {
     #[cfg(target_os = "macos")]
     {
-        crate::tray::ask_approval(title, body, code).await
+        crate::tray::ask_approval(title, body, code, allow_always).await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (title, body, code);
+        let _ = (title, body, code, allow_always);
         ApprovalOutcome::Yes
     }
 }

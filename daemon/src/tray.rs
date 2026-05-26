@@ -7,7 +7,7 @@
 //! via [`report_issue`] / [`clear_issue`]; when the issue set is
 //! non-empty the icon shows a warning overlay, otherwise the normal
 //! kyris template glyph. All actionable surfaces (logs, doctor,
-//! continue, stop/start) live in the `kyris` CLI.
+//! continue, disable/enable, uninstall) live in the `kyris` CLI.
 //!
 //! The issue-set API + helper accessors are compiled unconditionally
 //! so callers in `server.rs`, `reconcile_watcher.rs`, and
@@ -25,6 +25,7 @@
 //! thread; see `kyrisd::main`.
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Subsystem -> human-readable reason. Empty map means "all good"; a
 /// non-empty map means the tray shows the warning overlay. Keys are
@@ -32,6 +33,26 @@ use std::sync::Mutex;
 /// are owned strings so a subsystem can describe its current failure
 /// in detail (e.g. "socket not accepting connections at /foo/bar").
 static ISSUES: Mutex<BTreeMap<&'static str, String>> = Mutex::new(BTreeMap::new());
+
+/// `true` when agentpactd's effective user policy is `mode: log` —
+/// commands are recorded but not mediated. The tray paints a red
+/// horizontal bar across the kyris glyph so the non-enforcing state
+/// is visible at all times. Updated from kyrisd's policy poller (see
+/// `server::policy_mode_poller`); read every tray refresh tick.
+static LOG_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Push the current "is the user policy in log mode?" state. Called by
+/// kyrisd's policy poller after every `~/.config/agentpact/policy/pact.yaml`
+/// read. Idempotent; the tray refresh picks up changes on its next tick.
+pub fn set_log_mode(active: bool) {
+    LOG_MODE.store(active, Ordering::Relaxed);
+}
+
+/// Whether the tray is currently representing log-mode.
+#[must_use]
+pub fn log_mode() -> bool {
+    LOG_MODE.load(Ordering::Relaxed)
+}
 
 /// Record a problem from a subsystem. Idempotent — repeated calls with
 /// the same key just update the reason. Cleared by [`clear_issue`].
@@ -72,22 +93,6 @@ pub fn issue_count() -> usize {
     issues.len()
 }
 
-/// Fold the held-pending-approvals counter into the issue set. The
-/// permission/hold paths in `server.rs` call this after every queue
-/// transition; the tray then shows the warning overlay when the user
-/// has prompts waiting.
-pub fn set_pending_approval_count(count: usize) {
-    if count == 0 {
-        clear_issue("pending_approvals");
-    } else {
-        let suffix = if count == 1 { "" } else { "s" };
-        report_issue(
-            "pending_approvals",
-            format!("{count} approval prompt{suffix} waiting"),
-        );
-    }
-}
-
 // --- Feature-gated GUI plumbing -------------------------------------------
 //
 // The native icon + event loop are only compiled when the `tray` feature is
@@ -113,6 +118,7 @@ mod gui {
         _title: &str,
         _body: &str,
         _code: Option<&str>,
+        _allow_always: bool,
     ) -> crate::notify::ApprovalOutcome {
         crate::notify::ApprovalOutcome::Yes
     }
@@ -139,6 +145,7 @@ mod gui {
         _title: &str,
         _body: &str,
         _code: Option<&str>,
+        _allow_always: bool,
     ) -> crate::notify::ApprovalOutcome {
         crate::notify::ApprovalOutcome::Yes
     }
@@ -158,7 +165,7 @@ mod gui {
 #[cfg(all(feature = "tray", target_os = "macos"))]
 #[allow(unsafe_code)]
 mod gui {
-    use super::issue_count;
+    use super::{issue_count, log_mode};
     use block2::RcBlock;
     use core::ffi::c_uchar;
     use objc2::rc::Retained;
@@ -262,12 +269,14 @@ mod gui {
     #[derive(PartialEq, Eq, Clone, Copy)]
     struct Snapshot {
         has_issues: bool,
+        log_mode: bool,
     }
 
     impl Snapshot {
         fn read() -> Self {
             Self {
                 has_issues: issue_count() > 0,
+                log_mode: log_mode(),
             }
         }
     }
@@ -283,6 +292,7 @@ mod gui {
         status_item: Retained<objc2_app_kit::NSStatusItem>,
         normal_image: Retained<NSImage>,
         warning_image: Retained<NSImage>,
+        logmode_image: Retained<NSImage>,
         last_snapshot: Snapshot,
         // The icon set in build_tray_ui runs before [NSApp run] — at that
         // point macOS may not have finished resolving the bundle identity
@@ -311,13 +321,19 @@ mod gui {
         title: &str,
         body: &str,
         code: Option<&str>,
+        allow_always: bool,
     ) -> crate::notify::ApprovalOutcome {
         let (tx, rx) = tokio::sync::oneshot::channel::<crate::notify::ApprovalOutcome>();
         let title = title.to_string();
         let body = body.to_string();
         let code = code.map(str::to_string);
         push_main_work(move || {
-            let result = crate::notify_macos::show_approval_alert(&title, &body, code.as_deref());
+            let result = crate::notify_macos::show_approval_alert(
+                &title,
+                &body,
+                code.as_deref(),
+                allow_always,
+            );
             let _ = tx.send(result);
         });
         wake_main_run_loop();
@@ -384,6 +400,7 @@ mod gui {
         let warning_image = build_warning_image(&normal_image)
             .or_else(build_warning_image_fallback)
             .expect("warning icon failed to materialize as NSImage");
+        let logmode_image = build_logmode_image(&normal_image);
 
         // Initial state: assume healthy. The first refresh tick will
         // correct if the issue set is already populated.
@@ -393,6 +410,7 @@ mod gui {
             status_item,
             normal_image,
             warning_image,
+            logmode_image,
             last_snapshot: Snapshot::read(),
             needs_initial_paint: true,
         }
@@ -417,7 +435,16 @@ mod gui {
             }
             ui.needs_initial_paint = false;
 
-            let image = if now.has_issues {
+            // Precedence: log mode (durable state) > issues (actionable) >
+            // normal. Log mode wins outright: when the user has run
+            // `kyris disable`, the daemon is observe-only and not
+            // mediating anything, so there is nothing actionable to
+            // alarm about — overlaying a warning would contradict the
+            // "disabled" signal the user explicitly asked for. Issues
+            // still win over normal when enforcing.
+            let image = if now.log_mode {
+                &ui.logmode_image
+            } else if now.has_issues {
                 &ui.warning_image
             } else {
                 &ui.normal_image
@@ -562,6 +589,70 @@ mod gui {
         )
     }
 
+    /// Log-mode icon: kyris glyph (theme-tinted) with a long red
+    /// horizontal bar drawn through the vertical center. Signals
+    /// "agentpactd is auditing but not enforcing" — commands run
+    /// unmediated until the user flips the user policy from
+    /// `mode: log` to `mode: enforce`.
+    ///
+    /// Drawn at render time (`imageWithSize:flipped:drawingHandler:`)
+    /// for the same theme-awareness reason as the warning composite:
+    /// the labelColor mask tracks dark/light mode automatically. The
+    /// red bar uses `systemRedColor`, which macOS desaturates slightly
+    /// in dark mode on its own.
+    fn build_logmode_image(normal_template: &NSImage) -> Retained<NSImage> {
+        let base = normal_template.retain();
+        let size = NSSize {
+            width: TRAY_ICON_LOGICAL_PTS,
+            height: TRAY_ICON_LOGICAL_PTS,
+        };
+
+        // Bar geometry: full-width, ~2.5pt thick, vertically centered.
+        // 2.5pt at 22pt logical is the smallest stroke that remains
+        // visible at @2x without being heavy. Centering uses the icon
+        // mid-line (11pt) ± half thickness.
+        let bar_thickness = 2.5_f64;
+        let bar_y = (TRAY_ICON_LOGICAL_PTS - bar_thickness) / 2.0;
+        let bar_rect = NSRect {
+            origin: NSPoint { x: 0.0, y: bar_y },
+            size: NSSize {
+                width: TRAY_ICON_LOGICAL_PTS,
+                height: bar_thickness,
+            },
+        };
+
+        let block = RcBlock::new(move |rect: NSRect| -> Bool {
+            unsafe {
+                // 1. Theme-aware tint mask for the kyris glyph.
+                let label_color = NSColor::labelColor();
+                label_color.set();
+                NSRectFill(rect);
+                base.drawInRect_fromRect_operation_fraction(
+                    rect,
+                    NSRect::ZERO,
+                    NSCompositingOperation::DestinationIn,
+                    1.0,
+                );
+
+                // 2. Red horizontal bar drawn on top with SourceOver.
+                //    systemRedColor adapts slightly in dark mode; no
+                //    need for a custom dark-mode variant.
+                let red = NSColor::systemRedColor();
+                red.set();
+                NSRectFill(bar_rect);
+            }
+            Bool::YES
+        });
+
+        let composite = NSImage::imageWithSize_flipped_drawingHandler(size, false, &block);
+        // NOT a template — the red bar must render as red, not be
+        // auto-tinted to a single menu-bar foreground color.
+        unsafe {
+            let _: () = msg_send![&*composite, setTemplate: false];
+        }
+        composite
+    }
+
     /// Pre-macOS-11 fallback: the legacy amber recolor. Static (no
     /// theme awareness) but always available since it's pure pixel
     /// math on the existing kyris RGBA.
@@ -695,6 +786,14 @@ pub use gui::run_event_loop;
 mod tests {
     use super::*;
 
+    // Every test in this module mutates the process-global `ISSUES`
+    // map. cargo's default test runner parallelizes within a binary,
+    // so without serialization tests would race and produce flaky
+    // failures (observed pre-fix: a test asserting `listed.len() == 1`
+    // saw an unrelated test's key still in the map). The same pattern
+    // used in `kyris_core::paths::tests::ENV_LOCK`.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn reset_issues() {
         let mut issues = ISSUES
             .lock()
@@ -702,9 +801,20 @@ mod tests {
         issues.clear();
     }
 
+    /// Acquire the serializing lock + clear the issue set so every
+    /// test starts from a known-empty state. Returns the guard so
+    /// the lock is held for the lifetime of the test.
+    fn isolated() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_issues();
+        guard
+    }
+
     #[test]
     fn testReportAndClearIssue() {
-        reset_issues();
+        let _g = isolated();
         assert_eq!(issue_count(), 0);
         report_issue("agentpactd", "socket unreachable");
         assert_eq!(issue_count(), 1);
@@ -718,49 +828,28 @@ mod tests {
 
     #[test]
     fn testIssueSetIsKeyedSoDuplicatesAreUpdates() {
-        reset_issues();
+        let _g = isolated();
         report_issue("sync", "first reason");
         report_issue("sync", "updated reason");
         let listed = list_issues();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].1, "updated reason");
-        clear_issue("sync");
     }
 
     #[test]
     fn testListIssuesReturnsDeterministicOrder() {
-        reset_issues();
+        let _g = isolated();
         report_issue("zulu", "z");
         report_issue("alpha", "a");
         report_issue("mike", "m");
         let listed = list_issues();
         let keys: Vec<&'static str> = listed.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec!["alpha", "mike", "zulu"]);
-        clear_issue("zulu");
-        clear_issue("alpha");
-        clear_issue("mike");
-    }
-
-    #[test]
-    fn testPendingApprovalCountTogglesIssue() {
-        reset_issues();
-        set_pending_approval_count(0);
-        assert_eq!(issue_count(), 0);
-        set_pending_approval_count(3);
-        assert_eq!(issue_count(), 1);
-        let listed = list_issues();
-        assert!(listed[0].1.contains("3 approval prompts"));
-        set_pending_approval_count(1);
-        let listed = list_issues();
-        assert!(listed[0].1.contains("1 approval prompt"));
-        assert!(!listed[0].1.contains("prompts"));
-        set_pending_approval_count(0);
-        assert_eq!(issue_count(), 0);
     }
 
     #[test]
     fn testClearIssueIsIdempotent() {
-        reset_issues();
+        let _g = isolated();
         clear_issue("nonexistent");
         assert_eq!(issue_count(), 0);
     }

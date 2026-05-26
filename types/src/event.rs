@@ -57,31 +57,13 @@ pub struct Event {
     pub event_kind: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum Action {
-    Execute,
-    Call,
-    Read,
-    Write,
-    Think,
-    #[serde(other)]
-    Unknown,
-}
-
-impl std::fmt::Display for Action {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Execute => f.write_str("execute"),
-            Self::Call => f.write_str("call"),
-            Self::Read => f.write_str("read"),
-            Self::Write => f.write_str("write"),
-            Self::Think => f.write_str("think"),
-            Self::Unknown => f.write_str("unknown"),
-        }
-    }
-}
+// Action lives in `agentpact-types` (the canonical home for wire
+// value types shared with agentpact). Re-exported here so kyris
+// consumers can keep importing `kyris_types::event::Action`.
+// The `JsonSchema` derive lives on the canonical definition,
+// gated by agentpact-types' `schema` feature which kyris-types'
+// own `schema` feature forwards to (see Cargo.toml).
+pub use agentpact_types::Action;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -107,26 +89,8 @@ impl std::fmt::Display for Decision {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum AttributionMethod {
-    Boundary,
-    Lineage,
-    #[default]
-    #[serde(other)]
-    Unknown,
-}
-
-impl std::fmt::Display for AttributionMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Boundary => f.write_str("boundary"),
-            Self::Lineage => f.write_str("lineage"),
-            Self::Unknown => f.write_str("unknown"),
-        }
-    }
-}
+// AttributionMethod lives in `agentpact-types`; see Action above.
+pub use agentpact_types::AttributionMethod;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]

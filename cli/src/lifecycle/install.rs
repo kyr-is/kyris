@@ -38,22 +38,6 @@ pub fn run(_args: InstallArgs) {
     let log = InstallLog::open_install();
     log.info("=== kyris install started ===");
 
-    // Install implies "I want governance on" — clear any leftover
-    // `kyris stop` sentinel so the freshly-installed hooks don't
-    // immediately bypass themselves. Quiet best-effort: the file may
-    // not exist (common), and a remove failure shouldn't block the
-    // install.
-    let sentinel = kyris_core::paths::disabled_marker_path();
-    if sentinel.exists() {
-        match std::fs::remove_file(&sentinel) {
-            Ok(()) => log.info(&format!("cleared sentinel {}", sentinel.display())),
-            Err(e) => log.warn(&format!(
-                "could not clear sentinel {}: {e}",
-                sentinel.display()
-            )),
-        }
-    }
-
     if let Err(error) = load_or_init_config() {
         log.error(&format!("load_or_init_config: {error}"));
         eprintln!("{error}");
@@ -159,14 +143,16 @@ pub fn run(_args: InstallArgs) {
             log.warn("kyrisd did not become ready within 10s — agent burn-control setup may fail");
             eprintln!(
                 "Warning: kyrisd is not responding at {base_url}/healthz. \
-                 Run `kyris start` if it is not running."
+                 Inspect `kyris logs` or try `launchctl kickstart gui/$UID/is.kyr.kyrisd`."
             );
         }
     }
 
-    if let Err(e) = seed_user_policy_if_missing(&log) {
-        log.warn(&format!("seed_user_policy: {e}"));
-    }
+    // Note: agentpact materializes its default user policy
+    // (`~/.config/agentpact/policy/pact.yaml`) on daemon startup —
+    // see `agentpact::config::DaemonConfig::ensure_dirs` /
+    // `copy_default_policy_if_missing`. kyris no longer reaches
+    // across the boundary to write into agentpact's namespace.
 
     println!("\nReconciling agent integrations...");
     log.info("--- reconcile_all ---");
@@ -656,45 +642,4 @@ fn check_agent_surfaces() -> bool {
         }
     }
     all_ok
-}
-
-// Seed a minimal user-level Pact at the canonical XDG path
-// `$XDG_CONFIG_HOME/agentpact/policy/pact.yaml` so that both the
-// agentpactd runtime and the kyris compile-policy walk-up have something
-// to read. The single canonical path is provided by
-// `agentpact::config::default_user_policy_dir`, which mirrors the daemon's
-// `DaemonConfig.user_policy_dir`. XDG dirs are preserved across uninstall,
-// so user customizations survive upgrade. Without this seed, agents
-// whose only command-control mechanism is compiled policy (e.g., cline)
-// can never finish setup on a fresh machine. Idempotent: skips if any
-// *.yaml is already present in the user policy dir.
-fn seed_user_policy_if_missing(log: &InstallLog) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|e| format!("HOME not set: {e}"))?;
-    let policy_dir = agentpact::config::default_user_policy_dir(&PathBuf::from(&home));
-    if let Ok(entries) = std::fs::read_dir(&policy_dir)
-        && entries.flatten().any(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-    {
-        return Ok(());
-    }
-    std::fs::create_dir_all(&policy_dir)
-        .map_err(|e| format!("create {}: {e}", policy_dir.display()))?;
-    let seed_path = policy_dir.join("pact.yaml");
-    let body = "# SPDX-License-Identifier: Apache-2.0\n\
-                # Minimal starter policy seeded by `kyris install`. Mode `log`\n\
-                # records command attribution without blocking — replace with\n\
-                # `enforce` and add `commands:` rules to start mediating. Delete\n\
-                # this file to opt out; the installer will not re-seed if any\n\
-                # *.yaml is present.\n\
-                apiVersion: agentpact/v1\n\
-                kind: Pact\n\
-                metadata:\n  name: user-default\n\
-                spec:\n  mode: log\n";
-    std::fs::write(&seed_path, body).map_err(|e| format!("write {}: {e}", seed_path.display()))?;
-    log.info(&format!("seeded starter policy: {}", seed_path.display()));
-    println!("Seeded starter policy: {}", seed_path.display());
-    Ok(())
 }

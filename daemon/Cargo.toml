@@ -16,6 +16,12 @@ path = "src/main.rs"
 [dependencies]
 kyris-core = { workspace = true, features = ["pending"] }
 kyris-agentpact-client = { workspace = true }
+# In-process policy/mode resolution for the tray icon's user-level
+# mode display. Wire interaction with agentpactd still goes through
+# `kyris-agentpact-client` per BOUNDARY.md; this dep is read-only
+# library-level use of the resolver/loader, not wire-message
+# construction.
+agentpact = { workspace = true }
 kyris-peer-cwd = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "signal", "macros", "io-util", "time"] }
 axum = { workspace = true }
@@ -63,6 +69,8 @@ journald = ["dep:tracing-journald"]
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+# Process enumeration for the startup stray-daemon reaper (server.rs).
+sysinfo = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }

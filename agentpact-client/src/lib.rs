@@ -16,6 +16,11 @@ pub use kyris_core::agentpact::{
     ApprovalResponse, DenyCode, McpContext, McpPermissionDecision, ToolAnnotations,
     daemon_unavailable_message, default_socket_path,
 };
+// `Mode` is the wire value type canonically defined by agentpact
+// (the server crate's policy engine owns the semantics). Re-export
+// from `agentpact-types` so external consumers can continue to
+// `use kyris_agentpact_client::Mode` without a separate import.
+pub use agentpact_types::Mode;
 
 /// Builds a `permission.request` for an agent hook action (native hooks).
 ///
@@ -108,7 +113,20 @@ pub fn build_permission_respond_request(
 #[must_use]
 pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermissionDecision {
     match response.get("code").and_then(|code| code.as_str()) {
-        Some("PACT_OK") => McpPermissionDecision::Allow,
+        Some("PACT_OK") => {
+            // `mode` is required on every PACT_OK from current
+            // agentpactd. A missing/unknown value indicates either
+            // a malformed daemon response or a downstream proxy that
+            // stripped the field — fail safe by treating it as
+            // `enforce` (agent keeps its prompt UX) rather than
+            // assuming the laxer `log` posture.
+            let mode = response
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .and_then(Mode::from_wire)
+                .unwrap_or(Mode::Enforce);
+            McpPermissionDecision::Allow { mode }
+        }
         Some("PACT_DENIED") => {
             let reason = response
                 .get("reason")
@@ -246,6 +264,54 @@ pub fn request_hook_permission(
     })
 }
 
+/// Classify a hook command **without side effects** — a preview request.
+///
+/// Unlike [`request_hook_permission`], this sets `preview: true`, so the
+/// daemon evaluates policy and returns the decision (and the compound
+/// `segments` it parsed) but issues **no** approval token and stores no
+/// pending entry. Used by the per-segment hook flow to learn how a
+/// compound splits and whether any part needs asking, before issuing the
+/// real, token-bearing per-segment requests that drive the popups.
+///
+/// # Errors
+///
+/// Returns an error when `agentpactd` is unreachable or returns a
+/// malformed response.
+pub fn request_hook_permission_preview(
+    socket_path: &str,
+    request_id_prefix: &str,
+    action: &str,
+    detail: &str,
+    working_dir: Option<&str>,
+    seed_boundary_pid: Option<u32>,
+    socket_timeout: Duration,
+) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
+    let mut request = build_hook_permission_request(
+        request_id_prefix,
+        action,
+        detail,
+        working_dir,
+        seed_boundary_pid,
+    );
+    request["preview"] = serde_json::json!(true);
+    send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
+        // A preview `PACT_ASK` carries no approval token (the daemon
+        // issues none for previews). `parse_mcp_permission_response`
+        // treats a token-less ASK as an error, so map it to `Ask`
+        // ourselves; the preview caller only inspects the variant, never
+        // the (empty) token. PACT_OK / PACT_DENIED / errors parse normally.
+        let decision = match response.get("code").and_then(|c| c.as_str()) {
+            Some("PACT_ASK") => McpPermissionDecision::Ask {
+                approval_id: String::new(),
+                approval_token: String::new(),
+            },
+            _ => parse_mcp_permission_response(&response),
+        };
+        let segments = parse_response_segments(&response);
+        (decision, segments)
+    })
+}
+
 /// Extracts the `segments` array from an agentpactd permission response, if
 /// present. Returns `None` for non-execute actions, single-segment commands,
 /// and fail-closed parses — i.e. whenever the daemon decided segmentation
@@ -317,7 +383,7 @@ pub fn send_permission_response(
     let request = build_permission_respond_request(request_id_prefix, approval_token, response);
     let response_value = send_daemon_request_to_socket(socket_path, &request, socket_timeout)?;
     match parse_mcp_permission_response(&response_value) {
-        McpPermissionDecision::Allow => Ok(()),
+        McpPermissionDecision::Allow { .. } => Ok(()),
         McpPermissionDecision::Deny { .. } if response == ApprovalResponse::Denied => Ok(()),
         McpPermissionDecision::Deny { reason, .. } => {
             Err(format!("agentpactd rejected approval response: {reason}"))
@@ -325,6 +391,36 @@ pub fn send_permission_response(
         McpPermissionDecision::Ask { .. } => {
             Err("agentpactd returned an unexpected ask response".to_string())
         }
+    }
+}
+
+/// Probe agentpactd liveness with a real `daemon.health` round-trip.
+///
+/// Unlike a bare `UnixStream::connect()`, this writes a request, reads
+/// the response, and only returns `true` when the daemon answers
+/// `PACT_OK`. That means it actually exercises the accept loop and
+/// method dispatch — a bare connect succeeds whenever the kernel queues
+/// the connection, even if the daemon's accept loop is wedged, so it
+/// can't distinguish "alive" from "hung".
+///
+/// It also completes a full request/response and shuts the write half
+/// down cleanly (via [`send_daemon_request_to_socket`]), so the daemon
+/// never sees a connection that vanished mid-accept. A bare connect that
+/// is dropped immediately races the server's `accept()` and surfaces
+/// there as a transient `ENOTCONN`, which spammed agentpactd's logs once
+/// per probe.
+///
+/// Returns `false` on any connect/transport/parse failure or non-`OK`
+/// code — i.e. "treat as unreachable."
+#[must_use]
+pub fn probe_daemon_health(socket_path: &str, timeout: Duration) -> bool {
+    let request = serde_json::json!({
+        "id": "kyrisd-health",
+        "method": "daemon.health",
+    });
+    match send_daemon_request_to_socket(socket_path, &request, Some(timeout)) {
+        Ok(response) => response.get("code").and_then(|c| c.as_str()) == Some("PACT_OK"),
+        Err(_) => false,
     }
 }
 
@@ -498,8 +594,15 @@ mod tests {
 
     #[test]
     fn testReexportedTypesAccessible() {
-        let decision = McpPermissionDecision::Allow;
-        assert_eq!(decision, McpPermissionDecision::Allow);
+        let decision = McpPermissionDecision::Allow {
+            mode: Mode::Enforce,
+        };
+        assert_eq!(
+            decision,
+            McpPermissionDecision::Allow {
+                mode: Mode::Enforce
+            }
+        );
 
         assert!(ApprovalResponse::Approved.allows_execution());
         assert!(!ApprovalResponse::Denied.allows_execution());
@@ -532,10 +635,48 @@ mod tests {
         assert_eq!(request["detail"], "tool");
         assert_eq!(request["context"]["mcp_operation"], "tools/call");
 
-        let ok_resp = serde_json::json!({"code": "PACT_OK"});
+        // Per the new protocol, a PACT_OK response always carries a
+        // `mode` field. The parser surfaces it on the typed Allow
+        // variant so hook adapters can branch on log vs. enforce
+        // without re-reading any YAML.
+        let ok_log_resp = serde_json::json!({"code": "PACT_OK", "mode": "log"});
         assert_eq!(
-            parse_mcp_permission_response(&ok_resp),
-            McpPermissionDecision::Allow
+            parse_mcp_permission_response(&ok_log_resp),
+            McpPermissionDecision::Allow { mode: Mode::Log }
+        );
+        let ok_enforce_resp = serde_json::json!({"code": "PACT_OK", "mode": "enforce"});
+        assert_eq!(
+            parse_mcp_permission_response(&ok_enforce_resp),
+            McpPermissionDecision::Allow {
+                mode: Mode::Enforce
+            }
+        );
+    }
+
+    #[test]
+    fn testParsePactOkWithMissingModeFallsBackToEnforce() {
+        // Future-proofing: a malformed daemon or a downstream proxy
+        // that strips the field must NOT cause kyris to silently
+        // assume log mode (which would suppress the agent's own
+        // prompt). Treat the absence as enforce — keep the agent
+        // honest.
+        let resp = serde_json::json!({"code": "PACT_OK"});
+        assert_eq!(
+            parse_mcp_permission_response(&resp),
+            McpPermissionDecision::Allow {
+                mode: Mode::Enforce
+            }
+        );
+    }
+
+    #[test]
+    fn testParsePactOkWithUnknownModeFallsBackToEnforce() {
+        let resp = serde_json::json!({"code": "PACT_OK", "mode": "paranoid"});
+        assert_eq!(
+            parse_mcp_permission_response(&resp),
+            McpPermissionDecision::Allow {
+                mode: Mode::Enforce
+            }
         );
     }
 
@@ -668,10 +809,13 @@ mod tests {
 
     #[test]
     fn testParseMcpPermissionResponseAllow() {
-        let response = serde_json::json!({"code": "PACT_OK", "decision": "auto"});
+        let response =
+            serde_json::json!({"code": "PACT_OK", "decision": "auto", "mode": "enforce"});
         assert_eq!(
             parse_mcp_permission_response(&response),
-            McpPermissionDecision::Allow
+            McpPermissionDecision::Allow {
+                mode: Mode::Enforce
+            }
         );
     }
 

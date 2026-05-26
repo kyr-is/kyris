@@ -167,12 +167,14 @@ fn test_install_skips_local_kyrisd_when_homebrew_managed() {
 }
 
 // `kyris daemon start` / `kyris daemon stop` were removed when the
-// top-level `kyris stop` / `kyris start` commands took over; those
-// new commands manage both daemons together plus the disabled-hooks
-// sentinel, which doesn't fit this single-daemon shim harness. The
-// surface is now covered by `cli/src/main.rs` parser tests plus the
-// run_state unit tests; integration coverage will come back once we
-// have a launchctl-aware test fixture.
+// sentinel mechanism was retired. Mode toggling now lives in top-
+// level `kyris disable` / `kyris enable`, which edit
+// `~/.config/agentpact/policy/pact.yaml` and don't require a
+// launchctl-aware fixture. Coverage for the new commands is the
+// `rewrite_mode_line` / `write_mode_in_place` unit tests in
+// `cli/src/lifecycle/run_state.rs` plus the `cli/src/main.rs`
+// parser tests confirming the verbs accept and the old `stop`/`start`
+// verbs error out.
 
 #[test]
 fn test_update_check_warns_when_homebrew_manages_kyris() {

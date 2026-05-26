@@ -198,7 +198,7 @@ pub async fn check_permission_with_socket(
     };
 
     match outcome {
-        Ok(PermissionRequestOutcome::Allow) => PactDecision::Allow,
+        Ok(PermissionRequestOutcome::Allow { .. }) => PactDecision::Allow,
         Ok(PermissionRequestOutcome::Deny { code, reason, hint }) => {
             PactDecision::Deny { code, reason, hint }
         }
@@ -313,6 +313,8 @@ async fn resolve_ask_via_kyrisd(
             // the daemon falls back to plain-text informativeText. Adding
             // the serialized args is a follow-up.
             code: None,
+            // MCP tool calls aren't shell privilege escalation; "Always" is fine.
+            allow_always: true,
         },
     )
     .await;
@@ -400,10 +402,14 @@ mod tests {
 
     #[test]
     fn testParsePermissionRequestResponseOk() {
-        let response = serde_json::json!({"code": "PACT_OK", "decision": "auto"});
+        use kyris_agentpact_client::Mode;
+        let response =
+            serde_json::json!({"code": "PACT_OK", "decision": "auto", "mode": "enforce"});
         assert_eq!(
             agentpact::parse_mcp_permission_response(&response),
-            PermissionRequestOutcome::Allow
+            PermissionRequestOutcome::Allow {
+                mode: Mode::Enforce
+            }
         );
     }
 

@@ -14,6 +14,10 @@ pending = ["tokio", "reqwest"]
 
 [dependencies]
 kyris-types = { workspace = true }
+# Wire value types defined by agentpact. Re-exported from
+# `core::agentpact` so consumers can import `Mode` through kyris-core
+# without touching the agentpact server crate.
+agentpact-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

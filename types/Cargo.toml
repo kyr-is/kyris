@@ -11,9 +11,16 @@ description = "Pure schema and serialization types for the Kyris workspace. No I
 
 [features]
 openapi = ["utoipa"]
-schema = ["schemars"]
+# Forwards to agentpact-types so the shared `Action` and
+# `AttributionMethod` enums get `schemars::JsonSchema` derives when
+# downstream tooling (`cargo xtask schemas`) builds with this feature.
+schema = ["schemars", "agentpact-types/schema"]
 
 [dependencies]
+# Shared wire value types defined by agentpact (Action,
+# AttributionMethod, Mode). Re-exported from `event.rs` so existing
+# `kyris_types::event::Action` imports keep working.
+agentpact-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

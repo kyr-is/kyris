@@ -8,6 +8,13 @@
 // crates need without ever talking to the daemon directly.
 use std::path::PathBuf;
 
+/// Re-export of the canonical [`agentpact_types::Mode`] so kyris-core
+/// consumers that already import from this module keep working
+/// after the type was extracted to its own crate. The wire value is
+/// defined once, in `agentpact-types` — see
+/// [`McpPermissionDecision::Allow`] for where the parser surfaces it.
+pub use agentpact_types::Mode;
+
 /// Machine-readable cause code for a governance denial (I-05).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyCode {
@@ -23,7 +30,15 @@ pub enum DenyCode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpPermissionDecision {
-    Allow,
+    Allow {
+        /// Effective mode the daemon was in for this request. Hook
+        /// adapters MUST check this and switch their allow shape to
+        /// `EmptyStdout` (defer to agent) when the value is
+        /// [`Mode::Log`] — otherwise log mode silently overrides the
+        /// agent's permission UX, which is the bug log mode exists to
+        /// avoid.
+        mode: Mode,
+    },
     Deny {
         code: DenyCode,
         reason: String,
@@ -96,4 +111,10 @@ mod tests {
         assert!(ApprovalResponse::Always.allows_execution());
         assert!(!ApprovalResponse::Denied.allows_execution());
     }
+
+    // Mode is now re-exported from `agentpact-types`; its
+    // from_wire/as_wire/is_log/Display tests live in that crate.
+    // Don't duplicate them here — the re-export is statically
+    // verified to compile and tests on the canonical home cover
+    // the wire-form contract.
 }

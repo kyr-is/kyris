@@ -12,20 +12,12 @@ use crate::state::{bin_dir, credentials_path, load_config};
 pub struct StatusArgs {}
 
 pub fn run(_args: StatusArgs) {
-    println!("Kyris Status");
-    println!("============");
-
-    if kyris_core::paths::is_disabled() {
-        // Banner-style early line so the rest of the report is read in
-        // the right frame: daemons are *intentionally* down, hooks are
-        // bypassed, and the missing health checks below are expected
-        // rather than a system fault.
-        println!(
-            "  [!] DISABLED via {} — run `kyris start` to re-enable",
-            kyris_core::paths::disabled_marker_path().display()
-        );
-        println!();
-    }
+    // Headline first — single-line summary of effective enforcement
+    // posture (enforcing, log-only, errored, kill-switched). Replaces
+    // the old "Kyris Status / ============" header and the separate
+    // "[!] DISABLED via …" banner: the headline already encodes both.
+    println!("{}", crate::headline::render());
+    println!();
 
     check_agentpactd();
     check_kyrisd();

@@ -371,12 +371,7 @@ async fn relay_agent_to_server(
     let mut mode = FrameMode::Unknown;
     while let Some(msg) = read_message(&mut reader, &mut mode).await? {
         let compact = normalize(&msg);
-        // Governance kill switch — `~/.kyris/disabled` (created by
-        // `kyris stop`). When set, every JSON-RPC message — including
-        // tools/call — forwards straight to the wrapped server without
-        // contacting agentpactd. The wrapped server runs as if the
-        // kyris-mcp interposer weren't here.
-        if framing::is_tools_call(&compact) && !kyris_core::paths::is_disabled() {
+        if framing::is_tools_call(&compact) {
             let original_id = extract_request_id(&compact).unwrap_or(serde_json::Value::Null);
             tool_tx
                 .send((compact, original_id))

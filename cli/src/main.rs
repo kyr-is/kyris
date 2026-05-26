@@ -34,6 +34,7 @@ mod compile_policy;
 mod config_writer;
 mod continue_cmd;
 mod doctor;
+mod headline;
 mod hook_cmd;
 mod integration;
 mod json_patch_ops;
@@ -80,8 +81,8 @@ enum Command {
     Daemon(lifecycle::daemon_cmd::DaemonArgs),
     Logs(logs_cmd::LogsArgs),
     Mcp(mcp_cmd::McpArgs),
-    Stop(lifecycle::run_state::StopArgs),
-    Start(lifecycle::run_state::StartArgs),
+    Disable(lifecycle::run_state::DisableArgs),
+    Enable(lifecycle::run_state::EnableArgs),
     Uninstall(lifecycle::uninstall::UninstallArgs),
     Verify(lifecycle::verify::VerifyArgs),
     Status(status::StatusArgs),
@@ -112,8 +113,8 @@ fn main() {
         Command::Daemon(args) => lifecycle::daemon_cmd::run(args),
         Command::Logs(args) => logs_cmd::run(args),
         Command::Mcp(args) => mcp_cmd::run(args),
-        Command::Stop(args) => lifecycle::run_state::run_stop(args),
-        Command::Start(args) => lifecycle::run_state::run_start(args),
+        Command::Disable(args) => lifecycle::run_state::run_disable(args),
+        Command::Enable(args) => lifecycle::run_state::run_enable(args),
         Command::Uninstall(args) => lifecycle::uninstall::run(args),
         Command::Verify(args) => lifecycle::verify::run(args),
         Command::Status(args) => status::run(args),
@@ -192,19 +193,28 @@ mod tests {
     }
 
     #[test]
-    fn testParseStop() {
-        assert!(try_parse(&["stop"]).is_ok());
+    fn testParseDisable() {
+        assert!(try_parse(&["disable"]).is_ok());
     }
 
     #[test]
-    fn testParseStart() {
-        assert!(try_parse(&["start"]).is_ok());
+    fn testParseEnable() {
+        assert!(try_parse(&["enable"]).is_ok());
+    }
+
+    #[test]
+    fn testParseStopAndStartAreGone() {
+        // Renamed to `disable`/`enable` when the sentinel mechanism
+        // was retired in favor of a pure `mode: log` ↔ `mode: enforce`
+        // toggle. Old verbs must not silently accept.
+        assert!(try_parse(&["stop"]).is_err());
+        assert!(try_parse(&["start"]).is_err());
     }
 
     #[test]
     fn testParseDaemonOnlyHasStatus() {
         // `kyris daemon start|stop` were replaced by top-level
-        // `kyris start|stop` (both daemons + sentinel). `kyris daemon
+        // `kyris disable|enable` (policy mode toggle). `kyris daemon
         // logs` was replaced by top-level `kyris logs` (all log files).
         // What remains is the focused kyrisd service probe.
         assert!(try_parse(&["daemon", "start"]).is_err());

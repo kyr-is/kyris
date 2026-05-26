@@ -11,5 +11,9 @@ description = "AgentPact daemon UDS client: socket I/O, retry, daemon-state fall
 
 [dependencies]
 kyris-core = { workspace = true }
+# Wire value types shared with agentpact's server crate (Mode et al.).
+# Re-exported so out-of-tree consumers can branch on `Mode` without
+# pulling in agentpact's policy engine.
+agentpact-types = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }

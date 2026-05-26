@@ -120,13 +120,13 @@ pub fn setup_agent(
         if let Err(error) = verify_kyrisd_health(&base_url) {
             return Err(format!(
                 "kyrisd unreachable ({error}). \
-                 Start it with `kyris start`, then re-run `kyris agents setup {agent_id}`."
+                 Bring kyrisd up (try `launchctl kickstart gui/$UID/is.kyr.kyrisd` or reinstall), then re-run `kyris agents setup {agent_id}`."
             ));
         }
     } else if let Err(error) = verify_kyrisd_health(&base_url) {
         return Err(format!(
             "kyrisd unreachable ({error}). \
-             Start it with `kyris start`, then re-run `kyris agents setup {agent_id}`."
+             Bring kyrisd up (try `launchctl kickstart gui/$UID/is.kyr.kyrisd` or reinstall), then re-run `kyris agents setup {agent_id}`."
         ));
     }
 
@@ -188,7 +188,7 @@ pub fn configure_agent(
         if let Err(error) = verify_kyrisd_health(&base_url) {
             return Err(format!(
                 "kyrisd unreachable ({error}). \
-                 Start it with `kyris start`, then re-run `kyris agents setup {agent_id}`."
+                 Bring kyrisd up (try `launchctl kickstart gui/$UID/is.kyr.kyrisd` or reinstall), then re-run `kyris agents setup {agent_id}`."
             ));
         }
     }

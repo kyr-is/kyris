@@ -3,7 +3,10 @@
 //! `kyris daemon` — inspect kyrisd's service state.
 //!
 //! Today this is a single-subcommand shape (`kyris daemon status`).
-//! Start/stop moved to top-level `kyris start` / `kyris stop`; log
+//! Start/stop are no longer kyris's job — the launchd plists keep the
+//! daemons up. Use `kyris disable` / `kyris enable` to toggle the
+//! enforcement mode without touching daemon lifecycle, or `kyris
+//! uninstall` for a real teardown. Log
 //! discovery moved to top-level `kyris logs`. What's left here is
 //! the focused "is the launchd plist loaded and is /healthz happy?"
 //! probe — it's narrow enough that we keep the `daemon` namespace

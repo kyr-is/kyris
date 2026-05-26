@@ -1,153 +1,336 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-//! `kyris stop` and `kyris start` — pause and resume governance.
+//! `kyris disable` and `kyris enable` — toggle the user policy's
+//! enforcement mode.
 //!
-//! `stop` writes the `~/.kyris/disabled` sentinel (which every hook
-//! entry point honors as a no-contact early exit), `launchctl disable`s
-//! both daemons so they don't come back on reboot, and `launchctl kill
-//! TERM`s the running instances. The user is now ungoverned until they
-//! run `start`.
+//! Both commands edit the `mode:` value in
+//! `$XDG_CONFIG_HOME/agentpact/policy/pact.yaml` (the user-level policy
+//! that the daemon walk-up merge picks up). `agentpactd`'s policy
+//! watcher reloads the file in place, so the change takes effect
+//! without restarting any daemons. kyrisd's `policy_mode_poller`
+//! refreshes the tray icon within 5s.
 //!
-//! `start` reverses each step: `launchctl enable`, `launchctl kickstart`,
-//! polls both daemons until they respond on their endpoints, and only
-//! then removes the sentinel. Polling matters because `kickstart` is
-//! fire-and-forget — the daemons need a moment to bind their socket and
-//! HTTP port. If either daemon fails to respond within 10s the sentinel
-//! stays in place (system pinned to a clean disabled state) and the
-//! command prints a reinstall hint.
+//!   disable  →  spec.mode: log     (record-only; commands run unmediated)
+//!   enable   →  spec.mode: enforce (catalog auto-allows, unclassified asks)
+//!
+//! Both commands probe `agentpactd`'s socket first and fail loudly if
+//! it isn't reachable. Rationale: writing the YAML when the daemon
+//! can't read it produces a silent "I told kyris something but nothing
+//! happened" UX. Users who want kyris fully removed should run
+//! `kyris uninstall` (preserves data) or `kyris uninstall --reset-data`
+//! (full wipe) — not a runtime toggle.
 
 use clap::Args;
-use std::time::Duration;
+use std::fmt::Write as _;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 
-use crate::service::{
-    ServiceKind, disable_service, enable_service, kickstart_service, kill_service,
-    wait_for_agentpactd, wait_for_kyrisd,
-};
+const MODE_LOG: &str = "log";
+const MODE_ENFORCE: &str = "enforce";
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Disable governance.
+/// Switch governance into log-only mode.
 ///
-/// Stops both daemons (`kyrisd` + `agentpactd`) and bypasses shell and
-/// agent hooks via a `~/.kyris/disabled` sentinel. Persists across
-/// reboot via `launchctl disable`. No audit log entries are written
-/// while disabled. Reverse with `kyris start`.
+/// Edits `pact.yaml` so the user policy's `spec.mode` is `log`.
+/// agentpactd continues to evaluate every request but returns Allow
+/// without prompting; everything is still recorded in the audit log
+/// and the tray icon shows a red horizontal bar across the kyris
+/// glyph to make the non-enforcing state visible at a glance.
 #[derive(Args)]
-pub struct StopArgs {}
+pub struct DisableArgs {}
 
-/// Re-enable governance.
+/// Switch governance into enforce mode.
 ///
-/// `launchctl enable` + `kickstart` both daemons (agentpactd first),
-/// waits up to 10s for them to respond on their endpoints, then removes
-/// the sentinel. If either daemon fails to come up, the sentinel stays
-/// in place and the command exits non-zero with a reinstall hint.
+/// Edits `pact.yaml` so the user policy's `spec.mode` is `enforce`.
+/// Catalog-classified commands auto-allow; unclassified commands
+/// route to the menu-bar approval popup (or `kyris pending` when the
+/// agent runs without a TTY). Tray icon clears the log-mode overlay.
 #[derive(Args)]
-pub struct StartArgs {}
+pub struct EnableArgs {}
 
-pub fn run_stop(_args: StopArgs) {
-    let sentinel = kyris_core::paths::disabled_marker_path();
-    if let Some(parent) = sentinel.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        eprintln!("Failed to ensure {}: {e}", parent.display());
+pub fn run_disable(_args: DisableArgs) {
+    run_toggle(MODE_LOG);
+}
+
+pub fn run_enable(_args: EnableArgs) {
+    run_toggle(MODE_ENFORCE);
+}
+
+fn run_toggle(target_mode: &str) {
+    if !agentpactd_reachable() {
+        let sock = agentpact_socket();
+        eprintln!(
+            "[kyris] agentpactd is not reachable at {sock}. \
+             Mode changes only take effect when the policy daemon is running. \
+             Fix that first (try `kyris doctor` or reinstall agentpact), then re-run."
+        );
         std::process::exit(1);
     }
-    if let Err(e) = std::fs::write(&sentinel, b"") {
-        eprintln!("Failed to write sentinel {}: {e}", sentinel.display());
-        std::process::exit(1);
-    }
 
-    // Order: kyrisd first (it talks to agentpactd via UDS during
-    // gateway / MCP routing; shutting agentpactd while kyrisd is still
-    // serving means in-flight requests fail mid-flight). Disable
-    // before kill so a respawn race can't slip a fresh instance in.
-    let mut failures: Vec<String> = Vec::new();
-    for kind in [ServiceKind::Kyrisd, ServiceKind::Agentpactd] {
-        if let Err(e) = disable_service(kind) {
-            failures.push(format!("disable {}: {e}", kind.launchd_label()));
+    let path = pact_yaml_path();
+    let outcome = match write_mode_in_place(&path, target_mode) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[kyris] could not update {}: {e}", path.display());
+            std::process::exit(1);
         }
-        if let Err(e) = kill_service(kind) {
-            failures.push(format!("kill {}: {e}", kind.launchd_label()));
-        }
-    }
+    };
 
-    println!("Kyris stopped. Governance is paused.");
-    println!("  - Both daemons (kyrisd, agentpactd) are down and disabled across reboot.");
-    println!(
-        "  - Shell + agent hooks early-exit via {} — no audit log entries.",
-        sentinel.display()
-    );
-    println!();
-    println!("Run `kyris start` to re-enable.");
-    if !failures.is_empty() {
-        eprintln!();
-        eprintln!("Note: some launchctl steps reported errors (system may already have");
-        eprintln!("been in the target state — sentinel is what actually disables hooks):");
-        for f in &failures {
-            eprintln!("  - {f}");
+    match (target_mode, outcome) {
+        (MODE_LOG, WriteOutcome::Updated) => {
+            println!("Kyris disabled — mode is now `log`.");
+            println!("  - agentpactd will record commands but not enforce. The tray icon");
+            println!("    shows a red bar across the kyris glyph until you run `kyris enable`.");
         }
+        (MODE_ENFORCE, WriteOutcome::Updated) => {
+            println!("Kyris enabled — mode is now `enforce`.");
+            println!("  - agentpactd will prompt for unclassified commands. Tray overlay cleared.");
+        }
+        (MODE_LOG, WriteOutcome::Unchanged) => {
+            println!("Kyris is already in `log` mode. No change.");
+        }
+        (MODE_ENFORCE, WriteOutcome::Unchanged) => {
+            println!("Kyris is already in `enforce` mode. No change.");
+        }
+        (MODE_LOG, WriteOutcome::Created) => {
+            println!(
+                "Kyris disabled — created {} with mode `log`.",
+                path.display()
+            );
+        }
+        (MODE_ENFORCE, WriteOutcome::Created) => {
+            println!(
+                "Kyris enabled — created {} with mode `enforce`.",
+                path.display()
+            );
+        }
+        _ => unreachable!("target_mode is always log or enforce"),
     }
 }
 
-pub fn run_start(_args: StartArgs) {
-    let mut prelim_failures: Vec<String> = Vec::new();
+#[derive(Debug, PartialEq, Eq)]
+enum WriteOutcome {
+    Created,
+    Updated,
+    Unchanged,
+}
 
-    // Order: agentpactd first (kyrisd makes UDS calls to it on
-    // startup), kyrisd second.
-    for kind in [ServiceKind::Agentpactd, ServiceKind::Kyrisd] {
-        if let Err(e) = enable_service(kind) {
-            prelim_failures.push(format!("enable {}: {e}", kind.launchd_label()));
+/// Edit the `mode:` line in `pact.yaml` to `target_mode`, preserving
+/// every other line (including comments, blank lines, the
+/// `apiVersion`/`kind`/`metadata` block, and any user-added `commands:`
+/// rules). If the file doesn't exist, write a fresh minimal pact.yaml
+/// with the requested mode. If the file exists but has no uncommented
+/// `mode:` line, return an error rather than guessing where to inject it.
+fn write_mode_in_place(path: &Path, target_mode: &str) -> Result<WriteOutcome, String> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create dir {}: {e}", parent.display()))?;
         }
-        if let Err(e) = kickstart_service(kind) {
-            prelim_failures.push(format!("kickstart {}: {e}", kind.launchd_label()));
-        }
-    }
-
-    let agentpactd_up = wait_for_agentpactd(HEALTH_TIMEOUT);
-    let kyrisd_up = wait_for_kyrisd(HEALTH_TIMEOUT);
-
-    if agentpactd_up && kyrisd_up {
-        let sentinel = kyris_core::paths::disabled_marker_path();
-        if sentinel.exists()
-            && let Err(e) = std::fs::remove_file(&sentinel)
-        {
-            // Sentinel removal failure is rare (permissions) but the
-            // daemons are up — better to keep the sentinel than lie
-            // about the state.
-            eprintln!(
-                "Daemons up but failed to remove sentinel {}: {e}",
-                sentinel.display()
-            );
-            eprintln!("Hooks will still treat governance as disabled. Remove the file manually:");
-            eprintln!("  rm {}", sentinel.display());
-            std::process::exit(1);
-        }
-        println!("Kyris started. Governance is enabled.");
-        return;
+        std::fs::write(path, fresh_pact_yaml(target_mode)).map_err(|e| format!("write: {e}"))?;
+        return Ok(WriteOutcome::Created);
     }
 
-    // Failure path — keep sentinel in place so hooks stay in the clean
-    // "disabled" state instead of trying to reach dead daemons.
-    eprintln!(
-        "Failed to start kyris within {}s:",
-        HEALTH_TIMEOUT.as_secs()
-    );
-    if !agentpactd_up {
-        eprintln!("  - agentpactd: did not become responsive");
+    let contents = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+    let (new_contents, changed) = rewrite_mode_line(&contents, target_mode)?;
+    if !changed {
+        return Ok(WriteOutcome::Unchanged);
     }
-    if !kyrisd_up {
-        eprintln!("  - kyrisd: /healthz did not respond");
-    }
-    if !prelim_failures.is_empty() {
-        eprintln!();
-        eprintln!("launchctl reported earlier errors:");
-        for f in &prelim_failures {
-            eprintln!("  - {f}");
+    std::fs::write(path, new_contents).map_err(|e| format!("write: {e}"))?;
+    Ok(WriteOutcome::Updated)
+}
+
+/// Pure helper — produces the rewritten file body and whether the
+/// content actually changed. Split out so unit tests can drive every
+/// edge case without disk I/O.
+fn rewrite_mode_line(contents: &str, target_mode: &str) -> Result<(String, bool), String> {
+    let mut output = String::with_capacity(contents.len() + 16);
+    let mut found = false;
+    let mut changed = false;
+
+    for raw_line in contents.lines() {
+        if found {
+            output.push_str(raw_line);
+            output.push('\n');
+            continue;
+        }
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            output.push_str(raw_line);
+            output.push('\n');
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("mode:") {
+            // Split off any inline `# comment` so we can preserve it.
+            let (value_part, comment_part) = match rest.find('#') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, ""),
+            };
+            let current_value = value_part.trim();
+            let indent_len = raw_line.len() - trimmed.len();
+            let indent = &raw_line[..indent_len];
+
+            let comment_suffix = if comment_part.is_empty() {
+                String::new()
+            } else {
+                format!("  {comment_part}")
+            };
+            writeln!(output, "{indent}mode: {target_mode}{comment_suffix}")
+                .expect("writing to String never fails");
+
+            found = true;
+            if current_value != target_mode {
+                changed = true;
+            }
+        } else {
+            output.push_str(raw_line);
+            output.push('\n');
         }
     }
-    eprintln!();
-    eprintln!("System is still disabled. Diagnose with `kyris verify`, then reinstall:");
-    eprintln!("  ~/.kyris/installer.sh                          (script install)");
-    eprintln!("  brew reinstall --cask kyr-is/tap/kyris         (brew install)");
-    std::process::exit(1);
+
+    if !found {
+        return Err(format!(
+            "no uncommented `mode:` key found. Add `  mode: {target_mode}` under `spec:` \
+             or delete the file to have `kyris install` re-seed it."
+        ));
+    }
+
+    // Preserve trailing-newline-or-not semantics of the input.
+    if !contents.ends_with('\n') && output.ends_with('\n') {
+        output.pop();
+    }
+
+    Ok((output, changed))
+}
+
+fn fresh_pact_yaml(target_mode: &str) -> String {
+    format!(
+        "# SPDX-License-Identifier: Apache-2.0\n\
+         # User policy. Toggle enforcement with `kyris disable` (log)\n\
+         # or `kyris enable` (enforce). Add `commands:` rules under\n\
+         # `spec:` for per-pattern decisions.\n\
+         apiVersion: agentpact/v1\n\
+         kind: Pact\n\
+         metadata:\n  name: user-default\n\
+         spec:\n  mode: {target_mode}\n",
+    )
+}
+
+fn pact_yaml_path() -> PathBuf {
+    let xdg = std::env::var("XDG_CONFIG_HOME").ok().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.config")
+    });
+    PathBuf::from(xdg).join("agentpact/policy/pact.yaml")
+}
+
+fn agentpact_socket() -> String {
+    std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.agentpact/agentpact.sock")
+    })
+}
+
+fn agentpactd_reachable() -> bool {
+    UnixStream::connect(agentpact_socket()).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testRewriteFlipsLogToEnforce() {
+        let body = "spec:\n  mode: log\n";
+        let (out, changed) = rewrite_mode_line(body, MODE_ENFORCE).unwrap();
+        assert!(changed);
+        assert!(out.contains("mode: enforce"));
+        assert!(!out.contains("mode: log"));
+    }
+
+    #[test]
+    fn testRewriteIsIdempotentWhenAlreadyTarget() {
+        let body = "spec:\n  mode: enforce\n";
+        let (out, changed) = rewrite_mode_line(body, MODE_ENFORCE).unwrap();
+        assert!(!changed);
+        // Output still contains the line (we preserve formatting), just
+        // didn't flag it as changed.
+        assert!(out.contains("mode: enforce"));
+    }
+
+    #[test]
+    fn testRewritePreservesSurroundingContent() {
+        let body = "# comment 1\n\
+                    apiVersion: agentpact/v1\n\
+                    kind: Pact\n\
+                    metadata:\n  name: user-default\n\
+                    spec:\n  mode: log\n  commands:\n    \"git·status\": auto\n";
+        let (out, changed) = rewrite_mode_line(body, MODE_ENFORCE).unwrap();
+        assert!(changed);
+        assert!(out.contains("# comment 1"));
+        assert!(out.contains("apiVersion: agentpact/v1"));
+        assert!(out.contains("kind: Pact"));
+        assert!(out.contains("name: user-default"));
+        assert!(out.contains("mode: enforce"));
+        assert!(out.contains("\"git·status\": auto"));
+    }
+
+    #[test]
+    fn testRewritePreservesInlineComment() {
+        let body = "spec:\n  mode: log   # observe-only for the demo\n";
+        let (out, _changed) = rewrite_mode_line(body, MODE_ENFORCE).unwrap();
+        assert!(out.contains("mode: enforce"));
+        assert!(
+            out.contains("# observe-only for the demo"),
+            "inline comment must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn testRewriteIgnoresCommentedOutModeLine() {
+        // A `mode: log` inside a comment must not be the line we edit.
+        let body = "# spec:\n#   mode: log\nspec:\n  mode: enforce\n";
+        let (out, changed) = rewrite_mode_line(body, MODE_LOG).unwrap();
+        assert!(changed);
+        // The commented line is untouched; only the real `mode:` line flips.
+        assert!(out.contains("#   mode: log"));
+        assert!(out.contains("  mode: log\n"));
+        assert!(!out.contains("mode: enforce"));
+    }
+
+    #[test]
+    fn testRewriteErrorsWhenNoModeKeyPresent() {
+        let body = "spec:\n  commands:\n    foo: auto\n";
+        let result = rewrite_mode_line(body, MODE_LOG);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn testFreshPactYamlIncludesMode() {
+        let body = fresh_pact_yaml(MODE_ENFORCE);
+        assert!(body.contains("mode: enforce"));
+        assert!(body.contains("kind: Pact"));
+    }
+
+    #[test]
+    fn testWriteModeInPlaceCreatesMissingFile() {
+        let tmp = std::env::temp_dir().join(format!("kyris-test-pact-{}.yaml", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let outcome = write_mode_in_place(&tmp, MODE_LOG).expect("create");
+        assert_eq!(outcome, WriteOutcome::Created);
+        let body = std::fs::read_to_string(&tmp).unwrap();
+        assert!(body.contains("mode: log"));
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn testWriteModeInPlaceReportsUnchanged() {
+        let tmp = std::env::temp_dir().join(format!(
+            "kyris-test-pact-unchanged-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, "spec:\n  mode: enforce\n").unwrap();
+        let outcome = write_mode_in_place(&tmp, MODE_ENFORCE).expect("unchanged");
+        assert_eq!(outcome, WriteOutcome::Unchanged);
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

@@ -96,6 +96,7 @@ pub async fn run(config: KyrisdConfig) {
     let agentpact_socket = probe_agentpact_socket();
 
     check_crash_recovery();
+    reap_stray_daemons().await;
     write_pid_file();
 
     let stats_config = config.stats.clone();
@@ -127,7 +128,6 @@ pub async fn run(config: KyrisdConfig) {
     tokio::spawn(crate::sync::daemon_sync::run_sync_loop(state.clone()));
     tokio::spawn(crate::pricing_fetch::run_pricing_fetch(state.clone()));
     tokio::spawn(run_pending_prune(state.pending.clone()));
-    tokio::spawn(run_pending_tray_broadcast(state.pending.clone()));
     tokio::spawn(crate::reconcile_watcher::run_reconcile_loop(state.clone()));
 
     let inbound_auth_config = state.config.clone();
@@ -160,6 +160,7 @@ pub async fn run(config: KyrisdConfig) {
     tokio::spawn(sighup_reload(state.clone(), signals.sighup));
     tokio::spawn(sigusr1_diagnostics(signals.sigusr1));
     tokio::spawn(agentpactd_health_poller());
+    tokio::spawn(watch_policy_mode());
 
     if tls_enabled {
         serve_tls_with_graceful_shutdown(
@@ -292,22 +293,6 @@ async fn run_pending_prune(pending: Arc<PendingStore>) {
     }
 }
 
-// Push the count of held pending approvals to the tray atomic so the
-// menu-bar refresh (250ms cadence) can show an attention state. Polling
-// rather than wiring every transition point keeps the contract simple —
-// the source of truth stays in PendingStore.list_held(); the tray sees
-// the current count within at most 750ms of any change.
-async fn run_pending_tray_broadcast(pending: Arc<PendingStore>) {
-    let mut interval = tokio::time::interval(Duration::from_millis(500));
-    loop {
-        interval.tick().await;
-        #[cfg(feature = "tray")]
-        crate::tray::set_pending_approval_count(pending.list_held().len());
-        #[cfg(not(feature = "tray"))]
-        let _ = &pending;
-    }
-}
-
 impl AppState {
     pub fn resolve_agentpact_socket(&self) -> Option<std::path::PathBuf> {
         if let Some(ref path) = self.agentpact_socket {
@@ -363,6 +348,100 @@ fn check_crash_recovery() {
     #[cfg(not(unix))]
     {
         let _ = old_pid;
+    }
+}
+
+/// Kill any *other* kyrisd processes owned by this user before we claim
+/// the pidfile and port, so exactly one kyrisd survives any start —
+/// install or reboot.
+///
+/// Production kyrisd is launchd-managed and does not orphan, but dev/test
+/// runs of the debug binary (`target/debug/kyrisd`) or the cargo test
+/// binary (`target/debug/deps/kyrisd-<hex>`) can detach from their parent
+/// when the terminal/cargo/IDE that launched them goes away, surviving as
+/// strays reparented to launchd. This sweep cleans them up at the next
+/// canonical start instead of letting them linger.
+///
+/// Safety bounds, in order of importance:
+/// - never our own PID;
+/// - only processes owned by our own UID (never signal another user);
+/// - only executables whose file name is exactly `kyrisd` or a cargo
+///   test/bench binary (`kyrisd-<hex>`) — the CLI (`kyris`, `kyris-mcp`)
+///   and `agentpactd` are deliberately excluded.
+///
+/// Each stray gets SIGTERM, a short grace period, then SIGKILL if it is
+/// still alive.
+#[cfg(unix)]
+async fn reap_stray_daemons() {
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::{Pid, Uid};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let own_pid = std::process::id();
+    let owner_uid = Uid::current().as_raw();
+
+    let mut sys = System::new();
+    let refresh = ProcessRefreshKind::nothing()
+        .with_exe(UpdateKind::Always)
+        .with_user(UpdateKind::Always);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+
+    let strays: Vec<u32> = sys
+        .processes()
+        .values()
+        .filter_map(|proc| {
+            let pid = proc.pid().as_u32();
+            if pid == own_pid {
+                return None;
+            }
+            // Same user only — never signal another user's processes.
+            // sysinfo's `Uid` derefs to the raw `libc::uid_t`, which is
+            // exactly what `nix::Uid::as_raw()` returns.
+            if proc.user_id().map(|uid| **uid) != Some(owner_uid) {
+                return None;
+            }
+            let name = proc.exe()?.file_name()?.to_str()?;
+            is_kyrisd_executable(name).then_some(pid)
+        })
+        .collect();
+
+    if strays.is_empty() {
+        return;
+    }
+
+    tracing::warn!(?strays, "reaping stray kyrisd process(es) on startup");
+    for &pid in &strays {
+        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for &pid in &strays {
+        let target = Pid::from_raw(pid as i32);
+        // `kill(.., None)` is signal 0: Ok means the process still exists
+        // and we may signal it. Anything else (exited, or now unowned) we
+        // leave alone.
+        if signal::kill(target, None).is_ok() {
+            tracing::warn!(pid, "stray kyrisd ignored SIGTERM — sending SIGKILL");
+            let _ = signal::kill(target, Signal::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reap_stray_daemons() {}
+
+/// `true` for a kyrisd executable file name: the installed/dev binary
+/// (`kyrisd`) or a cargo test/bench binary (`kyrisd-<hex>`). Excludes
+/// `kyris`, `kyris-mcp`, `agentpactd`, and unrelated names.
+#[cfg(unix)]
+fn is_kyrisd_executable(file_name: &str) -> bool {
+    if file_name == "kyrisd" {
+        return true;
+    }
+    match file_name.strip_prefix("kyrisd-") {
+        Some(suffix) => !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
     }
 }
 
@@ -580,6 +659,15 @@ struct HoldRequest {
     /// callers omit it — the popup falls back to plain body text.
     #[serde(default)]
     code: Option<String>,
+    /// Whether the popup may offer "Always". Defaults to `true` for older
+    /// callers; `false` greys out the button (e.g. privilege escalation,
+    /// which agentpactd never persists anyway).
+    #[serde(default = "default_allow_always")]
+    allow_always: bool,
+}
+
+fn default_allow_always() -> bool {
+    true
 }
 
 async fn hold_pending(
@@ -595,6 +683,7 @@ async fn hold_pending(
     let dialog_server = body.server.clone();
     let dialog_tool = body.tool.clone();
     let dialog_code = body.code.clone();
+    let dialog_allow_always = body.allow_always;
 
     let _rx = state
         .pending
@@ -632,6 +721,7 @@ async fn hold_pending(
                 &format!("Allow {dialog_server}"),
                 &body_line,
                 dialog_code.as_deref(),
+                dialog_allow_always,
             )
             .await;
             // CouldNotShow means the panel never became visible to the user
@@ -1008,11 +1098,17 @@ impl ShutdownSignals {
     }
 }
 
-/// Probe agentpactd's UDS every second and reflect reachability into
-/// the tray's issue set. The tray icon goes amber when the policy
-/// daemon stops accepting connections (e.g. crashed, bootout'd, or
-/// kyris-stopped) so the user notices without having to run a check
-/// command.
+/// Probe agentpactd every second and reflect reachability into the
+/// tray's issue set. The tray icon goes amber when the policy daemon
+/// stops servicing requests (e.g. crashed, bootout'd, kyris-stopped, or
+/// wedged) so the user notices without having to run a check command.
+///
+/// Uses a real `daemon.health` round-trip rather than a bare
+/// `connect()`: a bare connect succeeds as long as the kernel queues the
+/// connection — it can't tell "alive" from "accept loop hung" — and,
+/// because it is dropped immediately, it races the server's `accept()`
+/// and shows up there as a transient `ENOTCONN` logged once per probe.
+/// The round-trip both means something and closes cleanly.
 async fn agentpactd_health_poller() {
     let socket_path = std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -1021,7 +1117,14 @@ async fn agentpactd_health_poller() {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let reachable = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
+        // The probe is blocking I/O (connect + write + read); run it off
+        // the async worker so a wedged daemon can't stall the runtime.
+        let socket = socket_path.clone();
+        let reachable = tokio::task::spawn_blocking(move || {
+            agentpact::probe_daemon_health(&socket, Duration::from_secs(2))
+        })
+        .await
+        .unwrap_or(false);
         if reachable {
             crate::tray::clear_issue("agentpactd");
         } else {
@@ -1031,6 +1134,88 @@ async fn agentpactd_health_poller() {
             );
         }
     }
+}
+
+/// Event-driven watcher on the user-level `pact.yaml`. Resolves the
+/// effective mode once at startup, then re-resolves only when the
+/// `user_policy_dir` actually changes — same pattern agentpactd's
+/// own policy watcher uses, just narrowed to "tell the tray icon
+/// when mode flips."
+///
+/// The tray is a system-wide indicator with no working-directory
+/// context, so we resolve against `home` (no cwd) — repo overrides
+/// are surfaced by `kyris status` / `doctor` instead. Uses
+/// `agentpact::policy::resolution` so this watcher and the CLI's
+/// headline can't drift.
+///
+/// If the filesystem watcher fails to register (vanishingly rare
+/// on supported platforms — would require missing inotify on Linux
+/// or `FSEvents` on macOS), we log a warning and continue with
+/// whatever mode was resolved at startup. No polling fallback —
+/// "either event-driven, or static-from-boot" is easier to reason
+/// about than a silent polling fallback that wastes CPU.
+async fn watch_policy_mode() {
+    // `agentpact` is locally aliased to `kyris_agentpact_client` (the
+    // wire-types crate, no `policy`/`config`/`protocol` modules);
+    // reach the agentpact server lib via the fully-qualified
+    // `::agentpact` path.
+    use ::agentpact::policy::resolution::{SYSTEM_POLICY_DIR, resolve_mode_for};
+    use ::agentpact::protocol::types::Mode;
+    use notify_debouncer_mini::new_debouncer;
+
+    let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) else {
+        tracing::warn!("HOME unset; tray policy-mode indicator will stay at default");
+        return;
+    };
+    let user_dir = ::agentpact::config::default_user_policy_dir(&home);
+    let system_dir = std::path::Path::new(SYSTEM_POLICY_DIR);
+
+    // Capture the resolved mode and push to the tray.
+    let push_to_tray = || {
+        let log_mode = resolve_mode_for(&home, &home, &user_dir, system_dir).mode == Mode::Log;
+        crate::tray::set_log_mode(log_mode);
+    };
+    push_to_tray();
+
+    // notify thread → async task. Capacity 1 because any pending
+    // wakeup means "re-resolve"; coalescing extras is correct.
+    let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // 100ms debounce matches agentpactd's policy watcher.
+    let debouncer = match new_debouncer(Duration::from_millis(100), move |_| {
+        let _ = fs_tx.try_send(());
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to create policy mode watcher; tray mode will be static"
+            );
+            return;
+        }
+    };
+    let mut debouncer = debouncer;
+
+    if let Err(e) = debouncer
+        .watcher()
+        .watch(&user_dir, notify::RecursiveMode::NonRecursive)
+    {
+        tracing::warn!(
+            dir = %user_dir.display(),
+            error = %e,
+            "could not watch user-policy directory; tray mode will be static"
+        );
+        return;
+    }
+    tracing::info!(dir = %user_dir.display(), "watching for policy mode changes");
+
+    // Hold `debouncer` on this task's stack so the underlying
+    // watcher thread lives as long as the task does. The task
+    // itself lives until process exit.
+    while fs_rx.recv().await.is_some() {
+        push_to_tray();
+    }
+    drop(debouncer);
 }
 
 /// Write a JSON diagnostics dump to
@@ -1126,6 +1311,27 @@ async fn shutdown_signal(_streams: ShutdownStreams) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn testIsKyrisdExecutableMatchesInstalledAndTestBinaries() {
+        // Installed/dev binary.
+        assert!(is_kyrisd_executable("kyrisd"));
+        // cargo test/bench binaries: `kyrisd-<hex>`.
+        assert!(is_kyrisd_executable("kyrisd-63734a7a32da801b"));
+        assert!(is_kyrisd_executable("kyrisd-deadbeef"));
+        // Not kyrisd: the CLI, the MCP wrapper, the policy daemon.
+        assert!(!is_kyrisd_executable("kyris"));
+        assert!(!is_kyrisd_executable("kyris-mcp"));
+        assert!(!is_kyrisd_executable("agentpactd"));
+        // `kyrisd-` prefix with a non-hex suffix is not a cargo artifact
+        // and must not be swept (guards against e.g. `kyrisd-backup`).
+        assert!(!is_kyrisd_executable("kyrisd-backup"));
+        assert!(!is_kyrisd_executable("kyrisd-"));
+        // Substring / suffix matches must not trip it.
+        assert!(!is_kyrisd_executable("notkyrisd"));
+        assert!(!is_kyrisd_executable("kyrisdd"));
+    }
 
     use axum::routing::get;
     use kyris_core::config::ProviderFormat;
@@ -2021,6 +2227,7 @@ mod tests {
                     server: "github",
                     tool: "read_file",
                     code: None,
+                    allow_always: true,
                 },
             )
             .await
@@ -2081,6 +2288,7 @@ mod tests {
                     server: "github",
                     tool: "write_file",
                     code: None,
+                    allow_always: true,
                 },
             )
             .await

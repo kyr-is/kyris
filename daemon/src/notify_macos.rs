@@ -103,6 +103,7 @@ pub fn show_approval_alert(
     title: &str,
     body: &str,
     code: Option<&str>,
+    allow_always: bool,
 ) -> crate::notify::ApprovalOutcome {
     use crate::notify::ApprovalOutcome;
 
@@ -405,6 +406,12 @@ pub fn show_approval_alert(
     let yes_btn = make_button("Yes", yes_x, MODAL_CODE_YES, "\r"); // Return: default
     let no_btn = make_button("No", no_x, MODAL_CODE_NO, "\u{1b}"); // Escape: cancel
     let always_btn = make_button("Always", always_x, MODAL_CODE_ALWAYS, "");
+    // Privilege escalations (and anything agentpactd won't persist) can't be
+    // "Always"-remembered — grey the button out. The server-side guard in
+    // `should_persist_override` is authoritative regardless; this is UX.
+    if !allow_always {
+        always_btn.setEnabled(false);
+    }
     content_view.addSubview(&yes_btn);
     content_view.addSubview(&no_btn);
     content_view.addSubview(&always_btn);

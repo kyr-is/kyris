@@ -536,8 +536,8 @@ The short version is simple: AgentPact defines the contract, Kyris gets onto the
 |---------|-------------|
 | `kyris install` | Install shell hooks, binaries, and configure detected agents |
 | `kyris uninstall` | Remove all Kyris modifications (restores backups) |
-| `kyris stop` | Disable governance: stop both daemons (`kyrisd` + `agentpactd`) and bypass shell/agent hooks. Persists across reboot via `launchctl disable`. Writes `~/.kyris/disabled` so hook binaries early-exit without contacting any daemon. |
-| `kyris start` | Re-enable governance: `launchctl enable` + `kickstart` both daemons, wait for health (up to 10s), then remove the sentinel. Suggests reinstall if startup fails. |
+| `kyris disable` | Switch the user policy (`~/.config/agentpact/policy/pact.yaml`) to `mode: log` so agentpactd records commands but does not prompt or deny. Tray icon shows a red horizontal bar across the kyris glyph to make the non-enforcing state visible. Daemons stay running. Errors if agentpactd is unreachable. |
+| `kyris enable` | Flip the same policy file to `mode: enforce`: catalog-classified commands auto-allow, unclassified commands route to the menu-bar approval popup (or `kyris pending` when no TTY). Tray overlay cleared. Errors if agentpactd is unreachable. |
 | `kyris update [--check]` | Update Kyris binaries. `--check` prints available update without applying |
 | `kyris enroll [--force] [--relay-url URL]` | Enroll machine with Kyris hosted service via GitHub device flow. `--force` re-authenticates |
 | `kyris verify [--post-install] [--post-uninstall] [--json]` | Verify installation state |
@@ -581,11 +581,11 @@ The short version is simple: AgentPact defines the contract, Kyris gets onto the
 
 | Command | Description |
 |---------|-------------|
-| `kyris doctor` | Probe each subsystem (governance sentinel, agentpactd socket, kyrisd `/healthz`, pending approvals) and print `[✓]`/`[!]` per check with a fix suggestion. Exits non-zero on any failure. |
+| `kyris doctor` | Probe each subsystem (agentpactd socket, kyrisd `/healthz`, pending approvals) and print `[✓]`/`[!]` per check with a fix suggestion. First line is the headline (`Kyris — enforcing` / `Kyris — enforcement disabled — log only` / `Kyris — errors encountered — may not enforce correctly`). Exits non-zero on any failure. |
 | `kyris logs` | List log file paths (kyris, kyrisd-launchd, agentpactd, shell fail-open) with size and last-modified time |
 | `kyris daemon status` | Show kyrisd's launchd state and `/healthz` reachability |
 
-Daemon lifecycle (start/stop) is top-level `kyris start` / `kyris stop` under **Lifecycle** — those manage both daemons together and toggle the disabled-hooks sentinel. There is no separate `kyris daemon logs` — `kyris logs` covers all kyris log files.
+Daemon lifecycle is not kyris's responsibility — the launchd plists keep `kyrisd` and `agentpactd` up. Use `kyris disable` / `kyris enable` to toggle whether agentpactd actually enforces (without touching daemon lifecycle), or `kyris uninstall` for a real teardown. There is no separate `kyris daemon logs` — `kyris logs` covers all kyris log files.
 
 ### Operator Workflows
 

@@ -188,11 +188,8 @@ fn load_merged_policy(policy_dir: Option<&Path>) -> Result<PolicyLevel, String> 
         for (cmd, perm) in &level.commands {
             merged.commands.insert(cmd.clone(), *perm);
         }
-        for (cmd, perm) in &level.categories {
-            merged.categories.insert(cmd.clone(), *perm);
-        }
-        for (cmd, perm) in &level.domains {
-            merged.domains.insert(cmd.clone(), *perm);
+        for (host, perm) in &level.urls {
+            merged.urls.insert(host.clone(), *perm);
         }
         for (cmd, perm) in &level.paths {
             merged.paths.insert(cmd.clone(), *perm);
@@ -287,7 +284,7 @@ pub fn compile_opencode_permissions(
             .collect(),
     );
     let edit_rules = sorted_map(level.paths.iter().map(|(k, p)| (k.clone(), p)).collect());
-    let webfetch_rules = sorted_map(level.domains.iter().map(|(k, p)| (k.clone(), p)).collect());
+    let webfetch_rules = sorted_map(level.urls.iter().map(|(k, p)| (k.clone(), p)).collect());
 
     let mut output = serde_json::Map::new();
     if !bash_rules.is_empty() {
@@ -472,14 +469,14 @@ pub struct CodexPermissionsTable {
     pub gaps: Vec<String>,
 }
 
-/// Compile `AgentPact` `paths` and `domains` policy into the two permission
+/// Compile `AgentPact` `paths` and `urls` policy into the two permission
 /// tables that Codex CLI supports natively.
 ///
 /// **Filesystem** (`paths`): direct mapping — each path glob gets a Codex
 /// access mode via [`permission_to_file_mode`]. `Ask` fails closed to `none`.
 ///
-/// **Network** (`domains`): host-only mapping — Codex matches by hostname, not
-/// URL path. If a domain key includes a path component (`"api.example.com/v2/*"`)
+/// **Network** (`urls`): host-only mapping — Codex matches by hostname, not
+/// URL path. If a url key includes a path component (`"api.example.com/v2/*"`)
 /// the host is extracted (`"api.example.com"`) and the path is dropped with a
 /// gap warning. `Ask` fails closed to `deny`.
 ///
@@ -503,7 +500,7 @@ pub fn compile_codex_permissions_table(
         filesystem.insert(path_glob.clone(), mode.as_codex_token().to_string());
     }
 
-    for (domain_key, perm) in &level.domains {
+    for (domain_key, perm) in &level.urls {
         let host = extract_host(domain_key);
         if host != domain_key.as_str() {
             url_paths_dropped.push(domain_key.clone());
@@ -582,9 +579,9 @@ pub fn compile_mcp_tool_filters(
 /// Returns precision-loss warnings from compiling the current policy into
 /// Codex CLI's native permission tables.
 ///
-/// Paths and domains are now compiled into `[permissions.kyris]` in
+/// Paths and urls are now compiled into `[permissions.kyris]` in
 /// `config.toml`. This function surfaces only what was lost in translation:
-/// URL path components stripped from domain keys (Codex is host-only) and
+/// URL path components stripped from url keys (Codex is host-only) and
 /// ask rules that collapsed to deny/none (no prompt path at the sandbox layer).
 /// Returns an empty Vec when all rules compile without loss.
 pub fn detect_codex_gaps(policy_path: Option<&Path>) -> Vec<String> {
@@ -781,7 +778,7 @@ spec:
     "./secrets/*": deny
     "./src/*": auto
     "./config/*": ask
-  domains:
+  urls:
     "internal.corp.example.com": auto
     "*.evil.com": deny
     "api.external.io": ask
@@ -1147,7 +1144,7 @@ spec:
   paths:
     "/tmp/*": auto
     "/etc/secrets": deny
-  domains:
+  urls:
     "example.com": auto
     "*.evil.com": deny
 "#,
@@ -1190,7 +1187,7 @@ kind: PolicyOverride
 metadata:
   name: domains
 spec:
-  domains:
+  urls:
     "api.example.com/v2/*": deny
     "clean.example.com": auto
 "#,
@@ -1218,7 +1215,7 @@ metadata:
 spec:
   paths:
     "/home/user/sensitive/*": ask
-  domains:
+  urls:
     "internal.corp": ask
 "#,
         );
@@ -1250,7 +1247,7 @@ spec:
   paths:
     "/tmp/safe/*": auto
     "/etc/secrets": deny
-  domains:
+  urls:
     "api.example.com": auto
     "*.evil.com": deny
 "#,
@@ -1277,7 +1274,7 @@ kind: PolicyOverride
 metadata:
   name: url-paths
 spec:
-  domains:
+  urls:
     "api.example.com/v2/*": deny
     "https://cdn.example.com/assets": auto
     "clean.host.com": deny
@@ -1315,7 +1312,7 @@ metadata:
 spec:
   paths:
     "/sensitive/*": ask
-  domains:
+  urls:
     "internal.corp": ask
 "#,
         );
@@ -1431,7 +1428,7 @@ metadata:
 spec:
   paths:
     "./scripts/deploy.sh": deny
-  domains:
+  urls:
     "api.example.com": deny
 "#,
         );

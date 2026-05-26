@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-//! `kyris doctor` — diagnostic dump for "the tray icon is amber, what's wrong?"
+//! `kyris doctor` — diagnostic dump for "the tray icon shows the
+//! warning overlay, what's wrong?"
 //!
 //! Each check probes a subsystem first-hand from the user's process:
 //!
-//! - sentinel: is `~/.kyris/disabled` present?
 //! - agentpactd: does the UDS accept a connection?
 //! - kyrisd: does `/healthz` return success?
 //! - pending approvals: does kyrisd show held requests?
@@ -19,16 +19,20 @@ use std::time::Duration;
 
 /// Diagnose why the tray icon shows the warning overlay.
 ///
-/// Probes each subsystem first-hand from this process — the governance
-/// sentinel, the agentpactd UDS, kyrisd's `/healthz`, and the pending-
-/// approvals queue — and prints `[✓]`/`[!]` per check with a one-line
-/// fix hint when something's wrong. Exits non-zero if any check fails.
+/// Probes each subsystem first-hand from this process — the
+/// agentpactd UDS, kyrisd's `/healthz`, and the pending-approvals
+/// queue — and prints `[✓]`/`[!]` per check with a one-line fix hint
+/// when something's wrong. Exits non-zero if any check fails.
 #[derive(Args)]
 pub struct DoctorArgs {}
 
 pub fn run(_args: DoctorArgs) {
-    println!("Kyris Doctor");
-    println!("============");
+    // Headline first — single-line summary of effective enforcement
+    // posture so the operator knows at a glance whether kyris is
+    // mediating, observing-only, or broken before reading the per-
+    // check detail block below.
+    println!("{}", crate::headline::render());
+    println!();
 
     let checks = run_checks();
     let mut all_ok = true;
@@ -61,31 +65,97 @@ struct CheckResult {
 }
 
 fn run_checks() -> Vec<CheckResult> {
-    vec![
-        check_sentinel(),
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+    let mut checks = vec![
         check_agentpactd(),
         check_kyrisd(),
         check_pending_approvals(),
-    ]
+        check_directory_effective_mode(&cwd),
+    ];
+    checks.extend(check_repo_policy_parse(&cwd));
+    checks
 }
 
-fn check_sentinel() -> CheckResult {
-    let path = kyris_core::paths::disabled_marker_path();
-    if path.exists() {
-        CheckResult {
-            name: "governance",
+fn check_directory_effective_mode(cwd: &std::path::Path) -> CheckResult {
+    use agentpact::policy::resolution::{
+        ModeSource, SYSTEM_POLICY_DIR, resolve_mode_at, resolve_mode_for,
+    };
+    use agentpact::protocol::types::Mode;
+
+    let Some(here) = resolve_mode_at(cwd) else {
+        return CheckResult {
+            name: "effective mode (this directory)",
             ok: false,
-            detail: format!("disabled (sentinel present: {})", path.display()),
-            fix: Some("kyris start"),
-        }
+            detail: "HOME is unset — cannot resolve user policy".to_string(),
+            fix: Some("ensure HOME is exported"),
+        };
+    };
+
+    let user_resolution = std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .map(|home| {
+            let user_dir = agentpact::config::default_user_policy_dir(&home);
+            resolve_mode_for(
+                &home,
+                &home,
+                &user_dir,
+                std::path::Path::new(SYSTEM_POLICY_DIR),
+            )
+        });
+
+    let differs = user_resolution
+        .as_ref()
+        .is_some_and(|u| u.mode != here.mode);
+
+    let here_label = match here.mode {
+        Mode::Enforce => "enforce",
+        Mode::Log => "log",
+    };
+    let source = match &here.source {
+        ModeSource::Repo { path } => format!("repo override at {}", path.display()),
+        ModeSource::User { path } => format!("user policy at {}", path.display()),
+        ModeSource::System { path } => format!("system policy at {}", path.display()),
+        ModeSource::BundledDefault => "bundled default (no user policy yet)".to_string(),
+    };
+
+    let detail = if differs {
+        // SAFETY: differs implies user_resolution is Some.
+        let user_label = match user_resolution
+            .expect("user resolution present when differs is true")
+            .mode
+        {
+            Mode::Enforce => "enforce",
+            Mode::Log => "log",
+        };
+        format!("{here_label} (via {source}); differs from user-level mode `{user_label}`")
     } else {
-        CheckResult {
-            name: "governance",
-            ok: true,
-            detail: "enabled (no sentinel)".to_string(),
-            fix: None,
-        }
+        format!("{here_label} (via {source})")
+    };
+
+    CheckResult {
+        name: "effective mode (this directory)",
+        // The override is informational, not an error. Always `ok`
+        // — a real problem would be a parse failure (handled below).
+        ok: true,
+        detail,
+        fix: None,
     }
+}
+
+fn check_repo_policy_parse(cwd: &std::path::Path) -> Vec<CheckResult> {
+    agentpact::policy::resolution::policy_diagnostics_at(cwd)
+        .into_iter()
+        .filter_map(|diag| {
+            let err = diag.status.err()?;
+            Some(CheckResult {
+                name: "policy file parse",
+                ok: false,
+                detail: format!("{}: {err}", diag.path.display()),
+                fix: Some("fix the YAML or delete the file"),
+            })
+        })
+        .collect()
 }
 
 fn check_agentpactd() -> CheckResult {
@@ -106,7 +176,7 @@ fn check_agentpactd() -> CheckResult {
             name: "agentpactd",
             ok: false,
             detail: format!("socket not responding at {socket_path}"),
-            fix: Some("kyris start (or reinstall agentpact)"),
+            fix: Some("reinstall agentpact (try `kyris doctor` for socket diagnostics)"),
         }
     }
 }
@@ -126,13 +196,13 @@ fn check_kyrisd() -> CheckResult {
             name: "kyrisd",
             ok: false,
             detail: format!("/healthz returned a non-success status at {base_url}"),
-            fix: Some("kyris logs (then likely `kyris start`)"),
+            fix: Some("kyris logs (kyrisd is up but unhealthy — inspect logs)"),
         },
         Err(e) => CheckResult {
             name: "kyrisd",
             ok: false,
             detail: format!("/healthz unreachable at {base_url}: {e}"),
-            fix: Some("kyris start"),
+            fix: Some("launchctl kickstart gui/$UID/is.kyr.kyrisd (or reinstall)"),
         },
     }
 }
@@ -231,23 +301,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn testCheckSentinelDetailMentionsRunStart() {
-        // When sentinel is present we always suggest `kyris start` as
-        // the fix — keep the suggestion stable so docs don't drift.
-        let result = CheckResult {
-            name: "governance",
-            ok: false,
-            detail: "disabled".into(),
-            fix: Some("kyris start"),
-        };
-        assert_eq!(result.fix, Some("kyris start"));
-    }
-
-    #[test]
-    fn testRunChecksReturnsAtLeastFour() {
-        // governance + agentpactd + kyrisd + pending — the four
-        // diagnostic axes doctor reports on.
+    fn testRunChecksReturnsAtLeastThree() {
+        // agentpactd + kyrisd + pending — the three diagnostic axes
+        // doctor reports on after the sentinel mechanism was retired.
         let checks = run_checks();
-        assert!(checks.len() >= 4);
+        assert!(checks.len() >= 3);
     }
 }

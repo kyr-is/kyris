@@ -86,23 +86,6 @@ pub fn manifest_path() -> PathBuf {
     runtime_dir().join("manifest.json")
 }
 
-/// `~/.kyris/disabled` — sentinel file created by `kyris stop`. Presence
-/// means the user has paused governance: every hook entry point exits
-/// without contacting agentpactd or logging anything. Removed by
-/// `kyris start`.
-#[must_use]
-pub fn disabled_marker_path() -> PathBuf {
-    runtime_dir().join("disabled")
-}
-
-/// Whether governance is currently disabled via the sentinel file. Hot
-/// path: called by `kyris-hook`, `kyris hook check`, and `kyris-mcp`
-/// on every invocation. A single `stat(2)` — cheap.
-#[must_use]
-pub fn is_disabled() -> bool {
-    disabled_marker_path().exists()
-}
-
 /// `~/.kyris/hooks/` — agent hook scripts kyris install drops in place.
 #[must_use]
 pub fn hooks_dir() -> PathBuf {
@@ -309,41 +292,6 @@ mod tests {
             assert_eq!(data_dir(), PathBuf::from("/xdata/kyris"));
             assert_eq!(state_dir(), PathBuf::from("/xstate/kyris"));
             assert_eq!(runtime_dir(), PathBuf::from("/h/.kyris"));
-        });
-    }
-
-    #[test]
-    fn testDisabledMarkerPathDefaultsToRuntimeDir() {
-        run_in_isolated_env(|| {
-            assert_eq!(disabled_marker_path(), PathBuf::from("/h/.kyris/disabled"));
-        });
-    }
-
-    #[test]
-    fn testDisabledMarkerPathHonorsKyrisHome() {
-        run_in_isolated_env(|| {
-            unsafe {
-                std::env::set_var("KYRIS_HOME", "/sandbox/k");
-            }
-            // Sentinel rides along with runtime_dir, so `kyris stop` in
-            // a sandbox flips that sandbox specifically — not the user's
-            // real install.
-            assert_eq!(disabled_marker_path(), PathBuf::from("/sandbox/k/disabled"));
-        });
-    }
-
-    #[test]
-    fn testIsDisabledReflectsSentinelPresence() {
-        run_in_isolated_env(|| {
-            let temp = tempfile::tempdir().expect("temp");
-            unsafe {
-                std::env::set_var("KYRIS_HOME", temp.path());
-            }
-            assert!(!is_disabled(), "fresh runtime dir should not be disabled");
-            std::fs::write(temp.path().join("disabled"), b"").expect("write sentinel");
-            assert!(is_disabled(), "sentinel present should report disabled");
-            std::fs::remove_file(temp.path().join("disabled")).expect("remove sentinel");
-            assert!(!is_disabled(), "sentinel removed should report enabled");
         });
     }
 }

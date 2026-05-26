@@ -12,6 +12,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agentpact"
 version = "0.1.4"
 dependencies = [
+ "agentpact-types",
  "arc-swap",
  "aws-lc-rs",
  "chrono",
@@ -31,6 +32,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "agentpact-types"
+version = "0.1.5"
+dependencies = [
+ "schemars",
+ "serde",
 ]
 
 [[package]]
@@ -1975,6 +1984,7 @@ dependencies = [
 name = "kyris-agentpact-client"
 version = "0.1.4"
 dependencies = [
+ "agentpact-types",
  "kyris-core",
  "serde_json",
  "uuid",
@@ -1984,6 +1994,7 @@ dependencies = [
 name = "kyris-core"
 version = "0.1.4"
 dependencies = [
+ "agentpact-types",
  "chrono",
  "kyris-types",
  "reqwest 0.13.3",
@@ -2029,6 +2040,7 @@ dependencies = [
 name = "kyris-types"
 version = "0.1.4"
 dependencies = [
+ "agentpact-types",
  "chrono",
  "schemars",
  "serde",
@@ -2042,6 +2054,7 @@ dependencies = [
 name = "kyrisd"
 version = "0.1.4"
 dependencies = [
+ "agentpact",
  "arc-swap",
  "aws-lc-rs",
  "axum",
@@ -2072,6 +2085,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "syntect",
+ "sysinfo",
  "tempfile",
  "tokio",
  "tokio-rustls",
