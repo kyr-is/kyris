@@ -48,6 +48,12 @@ pub enum McpPermissionDecision {
     Ask {
         approval_id: String,
         approval_token: String,
+        /// Authoritative server signal: whether answering "Always" would
+        /// actually persist a standing override. UX surfaces offer "Always"
+        /// only when this is `true`. Defaults to `false` when the daemon omits
+        /// it (older daemon / malformed response) — conservative: a missing
+        /// signal means don't advertise a grant that may not stick.
+        allow_always: bool,
     },
 }
 

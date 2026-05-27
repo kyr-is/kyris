@@ -289,6 +289,7 @@ async fn forward_mcp_post(
         policy::PolicyDecision::Ask {
             approval_id,
             approval_token,
+            allow_always,
         } => {
             let pending_timeout = config.mcp.pending_timeout_seconds;
             let tool_display = tool_name.as_deref().unwrap_or("unknown tool");
@@ -300,6 +301,7 @@ async fn forward_mcp_post(
                 approval_token,
                 server_name.clone(),
                 tool_name,
+                allow_always,
             );
 
             let pending = state.pending.clone();

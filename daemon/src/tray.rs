@@ -113,14 +113,15 @@ mod gui {
     use std::thread::JoinHandle;
 
     /// Ask the user to approve an action.
-    /// TODO: Windows notification/dialog — returns `Yes` for now.
+    /// TODO: Windows notification/dialog. Until one exists, fail safe with
+    /// `CouldNotShow` (leave the request pending) — never auto-approve.
     pub async fn ask_approval(
         _title: &str,
         _body: &str,
         _code: Option<&str>,
         _allow_always: bool,
     ) -> crate::notify::ApprovalOutcome {
-        crate::notify::ApprovalOutcome::Yes
+        crate::notify::ApprovalOutcome::CouldNotShow
     }
 
     /// Run the UI event loop. TODO: Win32 Shell_NotifyIcon tray icon.
@@ -140,14 +141,15 @@ mod gui {
     use std::thread::JoinHandle;
 
     /// Ask the user to approve an action.
-    /// TODO: Linux desktop notification/dialog — returns `Yes` for now.
+    /// TODO: GTK4 / freedesktop dialog. Until one exists, fail safe with
+    /// `CouldNotShow` (leave the request pending) — never auto-approve.
     pub async fn ask_approval(
         _title: &str,
         _body: &str,
         _code: Option<&str>,
         _allow_always: bool,
     ) -> crate::notify::ApprovalOutcome {
-        crate::notify::ApprovalOutcome::Yes
+        crate::notify::ApprovalOutcome::CouldNotShow
     }
 
     /// Run the UI event loop. TODO: GTK4 / ksni tray icon for Linux.

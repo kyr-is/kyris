@@ -82,6 +82,9 @@ fn send_permission_response_with_socket(
     response: UserApprovalResponse,
     socket_timeout: std::time::Duration,
 ) -> Result<(), String> {
+    // The optional advisory warning (e.g. an "always" grant that could not be
+    // persisted) is logged by agentpactd; the MCP wrapper has no inline channel
+    // to surface it, so discard it here.
     agentpact::send_permission_response(
         sock_path,
         "kyris-mcp-resp",
@@ -89,9 +92,10 @@ fn send_permission_response_with_socket(
         response,
         Some(socket_timeout),
     )
+    .map(|_warning| ())
 }
 
-fn prompt_user_tty(server_name: &str, tool_name: &str) -> UserApprovalResponse {
+fn prompt_user_tty(server_name: &str, tool_name: &str, allow_always: bool) -> UserApprovalResponse {
     use std::io::{BufRead, Write};
 
     let Ok(tty_write) = std::fs::OpenOptions::new().write(true).open("/dev/tty") else {
@@ -101,10 +105,16 @@ fn prompt_user_tty(server_name: &str, tool_name: &str) -> UserApprovalResponse {
         return UserApprovalResponse::Denied;
     };
 
+    // Offer "always" only when the daemon says a grant would actually persist.
+    let choices = if allow_always {
+        "[y/n/always]"
+    } else {
+        "[y/n]"
+    };
     let mut writer = std::io::BufWriter::new(tty_write);
     let _ = write!(
         writer,
-        "[kyris] allow {server_name}/{tool_name}? [y/n/always] "
+        "[kyris] allow {server_name}/{tool_name}? {choices} "
     );
     let _ = writer.flush();
 
@@ -117,7 +127,15 @@ fn prompt_user_tty(server_name: &str, tool_name: &str) -> UserApprovalResponse {
     let trimmed = input.trim().to_lowercase();
     match trimmed.as_str() {
         "y" | "yes" => UserApprovalResponse::Approved,
-        "a" | "always" => UserApprovalResponse::Always,
+        // "always" is honored only when persistable; otherwise the daemon
+        // would refuse it anyway, so treat it as a one-time approval.
+        "a" | "always" => {
+            if allow_always {
+                UserApprovalResponse::Always
+            } else {
+                UserApprovalResponse::Approved
+            }
+        }
         _ => UserApprovalResponse::Denied,
     }
 }
@@ -205,12 +223,14 @@ pub async fn check_permission_with_socket(
         Ok(PermissionRequestOutcome::Ask {
             approval_id,
             approval_token,
+            allow_always,
         }) => {
             if tty {
                 resolve_ask_via_tty(
                     server_name,
                     tool_name,
                     &approval_token,
+                    allow_always,
                     sock_path,
                     socket_timeout,
                 )
@@ -221,6 +241,7 @@ pub async fn check_permission_with_socket(
                     &approval_token,
                     server_name,
                     tool_name,
+                    allow_always,
                     sock_path,
                     socket_timeout,
                 )
@@ -252,6 +273,7 @@ async fn resolve_ask_via_tty(
     server_name: &str,
     tool_name: &str,
     approval_token: &str,
+    allow_always: bool,
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
@@ -262,7 +284,7 @@ async fn resolve_ask_via_tty(
     let timeout = socket_timeout;
 
     let decision = tokio::task::spawn_blocking(move || {
-        let user_response = prompt_user_tty(&server, &tool);
+        let user_response = prompt_user_tty(&server, &tool, allow_always);
         match send_permission_response_with_socket(&socket, &token, user_response, timeout) {
             Ok(()) if user_response.allows_execution() => PactDecision::Allow,
             Ok(()) => PactDecision::Deny {
@@ -287,6 +309,7 @@ async fn resolve_ask_via_kyrisd(
     approval_token: &str,
     server_name: &str,
     tool_name: &str,
+    allow_always: bool,
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
@@ -313,8 +336,9 @@ async fn resolve_ask_via_kyrisd(
             // the daemon falls back to plain-text informativeText. Adding
             // the serialized args is a follow-up.
             code: None,
-            // MCP tool calls aren't shell privilege escalation; "Always" is fine.
-            allow_always: true,
+            // Authoritative server signal: only offer "Always" when the daemon
+            // would actually persist the grant (e.g. not a non-cacheable call).
+            allow_always,
         },
     )
     .await;
@@ -437,7 +461,8 @@ mod tests {
             agentpact::parse_mcp_permission_response(&response),
             PermissionRequestOutcome::Ask {
                 approval_id: "req-42".to_string(),
-                approval_token: "apt_123".to_string()
+                approval_token: "apt_123".to_string(),
+                allow_always: false,
             }
         );
     }

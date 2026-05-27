@@ -161,6 +161,10 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
                 McpPermissionDecision::Ask {
                     approval_id,
                     approval_token,
+                    allow_always: response
+                        .get("allow_always")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
                 }
             }
         }
@@ -206,6 +210,27 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
 
 const RETRY_BACKOFFS: &[u64] = &[50, 100, 250];
 
+/// Deny — without sending — an `execute` command longer than the shared
+/// governance ceiling ([`agentpact_types::MAX_COMMAND_LENGTH_CEILING`]). A
+/// command that long cannot fit within agentpactd's socket message limit, so
+/// it could never be received intact, and it is auto-denied regardless.
+/// Guarding here makes that deny deterministic: it avoids transmitting a
+/// payload the daemon would reject mid-read, which could otherwise surface as
+/// a transport error and fail *open* under `on_daemon_unavailable: allow`.
+fn oversized_execute_deny(action: &str, detail: &str) -> Option<McpPermissionDecision> {
+    (action == "execute" && detail.len() > agentpact_types::MAX_COMMAND_LENGTH_CEILING).then(|| {
+        McpPermissionDecision::Deny {
+            code: DenyCode::PolicyDenied,
+            reason: format!(
+                "command exceeds the {}-byte governance ceiling (length {}); split it into smaller commands",
+                agentpact_types::MAX_COMMAND_LENGTH_CEILING,
+                detail.len()
+            ),
+            hint: None,
+        }
+    })
+}
+
 /// Requests `AgentPact` permission for an MCP tool invocation.
 ///
 /// # Errors
@@ -250,6 +275,9 @@ pub fn request_hook_permission(
     seed_boundary_pid: Option<u32>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
+    if let Some(deny) = oversized_execute_deny(action, detail) {
+        return Ok((deny, None));
+    }
     let request = build_hook_permission_request(
         request_id_prefix,
         action,
@@ -286,6 +314,9 @@ pub fn request_hook_permission_preview(
     seed_boundary_pid: Option<u32>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
+    if let Some(deny) = oversized_execute_deny(action, detail) {
+        return Ok((deny, None));
+    }
     let mut request = build_hook_permission_request(
         request_id_prefix,
         action,
@@ -304,6 +335,10 @@ pub fn request_hook_permission_preview(
             Some("PACT_ASK") => McpPermissionDecision::Ask {
                 approval_id: String::new(),
                 approval_token: String::new(),
+                allow_always: response
+                    .get("allow_always")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             },
             _ => parse_mcp_permission_response(&response),
         };
@@ -369,6 +404,13 @@ pub fn send_trace_attach(
 
 /// Sends a user approval decision back to `agentpactd`.
 ///
+/// On success returns an optional advisory **warning** the daemon attached to
+/// the response (its `reason` field) — non-`None` when the decision was applied
+/// but a side effect could not be completed, e.g. an `Always` grant that was
+/// approved once but could not be persisted (read-only policy dir). Callers
+/// that surface UI should show it to the developer; others may ignore it (the
+/// daemon also logs it). `None` on an ordinary, fully-applied response.
+///
 /// # Errors
 ///
 /// Returns an error when the response cannot be delivered to `agentpactd` or when the
@@ -379,12 +421,17 @@ pub fn send_permission_response(
     approval_token: &str,
     response: ApprovalResponse,
     socket_timeout: Option<Duration>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let request = build_permission_respond_request(request_id_prefix, approval_token, response);
     let response_value = send_daemon_request_to_socket(socket_path, &request, socket_timeout)?;
+    let warning = response_value
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(str::to_owned);
     match parse_mcp_permission_response(&response_value) {
-        McpPermissionDecision::Allow { .. } => Ok(()),
-        McpPermissionDecision::Deny { .. } if response == ApprovalResponse::Denied => Ok(()),
+        McpPermissionDecision::Allow { .. } => Ok(warning),
+        McpPermissionDecision::Deny { .. } if response == ApprovalResponse::Denied => Ok(warning),
         McpPermissionDecision::Deny { reason, .. } => {
             Err(format!("agentpactd rejected approval response: {reason}"))
         }
@@ -606,6 +653,67 @@ mod tests {
 
         assert!(ApprovalResponse::Approved.allows_execution());
         assert!(!ApprovalResponse::Denied.allows_execution());
+    }
+
+    #[test]
+    fn testOversizedExecuteDeniedWithoutSending() {
+        // Over the ceiling → denied locally; the (nonexistent) socket is never
+        // contacted, so we get a Deny rather than a transport Err.
+        let big = "a".repeat(agentpact_types::MAX_COMMAND_LENGTH_CEILING + 1);
+        let result = request_hook_permission(
+            "/tmp/nonexistent-agentpact.sock",
+            "test",
+            "execute",
+            &big,
+            None,
+            None,
+            Duration::from_millis(50),
+        );
+        match result {
+            Ok((McpPermissionDecision::Deny { code, .. }, segments)) => {
+                assert_eq!(code, DenyCode::PolicyDenied);
+                assert!(segments.is_none());
+            }
+            other => panic!("expected local deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn testAtCeilingExecuteIsStillSent() {
+        // Exactly at the ceiling is allowed through to the daemon for the
+        // precise decision; with no daemon that surfaces as a transport Err,
+        // proving we attempted to send rather than denying locally.
+        let at = "a".repeat(agentpact_types::MAX_COMMAND_LENGTH_CEILING);
+        let result = request_hook_permission(
+            "/tmp/nonexistent-agentpact.sock",
+            "test",
+            "execute",
+            &at,
+            None,
+            None,
+            Duration::from_millis(50),
+        );
+        assert!(
+            result.is_err(),
+            "at-ceiling command must be sent: {result:?}"
+        );
+    }
+
+    #[test]
+    fn testNonExecuteIsNotLengthCapped() {
+        // The cap is for commands only; a long read path is not denied locally
+        // (unreachable socket → Err, proving it tried to send).
+        let big = "a".repeat(agentpact_types::MAX_COMMAND_LENGTH_CEILING + 1);
+        let result = request_hook_permission(
+            "/tmp/nonexistent-agentpact.sock",
+            "test",
+            "read",
+            &big,
+            None,
+            None,
+            Duration::from_millis(50),
+        );
+        assert!(result.is_err(), "non-execute must not be length-capped");
     }
 
     #[test]
@@ -834,6 +942,7 @@ mod tests {
 
     #[test]
     fn testParseMcpPermissionResponseAsk() {
+        // No allow_always field → conservative default false.
         let response = serde_json::json!({
             "code": "PACT_ASK",
             "approval_id": "req-42",
@@ -844,6 +953,25 @@ mod tests {
             McpPermissionDecision::Ask {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
+                allow_always: false,
+            }
+        );
+    }
+
+    #[test]
+    fn testParseMcpPermissionResponseAskCarriesAllowAlways() {
+        let response = serde_json::json!({
+            "code": "PACT_ASK",
+            "approval_id": "req-42",
+            "approval_token": "apt_123",
+            "allow_always": true
+        });
+        assert_eq!(
+            parse_mcp_permission_response(&response),
+            McpPermissionDecision::Ask {
+                approval_id: "req-42".to_string(),
+                approval_token: "apt_123".to_string(),
+                allow_always: true,
             }
         );
     }

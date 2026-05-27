@@ -291,7 +291,9 @@ impl AgentDescriptor for ClaudeCode {
             // governable side effect; skip the agentpactd round-trip entirely
             // (the daemon contract for action=call requires context.mcp_server,
             // which built-ins cannot supply). New Claude built-ins not listed
-            // here will warn-and-allow at run time — see hook_cmd.rs.
+            // here will warn-and-defer at run time — kyris hands them to
+            // Claude's own permission prompt rather than suppressing it. See
+            // hook_cmd.rs.
             pass_through_tools: vec![
                 "AskUserQuestion".to_string(),
                 "TodoWrite".to_string(),

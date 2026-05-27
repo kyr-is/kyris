@@ -496,6 +496,10 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
             get(operator_gateway_records).with_state(state.clone()),
         )
         .route(
+            "/operator/stream",
+            get(operator_stream).with_state(state.clone()),
+        )
+        .route(
             "/operator/session-tokens/{session_id}",
             get(operator_session_token).with_state(state),
         )
@@ -573,6 +577,25 @@ impl ResolveDecision {
     }
 }
 
+/// Map an approval-dialog outcome to a resolution.
+///
+/// `CouldNotShow` maps to `None`: the dialog never reached the user (occluded,
+/// off-space, or — on platforms without an approval UI — never attempted), so
+/// the request is left **pending** for `kyris pending` / the menu-bar path
+/// rather than resolved. Returning `Approved` here would defeat the permission
+/// gate; see `notify::ask_approval`'s non-macOS fallback, which returns
+/// `CouldNotShow` precisely so this leaves the request pending.
+fn decision_for_approval_outcome(
+    outcome: crate::notify::ApprovalOutcome,
+) -> Option<ResolveDecision> {
+    match outcome {
+        crate::notify::ApprovalOutcome::Yes => Some(ResolveDecision::Approved),
+        crate::notify::ApprovalOutcome::Always => Some(ResolveDecision::Always),
+        crate::notify::ApprovalOutcome::No => Some(ResolveDecision::Denied),
+        crate::notify::ApprovalOutcome::CouldNotShow => None,
+    }
+}
+
 fn parse_resolve_decision(value: &str) -> Option<ResolveDecision> {
     match value {
         "approved" => Some(ResolveDecision::Approved),
@@ -593,6 +616,9 @@ async fn send_permission_response(
 ) -> Result<(), String> {
     let token = approval_token.to_string();
     tokio::task::spawn_blocking(move || {
+        // Discard the optional advisory warning (e.g. an unpersisted "always"
+        // grant); agentpactd logs it, and the pending-resolution HTTP path has
+        // no channel to relay it back to the developer.
         agentpact::send_permission_response(
             &socket,
             "kyrisd-resolve",
@@ -600,6 +626,7 @@ async fn send_permission_response(
             decision.as_approval_response(),
             None,
         )
+        .map(|_warning| ())
         .map_err(|reason| reason.replace("approval response", "resolution"))
     })
     .await
@@ -685,9 +712,13 @@ async fn hold_pending(
     let dialog_code = body.code.clone();
     let dialog_allow_always = body.allow_always;
 
-    let _rx = state
-        .pending
-        .hold(body.id.clone(), body.approval_token, body.server, body.tool);
+    let _rx = state.pending.hold(
+        body.id.clone(),
+        body.approval_token,
+        body.server,
+        body.tool,
+        dialog_allow_always,
+    );
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(pending_timeout)).await;
         pending.timeout(&timeout_id);
@@ -730,18 +761,11 @@ async fn hold_pending(
             // up. Treating CouldNotShow as Denied would silently reject
             // every request whenever the user is in a fullscreen app or on
             // a different Space — the exact failure mode this design fixes.
-            let Some(decision) = (match outcome {
-                crate::notify::ApprovalOutcome::Yes => Some(ResolveDecision::Approved),
-                crate::notify::ApprovalOutcome::Always => Some(ResolveDecision::Always),
-                crate::notify::ApprovalOutcome::No => Some(ResolveDecision::Denied),
-                crate::notify::ApprovalOutcome::CouldNotShow => {
-                    tracing::warn!(
-                        pending_id = %dialog_id,
-                        "approval panel could not be shown — leaving request pending"
-                    );
-                    None
-                }
-            }) else {
+            let Some(decision) = decision_for_approval_outcome(outcome) else {
+                tracing::warn!(
+                    pending_id = %dialog_id,
+                    "approval panel could not be shown — leaving request pending"
+                );
                 return;
             };
             // Best-effort log of the user's answer for `kyris approvals`
@@ -926,6 +950,37 @@ async fn operator_gateway_records(
             ))
         }
     }
+}
+
+/// Live stream of gateway records as they are persisted (L4 of the monitoring
+/// strategy). Server-Sent Events; one JSON `GatewayRecord` per event. Subscribers
+/// that fall behind the broadcast buffer skip ahead (records are dropped for that
+/// reader, not buffered indefinitely) — the `DuckDB` store remains the full record.
+async fn operator_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let rx = state.db.subscribe_records();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(record) => {
+                    let event = Event::default()
+                        .json_data(&record)
+                        .unwrap_or_else(|_| Event::default().comment("record serialize error"));
+                    return Some((Ok::<_, std::convert::Infallible>(event), rx));
+                }
+                // Slow consumer: skip the gap and keep streaming (loop re-polls).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // Sender dropped (daemon shutting down): end the stream.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn operator_session_token(
@@ -1311,6 +1366,33 @@ async fn shutdown_signal(_streams: ShutdownStreams) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::ApprovalOutcome;
+
+    #[test]
+    fn testCouldNotShowLeavesRequestPending() {
+        // The permission-gate invariant: an outcome that never reached the
+        // user must NOT resolve the request (and must never auto-approve).
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::CouldNotShow),
+            None
+        );
+    }
+
+    #[test]
+    fn testExplicitOutcomesResolveAsChosen() {
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::Yes),
+            Some(ResolveDecision::Approved)
+        );
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::Always),
+            Some(ResolveDecision::Always)
+        );
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::No),
+            Some(ResolveDecision::Denied)
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1746,6 +1828,7 @@ mod tests {
             "tok-1".into(),
             "github".into(),
             Some("read_file".into()),
+            true,
         );
 
         let app = Router::new().route(
@@ -1844,6 +1927,7 @@ mod tests {
             "tok-s-1".into(),
             "github".into(),
             Some("read_file".into()),
+            true,
         );
 
         let app = Router::new().route(
@@ -1972,6 +2056,78 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorStreamDeliversPersistedRecord() {
+        use futures_util::StreamExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route(
+            "/operator/stream",
+            axum::routing::get(operator_stream).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        // `.send()` returns once response headers arrive, which is after the
+        // handler has already subscribed — so inserting now cannot race the
+        // subscription.
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        state
+            .db
+            .insert_batch(&[sample_event("trace-stream", Some("sess-stream"))])
+            .expect("insert");
+
+        // Read SSE chunks until the first `data:` line, then parse it.
+        let mut body = resp.bytes_stream();
+        let mut buf = String::new();
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let chunk = body.next().await.expect("stream ended").expect("chunk");
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+                    let json = line.trim_start_matches("data:").trim();
+                    return serde_json::from_str::<serde_json::Value>(json).expect("parse record");
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for streamed record");
+
+        assert_eq!(record["trace_id"], "trace-stream");
+        assert_eq!(record["provider"], "openai");
+        assert_eq!(record["status"], "success");
+
+        // The SSE response is a long-lived connection; graceful shutdown would
+        // block on it. Drop the client side and abort the server task instead.
+        drop(body);
+        let _ = shutdown_tx.send(());
+        handle.abort();
     }
 
     #[tokio::test]

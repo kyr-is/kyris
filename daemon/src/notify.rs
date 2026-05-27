@@ -47,7 +47,10 @@ pub enum ApprovalOutcome {
 
 /// Show a modal Yes / No / Always dialog and return the user's choice.
 /// On macOS with the tray feature this dispatches to the main thread via
-/// the tao event loop; on other platforms it falls back to `Yes`.
+/// the tao event loop. On other platforms there is no approval UI yet, so it
+/// returns [`ApprovalOutcome::CouldNotShow`] — the request stays pending for
+/// `kyris pending` / the menu-bar path. It must NOT return `Yes`: a permission
+/// gate that auto-approves when it cannot ask is not a gate.
 ///
 /// `code`, when `Some`, is rendered in the popup's accessoryView as
 /// monospaced text — the right surface for shell commands and file paths
@@ -69,7 +72,25 @@ pub async fn ask_approval(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (title, body, code, allow_always);
-        ApprovalOutcome::Yes
+        // No desktop approval UI on non-macOS yet. Fail safe: leave the
+        // request pending (resolvable via `kyris pending`) rather than
+        // silently approving it.
+        ApprovalOutcome::CouldNotShow
+    }
+}
+
+#[cfg(all(test, feature = "tray", not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn testNonMacosAskApprovalNeverAutoApproves() {
+        // Regression: the non-macOS fallback used to return `Yes`, silently
+        // approving every held request. It must return CouldNotShow so the
+        // request stays pending instead of being auto-approved.
+        let outcome = ask_approval("t", "b", Some("rm -rf /"), true).await;
+        assert_eq!(outcome, ApprovalOutcome::CouldNotShow);
+        assert_ne!(outcome, ApprovalOutcome::Yes);
     }
 }
 

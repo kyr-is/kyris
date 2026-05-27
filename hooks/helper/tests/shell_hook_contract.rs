@@ -196,6 +196,126 @@ fn test_kyris_hook_allows_command_via_agentpact_socket() {
 }
 
 #[test]
+fn test_kyris_hook_voids_token_and_exits_2_on_normal_ask() {
+    // A normal PACT_ASK is no longer answered with one whole-command token.
+    // The helper voids that token (so it does not linger as a pending entry)
+    // and exits 2, signaling the shell to hand off to `kyris hook
+    // resolve-shell` for per-segment approval. Stdout carries nothing.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![
+            serde_json::json!({
+                "id": "ask-1",
+                "code": "PACT_ASK",
+                "approval_id": "apr_1",
+                "approval_token": "apt_1"
+            }),
+            serde_json::json!({ "id": "void-1", "code": "PACT_OK" }),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg("safe_tool && mystery_tool")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "");
+
+    let requests = daemon.finish();
+    assert_eq!(requests.len(), 2, "expected request + void: {requests:?}");
+    assert_eq!(requests[0]["method"], "permission.request");
+    assert_eq!(requests[1]["method"], "permission.respond");
+    assert_eq!(requests[1]["response"], "voided");
+    assert_eq!(requests[1]["approval_token"], "apt_1");
+}
+
+#[test]
+fn test_kyris_hook_breaker_ask_still_returns_token_and_exits_3() {
+    // The circuit breaker is a session-level gate, not a per-command split,
+    // so it keeps its dedicated whole-command prompt: the helper returns the
+    // token (+ breaker count) and exits 3 without voiding.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "breaker-1",
+            "code": "PACT_ASK",
+            "approval_id": "apr_b",
+            "approval_token": "apt_b",
+            "extensions": { "circuit_breaker": { "count": 50 } }
+        })],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg("git status")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "apr_b\tapt_b\t50"
+    );
+
+    let requests = daemon.finish();
+    assert_eq!(requests.len(), 1, "breaker ask must not void: {requests:?}");
+    assert_eq!(requests[0]["method"], "permission.request");
+}
+
+#[test]
+fn test_kyris_hook_denies_oversized_command_locally() {
+    // A command past the 10240-byte ceiling is denied by the helper itself,
+    // before any socket contact — so a monster command can never race the
+    // socket limit into a fail-open. No daemon is started here on purpose.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+
+    let big = format!("echo {}", "a".repeat(10_241));
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg(&big)
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("governance ceiling"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn test_kyris_hook_blocks_unknown_daemon_response() {
     let temp_home = TempDir::new().expect("temp home");
     std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");

@@ -52,8 +52,23 @@ fn main() -> ExitCode {
     }
 }
 
+/// Hard ceiling (bytes) on a command we will even send to agentpactd. Mirrors
+/// `agentpact_types::MAX_COMMAND_LENGTH_CEILING`; kept as a literal because
+/// this helper is intentionally stdlib-only and takes no agentpact dependency.
+/// A command longer than this cannot fit the daemon's socket message limit, so
+/// we deny it locally rather than risk a transport error that fails open.
+const MAX_COMMAND_LENGTH_CEILING: usize = 10_240;
+
 fn cmd_check(args: &[String]) -> ExitCode {
     let (command, cwd, socket_path) = parse_check_args(args);
+
+    if command.len() > MAX_COMMAND_LENGTH_CEILING {
+        eprintln!(
+            "[agentpact] denied: command exceeds the {MAX_COMMAND_LENGTH_CEILING}-byte governance ceiling (length {}); split it into smaller commands",
+            command.len()
+        );
+        return ExitCode::from(1);
+    }
 
     if let Err(msg) = check_protocol_version(&socket_path) {
         eprintln!("[agentpact] {msg}");
@@ -105,10 +120,19 @@ fn cmd_check(args: &[String]) -> ExitCode {
             breaker_count,
         } => {
             if let Some(count) = breaker_count {
+                // Circuit breaker is a session-level gate ("too many commands
+                // without human input"), not a per-command split — so it keeps
+                // its dedicated whole-command prompt. The shell reads these
+                // fields to drive that prompt.
                 print!("{approval_id}\t{approval_token}\t{count}");
                 ExitCode::from(3)
             } else {
-                print!("{approval_id}\t{approval_token}");
+                // Normal ask. This real request minted a whole-command approval
+                // token; the shell hands off to `kyris hook resolve-shell`,
+                // which re-derives the compound split and prompts per segment,
+                // minting its own per-segment tokens. Void this whole-command
+                // token so it does not linger as a stale `kyris pending` entry.
+                void_token(&socket_path, &approval_token);
                 ExitCode::from(2)
             }
         }
@@ -245,6 +269,21 @@ fn cmd_respond(args: &[String]) -> ExitCode {
         }
         Err(_) => ExitCode::from(10),
     }
+}
+
+/// Release a minted approval token without approving it, so it does not
+/// linger as a pending entry. Sent when `check` got a normal `PACT_ASK` for
+/// a command the shell will re-resolve per segment via `kyris hook
+/// resolve-shell`. Best-effort: a failure here only means the whole-command
+/// token expires on its own TTL.
+fn void_token(socket_path: &str, approval_token: &str) {
+    let request = serde_json::json!({
+        "id": generate_id(),
+        "method": "permission.respond",
+        "approval_token": approval_token,
+        "response": "voided",
+    });
+    let _ = send_request(socket_path, &request);
 }
 
 fn cmd_send(args: &[String]) -> ExitCode {

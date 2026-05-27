@@ -33,6 +33,15 @@ pub enum HookCommand {
     /// `permission.respond` to agentpactd and exits 0 (approved) or
     /// non-zero (denied/failed).
     Hold(HookHoldArgs),
+    /// Resolve an interactive shell-hook approval **per compound segment**.
+    /// Invoked by the zsh/bash preexec hooks when `kyris-hook check` returns
+    /// a normal ask (exit 2). Re-derives the compound split with a
+    /// side-effect-free preview, then issues one real token-bearing request
+    /// per segment: auto segments run silently, and each segment that needs
+    /// approval gets its own prompt and its own "always" — on the TTY when
+    /// one is available, else via kyrisd's pending-approval system. Exits 0
+    /// (every segment allowed) or non-zero (a segment was denied/blocked).
+    ResolveShell(HookResolveShellArgs),
 }
 
 #[derive(Args)]
@@ -57,10 +66,238 @@ pub struct HookCheckArgs {
     pub agent: String,
 }
 
+#[derive(Args)]
+pub struct HookResolveShellArgs {
+    /// The full shell command line the preexec hook intercepted.
+    #[arg(long)]
+    pub cmd: String,
+    /// The shell's working directory (the request's `working_dir`).
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Path to the agentpactd UDS socket (defaults to the standard location).
+    #[arg(long)]
+    pub socket: Option<String>,
+}
+
 pub fn run(args: HookArgs) {
     match args.command {
         HookCommand::Check(check_args) => run_check(check_args),
         HookCommand::Hold(hold_args) => run_hold(hold_args),
+        HookCommand::ResolveShell(resolve_args) => run_resolve_shell(resolve_args),
+    }
+}
+
+/// Drive per-segment approval for a shell command the fast `kyris-hook check`
+/// path flagged as a normal ask. Mirrors the native hook's per-segment flow
+/// ([`dispatch_preview_outcome`]/[`drive_per_segment`]) but prompts on the
+/// TTY when one is available, falling back to kyrisd's pending-approval
+/// popup otherwise.
+fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
+    let sock_path = args
+        .socket
+        .unwrap_or_else(|| agentpact::default_socket_path().display().to_string());
+    let socket_timeout = std::time::Duration::from_secs(5);
+    let cwd = args.cwd.as_deref();
+    let action = "execute";
+
+    // Side-effect-free preview to learn the compound split. The hook never
+    // parses shell itself — the daemon owns splitting (`policy::splitter`).
+    // No token is minted here.
+    // The preview is a side-effect-free scout used ONLY for the compound split;
+    // its decision is discarded. Every line — including one the preview would
+    // deny — is re-driven through real per-segment requests below, so it is
+    // presented one component at a time and audited/accounted segment by
+    // segment in agentpactd (`classify_segment`), never short-circuited here
+    // on a side-effect-free preview.
+    let (_decision, segments) = match agentpact::request_hook_permission_preview(
+        &sock_path,
+        "kyris-hook",
+        action,
+        &args.cmd,
+        cwd,
+        None,
+        socket_timeout,
+    ) {
+        Ok(pair) => pair,
+        Err(reason) => {
+            if agentpact::allow_on_daemon_unavailable() {
+                kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
+                std::process::exit(0);
+            }
+            emit_deny(&reason);
+            std::process::exit(2);
+        }
+    };
+
+    let segs = segments.unwrap_or_else(|| vec![args.cmd.clone()]);
+
+    let allow_response = AllowResponse::EmptyStdout;
+    let ctx = PermissionCtx {
+        audit_conn: None,
+        hook_id: "",
+        agent: "shell",
+        action,
+        detail: &args.cmd,
+        cwd,
+        native_allow_response: &allow_response,
+        log_mode_fallback: false,
+        sock_path: &sock_path,
+        socket_timeout,
+        started_at: std::time::Instant::now(),
+    };
+
+    // Open the controlling terminal once. Present → prompt inline; absent
+    // (agent-spawned non-interactive shell) → delegate to kyrisd's pending
+    // popup, exactly as the no-TTY `kyris hook hold` path does today.
+    let tty = open_tty();
+
+    let result = run_segments(
+        &segs,
+        agentpact::allow_on_daemon_unavailable(),
+        |seg| classify_segment(&ctx, None, seg),
+        |approval_id, approval_token, seg, allow_always| match tty.as_ref() {
+            Some(tty) => tty_prompt_segment(
+                tty,
+                &sock_path,
+                socket_timeout,
+                approval_token,
+                seg,
+                allow_always,
+            ),
+            None => poll_segment(
+                "shell",
+                &sock_path,
+                socket_timeout,
+                approval_id,
+                approval_token,
+                seg,
+                allow_always,
+            ),
+        },
+    );
+
+    match result {
+        Ok(_) => std::process::exit(0),
+        Err(block) => {
+            emit_deny(&block.reason);
+            std::process::exit(block.exit_code);
+        }
+    }
+}
+
+/// Open the controlling terminal for interactive prompting. Returns `None`
+/// when there is no TTY (an agent-spawned non-interactive shell), in which
+/// case the caller falls back to kyrisd's pending-approval popup.
+fn open_tty() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()
+}
+
+/// Read one line from the TTY one byte at a time. Deliberately unbuffered:
+/// the same `/dev/tty` handle is reused across every per-segment prompt, so
+/// a `BufReader` could read past the newline and swallow the next prompt's
+/// answer. Returns `None` on EOF-before-any-input or a read error (treated
+/// as "no decision" → deny). The trailing newline is included; the caller
+/// trims.
+fn read_tty_line(tty: &std::fs::File) -> Option<String> {
+    use std::io::Read as _;
+    let mut reader = tty;
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    if line.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// Prompt for one segment on the TTY (`[y/n/always]`) and deliver the
+/// decision to agentpactd. Returns the [`PopupResult`] without emitting any
+/// shell output beyond the prompt — the caller maps the aggregate result to
+/// an exit code. A read failure denies safe.
+fn tty_prompt_segment(
+    tty: &std::fs::File,
+    sock_path: &str,
+    socket_timeout: std::time::Duration,
+    approval_token: &str,
+    seg: &str,
+    allow_always: bool,
+) -> PopupResult {
+    use std::io::Write as _;
+
+    // Offer "always" only when the daemon says a grant would persist.
+    let choices = if allow_always {
+        "[y/n/always]"
+    } else {
+        "[y/n]"
+    };
+    eprint!("\x1b[33m[kyris] allow?\x1b[0m {seg} {choices} ");
+    let _ = std::io::stderr().flush();
+
+    let Some(answer) = read_tty_line(tty) else {
+        deny_ask_immediately(approval_token, sock_path, socket_timeout);
+        return PopupResult::Blocked {
+            exit_code: 2,
+            source: "tty_error",
+            reason: "could not read approval from /dev/tty".to_string(),
+        };
+    };
+
+    let (response, source) = match answer.trim() {
+        "y" | "Y" | "yes" => (ApprovalResponse::Approved, "user_approved"),
+        // "always" sticks only when persistable; otherwise the daemon would
+        // refuse to persist anyway, so honor it as a one-time approval.
+        "a" | "A" | "always" => {
+            if allow_always {
+                (ApprovalResponse::Always, "user_always")
+            } else {
+                (ApprovalResponse::Approved, "user_approved")
+            }
+        }
+        _ => (ApprovalResponse::Denied, "user_denied"),
+    };
+
+    match agentpact::send_permission_response(
+        sock_path,
+        "kyris-hook-tty",
+        approval_token,
+        response,
+        Some(socket_timeout),
+    ) {
+        Ok(_) if response == ApprovalResponse::Denied => PopupResult::Blocked {
+            exit_code: 2,
+            source,
+            reason: "denied by developer".to_string(),
+        },
+        Ok(warning) => {
+            // The daemon applied the decision but may warn that a side effect
+            // (e.g. persisting an "always" grant) could not be completed — show
+            // it on the TTY where the developer just answered.
+            if let Some(warning) = warning {
+                eprintln!("\x1b[33m[kyris]\x1b[0m {warning}");
+            }
+            PopupResult::Approved { source }
+        }
+        Err(reason) => PopupResult::Blocked {
+            exit_code: 2,
+            source: "respond_failed",
+            reason,
+        },
     }
 }
 
@@ -78,6 +315,10 @@ fn run_hold(args: HookHoldArgs) {
     // `server` is "shell" (the popup title slot — "Kyris: Allow shell");
     // `args.display` (the verbatim command) is the segment text, which
     // becomes the popup body and the syntect-highlighted accessoryView.
+    //
+    // `hold` now serves only the circuit-breaker path (normal asks go through
+    // `resolve-shell`), and a breaker ask never persists an override — so
+    // "Always" is never offered here.
     match poll_segment(
         "shell",
         &sock_path,
@@ -85,6 +326,7 @@ fn run_hold(args: HookHoldArgs) {
         &args.req_id,
         &args.token,
         &args.display,
+        false,
     ) {
         PopupResult::Approved { .. } => std::process::exit(0),
         PopupResult::Blocked {
@@ -204,43 +446,20 @@ fn run_check(args: HookCheckArgs) {
 
     let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
 
-    // Fast-path: pass-through tools (LLM coordination primitives with no
-    // governable side effect) skip the daemon entirely. Unmapped tools also
-    // skip the daemon but emit a stderr warning so we notice and update the
-    // per-agent mapping table. Both rely on the agent's `allow_response`
-    // shape to suppress the agent's own permission prompt — except in log
-    // mode, where we must hand the decision back to the agent.
+    // Fast-path: tools that do not reach agentpactd. Returns here only when the
+    // tool IS governable; otherwise it audits, emits, and exits the process.
     if let (Some(proto), Some(tool)) = (protocol.as_ref(), tool_name.as_deref()) {
-        let governable = proto.tool_mappings.iter().any(|m| m.tool_name == tool);
-        let pass_through = proto.pass_through_tools.iter().any(|t| t == tool);
-        if !governable {
-            let source = if pass_through {
-                "passthrough"
-            } else {
-                "unmapped"
-            };
-            if !pass_through {
-                eprintln!(
-                    "[agentpact] warning: '{tool}' is not in the {agent} mapping table; allowing without governance. Add it to tool_mappings or pass_through_tools."
-                );
-            }
-            let response = effective_allow_response(&proto.allow_response, log_mode);
-            audit_log_hook(
-                audit_conn.as_ref(),
-                &hook_id,
-                agent,
-                &action,
-                &detail,
-                None,
-                "allow",
-                source,
-                None,
-                agent_prompt_for(&response),
-                started_at.elapsed(),
-            );
-            emit_allow(&response);
-            std::process::exit(0);
-        }
+        handle_non_governed(
+            proto,
+            tool,
+            agent,
+            &action,
+            &detail,
+            log_mode,
+            audit_conn.as_ref(),
+            &hook_id,
+            started_at,
+        );
     }
 
     let cwd = derive_session_cwd(&hook_input);
@@ -289,6 +508,58 @@ fn run_check(args: HookCheckArgs) {
     dispatch_preview_outcome(&ctx, seed_pid, outcome);
 }
 
+/// Handle a tool that does not go through agentpactd. Returns normally only
+/// when `tool` IS governable (a `tool_mappings` entry) — the caller then
+/// proceeds to the daemon round-trip. For a pass-through or unmapped tool it
+/// audits, emits the appropriate allow shape (see [`non_governed_response`]),
+/// and exits the process; it never returns in that case.
+#[allow(clippy::too_many_arguments)]
+fn handle_non_governed(
+    proto: &HookProtocol,
+    tool: &str,
+    agent: &str,
+    action: &str,
+    detail: &str,
+    log_mode: bool,
+    audit_conn: Option<&kyris_core::config::KyrisdConnection>,
+    hook_id: &str,
+    started_at: std::time::Instant,
+) {
+    let governable = proto.tool_mappings.iter().any(|m| m.tool_name == tool);
+    if governable {
+        return;
+    }
+    let pass_through = proto.pass_through_tools.iter().any(|t| t == tool);
+    if !pass_through {
+        eprintln!(
+            "[agentpact] warning: '{tool}' is not in the {agent} mapping table; \
+             deferring to {agent}'s own permission prompt (kyris is not governing it). \
+             Add it to tool_mappings to govern it, or pass_through_tools to bless it."
+        );
+    }
+    let source = if pass_through {
+        "passthrough"
+    } else {
+        "unmapped"
+    };
+    let response = non_governed_response(pass_through, &proto.allow_response, log_mode);
+    audit_log_hook(
+        audit_conn,
+        hook_id,
+        agent,
+        action,
+        detail,
+        None,
+        "allow",
+        source,
+        None,
+        agent_prompt_for(&response),
+        started_at.elapsed(),
+    );
+    emit_allow(&response);
+    std::process::exit(0);
+}
+
 /// References needed to route a permission outcome through audit, agent
 /// response emission, and process exit. Bundled because the dispatch
 /// function takes 10 parameters otherwise.
@@ -317,48 +588,50 @@ struct PermissionCtx<'a> {
 
 /// Route the side-effect-free PREVIEW outcome from agentpactd.
 ///
-/// The preview classifies the whole command without issuing a token:
-/// - `Auto`/`Inform` → fast path: emit the agent allow shape, no popups
-///   (in log mode this defers to the agent via `effective_allow_response`);
-/// - `Deny` → block;
-/// - daemon unreachable → fail open or closed per `on_daemon_unavailable`;
-/// - `Ask` → drive per-segment approval ([`drive_per_segment`]).
+/// The preview has no side effects: it neither audits, nor counts the circuit
+/// breaker, nor issues exec tokens, nor updates session state. So its decision
+/// is used **only** as a scout — for the compound split it carries and for the
+/// effective mode — and every command is then re-driven through real,
+/// token-bearing per-segment requests ([`drive_per_segment`]). That is what
+/// produces the `AgentPact` action events, breaker accounting, exec tokens, and
+/// session-cwd update, and it is uniform across what the preview classified as
+/// `Auto`, `Ask`, or `Deny`: the per-segment real requests determine the true
+/// outcome (auto segments run silently, ask segments each get their own popup
+/// and per-segment "Always", a denied segment blocks the line).
 ///
-/// Compound splitting is the daemon's job (`agentpact::policy::splitter`);
-/// the preview response carries the segments it parsed. For an `Ask` we
-/// issue one real, token-bearing request per segment, so each segment is
-/// classified on its own — auto segments run silently, and each segment
-/// that needs approval gets its own popup and its own per-segment
-/// "Always". The hook never parses shell itself.
+/// The success allow shape is mode-correct: `EmptyStdout` in log mode (defer to
+/// the agent's own prompt), the agent's native allow shape in enforce mode.
+/// Only the daemon-unreachable arms (no decision to scout) emit directly.
+///
+/// Compound splitting is the daemon's job (`agentpact::policy::splitter`); the
+/// hook never parses shell itself.
 fn dispatch_preview_outcome(
     ctx: &PermissionCtx<'_>,
     seed_pid: Option<u32>,
     outcome: Result<(McpPermissionDecision, Option<Vec<String>>), String>,
 ) -> ! {
     match outcome {
-        Ok((McpPermissionDecision::Allow { mode }, segments)) => {
-            let response = effective_allow_response(ctx.native_allow_response, mode.is_log());
-            audit_log_hook(
-                ctx.audit_conn,
-                ctx.hook_id,
-                ctx.agent,
-                ctx.action,
-                ctx.detail,
-                segments.as_deref(),
-                "allow",
-                "agentpact_auto",
-                None,
-                agent_prompt_for(&response),
-                ctx.started_at.elapsed(),
-            );
-            emit_allow(&response);
-            std::process::exit(0);
+        // A line the preview would DENY is doomed: the agent gets a failure
+        // response and runs none of it, so we present nothing per-segment.
+        // Issue ONE real whole-command request (segments = None) purely so the
+        // deny is written to agentpact's append-only event log, then fail. (A
+        // strictest-wins Ask aggregate, below, can never hide a denied segment,
+        // so the per-segment walk never prompts for a doomed line.)
+        Ok((McpPermissionDecision::Deny { .. }, _segments)) => {
+            drive_per_segment(ctx, seed_pid, None, false);
         }
-        Ok((McpPermissionDecision::Deny { reason, .. }, segments)) => {
-            audit_and_exit_deny(ctx, segments.as_deref(), "agentpact_deny", &reason);
-        }
-        Ok((McpPermissionDecision::Ask { .. }, segments)) => {
-            drive_per_segment(ctx, seed_pid, segments);
+        // Auto / Ask re-drive real per-segment requests: auto and already-
+        // "always" segments run silently, only ask segments are prompted (each
+        // with its own per-segment "Always"), and the agent gets one aggregate
+        // proceed response once every segment is approved. The preview only
+        // supplies the split and (for Allow) the effective mode — log mode
+        // surfaces every decision as `Allow { mode: Log }` (see process_preview),
+        // so deriving log-mode from an Allow is sufficient; an Ask is
+        // enforce-only and emits the native allow shape on success.
+        Ok((decision, segments)) => {
+            let log_mode =
+                matches!(&decision, McpPermissionDecision::Allow { mode } if mode.is_log());
+            drive_per_segment(ctx, seed_pid, segments, log_mode);
         }
         Err(_) if agentpact::allow_on_daemon_unavailable() => {
             let response =
@@ -390,10 +663,12 @@ fn dispatch_preview_outcome(
 enum SegClass {
     /// Catalog/default/already-"always"-allowed — runs with no popup.
     Auto,
-    /// Needs approval; carries the token that drives its popup.
+    /// Needs approval; carries the token that drives its popup and the
+    /// daemon's authoritative `allow_always` (whether "Always" would persist).
     Ask {
         approval_id: String,
         approval_token: String,
+        allow_always: bool,
     },
     /// Policy denied this segment.
     Deny { reason: String },
@@ -438,7 +713,7 @@ fn run_segments<C, P>(
 ) -> Result<&'static str, SegBlock>
 where
     C: FnMut(&str) -> SegClass,
-    P: FnMut(&str, &str, &str) -> PopupResult,
+    P: FnMut(&str, &str, &str, bool) -> PopupResult,
 {
     let mut source: &'static str = "agentpact_auto";
     for seg in segments {
@@ -465,7 +740,8 @@ where
             SegClass::Ask {
                 approval_id,
                 approval_token,
-            } => match prompt(&approval_id, &approval_token, seg) {
+                allow_always,
+            } => match prompt(&approval_id, &approval_token, seg, allow_always) {
                 PopupResult::Approved { source: s } => source = s,
                 PopupResult::Blocked {
                     exit_code,
@@ -484,14 +760,22 @@ where
     Ok(source)
 }
 
-/// Drive per-segment approval for an `Ask`'d command, emit one agent
-/// response, and exit. `segments` is the daemon's parsed split; when it
-/// did not split (single command, non-execute action) we treat the whole
-/// `detail` as the one segment.
+/// Drive per-segment approval, emit one agent response, and exit. `segments`
+/// is the daemon's parsed split; when it did not split (single command,
+/// non-execute action) we treat the whole `detail` as the one segment. Each
+/// segment is classified with a real, token-bearing request, so this is what
+/// audits the command, counts the circuit breaker, issues exec tokens, and
+/// updates session cwd — for every command, not just asks.
+///
+/// `log_mode` selects the success allow shape: in log mode the agent must keep
+/// its own permission UX, so we emit `EmptyStdout` (defer); in enforce mode we
+/// emit the agent's native allow shape (suppressing its prompt for a command
+/// `AgentPact` already cleared).
 fn drive_per_segment(
     ctx: &PermissionCtx<'_>,
     seed_pid: Option<u32>,
     segments: Option<Vec<String>>,
+    log_mode: bool,
 ) -> ! {
     let segs = segments.unwrap_or_else(|| vec![ctx.detail.to_string()]);
 
@@ -499,7 +783,7 @@ fn drive_per_segment(
         &segs,
         agentpact::allow_on_daemon_unavailable(),
         |seg| classify_segment(ctx, seed_pid, seg),
-        |approval_id, approval_token, seg| {
+        |approval_id, approval_token, seg, allow_always| {
             poll_segment(
                 ctx.action,
                 ctx.sock_path,
@@ -507,15 +791,14 @@ fn drive_per_segment(
                 approval_id,
                 approval_token,
                 seg,
+                allow_always,
             )
         },
     );
 
     match result {
         Ok(source) => {
-            // Ask only fires in enforce mode, so the agent's native allow
-            // shape is correct here (no log-mode override needed).
-            let response = ctx.native_allow_response.clone();
+            let response = effective_allow_response(ctx.native_allow_response, log_mode);
             audit_log_hook(
                 ctx.audit_conn,
                 ctx.hook_id,
@@ -568,11 +851,13 @@ fn classify_segment(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>, seg: &str) -
             McpPermissionDecision::Ask {
                 approval_id,
                 approval_token,
+                allow_always,
             },
             _,
         )) => SegClass::Ask {
             approval_id,
             approval_token,
+            allow_always,
         },
         Ok((McpPermissionDecision::Deny { reason, .. }, _)) => SegClass::Deny { reason },
         Err(reason) => {
@@ -592,6 +877,7 @@ fn poll_segment(
     approval_id: &str,
     approval_token: &str,
     seg: &str,
+    allow_always: bool,
 ) -> PopupResult {
     let Some(conn) = kyris_core::config::load_kyrisd_connection() else {
         if agentpact::allow_on_daemon_unavailable() {
@@ -625,9 +911,13 @@ fn poll_segment(
                 server,
                 tool: seg,
                 code: Some(seg),
-                // Privilege escalation is never persistable (agentpactd
-                // refuses it server-side), so grey out "Always" in the popup.
-                allow_always: !::agentpact::policy::compound::is_privilege_command(seg),
+                // Authoritative server signal from the per-segment PACT_ASK:
+                // the popup greys out "Always" when the daemon would not
+                // persist the grant (privilege/control/remote-destroy,
+                // breaker, or no working_dir) — superseding the old
+                // leading-word `sudo` heuristic, which missed wrapper-hidden
+                // privilege like `env sudo …`.
+                allow_always,
             },
             kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
         )
@@ -865,6 +1155,29 @@ fn effective_allow_response(native: &AllowResponse, log_mode: bool) -> AllowResp
     }
 }
 
+/// The allow shape for a tool that never reaches agentpactd.
+///
+/// - `pass_through` (a blessed coordination primitive): emit the agent's
+///   native allow shape so its own prompt is suppressed and the primitive runs
+///   frictionlessly — except in log mode, where we still defer.
+/// - **unmapped** (a tool kyris does not recognize): emit the `EmptyStdout`
+///   "no decision" shape so the agent's own permission system decides. kyris
+///   neither prompts nor suppresses — it behaves as if it were not installed.
+///   Emitting the native allow shape here would silently approve an unknown,
+///   possibly side-effecting tool (fail-open), which is exactly what must not
+///   happen for an ungoverned tool.
+fn non_governed_response(
+    pass_through: bool,
+    native: &AllowResponse,
+    log_mode: bool,
+) -> AllowResponse {
+    if pass_through {
+        effective_allow_response(native, log_mode)
+    } else {
+        AllowResponse::EmptyStdout
+    }
+}
+
 fn map_payload(protocol: Option<&HookProtocol>, input: &serde_json::Value) -> (String, String) {
     let Some(protocol) = protocol else {
         let method = input["method"].as_str().unwrap_or("call");
@@ -945,6 +1258,39 @@ mod tests {
         items.iter().map(|s| (*s).to_string()).collect()
     }
 
+    // --- read_tty_line: unbuffered, no cross-prompt over-read ---
+
+    #[test]
+    fn testReadTtyLineReturnsSingleLineWithNewline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tty");
+        std::fs::write(&path, "always\n").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_tty_line(&f).as_deref(), Some("always\n"));
+    }
+
+    #[test]
+    fn testReadTtyLineDoesNotOverReadAcrossCalls() {
+        // Two answers queued on one handle: the first read must stop at the
+        // first newline and leave the second answer for the next prompt.
+        // A BufReader would swallow the second line — this guards that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tty");
+        std::fs::write(&path, "y\nn\n").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_tty_line(&f).as_deref(), Some("y\n"));
+        assert_eq!(read_tty_line(&f).as_deref(), Some("n\n"));
+    }
+
+    #[test]
+    fn testReadTtyLineEmptyIsNone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tty");
+        std::fs::write(&path, "").unwrap();
+        let f = std::fs::File::open(&path).unwrap();
+        assert_eq!(read_tty_line(&f), None);
+    }
+
     #[test]
     fn testRunSegmentsAllAutoAllows() {
         // Every segment auto-allows → no popup invoked, allow.
@@ -954,7 +1300,7 @@ mod tests {
             &segs,
             false,
             |_seg| SegClass::Auto,
-            |_id, _tok, _seg| {
+            |_id, _tok, _seg, _allow| {
                 prompted += 1;
                 PopupResult::Approved {
                     source: "user_approved",
@@ -968,8 +1314,10 @@ mod tests {
     #[test]
     fn testRunSegmentsPromptsOnlyAskSegments() {
         // Mixed: only the unclassified segment is prompted; approval allows.
+        // Also asserts the per-segment `allow_always` propagates to the prompt.
         let segs = seg_vec(&["cat hello.txt", "mystery-bin"]);
         let mut prompted = Vec::new();
+        let mut prompted_allow_always = None;
         let result = run_segments(
             &segs,
             false,
@@ -978,13 +1326,15 @@ mod tests {
                     SegClass::Ask {
                         approval_id: "apr_1".to_string(),
                         approval_token: "tok_1".to_string(),
+                        allow_always: true,
                     }
                 } else {
                     SegClass::Auto
                 }
             },
-            |_id, _tok, seg| {
+            |_id, _tok, seg, allow_always| {
                 prompted.push(seg.to_string());
+                prompted_allow_always = Some(allow_always);
                 PopupResult::Approved {
                     source: "user_approved",
                 }
@@ -992,6 +1342,7 @@ mod tests {
         );
         assert_eq!(result.unwrap(), "user_approved");
         assert_eq!(prompted, vec!["mystery-bin".to_string()]);
+        assert_eq!(prompted_allow_always, Some(true));
     }
 
     #[test]
@@ -1008,9 +1359,10 @@ mod tests {
                 SegClass::Ask {
                     approval_id: "a".to_string(),
                     approval_token: "t".to_string(),
+                    allow_always: false,
                 }
             },
-            |_id, _tok, _seg| PopupResult::Blocked {
+            |_id, _tok, _seg, _allow| PopupResult::Blocked {
                 exit_code: 2,
                 source: "user_denied",
                 reason: "nope".to_string(),
@@ -1035,7 +1387,7 @@ mod tests {
             |_seg| SegClass::Deny {
                 reason: "blocked by policy".to_string(),
             },
-            |_id, _tok, _seg| unreachable!("deny must not prompt"),
+            |_id, _tok, _seg, _allow| unreachable!("deny must not prompt"),
         );
         let block = result.unwrap_err();
         assert_eq!(block.source, "agentpact_deny");
@@ -1051,7 +1403,7 @@ mod tests {
             |_seg| SegClass::Unavailable {
                 reason: "daemon down".to_string(),
             },
-            |_id, _tok, _seg| unreachable!(),
+            |_id, _tok, _seg, _allow| unreachable!(),
         );
         assert_eq!(result.unwrap_err().source, "agentpact_unreachable");
     }
@@ -1065,7 +1417,7 @@ mod tests {
             |_seg| SegClass::Unavailable {
                 reason: "daemon down".to_string(),
             },
-            |_id, _tok, _seg| unreachable!(),
+            |_id, _tok, _seg, _allow| unreachable!(),
         );
         assert_eq!(result.unwrap(), "agentpact_unreachable");
     }
@@ -1157,6 +1509,54 @@ mod tests {
         };
         let effective = effective_allow_response(&native, true);
         assert_eq!(agent_prompt_for(&effective), "agent_decides");
+    }
+
+    #[test]
+    fn testNonGovernedUnmappedDefersToAgentEvenInEnforce() {
+        // The P0 fix: an unmapped tool must NEVER get the agent's native allow
+        // shape (which suppresses the agent's own prompt and silently approves
+        // an unknown tool). It gets EmptyStdout — "no decision" — so the
+        // agent's own permission system decides, as if kyris weren't installed.
+        let native = AllowResponse::Json {
+            body: serde_json::json!({"hookSpecificOutput": {"permissionDecision": "allow"}}),
+        };
+        assert!(matches!(
+            non_governed_response(false, &native, false),
+            AllowResponse::EmptyStdout
+        ));
+        // Same in log mode — unmapped is always defer.
+        assert!(matches!(
+            non_governed_response(false, &native, true),
+            AllowResponse::EmptyStdout
+        ));
+        // Even when the agent's native shape is already EmptyStdout (Codex).
+        assert!(matches!(
+            non_governed_response(false, &AllowResponse::EmptyStdout, false),
+            AllowResponse::EmptyStdout
+        ));
+    }
+
+    #[test]
+    fn testNonGovernedPassThroughSuppressesAgentPromptInEnforce() {
+        // Blessed primitives keep the frictionless behavior: in enforce mode
+        // they get the agent's native allow shape (suppressing its prompt),
+        // and in log mode they defer like everything else.
+        let native = AllowResponse::Json {
+            body: serde_json::json!({"hookSpecificOutput": {"permissionDecision": "allow"}}),
+        };
+        match non_governed_response(true, &native, false) {
+            AllowResponse::Json { body } => assert_eq!(
+                body["hookSpecificOutput"]["permissionDecision"],
+                serde_json::json!("allow")
+            ),
+            AllowResponse::EmptyStdout => {
+                panic!("pass-through in enforce must keep the native allow shape")
+            }
+        }
+        assert!(matches!(
+            non_governed_response(true, &native, true),
+            AllowResponse::EmptyStdout
+        ));
     }
 
     #[test]

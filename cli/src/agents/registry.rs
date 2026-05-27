@@ -90,8 +90,10 @@ pub struct HookProtocol {
     /// (`AskUserQuestion`, `TodoWrite`, `ExitPlanMode`, etc.). Skipping the
     /// daemon is required because the daemon contract for `action=call`
     /// demands `context.mcp_server`, which these tools cannot supply.
-    /// Unmapped tools not in this list emit a stderr warning and are
-    /// allowed (fail-open) so a new agent built-in doesn't lock the user out.
+    /// Tools not in this list and not in `tool_mappings` are *unmapped*: kyris
+    /// emits a stderr warning and defers to the agent's own permission system
+    /// (the `EmptyStdout` "no decision" shape), behaving as if it were not
+    /// installed — it never suppresses the agent's prompt for an unknown tool.
     pub pass_through_tools: Vec<String>,
     pub default_action: String,
     pub allow_response: AllowResponse,

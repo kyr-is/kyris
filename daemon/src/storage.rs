@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use duckdb::Connection;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::metering::StatsEvent;
 
@@ -79,8 +79,16 @@ fn gateway_row_to_record(
     })
 }
 
+/// Buffer of gateway records broadcast to live `/operator/stream` subscribers.
+/// Sized for short consumer stalls; slow readers see `Lagged` and skip ahead
+/// rather than back-pressuring the insert path.
+const RECORD_STREAM_CAPACITY: usize = 256;
+
 pub struct DuckDbWriter {
     conn: std::sync::Mutex<Connection>,
+    /// Fans out each persisted record to live monitor subscribers. Send errors
+    /// (no subscribers) are ignored — this is a best-effort observability tap.
+    record_tx: broadcast::Sender<kyris_core::record::GatewayRecord>,
 }
 
 impl DuckDbWriter {
@@ -101,7 +109,15 @@ impl DuckDbWriter {
             .map_err(|e| format!("create sync_metadata table: {e}"))?;
         Ok(Self {
             conn: std::sync::Mutex::new(conn),
+            record_tx: broadcast::channel(RECORD_STREAM_CAPACITY).0,
         })
+    }
+
+    /// Subscribe to gateway records as they are persisted. Each `insert_batch`
+    /// fans freshly-written records to all live subscribers (the monitor's
+    /// `/operator/stream` SSE endpoint).
+    pub fn subscribe_records(&self) -> broadcast::Receiver<kyris_core::record::GatewayRecord> {
+        self.record_tx.subscribe()
     }
 
     pub fn open(path: &Path) -> Self {
@@ -109,6 +125,7 @@ impl DuckDbWriter {
     }
 
     pub fn insert_batch(&self, events: &[StatsEvent]) -> duckdb::Result<()> {
+        use std::str::FromStr as _;
         let conn = self.conn.lock().expect("lock db");
         let mut stmt = conn.prepare(
             "INSERT INTO gateway_records (
@@ -163,6 +180,30 @@ impl DuckDbWriter {
                 event.working_dir,
                 metering_str,
             ])?;
+
+            // Best-effort fan-out to live monitor subscribers. The DB row is the
+            // source of truth; a failed send (no subscribers) is not an error.
+            let _ = self.record_tx.send(kyris_core::record::GatewayRecord {
+                id,
+                trace_id: event.trace_id.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                provider: event.provider.clone(),
+                model: event.model.clone(),
+                tokens_in,
+                tokens_out,
+                tokens_cache_create: cache_create,
+                tokens_cache_read: cache_read,
+                cost_usd: event.cost,
+                latency_ms: event.latency_ms,
+                status: kyris_core::record::RecordStatus::from_str(&event.status)
+                    .unwrap_or(kyris_core::record::RecordStatus::Unknown),
+                session_id: event.session_id.clone(),
+                synced: false,
+                mcp_server: event.mcp_server.clone(),
+                mcp_tool: event.mcp_tool.clone(),
+                metering: event.metering,
+                working_dir: event.working_dir.clone(),
+            });
         }
         Ok(())
     }

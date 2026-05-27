@@ -124,10 +124,10 @@ __kyris_preexec() {
         0|11) return 0 ;;
         1) return 1 ;;
         2)
-            local req_id token
-            req_id=$(printf '%s' "$output" | cut -f1)
-            token=$(printf '%s' "$output" | cut -f2)
-            __kyris_prompt_user "$cmd" "$sock" "$req_id" "$token"
+            # Normal PACT_ASK: resolve per compound segment (kyris-hook has
+            # already voided the whole-command token). resolve-shell prompts
+            # on the TTY per segment, or delegates to kyrisd when there is none.
+            __kyris_resolve_shell "$cmd" "$sock"
             return $?
             ;;
         3)
@@ -180,41 +180,19 @@ __kyris_circuit_breaker_prompt() {
     esac
 }
 
-__kyris_prompt_user() {
-    local cmd="$1" sock="$2" req_id="$3" token="$4"
-    if ! __kyris_have_tty; then
-        if command -v kyris >/dev/null 2>&1; then
-            kyris hook hold --req-id "$req_id" --token "$token" \
-                --display "$cmd" --socket "$sock" 2>/dev/null
-            return $?
-        else
-            kyris-hook respond --socket "$sock" --req-id "$req_id" \
-                --token "$token" --response denied 2>/dev/null
-            return 1
-        fi
+# Hand a normal PACT_ASK to `kyris hook resolve-shell`, which re-derives the
+# compound split and prompts per segment (on the TTY when present, else via
+# kyrisd's pending-approval popup). The fast `kyris-hook check` path has
+# already voided the whole-command token, so there is nothing to clean up
+# here when kyris is absent — just deny.
+__kyris_resolve_shell() {
+    local cmd="$1" sock="$2"
+    if command -v kyris >/dev/null 2>&1; then
+        kyris hook resolve-shell --cmd "$cmd" --cwd "$PWD" --socket "$sock"
+        return $?
     fi
-    printf '\033[33m[kyris] allow?\033[0m %s [y/n/always] ' "$cmd" >&2
-    read -r answer < /dev/tty
-    case "$answer" in
-        y|Y|yes)
-            if kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response approved; then
-                return 0
-            else
-                printf '\033[31m[kyris] approval rejected by daemon\033[0m\n' >&2; return 1
-            fi
-            ;;
-        a|A|always)
-            if kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response always; then
-                return 0
-            else
-                printf '\033[31m[kyris] approval rejected by daemon\033[0m\n' >&2; return 1
-            fi
-            ;;
-        *)
-            kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response denied 2>/dev/null
-            return 1
-            ;;
-    esac
+    printf '\033[31m[agentpact]\033[0m kyris not on PATH — cannot resolve approval\n' >&2
+    return 1
 }
 
 __kyris_record_fail_open() {

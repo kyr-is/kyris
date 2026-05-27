@@ -24,6 +24,10 @@ pub struct PendingInfo {
     pub tool: Option<String>,
     pub state: PendingState,
     pub held_since_ms: u64,
+    /// Whether answering "Always" would persist a standing override (the
+    /// daemon's authoritative signal). `kyris pending` offers "always" only
+    /// when this is true.
+    pub allow_always: bool,
 }
 
 struct PendingEntry {
@@ -32,6 +36,7 @@ struct PendingEntry {
     tool: Option<String>,
     state: PendingState,
     created: Instant,
+    allow_always: bool,
     resolver: Option<oneshot::Sender<Resolution>>,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -64,6 +69,7 @@ impl PendingStore {
         approval_token: String,
         server: String,
         tool: Option<String>,
+        allow_always: bool,
     ) -> oneshot::Receiver<Resolution> {
         let (tx, rx) = oneshot::channel();
         let entry = PendingEntry {
@@ -72,6 +78,7 @@ impl PendingStore {
             tool,
             state: PendingState::Held,
             created: Instant::now(),
+            allow_always,
             resolver: Some(tx),
             timeout_handle: None,
         };
@@ -185,6 +192,7 @@ impl PendingStore {
                 tool: entry.tool.clone(),
                 state: entry.state,
                 held_since_ms: entry.created.elapsed().as_millis() as u64,
+                allow_always: entry.allow_always,
             })
             .collect()
     }
@@ -246,6 +254,7 @@ mod tests {
             "tok-1".into(),
             "github".into(),
             Some("read_file".into()),
+            true,
         );
 
         assert_eq!(store.list_held().len(), 1);
@@ -261,7 +270,7 @@ mod tests {
     #[test]
     fn testHoldAndClaimDenied() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         store.complete_claim(claim, false);
@@ -281,7 +290,7 @@ mod tests {
     #[test]
     fn testDoubleClaimFails() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         assert!(store.claim("req-1").is_err());
@@ -291,7 +300,7 @@ mod tests {
     #[test]
     fn testAbandonClaimRestoresHeld() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         store.abandon_claim(claim);
@@ -305,7 +314,7 @@ mod tests {
     #[test]
     fn testTimeout() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         store.timeout("req-1");
         assert_eq!(store.list_held().len(), 0);
@@ -315,7 +324,7 @@ mod tests {
     #[test]
     fn testCancel() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         store.cancel("req-1");
         assert_eq!(store.list_held().len(), 0);
@@ -325,7 +334,7 @@ mod tests {
     #[test]
     fn testClaimAfterTimeoutFails() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         store.timeout("req-1");
         assert!(matches!(
@@ -337,8 +346,8 @@ mod tests {
     #[test]
     fn testPruneResolved() {
         let store = PendingStore::new();
-        let _rx1 = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
-        let _rx2 = store.hold("req-2".into(), "tok-2".into(), "github".into(), None);
+        let _rx1 = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
+        let _rx2 = store.hold("req-2".into(), "tok-2".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         store.complete_claim(claim, true);
@@ -351,7 +360,7 @@ mod tests {
     #[tokio::test]
     async fn testClaimChannelReceivesApproval() {
         let store = PendingStore::new();
-        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         store.complete_claim(claim, true);
@@ -362,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn testClaimChannelReceivesDenial() {
         let store = PendingStore::new();
-        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         store.complete_claim(claim, false);
@@ -373,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn testTimeoutDropsChannel() {
         let store = PendingStore::new();
-        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         store.timeout("req-1");
         assert!(rx.await.is_err());
@@ -382,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn testCancelDropsChannel() {
         let store = PendingStore::new();
-        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         store.cancel("req-1");
         assert!(rx.await.is_err());
@@ -393,7 +402,7 @@ mod tests {
         let store = PendingStore::new();
         assert!(store.get_state("req-1").is_none());
 
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
         assert_eq!(store.get_state("req-1"), Some(PendingState::Held));
 
         let claim = store.claim("req-1").unwrap();
@@ -404,7 +413,7 @@ mod tests {
     #[test]
     fn testGetStateReturnsDenied() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         let claim = store.claim("req-1").unwrap();
         store.complete_claim(claim, false);
@@ -414,7 +423,7 @@ mod tests {
     #[test]
     fn testCompleteClaimRefusesToOverwriteTerminalState() {
         let store = PendingStore::new();
-        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
+        let _rx = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
 
         store.timeout("req-1");
         assert_eq!(store.get_state("req-1"), Some(PendingState::TimedOut));
@@ -433,8 +442,8 @@ mod tests {
     #[test]
     fn testHoldDuplicateIdReplacesEntry() {
         let store = PendingStore::new();
-        let _rx1 = store.hold("req-1".into(), "tok-1".into(), "github".into(), None);
-        let _rx2 = store.hold("req-1".into(), "tok-2".into(), "gitlab".into(), None);
+        let _rx1 = store.hold("req-1".into(), "tok-1".into(), "github".into(), None, true);
+        let _rx2 = store.hold("req-1".into(), "tok-2".into(), "gitlab".into(), None, true);
 
         assert_eq!(store.list().len(), 1);
         let claim = store.claim("req-1").unwrap();

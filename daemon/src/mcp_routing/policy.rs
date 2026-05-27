@@ -18,6 +18,8 @@ pub enum PolicyDecision {
     Ask {
         approval_id: String,
         approval_token: String,
+        /// Daemon's authoritative signal: whether "Always" would persist.
+        allow_always: bool,
     },
 }
 
@@ -128,9 +130,11 @@ fn map_permission_decision(decision: agentpact::McpPermissionDecision) -> Policy
         agentpact::McpPermissionDecision::Ask {
             approval_id,
             approval_token,
+            allow_always,
         } => PolicyDecision::Ask {
             approval_id,
             approval_token,
+            allow_always,
         },
     }
 }
@@ -272,6 +276,8 @@ mod tests {
             PolicyDecision::Ask {
                 approval_id: "req-42".to_string(),
                 approval_token: "tok-abc".to_string(),
+                // No allow_always in the response → parser default false.
+                allow_always: false,
             }
         );
     }
@@ -293,6 +299,7 @@ mod tests {
         let ask = PolicyDecision::Ask {
             approval_id: "id".to_string(),
             approval_token: "tok".to_string(),
+            allow_always: true,
         };
         if let PolicyDecision::Ask { approval_id, .. } = ask {
             assert_eq!(approval_id, "id");
