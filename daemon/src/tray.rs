@@ -177,8 +177,9 @@ mod gui {
     // MainThreadOnly classes (e.g. NSStatusItem).
     use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly, Message as _, msg_send};
     use objc2_app_kit::{
-        NSApplication, NSBitmapImageRep, NSColor, NSCompositingOperation, NSDeviceRGBColorSpace,
-        NSImage, NSImageSymbolConfiguration, NSStatusBar,
+        NSApplication, NSApplicationActivationPolicy, NSBitmapImageRep, NSColor,
+        NSCompositingOperation, NSDeviceRGBColorSpace, NSImage, NSImageSymbolConfiguration,
+        NSStatusBar,
     };
     use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString, NSTimer};
     use std::cell::RefCell;
@@ -357,9 +358,12 @@ mod gui {
         // Bring the app to an accessory state so the daemon can host an
         // NSStatusItem without claiming a Dock icon.
         let app = NSApplication::sharedApplication(mtm);
-        unsafe {
-            let _: () = msg_send![&*app, setActivationPolicy: 1isize]; // NSApplicationActivationPolicyAccessory
-        }
+        // Accessory: host an NSStatusItem without claiming a Dock icon. Use the
+        // safe typed binding rather than a raw `msg_send!` — `setActivationPolicy:`
+        // returns BOOL, and the old `let _: () = msg_send![…]` mistyped that as void,
+        // which objc2's debug-build return-type verification rejects (a startup panic
+        // when run directly). The safe binding's `-> bool` return is compiler-checked.
+        let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         TRAY_UI.with(|cell| {
             *cell.borrow_mut() = Some(build_tray_ui(mtm));
         });
@@ -742,6 +746,23 @@ mod gui {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn testSetActivationPolicyReturnsBool() {
+            // Regression for the tray.rs:361 startup panic. `-[NSApplication
+            // setActivationPolicy:]` returns BOOL; the old raw `let _: () =
+            // msg_send![…]` mistyped the return as void, which objc2's debug-build
+            // return-type verification rejects at runtime. run_event_loop now uses
+            // the safe typed binding — this compile-time assertion pins its signature
+            // to `-> bool`, so a regression to `()` (or an untyped msg_send) won't build.
+            // Anonymous `_` pattern — using `_signature` would trip
+            // clippy::no_effect_underscore_binding; this is a pure compile-time
+            // type check, no value needed.
+            let _: fn(
+                &objc2_app_kit::NSApplication,
+                objc2_app_kit::NSApplicationActivationPolicy,
+            ) -> bool = objc2_app_kit::NSApplication::setActivationPolicy;
+        }
 
         #[test]
         fn testDegradedIconRgbaLengthMatches() {

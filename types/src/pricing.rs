@@ -129,4 +129,29 @@ mod tests {
         assert_eq!(parsed.version, "v0.1.0");
         assert_eq!(parsed.models.len(), 2);
     }
+
+    #[test]
+    fn testBundledHasCurrentAnthropicModelIds() {
+        // CostCalculator looks up models by exact string match against the wire
+        // id `claude` sends (e.g. `claude-opus-4-7`). Earlier entries used the
+        // legacy `claude-4-{opus,sonnet,haiku}` keys which never matched, so
+        // every Claude Code record had `cost_usd: null`. Guard against losing
+        // the current ids.
+        let bundled = PricingTable::bundled();
+        for model in [
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-haiku-4-5-20251001",
+        ] {
+            assert!(
+                bundled.models.contains_key(model),
+                "bundled pricing missing wire model id `{model}`"
+            );
+        }
+        // And the lookup actually returns a non-zero cost for plausible tokens.
+        let cost = bundled
+            .cost("claude-opus-4-7", 1_000, 500, None, None)
+            .expect("priced");
+        assert!(cost > 0.0, "claude-opus-4-7 priced 1k/500 -> {cost}");
+    }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
@@ -15,6 +15,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 
 use kyris_core::config::ProviderFormat;
+use kyris_core::record::PlanStatus;
 
 use crate::metering::{StatsEvent, TokenCounts};
 use crate::server::AppState;
@@ -32,10 +33,30 @@ pub fn routes(state: Arc<AppState>) -> Router {
         )
 }
 
+/// Classify the cost-coverage of a request from the agent's inbound credential.
+/// A subscription OAuth credential (Anthropic `sk-ant-oat…` bearer, or an
+/// `oauth-` beta) is plan-covered (Included); anything else is billed (Overage).
+fn anthropic_plan_status(headers: &HeaderMap) -> PlanStatus {
+    let beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let authz = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if beta.contains("oauth") || authz.contains("sk-ant-oat") {
+        PlanStatus::Included
+    } else {
+        PlanStatus::Overage
+    }
+}
+
 async fn handle_messages(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
@@ -87,7 +108,10 @@ async fn handle_messages(
         .get(&provider_name)
         .cloned()
         .unwrap_or_else(reqwest::Client::new);
-    let upstream_url = format!("{}/v1/messages", provider.upstream);
+    let upstream_url = match raw_query.as_deref() {
+        Some(q) if !q.is_empty() => format!("{}/v1/messages?{q}", provider.upstream),
+        _ => format!("{}/v1/messages", provider.upstream),
+    };
 
     let timeout_secs = if is_stream {
         provider.streaming_timeout_seconds
@@ -95,17 +119,34 @@ async fn handle_messages(
         provider.timeout_seconds
     };
 
+    // Pass through the agent's own credential (subscription OAuth or its own API
+    // key) when present; fall back to the configured key only if it sent none.
+    // The cost class follows the auth mode (OAuth -> Included, else Overage).
+    let plan_status = anthropic_plan_status(&headers);
+    let forward_credential =
+        headers.contains_key("authorization") || headers.contains_key("x-api-key");
+
     let mut req = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("x-api-key", &provider.api_key)
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
         .body(body.to_vec());
 
+    if forward_credential {
+        if let Some(v) = headers.get("authorization") {
+            req = req.header("authorization", v);
+        }
+        if let Some(v) = headers.get("x-api-key") {
+            req = req.header("x-api-key", v);
+        }
+    } else {
+        req = req.header("x-api-key", &provider.api_key);
+    }
+
     for (key, value) in &headers {
         let name = key.as_str().to_lowercase();
-        if name.starts_with("anthropic-") && name != "anthropic-version" {
+        if (name.starts_with("anthropic-") && name != "anthropic-version") || name == "user-agent" {
             req = req.header(key, value);
         }
     }
@@ -131,6 +172,7 @@ async fn handle_messages(
             trace_token,
             peer_addr,
             start,
+            plan_status,
         );
     }
 
@@ -200,6 +242,7 @@ async fn handle_messages(
             mcp_server: None,
             mcp_tool: None,
             metering,
+            plan_status,
             working_dir,
         })
         .is_err()
@@ -231,6 +274,7 @@ fn relay_sse_stream(
     trace_token: Option<String>,
     peer_addr: SocketAddr,
     start: std::time::Instant,
+    plan_status: PlanStatus,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(StreamTokenCounts::default()));
     let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
@@ -401,6 +445,7 @@ fn relay_sse_stream(
                     mcp_server: None,
                     mcp_tool: None,
                     metering: stream_metering,
+                    plan_status,
                     working_dir,
                 })
                 .is_err()
@@ -476,17 +521,29 @@ async fn handle_count_tokens(
         .unwrap_or_else(reqwest::Client::new);
     let upstream_url = format!("{}/v1/messages/count_tokens", provider.upstream);
 
+    let forward_credential =
+        headers.contains_key("authorization") || headers.contains_key("x-api-key");
     let mut req = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(provider.timeout_seconds))
-        .header("x-api-key", &provider.api_key)
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
         .body(body.to_vec());
 
+    if forward_credential {
+        if let Some(v) = headers.get("authorization") {
+            req = req.header("authorization", v);
+        }
+        if let Some(v) = headers.get("x-api-key") {
+            req = req.header("x-api-key", v);
+        }
+    } else {
+        req = req.header("x-api-key", &provider.api_key);
+    }
+
     for (key, value) in &headers {
         let name = key.as_str().to_lowercase();
-        if name.starts_with("anthropic-") && name != "anthropic-version" {
+        if (name.starts_with("anthropic-") && name != "anthropic-version") || name == "user-agent" {
             req = req.header(key, value);
         }
     }
@@ -601,6 +658,32 @@ mod tests {
     use bytes::Bytes;
     use kyris_core::config::{KyrisdConfig, ProviderConfig, ProviderFormat};
     use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn testPlanStatusSubscriptionOauthIsIncluded() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer sk-ant-oat01-abc".parse().unwrap());
+        assert_eq!(anthropic_plan_status(&h), PlanStatus::Included);
+
+        let mut beta = HeaderMap::new();
+        beta.insert(
+            "anthropic-beta",
+            "claude-code-20250219,oauth-2025-04-20".parse().unwrap(),
+        );
+        assert_eq!(anthropic_plan_status(&beta), PlanStatus::Included);
+    }
+
+    #[test]
+    fn testPlanStatusApiKeyAndFallbackAreOverage() {
+        let mut key = HeaderMap::new();
+        key.insert("x-api-key", "sk-ant-api03-xyz".parse().unwrap());
+        assert_eq!(anthropic_plan_status(&key), PlanStatus::Overage);
+        // No agent credential -> kyrisd substitutes its configured key -> billed.
+        assert_eq!(
+            anthropic_plan_status(&HeaderMap::new()),
+            PlanStatus::Overage
+        );
+    }
 
     use crate::{
         circuit_breaker::CircuitBreaker, cost::CostCalculator, metering::StatsEvent,

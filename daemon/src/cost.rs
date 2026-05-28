@@ -35,7 +35,16 @@ impl CostCalculator {
             .cost(model, tokens_in, tokens_out, cache_create, cache_read)
     }
 
-    pub fn update_pricing(&self, table: PricingTable) {
+    pub fn update_pricing(&self, mut table: PricingTable) {
+        // Bundled entries are authoritative for the bare wire model ids agents
+        // actually send (e.g. `claude-opus-4-7`), where litellm catalogs them as
+        // dated/prefixed variants (`claude-opus-4-7-20260416`,
+        // `global.anthropic.claude-opus-4-7`, etc.) that an exact-match lookup
+        // misses. Merge with bundled-wins so a relay refresh fills in the long
+        // tail without dropping the curated bare-id pricing.
+        for (k, v) in PricingTable::bundled().models {
+            table.models.insert(k, v);
+        }
         self.pricing.store(Arc::new(table));
     }
 }
@@ -101,6 +110,47 @@ mod tests {
         table.version = "v99.0.0".to_string();
         calc.update_pricing(table);
         assert_eq!(calc.pricing.load().version, "v99.0.0");
+    }
+
+    #[test]
+    fn testUpdatePricingPreservesBundledWireIds() {
+        // The relay-fetched pricing (e.g. from litellm) catalogs Anthropic
+        // models as dated/prefixed variants, missing the bare wire ids that
+        // `claude` actually sends. update_pricing must merge with bundled-wins
+        // so a refresh from the relay can't silently drop `claude-opus-4-7` and
+        // leave every Claude Code record with `cost_usd: null`.
+        let calc = CostCalculator::new();
+        let mut sparse = PricingTable {
+            version: "litellm-2026".to_string(),
+            models: std::collections::HashMap::new(),
+        };
+        // Simulate a relay table that has only the dated variant.
+        sparse.models.insert(
+            "claude-opus-4-7-20260416".to_string(),
+            kyris_core::pricing::ModelPricing {
+                provider: "anthropic".to_string(),
+                input_per_million: 15.0,
+                output_per_million: 75.0,
+                cache_create_per_million: None,
+                cache_read_per_million: None,
+            },
+        );
+        calc.update_pricing(sparse);
+        let active = calc.pricing.load();
+        assert!(
+            active.models.contains_key("claude-opus-4-7-20260416"),
+            "relay-fetched models survive"
+        );
+        assert!(
+            active.models.contains_key("claude-opus-4-7"),
+            "bundled wire-id `claude-opus-4-7` must NOT be lost on refresh"
+        );
+        assert!(
+            calc.calculate("claude-opus-4-7", 1_000, 500, None, None)
+                .unwrap()
+                > 0.0,
+            "claude-opus-4-7 must price after refresh"
+        );
     }
 
     #[test]

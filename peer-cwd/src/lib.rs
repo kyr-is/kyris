@@ -88,11 +88,107 @@ fn find_pid_for_local_port_with_deadline(port: u16, deadline: std::time::Instant
     None
 }
 
+/// Read a process's current working directory on macOS.
+///
+/// `libproc`'s `pidcwd` is an unimplemented stub on macOS (returns
+/// "not implemented for macos"), so we call `proc_pidinfo` with the
+/// `PROC_PIDVNODEPATHINFO` flavor directly and read `pvi_cdir.vip_path`.
+/// This works same-uid for other processes (incl. hardened binaries like the
+/// `claude` CLI) without root — verified against `/usr/sbin/lsof`.
 #[cfg(target_os = "macos")]
 fn read_cwd(pid: i32) -> Option<String> {
-    libproc::libproc::proc_pid::pidcwd(pid)
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
+    use std::os::raw::{c_int, c_void};
+
+    const PROC_PIDVNODEPATHINFO: c_int = 9;
+    const MAXPATHLEN: usize = 1024;
+
+    // Layout mirrors <sys/proc_info.h>. We only read `pvi_cdir.vip_path`, but
+    // every preceding field must match so the path lands at the right offset;
+    // `testReadCwdOfSelfMatchesCurrentDir` validates the layout end-to-end.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VinfoStat {
+        vst_dev: u32,
+        vst_mode: u16,
+        vst_nlink: u16,
+        vst_ino: u64,
+        vst_uid: u32,
+        vst_gid: u32,
+        vst_atime: i64,
+        vst_atimensec: i64,
+        vst_mtime: i64,
+        vst_mtimensec: i64,
+        vst_ctime: i64,
+        vst_ctimensec: i64,
+        vst_birthtime: i64,
+        vst_birthtimensec: i64,
+        vst_size: i64,
+        vst_blocks: i64,
+        vst_blksize: i32,
+        vst_flags: u32,
+        vst_gen: u32,
+        vst_rdev: u32,
+        vst_qspare: [i64; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VnodeInfo {
+        vi_stat: VinfoStat,
+        vi_type: c_int,
+        vi_pad: c_int,
+        vi_fsid: [i32; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct VnodeInfoPath {
+        vip_vi: VnodeInfo,
+        vip_path: [u8; MAXPATHLEN],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ProcVnodePathInfo {
+        pvi_cdir: VnodeInfoPath,
+        pvi_rdir: VnodeInfoPath,
+    }
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+
+    let mut info = std::mem::MaybeUninit::<ProcVnodePathInfo>::zeroed();
+    let size = std::mem::size_of::<ProcVnodePathInfo>() as c_int;
+    // SAFETY: we hand `proc_pidinfo` a correctly-sized, aligned buffer and the
+    // matching flavor; it fills up to `size` bytes and returns the count.
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast::<c_void>(),
+            size,
+        )
+    };
+    if written != size {
+        // 0/-1 (errno) or a short read — treat as unattributable.
+        return None;
+    }
+    // SAFETY: `proc_pidinfo` wrote the full struct (`written == size`).
+    let info = unsafe { info.assume_init() };
+    let path = &info.pvi_cdir.vip_path;
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&path[..end]).ok().map(String::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +293,20 @@ fn read_cwd(_pid: i32) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn testReadCwdOfSelfMatchesCurrentDir() {
+        // Validates the proc_pidinfo FFI + struct layout: reading our own pid's
+        // cwd must equal std::env::current_dir(). Both are canonicalized because
+        // vip_path is the resolved real path (e.g. /tmp -> /private/tmp). A wrong
+        // struct offset would yield garbage and fail this assertion.
+        let got = read_cwd(std::process::id() as i32).expect("read own cwd via proc_pidinfo");
+        let got = std::fs::canonicalize(&got).expect("canonicalize read cwd");
+        let expected =
+            std::fs::canonicalize(std::env::current_dir().unwrap()).expect("canonicalize cwd");
+        assert_eq!(got, expected);
+    }
 
     #[test]
     fn testResolveReturnsNoneForBogusPort() {

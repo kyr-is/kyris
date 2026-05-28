@@ -53,6 +53,7 @@ fn gateway_row_to_record(
     use std::str::FromStr as _;
     let status_str: String = row.get(11)?;
     let metering_str: Option<String> = row.get::<_, Option<String>>(17)?;
+    let plan_status_str: Option<String> = row.get::<_, Option<String>>(18)?;
     Ok(kyris_core::record::GatewayRecord {
         id: row.get(0)?,
         trace_id: row.get(1)?,
@@ -76,6 +77,10 @@ fn gateway_row_to_record(
             Some("unavailable") => kyris_core::record::Metering::Unavailable,
             _ => kyris_core::record::Metering::Available,
         },
+        plan_status: kyris_core::record::PlanStatus::from_str(
+            plan_status_str.as_deref().unwrap_or("unknown"),
+        )
+        .unwrap_or_default(),
     })
 }
 
@@ -132,8 +137,8 @@ impl DuckDbWriter {
                 id, trace_id, timestamp, provider, model,
                 tokens_in, tokens_out, tokens_cache_create, tokens_cache_read,
                 cost_usd, latency_ms, status, session_id, synced, mcp_server, mcp_tool,
-                working_dir, metering
-            ) VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?, ?, ?)",
+                working_dir, metering, plan_status
+            ) VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?, ?, ?, ?)",
         )?;
         for event in events {
             let id = uuid::Uuid::now_v7().to_string();
@@ -162,6 +167,7 @@ impl DuckDbWriter {
                 kyris_core::record::Metering::Available => "available",
                 kyris_core::record::Metering::Unavailable => "unavailable",
             };
+            let plan_status_str = event.plan_status.to_string();
             stmt.execute(duckdb::params![
                 id,
                 event.trace_id,
@@ -179,6 +185,7 @@ impl DuckDbWriter {
                 event.mcp_tool,
                 event.working_dir,
                 metering_str,
+                plan_status_str,
             ])?;
 
             // Best-effort fan-out to live monitor subscribers. The DB row is the
@@ -202,6 +209,7 @@ impl DuckDbWriter {
                 mcp_server: event.mcp_server.clone(),
                 mcp_tool: event.mcp_tool.clone(),
                 metering: event.metering,
+                plan_status: event.plan_status,
                 working_dir: event.working_dir.clone(),
             });
         }
@@ -309,6 +317,27 @@ impl DuckDbWriter {
         Ok(())
     }
 
+    /// Records not yet synced to the relay that carry an attributable
+    /// `working_dir` (the relay scopes by it). Shares `gateway_row_to_record`
+    /// with `query_gateway_records` so the duckdb TIMESTAMP is `strftime`-ed
+    /// into the `String` the record expects — reading it raw errors per-row.
+    pub fn query_unsynced_records(&self) -> duckdb::Result<Vec<kyris_core::record::GatewayRecord>> {
+        let conn = self.conn.lock().expect("lock db");
+        let mut stmt = conn.prepare(
+            "SELECT id, trace_id, \
+                    strftime(timestamp, '%Y-%m-%dT%H:%M:%SZ') AS timestamp, \
+                    provider, model, \
+                    tokens_in, tokens_out, tokens_cache_create, tokens_cache_read, \
+                    cost_usd, latency_ms, status, session_id, synced, \
+                    mcp_server, mcp_tool, working_dir, metering, plan_status \
+             FROM gateway_records \
+             WHERE synced = false AND working_dir IS NOT NULL \
+             ORDER BY timestamp LIMIT 500",
+        )?;
+        let rows = stmt.query_map([], gateway_row_to_record)?;
+        rows.collect()
+    }
+
     /// Read-only query of `gateway_records` for the operator API.
     ///
     /// All filter parameters AND together. Pass `None` for "no filter".
@@ -325,7 +354,7 @@ impl DuckDbWriter {
                     provider, model, \
                     tokens_in, tokens_out, tokens_cache_create, tokens_cache_read, \
                     cost_usd, latency_ms, status, session_id, synced, \
-                    mcp_server, mcp_tool, working_dir, metering \
+                    mcp_server, mcp_tool, working_dir, metering, plan_status \
              FROM gateway_records WHERE 1 = 1",
         );
         let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
@@ -582,8 +611,35 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: kyris_core::record::Metering::Available,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
         }
+    }
+
+    #[test]
+    fn testQueryUnsyncedRecordsReturnsAttributedRecords() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = DuckDbWriter::open(&dir.path().join("test.duckdb"));
+        // Only the record with a working_dir is syncable (relay scopes by it).
+        let mut with_dir = sample_event("trace-attr");
+        with_dir.working_dir = Some("/work/repo".to_string());
+        let without = sample_event("trace-none"); // working_dir None -> skipped
+        writer.insert_batch(&[with_dir, without]).expect("insert");
+
+        let unsynced = writer.query_unsynced_records().expect("query unsynced");
+        assert_eq!(unsynced.len(), 1, "only the working_dir record syncs");
+        let rec = &unsynced[0];
+        assert_eq!(rec.trace_id, "trace-attr");
+        assert_eq!(rec.working_dir.as_deref(), Some("/work/repo"));
+        assert!(!rec.synced);
+        assert_eq!(rec.plan_status, kyris_core::record::PlanStatus::Overage);
+        // Regression: the duckdb TIMESTAMP must come back as a usable string
+        // (reading it raw errored per-row and silently dropped every record).
+        assert!(
+            rec.timestamp.contains('T') && rec.timestamp.ends_with('Z'),
+            "timestamp not strftime'd: {}",
+            rec.timestamp
+        );
     }
 
     #[test]
@@ -787,6 +843,7 @@ mod tests {
             mcp_server: Some("github".to_string()),
             mcp_tool: Some("read_file".to_string()),
             metering: kyris_core::record::Metering::Available,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: Some("/tmp/project".to_string()),
         };
 
@@ -873,6 +930,7 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: kyris_core::record::Metering::Unavailable,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
         };
         writer.insert_batch(&[event]).expect("insert");
@@ -963,6 +1021,7 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: kyris_core::record::Metering::Available,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
         }
     }

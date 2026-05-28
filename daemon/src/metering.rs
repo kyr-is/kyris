@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-use kyris_core::record::Metering;
+use kyris_core::record::{Metering, PlanStatus};
 
 #[derive(Debug, Clone, Default)]
 pub struct TokenCounts {
@@ -23,6 +23,10 @@ pub struct StatsEvent {
     pub mcp_server: Option<String>,
     pub mcp_tool: Option<String>,
     pub metering: Metering,
+    /// Cost-coverage class derived from the upstream auth mode kyrisd used:
+    /// forwarded subscription credential -> Included; substituted/forwarded API
+    /// key -> Overage.
+    pub plan_status: PlanStatus,
     pub working_dir: Option<String>,
 }
 

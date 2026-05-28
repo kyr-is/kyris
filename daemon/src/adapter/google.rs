@@ -173,6 +173,7 @@ async fn handle_generate_content(
             mcp_server: None,
             mcp_tool: None,
             metering,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir,
         })
         .is_err()
@@ -439,6 +440,7 @@ fn relay_ndjson_stream(
                     mcp_server: None,
                     mcp_tool: None,
                     metering: stream_metering,
+                    plan_status: kyris_core::record::PlanStatus::Overage,
                     working_dir,
                 })
                 .is_err()

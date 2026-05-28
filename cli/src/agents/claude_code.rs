@@ -38,8 +38,17 @@ pub fn claude_hooks_dir() -> Result<PathBuf, String> {
 fn claude_code_env_exports(base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
     vec![
         ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
-        ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
-        ("ANTHROPIC_AUTH_TOKEN".to_string(), inbound_key.to_string()),
+        // Deliver the kyrisd gate secret in a dedicated header (parsed by Claude
+        // Code's ANTHROPIC_CUSTOM_HEADERS) so the agent's OWN credential —
+        // subscription OAuth or the user's API key — flows through to the
+        // provider untouched. That lets kyrisd forward it and classify usage as
+        // included (subscription/burn-only) vs overage (API key). We deliberately
+        // do NOT set ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, which would override
+        // the subscription OAuth.
+        (
+            "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+            format!("x-kyris-inbound: {inbound_key}"),
+        ),
         (
             "ANTHROPIC_BEDROCK_BASE_URL".to_string(),
             base_url.to_string(),
@@ -404,6 +413,16 @@ mod tests {
         assert!(keys.contains(&"ANTHROPIC_BEDROCK_MANTLE_BASE_URL"));
         assert!(keys.contains(&"CLAUDE_CODE_SKIP_BEDROCK_AUTH"));
         assert!(keys.contains(&"CLAUDE_CODE_SKIP_VERTEX_AUTH"));
-        assert!(keys.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        // The gate secret rides in a custom header; the agent's own credential
+        // is left untouched (no forced ANTHROPIC_API_KEY/AUTH_TOKEN).
+        assert!(keys.contains(&"ANTHROPIC_CUSTOM_HEADERS"));
+        assert!(!keys.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!keys.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        let custom = exports
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_CUSTOM_HEADERS")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(custom, "x-kyris-inbound: sk-test");
     }
 }

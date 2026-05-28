@@ -26,6 +26,12 @@ pub struct GatewayRecord {
     pub mcp_tool: Option<String>,
     #[serde(default)]
     pub metering: Metering,
+    /// Whether this usage is covered by a subscription/monthly plan (`included`)
+    /// or billed pay-per-token (`overage`). Derived from the auth mode kyrisd
+    /// used upstream: forwarded subscription credential -> included; substituted
+    /// API key -> overage. `unknown` when it could not be determined.
+    #[serde(default)]
+    pub plan_status: PlanStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
 }
@@ -78,6 +84,46 @@ pub enum Metering {
     Available,
 }
 
+/// Cost-coverage class for a gateway record. Orthogonal to [`Metering`] (which
+/// only says whether the usage block was parseable): `plan_status` says whether
+/// the parsed usage is plan-covered or billable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    /// Routed on the agent's own subscription/monthly plan (burn-only) — the
+    /// computed cost is shown for visibility but is covered by the plan.
+    Included,
+    /// Routed pay-per-token on an API key — the computed cost is real billing.
+    Overage,
+    /// Auth mode could not be determined.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl std::fmt::Display for PlanStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Included => f.write_str("included"),
+            Self::Overage => f.write_str("overage"),
+            Self::Unknown => f.write_str("unknown"),
+        }
+    }
+}
+
+impl std::str::FromStr for PlanStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "included" => Ok(Self::Included),
+            "overage" => Ok(Self::Overage),
+            _ => Ok(Self::Unknown),
+        }
+    }
+}
+
 pub const CREATE_GATEWAY_RECORDS: &str = "\
 CREATE TABLE IF NOT EXISTS gateway_records (
     id          VARCHAR PRIMARY KEY,
@@ -97,7 +143,8 @@ CREATE TABLE IF NOT EXISTS gateway_records (
     mcp_server  VARCHAR,
     mcp_tool    VARCHAR,
     working_dir VARCHAR,
-    metering    VARCHAR NOT NULL DEFAULT 'available'
+    metering    VARCHAR NOT NULL DEFAULT 'available',
+    plan_status VARCHAR NOT NULL DEFAULT 'unknown'
 )";
 
 pub const CREATE_SESSION_TOKENS: &str = "\
@@ -151,6 +198,27 @@ mod tests {
     }
 
     #[test]
+    fn testPlanStatusRoundTrip() {
+        assert_eq!(PlanStatus::default(), PlanStatus::Unknown);
+        assert_eq!(
+            serde_json::to_string(&PlanStatus::Included).unwrap(),
+            r#""included""#
+        );
+        assert_eq!(
+            serde_json::to_string(&PlanStatus::Overage).unwrap(),
+            r#""overage""#
+        );
+        assert_eq!(
+            serde_json::from_str::<PlanStatus>(r#""subscription""#).unwrap(),
+            PlanStatus::Unknown
+        );
+        assert_eq!(
+            "included".parse::<PlanStatus>().unwrap(),
+            PlanStatus::Included
+        );
+    }
+
+    #[test]
     fn testGatewayRecordRoundTrip() {
         let record = GatewayRecord {
             id: "rec-1".to_string(),
@@ -170,6 +238,7 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: Metering::Available,
+            plan_status: PlanStatus::Included,
             working_dir: Some("/tmp/project".to_string()),
         };
         let json = serde_json::to_string(&record).unwrap();
@@ -177,6 +246,7 @@ mod tests {
         assert_eq!(parsed.id, "rec-1");
         assert_eq!(parsed.tokens_in, Some(100));
         assert_eq!(parsed.status, RecordStatus::Success);
+        assert_eq!(parsed.plan_status, PlanStatus::Included);
     }
 
     #[test]
@@ -199,6 +269,7 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: Metering::Unavailable,
+            plan_status: PlanStatus::Unknown,
             working_dir: None,
         };
         let json = serde_json::to_string(&record).unwrap();

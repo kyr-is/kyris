@@ -1439,6 +1439,7 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: kyris_core::record::Metering::Available,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
         }
     }

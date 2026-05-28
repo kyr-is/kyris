@@ -27,6 +27,30 @@ models:
     cache_create_per_million: 1.0
     cache_read_per_million: 0.08
 
+  # Anthropic 4.x wire model ids (what `claude` CLI sends, e.g. `claude-opus-4-7`).
+  # CostCalculator does an exact-string lookup, so the keys must match the wire
+  # id exactly — the `claude-4-{opus,sonnet,haiku}` keys above don't match these.
+  claude-opus-4-7:
+    provider: anthropic
+    input_per_million: 15.0
+    output_per_million: 75.0
+    cache_create_per_million: 18.75
+    cache_read_per_million: 1.50
+
+  claude-sonnet-4-6:
+    provider: anthropic
+    input_per_million: 3.0
+    output_per_million: 15.0
+    cache_create_per_million: 3.75
+    cache_read_per_million: 0.30
+
+  claude-haiku-4-5-20251001:
+    provider: anthropic
+    input_per_million: 0.80
+    output_per_million: 4.0
+    cache_create_per_million: 1.0
+    cache_read_per_million: 0.08
+
   gpt-4o:
     provider: openai
     input_per_million: 2.50

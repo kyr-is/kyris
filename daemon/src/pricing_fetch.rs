@@ -17,7 +17,9 @@ pub async fn run_pricing_fetch(state: Arc<AppState>) {
 
     let fetch_interval_hours = config.pricing.fetch_interval_hours;
     let client = reqwest::Client::new();
-    let pricing_url = format!("{relay_url}/api/pricing");
+    // The relay serves pricing at `/api/v1/pricing`; an earlier bare `/api/pricing`
+    // here 404'd against every real relay (the bundled table was the silent fallback).
+    let pricing_url = format!("{}/api/v1/pricing", relay_url.trim_end_matches('/'));
 
     if let Some(table) = fetch_pricing(&client, &pricing_url).await {
         tracing::info!(version = %table.version, "loaded pricing table from relay");
