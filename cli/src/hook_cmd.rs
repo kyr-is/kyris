@@ -836,7 +836,23 @@ fn drive_per_segment(
 }
 
 /// Classify one segment with a real (token-bearing) request to agentpactd.
+///
+/// The `anchor_pid` we pass is `parent_id()` — i.e. the agent's PID, since
+/// this CLI runs as a hook child of the agent (Claude Code, Codex CLI, …).
+/// That tag makes the `exec_token` the daemon mints anchored to the agent,
+/// so when the agent later spawns `bash -c '…'` the shell trap's
+/// `ppid_chain` will match and the daemon auto-allows the segments
+/// instead of re-asking. This is the kyris-side half of the
+/// `AGENTPACT_EXEC_TOKEN` chain-anchoring contract (the other half is
+/// `consume_by_chain` in `agentpact::permission::request`).
 fn classify_segment(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>, seg: &str) -> SegClass {
+    // The agent process is our parent (this CLI runs as a hook child of
+    // Claude Code / Codex / Gemini). `std::os::unix::process::parent_id`
+    // is stable since 1.69 and returns `u32`; kyris targets only Unix.
+    #[cfg(unix)]
+    let anchor_pid = Some(std::os::unix::process::parent_id());
+    #[cfg(not(unix))]
+    let anchor_pid: Option<u32> = None;
     match agentpact::request_hook_permission(
         ctx.sock_path,
         "kyris-hook",
@@ -844,6 +860,8 @@ fn classify_segment(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>, seg: &str) -
         seg,
         ctx.cwd,
         seed_pid,
+        anchor_pid,
+        None,
         ctx.socket_timeout,
     ) {
         Ok((McpPermissionDecision::Allow { .. }, _)) => SegClass::Auto,

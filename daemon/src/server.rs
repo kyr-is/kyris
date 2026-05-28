@@ -148,7 +148,12 @@ pub async fn run(config: KyrisdConfig) {
         .merge(routed_routes)
         .merge(operator_routes)
         .merge(health_routes(state.clone()))
-        .layer(RequestBodyLimitLayer::new(max_body));
+        .layer(RequestBodyLimitLayer::new(max_body))
+        // Outermost layer: every request that reaches the daemon — including
+        // ones rejected by auth or body-limit — gets a log line. "No log
+        // entry for the request" must reliably mean "request never reached
+        // the daemon," not "swallowed silently."
+        .layer(axum::middleware::from_fn(request_log_middleware));
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
@@ -189,6 +194,31 @@ pub async fn run(config: KyrisdConfig) {
     }
 
     remove_pid_file();
+}
+
+/// Per-request access log. Logs every request the daemon receives at
+/// `INFO` (4xx -> WARN, 5xx -> ERROR), with method / path / status /
+/// `latency_ms`. The outermost layer on the router, so even requests
+/// rejected by auth or body-limit middleware are visible.
+async fn request_log_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    #[allow(clippy::cast_possible_truncation)]
+    let latency_ms = start.elapsed().as_millis() as u64;
+    if status >= 500 {
+        tracing::error!(method = %method, path = %path, status, latency_ms, "request");
+    } else if status >= 400 {
+        tracing::warn!(method = %method, path = %path, status, latency_ms, "request");
+    } else {
+        tracing::info!(method = %method, path = %path, status, latency_ms, "request");
+    }
+    response
 }
 
 async fn serve_with_graceful_shutdown<F>(

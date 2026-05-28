@@ -9,10 +9,17 @@
 //! Gemini CLI `BeforeTool`) use `kyris hook check` in the CLI binary — that
 //! binary has tokio + reqwest and can run the hold-poll-resolve pattern for
 //! `PACT_ASK` approval delegation.
-#![cfg_attr(not(test), forbid(unsafe_code))]
+// The hook helper is unsafe-free *except* for the `ppid_chain` module,
+// which needs a single FFI call on macOS to walk parent PIDs (so the
+// daemon can match anchored exec_tokens). That module opts in
+// explicitly via `#[allow(unsafe_code)]`; everything else stays
+// strictly safe.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(non_snake_case))]
+
+mod ppid_chain;
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -80,6 +87,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
         .ok()
         .filter(|t| !t.is_empty());
 
+    // Always include the ancestor chain (cheap to compute, bounded by
+    // `MAX_CHAIN_LEN`). When the agent's native PreToolUse hook already
+    // approved the parent command and the daemon issued an exec_token
+    // anchored to the agent's PID, this chain lets the daemon find and
+    // consume that token without `AGENTPACT_EXEC_TOKEN` being in env —
+    // which it isn't, because Claude Code & co. have no API to
+    // propagate hook outputs into spawned-tool envs. Empty chain (we
+    // could not even find our own parent) is omitted by the wire side
+    // rather than serialized as `[]`.
+    let ppid_chain = ppid_chain::current_chain();
+
     let mut request = serde_json::json!({
         "id": generate_id(),
         "method": "permission.request",
@@ -91,6 +109,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
     });
     if let Some(ref token) = exec_token {
         request["exec_token"] = serde_json::Value::String(token.clone());
+    }
+    if !ppid_chain.is_empty() {
+        request["ppid_chain"] = serde_json::json!(ppid_chain);
     }
 
     let Ok(response) = send_request(&socket_path, &request) else {

@@ -67,8 +67,14 @@ pub async fn inbound_auth_middleware(
 
     match validate_inbound_key(request.headers(), inbound_key) {
         AuthResult::Ok => Ok(next.run(request).await),
-        AuthResult::Rejected => Err(StatusCode::UNAUTHORIZED),
-        AuthResult::Misconfigured => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        AuthResult::Rejected => {
+            drain_request_body(request).await;
+            Err(StatusCode::UNAUTHORIZED)
+        }
+        AuthResult::Misconfigured => {
+            drain_request_body(request).await;
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
 }
 
@@ -82,9 +88,25 @@ pub async fn operator_auth_middleware(
 
     match validate_key(request.headers(), operator_key) {
         AuthResult::Ok => Ok(next.run(request).await),
-        AuthResult::Rejected => Err(StatusCode::UNAUTHORIZED),
-        AuthResult::Misconfigured => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        AuthResult::Rejected => {
+            drain_request_body(request).await;
+            Err(StatusCode::UNAUTHORIZED)
+        }
+        AuthResult::Misconfigured => {
+            drain_request_body(request).await;
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
+}
+
+/// Drain the request body before returning an error response. If we drop the
+/// request with the body unread, hyper RSTs the connection (the HTTP/1.1
+/// protocol state is undefined with an unconsumed body), and the client sees
+/// `RemoteDisconnected` instead of the actual status we returned. Draining
+/// lets hyper deliver the response cleanly. The body is already capped by the
+/// outer `RequestBodyLimitLayer`, so `usize::MAX` here just means "all of it".
+async fn drain_request_body(request: Request<Body>) {
+    let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await;
 }
 
 #[cfg(test)]

@@ -10,20 +10,36 @@
 # file with a shebang that would mislead "is this script executable?"
 # tooling.
 
-# Skip the trap entirely when this shell is a subprocess of a governed
-# agent (Claude Code, Codex CLI, Gemini CLI, OpenCode, Cline). The
-# agent's PreToolUse hook already approved the parent command — letting
-# the DEBUG trap re-fire on every line of /etc/profile and every
-# sub-command inside the approved compound triggered ~10x redundant
-# popups. See kyris/daemon/src/approvals_log.rs for empirical evidence.
+# Kyris governs commands spawned *by* agents, not commands the human
+# types into their own terminal. Source-from-rc is the only delivery
+# vehicle we have for non-interactive agent subshells (BASH_ENV /
+# .zshenv reach those), but rc files are read by the human's shell too.
+# So this detector decides whether the current shell is inside a
+# governed agent's process tree — only then do we install the trap.
+# Fast path: env markers set by `kyris agents setup <agent>`'s shim
+# (KYRIS_GOVERNED_SUBPROCESS=<id>) or by the agent itself (CLAUDECODE).
+# Slow path: a bounded walk up the ppid chain for known agent comms,
+# covering agents launched before the shim was installed.
 __kyris_running_under_governed_agent() {
+    # Cache: once this shell decides, its descendants inherit the
+    # answer via env and skip the walk. Saves the per-shell `ps` cost
+    # (5–30ms on macOS) across heavy fan-out workloads — `make -j`,
+    # recursive shell tests, anything that forks subshells. The cache
+    # value is one of `1` (governed) or `0` (not), so `[ "$v" = "1" ]`
+    # works at either decision.
+    if [ -n "${__KYRIS_GUARD_RESULT:-}" ]; then
+        [ "$__KYRIS_GUARD_RESULT" = "1" ] && return 0 || return 1
+    fi
+
     # Fast path: env vars known to be injected by specific agents.
     # CLAUDECODE=1 is the canonical Claude Code marker (verified via
     # `env | grep CLAUDE` inside a Claude-spawned subprocess).
-    # KYRIS_GOVERNED_SUBPROCESS is the universal override for agents
-    # we don't auto-detect.
-    [ -n "${CLAUDECODE:-}" ] && return 0
-    [ -n "${KYRIS_GOVERNED_SUBPROCESS:-}" ] && return 0
+    # KYRIS_GOVERNED_SUBPROCESS is the universal override set by the
+    # `kyris agents setup <agent>` shim for the other four agents.
+    if [ -n "${CLAUDECODE:-}" ] || [ -n "${KYRIS_GOVERNED_SUBPROCESS:-}" ]; then
+        export __KYRIS_GUARD_RESULT=1
+        return 0
+    fi
 
     # Slow path (only reached when env vars don't match): walk the
     # parent process chain looking for known agent binaries. Bounded
@@ -36,17 +52,19 @@ __kyris_running_under_governed_agent() {
         _kyris_comm="${_kyris_comm##*/}"
         case "$_kyris_comm" in
             claude|claude-code|codex|gemini|opencode|cline)
+                export __KYRIS_GUARD_RESULT=1
                 return 0
                 ;;
         esac
         _kyris_pid=$(ps -p "$_kyris_pid" -o ppid= 2>/dev/null | tr -d ' ')
-        [ -z "$_kyris_pid" ] && return 1
+        [ -z "$_kyris_pid" ] && break
         _kyris_hops=$((_kyris_hops + 1))
     done
+    export __KYRIS_GUARD_RESULT=0
     return 1
 }
 
-if __kyris_running_under_governed_agent; then
+if ! __kyris_running_under_governed_agent; then
     return 0 2>/dev/null || exit 0
 fi
 

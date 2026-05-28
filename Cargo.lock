@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentpact"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "agentpact-types",
  "arc-swap",
@@ -1955,7 +1955,7 @@ dependencies = [
 
 [[package]]
 name = "kyris"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "agentpact",
  "aws-lc-rs",
@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-agentpact-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "agentpact-types",
  "kyris-core",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "agentpact-types",
  "chrono",
@@ -2011,6 +2011,7 @@ dependencies = [
 name = "kyris-hook"
 version = "0.1.1"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -2018,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "kyris-agentpact-client",
  "kyris-core",
@@ -2032,14 +2033,14 @@ dependencies = [
 
 [[package]]
 name = "kyris-peer-cwd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libproc",
 ]
 
 [[package]]
 name = "kyris-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "agentpact-types",
  "chrono",
@@ -2053,7 +2054,7 @@ dependencies = [
 
 [[package]]
 name = "kyrisd"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "agentpact",
  "arc-swap",
@@ -5271,7 +5272,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "kyris-types",
  "schemars",

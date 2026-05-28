@@ -99,14 +99,15 @@ fn run_zsh_trapdebug(
         .env("AGENTPACT_SOCK", socket_path)
         .env("PATH", path_env)
         .env("HOOK_PATH", hook_path("zsh_hook.sh"))
-        // The hook bails out of its own setup when it detects it is
-        // running inside a governed agent (env vars CLAUDECODE /
-        // KYRIS_GOVERNED_SUBPROCESS, or `claude`/`codex`/… anywhere
-        // in the parent process chain). The test environment can match
-        // any of those — clearing the env vars isn't enough because
-        // the parent process walk still finds the agent that spawned
-        // `cargo test`. `KYRIS_HOOK_FORCE=1` is the dedicated test
-        // escape hatch that bypasses the entire guard.
+        // The hook installs the trap *only* inside a governed agent's
+        // process tree (env vars CLAUDECODE / KYRIS_GOVERNED_SUBPROCESS,
+        // or `claude`/`codex`/… anywhere in the parent process chain).
+        // The test environment is ambiguous — clearing the env vars isn't
+        // enough because the parent process walk may still find the
+        // agent that spawned `cargo test` (or, after the guard
+        // inversion, the absence of any marker would itself suppress
+        // the trap). `KYRIS_HOOK_FORCE=1` is the dedicated test escape
+        // hatch that bypasses the guard either way.
         .env_remove("CLAUDECODE")
         .env_remove("KYRIS_GOVERNED_SUBPROCESS")
         .env("KYRIS_HOOK_FORCE", "1")
@@ -151,6 +152,103 @@ fn test_zsh_hook_blocks_denied_command_via_kyris_hook() {
     assert_eq!(request["method"], "permission.request");
     assert_eq!(request["action"], "execute");
     assert_eq!(request["detail"], "git status");
+}
+
+#[test]
+fn test_kyris_hook_request_carries_ppid_chain_for_anchor_lookup() {
+    // The shell hook's outgoing request MUST include `ppid_chain` —
+    // that's how agentpactd matches the request to an exec_token the
+    // native PreToolUse hook anchored to the agent's PID. Without it,
+    // every segment of a compound the agent already approved would
+    // re-prompt the user.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "chain-1",
+            "code": "PACT_OK",
+            "decision": "auto"
+        })],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg("git status")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+    assert_eq!(output.status.code(), Some(0));
+
+    let requests = daemon.finish();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+
+    let chain = request["ppid_chain"]
+        .as_array()
+        .expect("ppid_chain present in wire request");
+    assert!(
+        !chain.is_empty(),
+        "ppid_chain must contain at least the direct parent"
+    );
+    // First entry is the immediate parent — this test runner spawns
+    // kyris-hook as its child, so the direct parent is *this* test
+    // process. Cross-check against `std::process::id()`.
+    let first = chain[0].as_u64().expect("chain entries are integers");
+    assert_eq!(
+        first,
+        u64::from(std::process::id()),
+        "chain index 0 must be the direct parent (this test process)"
+    );
+}
+
+#[test]
+fn test_kyris_hook_request_carries_exec_token_when_env_set() {
+    // The env-based AGENTPACT_EXEC_TOKEN path (the relay-conventional
+    // shape from the agentpact README) must still work alongside the
+    // new chain path. Both fields can ride on the same request; the
+    // daemon prefers the precise string token, falls back to chain.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "tok-1",
+            "code": "PACT_OK",
+            "decision": "auto"
+        })],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .env("AGENTPACT_EXEC_TOKEN", "ext_test_token_42")
+        .arg("check")
+        .arg("git status")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+    assert_eq!(output.status.code(), Some(0));
+
+    let requests = daemon.finish();
+    let request = &requests[0];
+    assert_eq!(request["exec_token"], "ext_test_token_42");
+    assert!(
+        request["ppid_chain"].is_array(),
+        "ppid_chain must still be present alongside the env token"
+    );
 }
 
 #[test]

@@ -13,11 +13,17 @@ description = "Minimal UDS helper for shell hooks: JSON construction, AgentPact 
 name = "kyris-hook"
 path = "src/main.rs"
 
-# Intentionally minimal: stdlib UnixStream + serde + serde_json only.
-# No DuckDB, no Tokio. < 1MB, < 5ms cold start.
+# Intentionally minimal: stdlib UnixStream + serde + serde_json. macOS
+# adds `libc` for the one FFI call needed to walk the ppid chain (so the
+# daemon can match anchored exec_tokens to the agent's PID). Linux walks
+# the chain by reading `/proc/<pid>/status` with stdlib only. Both paths
+# preserve the < 1MB, < 5ms cold-start target — `libc` is bindings-only.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

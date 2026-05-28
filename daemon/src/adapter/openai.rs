@@ -80,7 +80,12 @@ async fn handle_completions(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::OpenAI)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical OpenAI upstream with an empty fallback key.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::OpenAI)
+        });
     let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();
@@ -251,7 +256,12 @@ async fn handle_responses(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::OpenAI)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical OpenAI upstream with an empty fallback key.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::OpenAI)
+        });
     let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();

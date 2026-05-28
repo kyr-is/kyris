@@ -28,6 +28,18 @@ pub use agentpact_types::Mode;
 /// detail string and an optional `working_dir`. `seed_boundary_pid`, when
 /// supplied, registers the caller's PID as a boundary anchor — agentpactd
 /// validates ancestry and signature-table match before honoring it.
+///
+/// `anchor_pid`, when supplied, asks agentpactd to tag the `exec_token` issued
+/// on this request with that PID, so a later request from a descendant of
+/// `anchor_pid` can consume the token via `ppid_chain` without holding the
+/// token string. Typical caller: the native hook adapter inside the agent's
+/// hook process, passing its own `getppid()` (= the agent's PID).
+///
+/// `ppid_chain`, when supplied, asks agentpactd to look up an existing
+/// anchored `exec_token` whose anchor sits anywhere in the chain. Typical
+/// caller: a shell trap inside an agent-spawned subshell, reporting its
+/// own ancestor chain so the daemon can find the token the native hook
+/// anchored to the agent.
 #[must_use]
 pub fn build_hook_permission_request(
     request_id_prefix: &str,
@@ -35,6 +47,8 @@ pub fn build_hook_permission_request(
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    anchor_pid: Option<u32>,
+    ppid_chain: Option<&[u32]>,
 ) -> serde_json::Value {
     let mut context = serde_json::json!({});
     if let Some(dir) = working_dir {
@@ -49,6 +63,14 @@ pub fn build_hook_permission_request(
     });
     if let Some(pid) = seed_boundary_pid {
         request["seed_boundary_pid"] = serde_json::json!(pid);
+    }
+    if let Some(pid) = anchor_pid {
+        request["anchor_pid"] = serde_json::json!(pid);
+    }
+    if let Some(chain) = ppid_chain
+        && !chain.is_empty()
+    {
+        request["ppid_chain"] = serde_json::json!(chain);
     }
     request
 }
@@ -266,6 +288,7 @@ pub fn request_mcp_tool_permission(
 ///
 /// Returns an error when the request cannot be sent to `agentpactd` or when the daemon
 /// response is malformed.
+#[allow(clippy::too_many_arguments)]
 pub fn request_hook_permission(
     socket_path: &str,
     request_id_prefix: &str,
@@ -273,6 +296,8 @@ pub fn request_hook_permission(
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    anchor_pid: Option<u32>,
+    ppid_chain: Option<&[u32]>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     if let Some(deny) = oversized_execute_deny(action, detail) {
@@ -284,6 +309,8 @@ pub fn request_hook_permission(
         detail,
         working_dir,
         seed_boundary_pid,
+        anchor_pid,
+        ppid_chain,
     );
     send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
         let decision = parse_mcp_permission_response(&response);
@@ -317,12 +344,17 @@ pub fn request_hook_permission_preview(
     if let Some(deny) = oversized_execute_deny(action, detail) {
         return Ok((deny, None));
     }
+    // Preview is strictly side-effect-free: it never mints or consumes
+    // exec_tokens, so anchor_pid and ppid_chain would do nothing here and
+    // are intentionally omitted from the preview API.
     let mut request = build_hook_permission_request(
         request_id_prefix,
         action,
         detail,
         working_dir,
         seed_boundary_pid,
+        None,
+        None,
     );
     request["preview"] = serde_json::json!(true);
     send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
@@ -667,6 +699,8 @@ mod tests {
             &big,
             None,
             None,
+            None,
+            None,
             Duration::from_millis(50),
         );
         match result {
@@ -691,6 +725,8 @@ mod tests {
             &at,
             None,
             None,
+            None,
+            None,
             Duration::from_millis(50),
         );
         assert!(
@@ -709,6 +745,8 @@ mod tests {
             "test",
             "read",
             &big,
+            None,
+            None,
             None,
             None,
             Duration::from_millis(50),
@@ -868,6 +906,8 @@ mod tests {
             "ls -la",
             Some("/tmp/repo"),
             None,
+            None,
+            None,
         );
         assert_eq!(request["method"], "permission.request");
         assert_eq!(request["action"], "execute");
@@ -875,6 +915,8 @@ mod tests {
         assert_eq!(request["context"]["working_dir"], "/tmp/repo");
         assert!(request["context"]["mcp_server"].is_null());
         assert!(request["seed_boundary_pid"].is_null());
+        assert!(request["anchor_pid"].is_null());
+        assert!(request["ppid_chain"].is_null());
         assert!(
             request["id"]
                 .as_str()
@@ -884,7 +926,8 @@ mod tests {
 
     #[test]
     fn testBuildHookPermissionRequestNoWorkingDir() {
-        let request = build_hook_permission_request("kyris-hook", "call", "unknown", None, None);
+        let request =
+            build_hook_permission_request("kyris-hook", "call", "unknown", None, None, None, None);
         assert_eq!(request["action"], "call");
         assert!(request["context"]["working_dir"].is_null());
     }
@@ -897,8 +940,63 @@ mod tests {
             "git status",
             Some("/tmp"),
             Some(12345),
+            None,
+            None,
         );
         assert_eq!(request["seed_boundary_pid"], 12345);
+    }
+
+    #[test]
+    fn testBuildHookPermissionRequestWithAnchorPid() {
+        // The native-hook adapter passes its own getppid() as the anchor so
+        // the issued exec_token gets tagged with the agent's PID — letting a
+        // later shell trap consume it via `ppid_chain` without env propagation.
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "execute",
+            "git status",
+            Some("/tmp"),
+            None,
+            Some(54321),
+            None,
+        );
+        assert_eq!(request["anchor_pid"], 54321);
+        assert!(request["ppid_chain"].is_null());
+    }
+
+    #[test]
+    fn testBuildHookPermissionRequestWithPpidChain() {
+        // The shell trap inside an agent subshell reports its ancestor chain
+        // so agentpactd can find an anchored token tagged with the agent's PID.
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "execute",
+            "ls /tmp",
+            Some("/tmp"),
+            None,
+            None,
+            Some(&[9999, 5678, 4321]),
+        );
+        assert_eq!(request["ppid_chain"][0], 9999);
+        assert_eq!(request["ppid_chain"][1], 5678);
+        assert_eq!(request["ppid_chain"][2], 4321);
+        assert!(request["anchor_pid"].is_null());
+    }
+
+    #[test]
+    fn testBuildHookPermissionRequestEmptyPpidChainOmittedFromWire() {
+        // An empty chain would always miss daemon-side and bloats the
+        // payload — the builder must drop it rather than serialize `[]`.
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "execute",
+            "ls",
+            None,
+            None,
+            None,
+            Some(&[]),
+        );
+        assert!(request["ppid_chain"].is_null());
     }
 
     #[test]

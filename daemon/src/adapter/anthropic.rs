@@ -100,7 +100,13 @@ async fn handle_messages(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Anthropic)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Anthropic upstream with an empty fallback key. The
+            // agent's own credential (OAuth or API key) is what gets forwarded.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Anthropic)
+        });
     let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();
@@ -512,7 +518,13 @@ async fn handle_count_tokens(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Anthropic)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Anthropic upstream with an empty fallback key. The
+            // agent's own credential (OAuth or API key) is what gets forwarded.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Anthropic)
+        });
 
     let clients = state.provider_clients.load();
     let client = clients

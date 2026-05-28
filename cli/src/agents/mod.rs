@@ -13,6 +13,7 @@ pub mod probe;
 pub mod profile;
 pub mod reconcile;
 pub mod registry;
+pub mod shim;
 pub mod undo;
 
 use clap::{Args, Subcommand};

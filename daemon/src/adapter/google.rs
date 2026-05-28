@@ -96,7 +96,12 @@ async fn handle_generate_content(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Google)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Google upstream with an empty fallback key.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Google)
+        });
     let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();
@@ -223,7 +228,12 @@ async fn handle_stream_generate_content(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Google)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Google upstream with an empty fallback key.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Google)
+        });
     let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();

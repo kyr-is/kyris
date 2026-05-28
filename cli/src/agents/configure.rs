@@ -114,6 +114,12 @@ pub fn setup_agent(
     let mut changes = super::prestage::prestage_agent(agent_id)?;
 
     if agent.is_installed() {
+        // PATH shim must exist before we declare success: it is what arms
+        // the shell hook inside agent-spawned shells. Skipped for
+        // not-yet-installed agents — reconcile will create it when the
+        // agent appears, to avoid shadowing a `<binary>: command not
+        // found` message with our own.
+        changes.extend(super::shim::install_shim(agent_id)?);
         changes.extend(agent.configure_execution(&base_url, inbound_key, agent_specific)?);
         changes.extend(agent.configure_burn_control(&base_url, inbound_key, agent_specific)?);
 
@@ -180,7 +186,8 @@ pub fn configure_agent(
     let base_url = config.base_url();
     let inbound_key = &config.server.inbound_key;
 
-    let mut changes = agent.configure_execution(&base_url, inbound_key, agent_specific)?;
+    let mut changes = super::shim::install_shim(agent_id)?;
+    changes.extend(agent.configure_execution(&base_url, inbound_key, agent_specific)?);
 
     if !skip_burn_control {
         changes.extend(agent.configure_burn_control(&base_url, inbound_key, agent_specific)?);

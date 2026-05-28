@@ -120,6 +120,31 @@ pub struct ProviderConfig {
     pub streaming_timeout_seconds: u64,
 }
 
+impl ProviderConfig {
+    /// Canonical defaults for each well-known format: a fresh-install kyrisd
+    /// with no `providers[]` configured is still a usable transparent proxy —
+    /// the agent brings its own credential and kyrisd forwards it to the
+    /// standard upstream. Explicit `providers[]` entries only matter when you
+    /// want to override the upstream or supply a fallback API key.
+    #[must_use]
+    pub fn default_for(format: ProviderFormat) -> Self {
+        let (name, upstream) = match format {
+            ProviderFormat::Anthropic => ("anthropic", "https://api.anthropic.com"),
+            ProviderFormat::OpenAI => ("openai", "https://api.openai.com"),
+            ProviderFormat::Google => ("google", "https://generativelanguage.googleapis.com"),
+        };
+        Self {
+            name: name.to_string(),
+            format,
+            api_key: String::new(),
+            upstream: upstream.to_string(),
+            models: Vec::new(),
+            timeout_seconds: default_timeout_seconds(),
+            streaming_timeout_seconds: default_streaming_timeout_seconds(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
     #[serde(default)]
