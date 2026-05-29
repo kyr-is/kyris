@@ -39,6 +39,61 @@ pub fn extract_agent_id(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
+/// Connection-level + body-framing headers that describe the UPSTREAM hop and
+/// must never be relayed verbatim. kyrisd buffers the body and re-serves it over
+/// its own connection, so hyper recomputes content-length/framing for the bytes
+/// it actually writes; relaying these makes the declared framing contradict the
+/// re-served body and hyper resets the connection (client sees `RemoteDisconnected`).
+/// Hop-by-hop set per RFC 7230 §6.1.
+///
+/// `content-encoding` is intentionally NOT here: kyrisd's reqwest is built
+/// WITHOUT gzip/brotli/deflate, so the body is byte-identical to upstream and its
+/// content-encoding stays valid. If client-side decompression is ever enabled,
+/// add `content-encoding` (the body would then be decoded plaintext).
+const NON_RELAYABLE_HEADERS: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+/// Relay `upstream` response headers onto `builder`, dropping the connection /
+/// body-framing headers ([`NON_RELAYABLE_HEADERS`]) plus any header named in the
+/// upstream `Connection` header (RFC 7230 §6.1). Everything else (`content-type`,
+/// `content-encoding`, rate-limit / request-id / app headers) is relayed verbatim.
+/// Used by every adapter relay path so a buffered upstream response is re-framed
+/// correctly instead of resetting the client connection.
+#[must_use]
+pub fn relay_upstream_headers(
+    mut builder: axum::http::response::Builder,
+    upstream: &HeaderMap,
+) -> axum::http::response::Builder {
+    let connection_listed: Vec<String> = upstream
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    for (key, value) in upstream {
+        let name = key.as_str().to_ascii_lowercase();
+        if NON_RELAYABLE_HEADERS.contains(&name.as_str())
+            || connection_listed.iter().any(|c| c == &name)
+        {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    builder
+}
+
 pub fn relay_trace_attach_sync(
     state: &AppState,
     trace_token: &str,
@@ -220,6 +275,54 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-kyris-agent-id", HeaderValue::from_static(""));
         assert_eq!(extract_agent_id(&headers), None);
+    }
+
+    #[test]
+    fn testRelayUpstreamHeadersDropsFramingKeepsContent() {
+        use axum::http::Response;
+
+        let mut upstream = HeaderMap::new();
+        upstream.insert("content-length", HeaderValue::from_static("123"));
+        upstream.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        upstream.insert("connection", HeaderValue::from_static("keep-alive"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream.insert("content-encoding", HeaderValue::from_static("gzip"));
+
+        let builder = relay_upstream_headers(Response::builder().status(200), &upstream);
+        let response = builder.body(()).expect("build response");
+        let out = response.headers();
+
+        assert_eq!(
+            out.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            out.get("content-encoding").and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(!out.contains_key("content-length"));
+        assert!(!out.contains_key("transfer-encoding"));
+        assert!(!out.contains_key("connection"));
+    }
+
+    #[test]
+    fn testRelayUpstreamHeadersDropsConnectionListed() {
+        use axum::http::Response;
+
+        let mut upstream = HeaderMap::new();
+        upstream.insert("connection", HeaderValue::from_static("x-custom-hop"));
+        upstream.insert("x-custom-hop", HeaderValue::from_static("drop-me"));
+        upstream.insert("x-keep", HeaderValue::from_static("keep-me"));
+
+        let builder = relay_upstream_headers(Response::builder().status(200), &upstream);
+        let response = builder.body(()).expect("build response");
+        let out = response.headers();
+
+        assert!(!out.contains_key("x-custom-hop"));
+        assert_eq!(
+            out.get("x-keep").and_then(|v| v.to_str().ok()),
+            Some("keep-me")
+        );
     }
 
     #[test]

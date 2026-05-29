@@ -317,6 +317,18 @@ async fn response_framing_check_middleware(
 ///   `trailer`, `upgrade`, `proxy-*`) survive past a proxy: hyper
 ///   strips some and errors on others depending on version.
 fn response_framing_violation(response: &axum::response::Response) -> Option<String> {
+    // True hop-by-hop headers (RFC 7230 §6.1) must never survive past a
+    // proxy. `content-length`/`transfer-encoding` are legitimate on their
+    // own and are NOT flagged here; only the connection-scoped set is.
+    const HOP_BY_HOP: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "te",
+        "trailer",
+        "proxy-authenticate",
+        "proxy-authorization",
+    ];
     let headers = response.headers();
     let has_te = headers.contains_key("transfer-encoding");
     let has_cl = headers.contains_key("content-length");
@@ -326,6 +338,14 @@ fn response_framing_violation(response: &axum::response::Response) -> Option<Str
              on the response (hyper requires exactly one)"
                 .to_string(),
         );
+    }
+    for name in HOP_BY_HOP {
+        if headers.contains_key(*name) {
+            return Some(format!(
+                "hop-by-hop header `{name}` is set on the response (RFC 7230 \
+                 §6.1 forbids relaying connection-scoped headers past a proxy)"
+            ));
+        }
     }
     None
 }

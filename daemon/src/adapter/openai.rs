@@ -235,10 +235,8 @@ async fn handle_completions(
         crate::storage::record_dropped(1);
     }
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     let response_body_bytes = resp_body.len();
@@ -433,10 +431,8 @@ async fn handle_responses(
         crate::storage::record_dropped(1);
     }
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     builder.body(Body::from(resp_body)).map_err(|e| {
@@ -661,16 +657,8 @@ fn relay_responses_sse_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     builder.body(Body::from_stream(full_stream)).map_err(|e| {
@@ -895,16 +883,8 @@ fn relay_sse_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     builder.body(Body::from_stream(full_stream)).map_err(|e| {

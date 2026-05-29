@@ -310,10 +310,8 @@ async fn handle_messages(
         crate::storage::record_dropped(1);
     }
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     // Spine event 3/3: response we're about to hand hyper. Header
@@ -564,16 +562,8 @@ fn relay_sse_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     builder.body(Body::from_stream(full_stream)).map_err(|e| {
