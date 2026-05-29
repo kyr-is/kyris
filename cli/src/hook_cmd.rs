@@ -189,6 +189,18 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
 /// when there is no TTY (an agent-spawned non-interactive shell), in which
 /// case the caller falls back to kyrisd's pending-approval popup.
 fn open_tty() -> Option<std::fs::File> {
+    // A TUI agent (Claude Code et al.) owns the controlling terminal in raw
+    // mode with focus/mouse reporting enabled. Opening and blocking-reading
+    // /dev/tty here would steal the agent's input bytes (focus `\e[I`/`\e[O`
+    // events, keystrokes) and desync its TUI, freezing its input line. When we
+    // detect a TUI-agent context, report "no TTY" so the caller falls back to
+    // kyrisd's out-of-band pending-approval flow and never touches the agent's
+    // terminal.
+    if std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("KYRIS_GOVERNED_SUBPROCESS").is_some()
+    {
+        return None;
+    }
     std::fs::OpenOptions::new()
         .read(true)
         .write(true)

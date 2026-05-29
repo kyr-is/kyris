@@ -164,6 +164,14 @@ __kyris_preexec() {
 }
 
 __kyris_have_tty() {
+    # A TUI agent (Claude Code et al.) owns the controlling terminal in raw
+    # mode with focus/mouse reporting enabled. A second reader on /dev/tty here
+    # would steal the agent's input bytes (focus events, keystrokes), desync its
+    # TUI, and leak `\e[I`/`\e[O` into its input line (frozen input). Report "no
+    # TTY" so approval delegates to kyrisd's out-of-band pending flow instead.
+    if [ -n "${CLAUDECODE:-}" ] || [ -n "${KYRIS_GOVERNED_SUBPROCESS:-}" ]; then
+        return 1
+    fi
     [ -e /dev/tty ] && { exec 3</dev/tty; } 2>/dev/null && exec 3>&-
 }
 
