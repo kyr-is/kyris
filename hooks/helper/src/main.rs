@@ -98,8 +98,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // rather than serialized as `[]`.
     let ppid_chain = ppid_chain::current_chain();
 
+    let request_id = generate_id();
     let mut request = serde_json::json!({
-        "id": generate_id(),
+        "id": request_id.clone(),
         "method": "permission.request",
         "action": "execute",
         "detail": command,
@@ -122,6 +123,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
         return ExitCode::from(10);
     };
 
+    // Step 2 error-tracing: recover the agentpactd request id from the echoed
+    // response (falling back to the id we sent) so a deny/error can be traced
+    // back to the matching agentpact governance event.
+    let traced_id = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| request_id.clone(), str::to_string);
+
     match parse_check_response(&response) {
         CheckResponse::Allow { inform_reason } => {
             if let Some(reason) = inform_reason {
@@ -130,6 +139,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
             ExitCode::from(0)
         }
         CheckResponse::Deny { reason } => {
+            log_error(&format!(
+                "denied (agentpactd id={traced_id}): {}",
+                reason.as_deref().unwrap_or("no reason")
+            ));
             if let Some(reason) = reason {
                 eprintln!("[agentpact] denied: {reason}");
             }
@@ -159,7 +172,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
         CheckResponse::Invalid(reason) => {
             eprintln!("[agentpact] {reason}");
-            log_error(&reason);
+            log_error(&format!("(agentpactd id={traced_id}): {reason}"));
             ExitCode::from(1)
         }
     }

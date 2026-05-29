@@ -149,11 +149,26 @@ pub async fn run(config: KyrisdConfig) {
         .merge(operator_routes)
         .merge(health_routes(state.clone()))
         .layer(RequestBodyLimitLayer::new(max_body))
-        // Outermost layer: every request that reaches the daemon — including
-        // ones rejected by auth or body-limit — gets a log line. "No log
-        // entry for the request" must reliably mean "request never reached
-        // the daemon," not "swallowed silently."
-        .layer(axum::middleware::from_fn(request_log_middleware));
+        // Per-request access log (boundary). Reads trace_id from the
+        // extension stamped by the outer trace_id_middleware below.
+        .layer(axum::middleware::from_fn(request_log_middleware))
+        // Response-side framing sanity check: catches known-bad
+        // body-framing header combinations BEFORE hyper rejects them
+        // and writes nothing. The most common silent failure mode is
+        // a hop-by-hop or content-encoding header copied verbatim from
+        // an upstream response onto our own (smaller, decompressed,
+        // re-collected) body. This layer surfaces the conflict at
+        // ERROR with the constructed-response context.
+        .layer(axum::middleware::from_fn(response_framing_check_middleware))
+        // Outermost layer: mint or accept the trace_id, attach to
+        // extensions + span, echo as x-kyris-trace-id. EVERY layer
+        // below (auth, body-limit, the framing check) runs inside
+        // the trace span, so even rejected requests carry the id in
+        // their log lines. "No log entry for this trace_id" must
+        // reliably mean "the request never reached the daemon."
+        .layer(axum::middleware::from_fn(
+            crate::trace_id::trace_id_middleware,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
@@ -164,6 +179,7 @@ pub async fn run(config: KyrisdConfig) {
 
     tokio::spawn(sighup_reload(state.clone(), signals.sighup));
     tokio::spawn(sigusr1_diagnostics(signals.sigusr1));
+    tokio::spawn(sigusr2_toggle_log_filter(state.clone(), signals.sigusr2));
     tokio::spawn(agentpactd_health_poller());
     tokio::spawn(watch_policy_mode());
 
@@ -196,29 +212,132 @@ pub async fn run(config: KyrisdConfig) {
     remove_pid_file();
 }
 
-/// Per-request access log. Logs every request the daemon receives at
-/// `INFO` (4xx -> WARN, 5xx -> ERROR), with method / path / status /
-/// `latency_ms`. The outermost layer on the router, so even requests
-/// rejected by auth or body-limit middleware are visible.
+/// Per-request access log. Logs every request the daemon sees at
+/// `INFO` (4xx → WARN, 5xx → ERROR), with method / path / status /
+/// `latency_ms` / body sizes / `trace_id`. Runs inside the request span
+/// opened by [`crate::trace_id::trace_id_middleware`], so the same
+/// `trace_id` field appears on this line and every nested handler
+/// log — making `kyris logs trace <id>` a single coherent view.
 async fn request_log_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // Cheap body-size telemetry: read Content-Length from the request
+    // and response headers without consuming the bodies. Streamed or
+    // chunked responses come through as `None`; that itself is
+    // diagnostic information (LLM streaming responses look that way).
+    let req_bytes = content_length(req.headers());
     let start = std::time::Instant::now();
     let response = next.run(req).await;
     let status = response.status().as_u16();
+    let resp_bytes = content_length(response.headers());
     #[allow(clippy::cast_possible_truncation)]
     let latency_ms = start.elapsed().as_millis() as u64;
     if status >= 500 {
-        tracing::error!(method = %method, path = %path, status, latency_ms, "request");
+        tracing::error!(
+            method = %method,
+            path = %path,
+            status,
+            latency_ms,
+            req_bytes = ?req_bytes,
+            resp_bytes = ?resp_bytes,
+            "request"
+        );
     } else if status >= 400 {
-        tracing::warn!(method = %method, path = %path, status, latency_ms, "request");
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status,
+            latency_ms,
+            req_bytes = ?req_bytes,
+            resp_bytes = ?resp_bytes,
+            "request"
+        );
     } else {
-        tracing::info!(method = %method, path = %path, status, latency_ms, "request");
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status,
+            latency_ms,
+            req_bytes = ?req_bytes,
+            resp_bytes = ?resp_bytes,
+            "request"
+        );
     }
     response
+}
+
+/// Sanity check on the response before it goes to hyper. Catches the
+/// "framing conflict" silent failure: when a handler builds a
+/// response carrying header combinations hyper rejects, hyper resets
+/// the TCP connection and writes nothing — the client sees
+/// `RemoteDisconnected`, our `request_log_middleware` logged status
+/// 401/200/whatever (because the response object was built), and
+/// nothing in the log says WHY the bytes never landed.
+///
+/// We surface the conflict at ERROR here so the log answers the
+/// question without anyone having to attach hyper at DEBUG. We do
+/// NOT auto-fix the response — adapter-level filtering is the right
+/// fix point, and we want the bug to remain visible until that
+/// filter lands.
+async fn response_framing_check_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(req).await;
+    if let Some(reason) = response_framing_violation(&response) {
+        let status = response.status().as_u16();
+        let header_names: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(axum::http::HeaderName::as_str)
+            .collect();
+        tracing::error!(
+            status,
+            reason = %reason,
+            header_names = ?header_names,
+            "response_framing_conflict: hyper will reset this connection \
+             and the client will see RemoteDisconnected / Empty reply; \
+             the response was built but the framing headers contradict \
+             the body the response will be serialized with"
+        );
+    }
+    response
+}
+
+/// Detect response header combinations hyper rejects at serialize
+/// time. Returns `Some(reason)` if a known conflict is present.
+///
+/// Known conflicts (RFC 7230 §3.3.3 + RFC 7230 §4):
+/// - `transfer-encoding` AND `content-length` together: hyper
+///   refuses to choose between them and resets the connection.
+/// - Hop-by-hop headers (`connection`, `keep-alive`, `te`,
+///   `trailer`, `upgrade`, `proxy-*`) survive past a proxy: hyper
+///   strips some and errors on others depending on version.
+fn response_framing_violation(response: &axum::response::Response) -> Option<String> {
+    let headers = response.headers();
+    let has_te = headers.contains_key("transfer-encoding");
+    let has_cl = headers.contains_key("content-length");
+    if has_te && has_cl {
+        return Some(
+            "both transfer-encoding and content-length headers are set \
+             on the response (hyper requires exactly one)"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Read `Content-Length` from a header map as `u64`. None when the
+/// header is absent or unparseable (streamed/chunked responses, or
+/// requests with no body).
+fn content_length(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 async fn serve_with_graceful_shutdown<F>(
@@ -531,7 +650,13 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
         )
         .route(
             "/operator/session-tokens/{session_id}",
-            get(operator_session_token).with_state(state),
+            get(operator_session_token).with_state(state.clone()),
+        )
+        .route(
+            "/operator/diag/log-filter",
+            get(diag_log_filter_get)
+                .post(diag_log_filter_set)
+                .with_state(state),
         )
 }
 
@@ -1033,6 +1158,100 @@ async fn operator_session_token(
     }
 }
 
+/// Maximum auto-revert window the diag endpoint accepts (1 hour).
+/// Past this, edit `kyrisd.yaml`'s `log.filter` and restart — long-
+/// term verbose logging shouldn't ride on a Tokio timer that the
+/// next crash wipes.
+const DIAG_LOG_FILTER_MAX_DURATION_SECS: u64 = 3600;
+
+#[derive(Deserialize)]
+struct DiagLogFilterRequest {
+    /// `EnvFilter` directive string (e.g. `kyrisd::adapter=trace,kyrisd=debug`).
+    filter: String,
+    /// Auto-revert window in seconds. Absent / 0 = manual revert.
+    /// Capped at [`DIAG_LOG_FILTER_MAX_DURATION_SECS`].
+    #[serde(default)]
+    duration_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DiagLogFilterResponse {
+    previous_filter: String,
+    new_filter: String,
+    /// Absent when no auto-revert was requested or `duration_secs=0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reverts_at: Option<String>,
+}
+
+/// GET /operator/diag/log-filter — read the currently-active filter.
+/// Returns whatever `try_set_filter` last accepted (or the startup
+/// value when nothing has been mutated since boot).
+async fn diag_log_filter_get() -> Json<serde_json::Value> {
+    let current =
+        crate::logging::current_filter().unwrap_or_else(|| "(not initialized)".to_string());
+    Json(serde_json::json!({ "filter": current }))
+}
+
+/// POST /operator/diag/log-filter — swap the active filter,
+/// optionally scheduling an auto-revert. Validates the directive
+/// before applying so a typo never breaks logging mid-stream.
+async fn diag_log_filter_set(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DiagLogFilterRequest>,
+) -> Result<Json<DiagLogFilterResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let previous =
+        crate::logging::current_filter().unwrap_or_else(|| state.config.load().log.filter.clone());
+
+    if let Err(error) = crate::logging::try_set_filter(&req.filter) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ));
+    }
+
+    let duration = req
+        .duration_secs
+        .filter(|d| *d > 0)
+        .map(|d| d.min(DIAG_LOG_FILTER_MAX_DURATION_SECS));
+
+    let reverts_at = duration.map(|secs| {
+        let when = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
+        when.to_rfc3339()
+    });
+
+    if let Some(secs) = duration {
+        let revert_to = previous.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            match crate::logging::try_set_filter(&revert_to) {
+                Ok(()) => tracing::info!(
+                    reverted_to = %revert_to,
+                    source = "diag_endpoint_auto_revert",
+                    "log_filter_reverted"
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "log_filter auto-revert failed; current filter unchanged"
+                ),
+            }
+        });
+    }
+
+    tracing::info!(
+        previous = %previous,
+        new = %req.filter,
+        duration_secs = ?duration,
+        source = "diag_endpoint",
+        "log_filter_changed"
+    );
+
+    Ok(Json(DiagLogFilterResponse {
+        previous_filter: previous,
+        new_filter: req.filter,
+        reverts_at,
+    }))
+}
+
 #[derive(Serialize)]
 struct HealthzResponse {
     ready: bool,
@@ -1139,6 +1358,7 @@ async fn reload_loop<F, Fut>(
 pub(crate) struct ShutdownSignals {
     pub sighup: tokio::signal::unix::Signal,
     pub sigusr1: tokio::signal::unix::Signal,
+    pub sigusr2: tokio::signal::unix::Signal,
     pub shutdown: ShutdownStreams,
 }
 
@@ -1146,6 +1366,7 @@ pub(crate) struct ShutdownSignals {
 pub(crate) struct ShutdownSignals {
     pub sighup: (),
     pub sigusr1: (),
+    pub sigusr2: (),
     pub shutdown: ShutdownStreams,
 }
 
@@ -1166,6 +1387,7 @@ impl ShutdownSignals {
             Self {
                 sighup: signal(SignalKind::hangup()).expect("install SIGHUP handler"),
                 sigusr1: signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler"),
+                sigusr2: signal(SignalKind::user_defined2()).expect("install SIGUSR2 handler"),
                 shutdown: ShutdownStreams {
                     sigterm: signal(SignalKind::terminate()).expect("install SIGTERM handler"),
                     sigint: signal(SignalKind::interrupt()).expect("install SIGINT handler"),
@@ -1177,6 +1399,7 @@ impl ShutdownSignals {
             Self {
                 sighup: (),
                 sigusr1: (),
+                sigusr2: (),
                 shutdown: ShutdownStreams,
             }
         }
@@ -1347,6 +1570,47 @@ async fn sigusr1_diagnostics(mut sigusr1: tokio::signal::unix::Signal) {
 
 #[cfg(not(unix))]
 async fn sigusr1_diagnostics(_sigusr1: ()) {
+    std::future::pending::<()>().await;
+}
+
+/// SIGUSR2 — toggle the active log filter between the configured
+/// baseline (`log.filter`) and the verbose preset (`log.verbose_filter`).
+/// Lets an operator with shell access flip on adapter-level debug
+/// during a misbehaving request without restarting the daemon, and
+/// flip back when done. The transition itself is always logged at
+/// INFO so it appears in the log regardless of which filter is now
+/// active.
+///
+/// No auto-revert on this path — it sticks until another SIGUSR2 or
+/// a daemon restart. For bounded-window debugging, prefer the
+/// admin endpoint (`POST /operator/diag/log-filter`) which accepts
+/// `duration_secs` and auto-reverts via a Tokio timer.
+#[cfg(unix)]
+async fn sigusr2_toggle_log_filter(state: Arc<AppState>, mut sigusr2: tokio::signal::unix::Signal) {
+    loop {
+        sigusr2.recv().await;
+        let config = state.config.load();
+        let baseline = config.log.filter.clone();
+        let verbose = config.log.verbose_filter.clone();
+        match crate::logging::try_toggle_verbose(&baseline, &verbose) {
+            Ok(now_active) => {
+                tracing::info!(
+                    active_filter = %now_active,
+                    baseline = %baseline,
+                    verbose = %verbose,
+                    source = "sigusr2",
+                    "log_filter_toggled"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGUSR2 log-filter toggle failed");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn sigusr2_toggle_log_filter(_state: Arc<AppState>, _sigusr2: ()) {
     std::future::pending::<()>().await;
 }
 

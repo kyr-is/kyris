@@ -8,3 +8,4 @@ pub mod replay;
 pub mod stats;
 mod sync_state;
 pub mod timeline;
+pub mod trace;

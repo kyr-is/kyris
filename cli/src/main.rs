@@ -33,6 +33,7 @@ mod check;
 mod compile_policy;
 mod config_writer;
 mod continue_cmd;
+mod diag_cmd;
 mod doctor;
 mod headline;
 mod hook_cmd;
@@ -70,6 +71,7 @@ enum Command {
     History(query::history::HistoryArgs),
     Check(check::CheckArgs),
     CompilePolicy(compile_policy::CompilePolicyArgs),
+    Diag(diag_cmd::DiagArgs),
     Hook(hook_cmd::HookArgs),
     Pending(pending::PendingArgs),
     Continue(continue_cmd::ContinueArgs),
@@ -102,6 +104,7 @@ fn main() {
         Command::History(args) => query::history::run(args),
         Command::Check(args) => check::run(args),
         Command::CompilePolicy(args) => compile_policy::run(args),
+        Command::Diag(args) => diag_cmd::run(args),
         Command::Hook(args) => hook_cmd::run(args),
         Command::Pending(args) => pending::run(args),
         Command::Continue(args) => continue_cmd::run(args),
@@ -231,6 +234,11 @@ mod tests {
     #[test]
     fn testParseLogs() {
         assert!(try_parse(&["logs"]).is_ok());
+    }
+
+    #[test]
+    fn testParseLogsTrace() {
+        assert!(try_parse(&["logs", "trace", "abc-123"]).is_ok());
     }
 
     #[test]

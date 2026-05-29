@@ -267,9 +267,44 @@ pub fn request_mcp_tool_permission(
     mcp_ctx: &McpContext,
     socket_timeout: Duration,
 ) -> Result<McpPermissionDecision, String> {
+    request_mcp_tool_permission_with_id(
+        socket_path,
+        request_id_prefix,
+        server_name,
+        tool_name,
+        mcp_ctx,
+        socket_timeout,
+    )
+    .map(|(decision, _id)| decision)
+}
+
+/// Same as [`request_mcp_tool_permission`] but also returns the agentpactd
+/// request `id` so a caller surfacing a deny/error can log it for tracing.
+///
+/// The id (`"{prefix}-{uuid}"`) is the one embedded in the request and echoed
+/// by agentpactd in its response — the same id the daemon records on its
+/// governance event, so it ties a user-visible denial back to that event.
+///
+/// # Errors
+///
+/// Returns an error when the request cannot be sent to `agentpactd` or when the daemon
+/// response is malformed.
+pub fn request_mcp_tool_permission_with_id(
+    socket_path: &str,
+    request_id_prefix: &str,
+    server_name: &str,
+    tool_name: &str,
+    mcp_ctx: &McpContext,
+    socket_timeout: Duration,
+) -> Result<(McpPermissionDecision, String), String> {
     let request = build_mcp_permission_request(request_id_prefix, server_name, tool_name, mcp_ctx);
+    let request_id = request
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     send_daemon_request_with_retry(socket_path, &request, socket_timeout)
-        .map(|response| parse_mcp_permission_response(&response))
+        .map(|response| (parse_mcp_permission_response(&response), request_id))
 }
 
 /// Requests `AgentPact` permission for an agent hook action (native hooks).

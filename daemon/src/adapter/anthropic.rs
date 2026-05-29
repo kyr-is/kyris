@@ -55,13 +55,16 @@ fn anthropic_plan_status(headers: &HeaderMap) -> PlanStatus {
 async fn handle_messages(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let body_value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "failed to parse Anthropic messages request body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let model = body_value
         .get("model")
@@ -74,7 +77,15 @@ async fn handle_messages(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let trace_id = uuid::Uuid::now_v7().to_string();
+    // Unified trace_id: prefer the one stamped by the outer
+    // trace_id_middleware (production path) so this id matches what
+    // request_log_middleware logs, what we echo as x-kyris-trace-id,
+    // and what the gateway record stores. Mint a fresh one only for
+    // direct-handler unit tests that bypass the middleware.
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -131,6 +142,25 @@ async fn handle_messages(
     let plan_status = anthropic_plan_status(&headers);
     let forward_credential =
         headers.contains_key("authorization") || headers.contains_key("x-api-key");
+    let credential_mode = if forward_credential {
+        "passthrough"
+    } else {
+        "config_api_key"
+    };
+
+    // Spine event 1/3: provider selection + credential mode. Answers
+    // "did we route to the right upstream?" and "did we forward the
+    // caller's credential or fall back to ours?" without anyone
+    // having to instrument those decision points by hand.
+    tracing::debug!(
+        provider = %provider_name,
+        upstream = %provider.upstream,
+        model = %model,
+        is_stream,
+        credential_mode,
+        plan_status = ?plan_status,
+        "provider_selected"
+    );
 
     let mut req = client
         .post(&upstream_url)
@@ -158,12 +188,36 @@ async fn handle_messages(
     }
 
     let response = req.send().await.map_err(|e| {
-        tracing::error!(error = %e, "upstream request failed");
+        tracing::error!(
+            upstream = %provider.upstream,
+            error = %e,
+            "upstream_request_failed"
+        );
         StatusCode::BAD_GATEWAY
     })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
+
+    // Spine event 2/3: upstream framing. The five fields below are
+    // exactly what a "why did this response not reach the client?"
+    // investigation needs — they pin the framing-conflict failure
+    // mode (e.g. `transfer-encoding: chunked` from the upstream
+    // copied verbatim onto our own collected-Bytes body) to a
+    // single log line instead of requiring a packet capture.
+    tracing::debug!(
+        upstream_status = status.as_u16(),
+        content_length = ?resp_headers.get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        content_encoding = ?resp_headers.get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        transfer_encoding = ?resp_headers.get(axum::http::header::TRANSFER_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        content_type = ?resp_headers.get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        is_stream,
+        "upstream_response"
+    );
 
     if is_stream {
         return relay_sse_stream(
@@ -182,10 +236,10 @@ async fn handle_messages(
         );
     }
 
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read Anthropic messages upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
     let usage = extract_usage_from_body(&resp_body);
     let metering = if usage.is_some() {
         kyris_core::record::Metering::Available
@@ -262,9 +316,28 @@ async fn handle_messages(
     }
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    // Spine event 3/3: response we're about to hand hyper. Header
+    // names (not values — values can carry secrets) + body byte
+    // count make the framing situation observable: if upstream sent
+    // `transfer-encoding: chunked` and we're emitting a fixed-size
+    // body, both names appear here AND the response_framing_check
+    // middleware will ERROR with the exact reason.
+    let response_body_bytes = resp_body.len();
+    let header_names: Vec<&str> = resp_headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .collect();
+    tracing::debug!(
+        response_status = status.as_u16(),
+        response_body_bytes,
+        header_names = ?header_names,
+        "response_built"
+    );
+
+    builder.body(Body::from(resp_body)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build Anthropic messages response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -503,9 +576,10 @@ fn relay_sse_stream(
     }
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from_stream(full_stream)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build Anthropic messages SSE stream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn handle_count_tokens(
@@ -566,16 +640,19 @@ async fn handle_count_tokens(
     })?;
 
     let status = response.status();
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read Anthropic count_tokens upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build Anthropic count_tokens response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 struct BodyUsage {

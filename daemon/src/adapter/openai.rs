@@ -32,12 +32,15 @@ pub fn routes(state: Arc<AppState>) -> Router {
 async fn handle_completions(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let mut body_value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "failed to parse OpenAI chat completions request body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let model = body_value
         .get("model")
@@ -50,7 +53,10 @@ async fn handle_completions(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let trace_id = uuid::Uuid::now_v7().to_string();
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -95,13 +101,28 @@ async fn handle_completions(
         .unwrap_or_else(reqwest::Client::new);
     let upstream_url = format!("{}/v1/chat/completions", provider.upstream);
 
-    let outbound_body = serde_json::to_vec(&body_value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let outbound_body = serde_json::to_vec(&body_value).map_err(|e| {
+        tracing::warn!(error = %e, "failed to serialize OpenAI chat completions outbound body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let timeout_secs = if is_stream {
         provider.streaming_timeout_seconds
     } else {
         provider.timeout_seconds
     };
+
+    // Spine event 1/3: provider selection. (OpenAI adapter always
+    // uses the configured api_key — no credential passthrough today,
+    // so credential_mode is fixed.)
+    tracing::debug!(
+        provider = %provider_name,
+        upstream = %provider.upstream,
+        model = %model,
+        is_stream,
+        credential_mode = "config_api_key",
+        "provider_selected"
+    );
 
     let response = client
         .post(&upstream_url)
@@ -112,12 +133,29 @@ async fn handle_completions(
         .send()
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "upstream request failed");
+            tracing::error!(
+                upstream = %provider.upstream,
+                error = %e,
+                "upstream_request_failed"
+            );
             StatusCode::BAD_GATEWAY
         })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
+    tracing::debug!(
+        upstream_status = status.as_u16(),
+        content_length = ?resp_headers.get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        content_encoding = ?resp_headers.get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        transfer_encoding = ?resp_headers.get(axum::http::header::TRANSFER_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        content_type = ?resp_headers.get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        is_stream,
+        "upstream_response"
+    );
 
     if is_stream {
         return relay_sse_stream(
@@ -138,7 +176,10 @@ async fn handle_completions(
     let resp_body = response
         .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to read OpenAI chat completions upstream response body");
+            StatusCode::BAD_GATEWAY
+        })?;
 
     let parsed_tokens = extract_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
@@ -200,20 +241,36 @@ async fn handle_completions(
     }
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let response_body_bytes = resp_body.len();
+    let header_names: Vec<&str> = resp_headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .collect();
+    tracing::debug!(
+        response_status = status.as_u16(),
+        response_body_bytes,
+        header_names = ?header_names,
+        "response_built"
+    );
+
+    builder.body(Body::from(resp_body)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI chat completions response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn handle_responses(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let mut body_value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "failed to parse OpenAI responses request body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let model = body_value
         .get("model")
@@ -226,7 +283,10 @@ async fn handle_responses(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
 
-    let trace_id = uuid::Uuid::now_v7().to_string();
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -271,7 +331,10 @@ async fn handle_responses(
         .unwrap_or_else(reqwest::Client::new);
     let upstream_url = format!("{}/v1/responses", provider.upstream);
 
-    let outbound_body = serde_json::to_vec(&body_value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let outbound_body = serde_json::to_vec(&body_value).map_err(|e| {
+        tracing::warn!(error = %e, "failed to serialize OpenAI responses outbound body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let timeout_secs = if is_stream {
         provider.streaming_timeout_seconds
@@ -288,7 +351,7 @@ async fn handle_responses(
         .send()
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "upstream request failed");
+            tracing::error!(error = %e, "OpenAI responses upstream request failed");
             StatusCode::BAD_GATEWAY
         })?;
 
@@ -311,10 +374,10 @@ async fn handle_responses(
         );
     }
 
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read OpenAI responses upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let parsed_tokens = extract_responses_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
@@ -376,9 +439,10 @@ async fn handle_responses(
     }
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from(resp_body)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI responses response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -609,9 +673,10 @@ fn relay_responses_sse_stream(
     }
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from_stream(full_stream)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI responses SSE stream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,9 +907,10 @@ fn relay_sse_stream(
     }
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from_stream(full_stream)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI chat completions SSE stream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn circuit_breaker_message(token_count: i64) -> String {

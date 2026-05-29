@@ -24,6 +24,38 @@ pub struct KyrisdConfig {
     pub agents: AgentsConfig,
     #[serde(default)]
     pub spend: SpendConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+/// Operational logging configuration. `filter` is the baseline
+/// `EnvFilter` directive applied at startup (overridden by
+/// `KYRIS_LOG` / `RUST_LOG` env vars when present). `verbose_filter`
+/// is what `SIGUSR2` toggles to and back from — typically something
+/// like `kyrisd::adapter=trace,kyrisd=debug` for one-off forensics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_filter")]
+    pub filter: String,
+    #[serde(default = "default_log_verbose_filter")]
+    pub verbose_filter: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            filter: default_log_filter(),
+            verbose_filter: default_log_verbose_filter(),
+        }
+    }
+}
+
+fn default_log_filter() -> String {
+    "kyrisd=info".to_string()
+}
+
+fn default_log_verbose_filter() -> String {
+    "kyrisd::adapter=trace,kyrisd::auth=debug,kyrisd=debug".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

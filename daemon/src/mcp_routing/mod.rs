@@ -136,9 +136,10 @@ fn build_upstream_response(
         }
         builder = builder.header(key, value);
     }
-    builder
-        .body(body)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(body).map_err(|e| {
+        tracing::error!(error = %e, "failed to build MCP upstream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn resolve_server<'a>(
@@ -238,7 +239,10 @@ async fn forward_mcp_post(
                 })
                 .to_string(),
             ))
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+            .map_err(|e| {
+                tracing::error!(error = %e, server = %server_name, "failed to build MCP working_dir_required response");
+                StatusCode::INTERNAL_SERVER_ERROR
+            });
     }
 
     let tool_name = policy::extract_tool_name(&path, &body);
@@ -284,7 +288,10 @@ async fn forward_mcp_post(
                 .status(status)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                .map_err(|e| {
+                    tracing::error!(error = %e, server = %server_name, "failed to build MCP policy-deny response");
+                    StatusCode::INTERNAL_SERVER_ERROR
+                });
         }
         policy::PolicyDecision::Ask {
             approval_id,
@@ -326,7 +333,10 @@ async fn forward_mcp_post(
                         .body(Body::from(
                             serde_json::json!({"error": "denied by user"}).to_string(),
                         ))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                        .map_err(|e| {
+                            tracing::error!(error = %e, server = %server_name, "failed to build MCP denied-by-user response");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
                 }
                 Err(_) => {
                     tracing::info!(id = %approval_id, "mcp request timed out or cancelled");
@@ -336,7 +346,10 @@ async fn forward_mcp_post(
                         .body(Body::from(
                             serde_json::json!({"error": "request timed out"}).to_string(),
                         ))
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
+                        .map_err(|e| {
+                            tracing::error!(error = %e, server = %server_name, "failed to build MCP request-timeout response");
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
                 }
             }
         }
@@ -365,7 +378,10 @@ async fn forward_mcp_post(
     let resp_body = response
         .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, server = %server_name, "failed to read MCP upstream POST response body");
+            StatusCode::BAD_GATEWAY
+        })?;
 
     if is_tools_list_request(&path, &body) {
         state
@@ -423,7 +439,10 @@ async fn forward_mcp_get(
     let body = response
         .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, server = %server_name, "failed to read MCP upstream GET response body");
+            StatusCode::BAD_GATEWAY
+        })?;
     build_upstream_response(status, &resp_headers, Body::from(body))
 }
 
@@ -466,7 +485,10 @@ async fn forward_mcp_delete(
     let body = response
         .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, server = %server_name, "failed to read MCP upstream DELETE response body");
+            StatusCode::BAD_GATEWAY
+        })?;
     build_upstream_response(status, &resp_headers, Body::from(body))
 }
 

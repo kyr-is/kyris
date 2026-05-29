@@ -21,6 +21,7 @@
 use std::io::IsTerminal;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
@@ -30,16 +31,25 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// Initialize the global tracing subscriber. Safe to call once at
-/// startup.
+/// startup. After this returns, [`try_set_filter`] /
+/// [`current_filter`] / [`try_toggle_verbose`] are usable.
 pub fn init() {
-    let filter = resolve_filter();
+    let initial = resolve_filter_string();
     let format = resolve_format();
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_writer(std::io::stderr);
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let parsed = EnvFilter::try_new(&initial).unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
+    // Reloadable filter: wraps the EnvFilter so we can swap it
+    // atomically at runtime via [`try_set_filter`]. Adds ~10ns per
+    // event check (one RwLock::read on the parking_lot fast path)
+    // and lets a long-running daemon flip into DEBUG / TRACE for a
+    // bounded window without restart.
+    let (reloadable, handle) = tracing_subscriber::reload::Layer::new(parsed);
+
+    let registry = tracing_subscriber::registry().with(reloadable);
 
     let file_layer = KyrisFileLayer::new();
 
@@ -50,14 +60,91 @@ pub fn init() {
         let layered = registry.with(stderr_layer).with(file_layer);
         install(layered);
     }
+
+    // Stash a type-erased modifier closure so the diag admin endpoint
+    // and the SIGUSR2 handler can mutate the filter without knowing
+    // the subscriber's nested generic types. The closure captures
+    // `handle` and our mirror of the current filter string.
+    let current = Arc::new(Mutex::new(initial));
+    let current_for_setter = Arc::clone(&current);
+    let setter: FilterSetter = Box::new(move |raw: &str| {
+        let new = EnvFilter::try_new(raw).map_err(|e| e.to_string())?;
+        handle
+            .modify(|f| *f = new)
+            .map_err(|e| format!("filter reload failed: {e}"))?;
+        *current_for_setter
+            .lock()
+            .expect("filter mirror lock poisoned") = raw.to_string();
+        Ok(())
+    });
+    let _ = FILTER_SETTER.set(setter);
+    let _ = CURRENT_FILTER.set(current);
 }
 
-fn resolve_filter() -> EnvFilter {
+/// Default filter when nothing is set via env or config.
+const DEFAULT_FILTER: &str = "kyrisd=info";
+
+/// Type-erased closure that swaps the active `EnvFilter`. Stored in
+/// a `OnceLock` so any module (signal handler, admin endpoint, CLI)
+/// can call [`try_set_filter`] without knowing the subscriber's
+/// nested generic types.
+type FilterSetter = Box<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+static FILTER_SETTER: OnceLock<FilterSetter> = OnceLock::new();
+static CURRENT_FILTER: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+
+/// Attempt to swap the active log filter to `new_filter`. On
+/// success, mirrors the new string into the process-global so
+/// [`current_filter`] returns it. On parse failure, returns the
+/// parser error string and leaves the filter unchanged.
+///
+/// # Errors
+/// Returns an error string if the filter isn't yet initialized
+/// or if `new_filter` fails `EnvFilter::try_new`.
+pub fn try_set_filter(new_filter: &str) -> Result<(), String> {
+    let setter = FILTER_SETTER
+        .get()
+        .ok_or_else(|| "log filter not initialized".to_string())?;
+    setter(new_filter)
+}
+
+/// The currently-active filter string (last value passed to
+/// [`try_set_filter`], or the startup value).
+#[must_use]
+pub fn current_filter() -> Option<String> {
+    CURRENT_FILTER
+        .get()
+        .and_then(|cf| cf.lock().ok().map(|s| s.clone()))
+}
+
+/// Toggle between the configured baseline filter and the verbose
+/// filter (both from `KyrisdConfig.log`). Returns the new active
+/// filter on success. Used by the SIGUSR2 handler.
+///
+/// # Errors
+/// Returns the error string from [`try_set_filter`] when the swap
+/// fails (parse error or uninitialized).
+pub fn try_toggle_verbose(baseline: &str, verbose: &str) -> Result<String, String> {
+    let current = current_filter().unwrap_or_else(|| DEFAULT_FILTER.to_string());
+    let next = if current == verbose {
+        baseline
+    } else {
+        verbose
+    };
+    try_set_filter(next)?;
+    Ok(next.to_string())
+}
+
+/// Resolve the startup filter as a string (the form `EnvFilter`
+/// accepts via `try_new`). We return the string rather than a
+/// parsed `EnvFilter` so the caller can mirror the same value
+/// into `CURRENT_FILTER` for `current_filter()` to report later.
+fn resolve_filter_string() -> String {
     std::env::var("KYRIS_LOG")
         .ok()
         .or_else(|| std::env::var("RUST_LOG").ok())
-        .and_then(|raw| EnvFilter::try_new(&raw).ok())
-        .unwrap_or_else(|| EnvFilter::new("kyrisd=info"))
+        .filter(|raw| EnvFilter::try_new(raw).is_ok())
+        .unwrap_or_else(|| DEFAULT_FILTER.to_string())
 }
 
 fn resolve_format() -> String {

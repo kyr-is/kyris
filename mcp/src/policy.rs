@@ -60,13 +60,13 @@ fn send_permission_request_with_socket(
     mcp_operation: Option<&str>,
     annotations: &ToolAnnotations,
     socket_timeout: std::time::Duration,
-) -> Result<PermissionRequestOutcome, String> {
+) -> Result<(PermissionRequestOutcome, String), String> {
     let mcp_ctx = McpContext {
         working_dir: current_working_dir(),
         mcp_operation: mcp_operation.map(str::to_owned),
         annotations: annotations.clone(),
     };
-    agentpact::request_mcp_tool_permission(
+    agentpact::request_mcp_tool_permission_with_id(
         sock_path,
         "kyris-mcp",
         server_name,
@@ -200,24 +200,24 @@ pub async fn check_permission_with_socket(
 
     let Ok(outcome) = outcome else {
         if allow_on_daemon_unavailable() {
-            let working_dir = current_working_dir();
-            eprintln!(
-                "[kyris-mcp] agentpactd unavailable, allowing {server_name}/{tool_name} due to policy"
-            );
-            kyris_core::fail_open_log::record(
-                "call",
-                tool_name,
-                server_name,
-                working_dir.as_deref(),
-            );
-            return PactDecision::Allow;
+            return fail_open_allow(server_name, tool_name);
         }
         return daemon_unavailable_deny();
+    };
+
+    // `request_id` is the agentpactd request id (echoed in its response) —
+    // logged on a daemon-returned deny so it can be traced to the event.
+    let (outcome, request_id) = match outcome {
+        Ok((inner, id)) => (Ok(inner), id),
+        Err(reason) => (Err(reason), String::new()),
     };
 
     match outcome {
         Ok(PermissionRequestOutcome::Allow { .. }) => PactDecision::Allow,
         Ok(PermissionRequestOutcome::Deny { code, reason, hint }) => {
+            eprintln!(
+                "[kyris-mcp] denied {server_name}/{tool_name} (agentpactd id={request_id}, code={code:?}): {reason}"
+            );
             PactDecision::Deny { code, reason, hint }
         }
         Ok(PermissionRequestOutcome::Ask {
@@ -248,25 +248,28 @@ pub async fn check_permission_with_socket(
                 .await
             }
         }
-        Err(_) if allow_on_daemon_unavailable() => {
-            let working_dir = current_working_dir();
-            eprintln!(
-                "[kyris-mcp] agentpactd unavailable, allowing {server_name}/{tool_name} due to policy"
-            );
-            kyris_core::fail_open_log::record(
-                "call",
-                tool_name,
-                server_name,
-                working_dir.as_deref(),
-            );
-            PactDecision::Allow
-        }
+        Err(_) if allow_on_daemon_unavailable() => fail_open_allow(server_name, tool_name),
         Err(reason) => PactDecision::Deny {
             code: DenyCode::DaemonUnreachable,
             reason,
             hint: None,
         },
     }
+}
+
+/// Fail-open path: agentpactd is unreachable but policy says allow. Logs the
+/// allow and records a fail-open event, then allows the tool call.
+fn fail_open_allow(server_name: &str, tool_name: &str) -> PactDecision {
+    eprintln!(
+        "[kyris-mcp] agentpactd unavailable, allowing {server_name}/{tool_name} due to policy"
+    );
+    kyris_core::fail_open_log::record(
+        "call",
+        tool_name,
+        server_name,
+        current_working_dir().as_deref(),
+    );
+    PactDecision::Allow
 }
 
 async fn resolve_ask_via_tty(

@@ -7,7 +7,7 @@
 //! the shell. Deliberately does not open anything: `Console.app` is
 //! unloved; modern operators use their own tools.
 
-use clap::Args;
+use clap::{Args, Subcommand};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -18,11 +18,25 @@ use std::time::SystemTime;
 /// files are listed too with `-` for size/mtime, since "we expected one
 /// here" is just as useful for diagnosis as the existing files.
 #[derive(Args)]
-pub struct LogsArgs {}
+pub struct LogsArgs {
+    #[command(subcommand)]
+    pub command: Option<LogsSubcommand>,
+}
 
-pub fn run(_args: LogsArgs) {
-    let entries = collect_log_entries();
-    print_table(&entries);
+#[derive(Subcommand)]
+pub enum LogsSubcommand {
+    /// Render every event/record across both stores sharing a correlation id
+    Trace(crate::query::trace::TraceArgs),
+}
+
+pub fn run(args: LogsArgs) {
+    match args.command {
+        None => {
+            let entries = collect_log_entries();
+            print_table(&entries);
+        }
+        Some(LogsSubcommand::Trace(a)) => crate::query::trace::run(a),
+    }
 }
 
 struct LogEntry {

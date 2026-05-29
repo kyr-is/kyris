@@ -54,7 +54,7 @@ pub fn relay_trace_attach_sync(
     ) {
         Ok(working_dir) => working_dir,
         Err(e) => {
-            tracing::debug!(error = %e, "trace.attach relay failed");
+            tracing::warn!(error = %e, "trace.attach relay failed");
             None
         }
     }
@@ -81,11 +81,11 @@ pub async fn relay_trace_attach(
     {
         Ok(Ok(working_dir)) => working_dir,
         Ok(Err(e)) => {
-            tracing::debug!(error = %e, "trace.attach relay failed");
+            tracing::warn!(error = %e, "trace.attach relay failed");
             None
         }
         Err(e) => {
-            tracing::debug!(error = %e, "trace.attach spawn_blocking failed");
+            tracing::warn!(error = %e, "trace.attach spawn_blocking failed");
             None
         }
     }

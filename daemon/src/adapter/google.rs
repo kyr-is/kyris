@@ -35,6 +35,7 @@ enum GoogleAction {
 async fn handle_model_action(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     Path(model_action): Path<String>,
     body: Bytes,
@@ -42,12 +43,16 @@ async fn handle_model_action(
     let Some((model, action)) = parse_model_action(&model_action) else {
         return Err(StatusCode::NOT_FOUND);
     };
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     match action {
         GoogleAction::GenerateContent => {
-            handle_generate_content(state, headers, model, peer_addr, body).await
+            handle_generate_content(state, headers, model, peer_addr, body, trace_id).await
         }
         GoogleAction::StreamGenerateContent => {
-            handle_stream_generate_content(state, headers, model, peer_addr, body).await
+            handle_stream_generate_content(state, headers, model, peer_addr, body, trace_id).await
         }
     }
 }
@@ -68,9 +73,9 @@ async fn handle_generate_content(
     model: String,
     peer_addr: SocketAddr,
     body: Bytes,
+    trace_id: String,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let trace_id = uuid::Uuid::now_v7().to_string();
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -127,10 +132,10 @@ async fn handle_generate_content(
         })?;
 
     let status = response.status();
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read Google generateContent upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
     let parsed_tokens = extract_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
         kyris_core::record::Metering::Available
@@ -191,7 +196,10 @@ async fn handle_generate_content(
         .header("content-type", "application/json")
         .header("x-kyris-trace-id", &trace_id)
         .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build Google generateContent response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn handle_stream_generate_content(
@@ -200,9 +208,9 @@ async fn handle_stream_generate_content(
     model: String,
     peer_addr: SocketAddr,
     body: Bytes,
+    trace_id: String,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let trace_id = uuid::Uuid::now_v7().to_string();
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -504,7 +512,10 @@ fn relay_ndjson_stream(
 
     builder
         .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build Google streamGenerateContent SSE stream response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 fn circuit_breaker_message(token_count: i64) -> String {
