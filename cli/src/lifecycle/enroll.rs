@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 use clap::Args;
+use kyris_core::credentials::Credentials;
 use kyris_core::sync::EnrollmentResponse;
 use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
@@ -50,11 +51,8 @@ pub fn run(args: EnrollArgs) {
 
 fn enroll(args: EnrollArgs) -> Result<(), String> {
     let mut config = load_or_init_config()?;
-    let relay_url = resolve_relay_url(&args, &config)?;
-    let existing_credentials = load_credentials()?;
-    if config.sync.relay_url != relay_url {
-        config.sync.relay_url.clone_from(&relay_url);
-    }
+    let existing_credentials = kyris_core::credentials::load();
+    let relay_url = resolve_relay_url(&args, &config.relay.url)?;
 
     let github_client_id = std::env::var("GITHUB_CLIENT_ID")
         .map_err(|_| "GITHUB_CLIENT_ID is not set.".to_string())?;
@@ -85,9 +83,17 @@ fn enroll(args: EnrollArgs) -> Result<(), String> {
     ))?;
     verify_force_rotation(existing_credentials.as_ref(), &enrollment, args.force)?;
 
-    write_credentials(&enrollment)?;
-    update_sync_config(&mut config)?;
-    save_config(&config)?;
+    let credentials = Credentials {
+        machine_id: enrollment.machine_id.clone(),
+        machine_token: enrollment.machine_token.clone(),
+    };
+    write_credentials(&credentials)?;
+    // `credentials.json` holds only the machine identity. The relay URL stays a
+    // config setting (`relay.url`), and `sync.scope` is the only other kyrisd.yaml
+    // concern enrollment touches.
+    if prompt_sync_scope(&mut config)? {
+        save_config(&config)?;
+    }
 
     println!("Enrollment complete.");
     println!("Credentials written to {}", credentials_path()?.display());
@@ -249,35 +255,25 @@ fn component_version(name: &str) -> String {
         .unwrap_or_else(|| "not-found".to_string())
 }
 
-fn write_credentials(credentials: &EnrollmentResponse) -> Result<(), String> {
+fn write_credentials(credentials: &Credentials) -> Result<(), String> {
     let path = credentials_path()?;
     let contents = serde_json::to_string_pretty(credentials)
         .map_err(|e| format!("Cannot serialize enrollment credentials: {e}"))?;
-    // Validate the round-trip against the same EnrollmentResponse shape — if
-    // the serializer ever produces output the deserializer can't read, this
+    // Validate the round-trip against the on-disk Credentials shape — if the
+    // serializer ever produces output the deserializer can't read, this
     // catches it before it lands on disk.
-    let validator = JsonShapeValidator::<EnrollmentResponse>::new();
+    let validator = JsonShapeValidator::<Credentials>::new();
     let _ = write_managed_file(&path, &contents, "credentials", Some(0o600), &validator)?;
     Ok(())
 }
 
-fn load_credentials() -> Result<Option<EnrollmentResponse>, String> {
-    let path = credentials_path()?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-    let credentials = serde_json::from_str(&contents)
-        .map_err(|e| format!("Cannot parse {}: {e}", path.display()))?;
-    Ok(Some(credentials))
-}
-
-fn update_sync_config(config: &mut kyris_core::config::KyrisdConfig) -> Result<(), String> {
-    config.sync.enabled = true;
-
+/// Prompts (interactively) for the sync directory scope, updating
+/// `config.sync.scope` in place. Returns `true` if the scope changed and the
+/// config should be persisted. Enrollment itself is recorded in
+/// `credentials.json`, so this only ever touches the orthogonal `scope` field.
+fn prompt_sync_scope(config: &mut kyris_core::config::KyrisdConfig) -> Result<bool, String> {
     if !std::io::stdin().is_terminal() {
-        return Ok(());
+        return Ok(false);
     }
 
     let default_scope = config.sync.scope.join(",");
@@ -296,7 +292,7 @@ fn update_sync_config(config: &mut kyris_core::config::KyrisdConfig) -> Result<(
 
     let trimmed = input.trim();
     if trimmed.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     config.sync.scope = trimmed
@@ -305,7 +301,7 @@ fn update_sync_config(config: &mut kyris_core::config::KyrisdConfig) -> Result<(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect();
-    Ok(())
+    Ok(true)
 }
 
 fn user_agent() -> String {
@@ -329,22 +325,29 @@ fn maybe_open_verification_uri(verification_uri: &str) {
     let _ = open::that(verification_uri);
 }
 
-fn resolve_relay_url(
-    args: &EnrollArgs,
-    config: &kyris_core::config::KyrisdConfig,
-) -> Result<String, String> {
+/// Resolve which relay to enroll against. Precedence: `--relay-url` flag >
+/// `KYRIS_RELAY_URL` env > config `relay.url`. Empty/whitespace sources are
+/// skipped. Fails-fast (loud, naming every source) when none yields a URL —
+/// never falls back to a guessed endpoint. (The relay URL is NOT read back from
+/// `credentials.json`; that artifact holds only the machine identity now.)
+fn resolve_relay_url(args: &EnrollArgs, config_relay_url: &str) -> Result<String, String> {
+    let non_empty = |s: String| {
+        let trimmed = s.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
     let relay_url = args
         .relay_url
         .clone()
-        .or_else(|| std::env::var("KYRIS_RELAY_URL").ok())
-        .unwrap_or_else(|| config.sync.relay_url.clone())
-        .trim()
+        .and_then(non_empty)
+        .or_else(|| std::env::var("KYRIS_RELAY_URL").ok().and_then(non_empty))
+        .or_else(|| non_empty(config_relay_url.to_string()))
+        .unwrap_or_default()
         .trim_end_matches('/')
         .to_string();
 
     if relay_url.is_empty() {
         return Err(
-            "Cannot enroll without a relay URL. Set `[sync].relay_url`, pass `--relay-url`, or set `KYRIS_RELAY_URL`."
+            "Cannot enroll without a relay URL. Set `relay.url` in kyrisd.yaml, pass `--relay-url`, or set `KYRIS_RELAY_URL`."
                 .to_string(),
         );
     }
@@ -352,7 +355,7 @@ fn resolve_relay_url(
 }
 
 fn verify_force_rotation(
-    existing: Option<&EnrollmentResponse>,
+    existing: Option<&Credentials>,
     enrollment: &EnrollmentResponse,
     force: bool,
 ) -> Result<(), String> {
@@ -414,23 +417,43 @@ mod tests {
             force: false,
             relay_url: Some("https://flag.example/".to_string()),
         };
-        let config: kyris_core::config::KyrisdConfig = serde_saphyr::from_str(
-            r#"
-sync:
-  relay_url: "https://config.example"
-"#,
-        )
-        .expect("config");
-
         assert_eq!(
-            resolve_relay_url(&args, &config).expect("relay url"),
+            resolve_relay_url(&args, "https://config.example").expect("relay url"),
             "https://flag.example"
         );
     }
 
     #[test]
+    fn test_resolve_relay_url_uses_config_when_no_flag() {
+        let args = EnrollArgs {
+            force: false,
+            relay_url: None,
+        };
+        // Config `relay.url` is the source when no flag/env is given; env must
+        // be unset for config to be the deciding source (test env does not set it).
+        if std::env::var("KYRIS_RELAY_URL").is_err() {
+            assert_eq!(
+                resolve_relay_url(&args, "https://config.example/").expect("relay url"),
+                "https://config.example"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_relay_url_errors_when_no_source() {
+        let args = EnrollArgs {
+            force: false,
+            relay_url: None,
+        };
+        if std::env::var("KYRIS_RELAY_URL").is_err() {
+            let error = resolve_relay_url(&args, "  ").expect_err("should fail");
+            assert!(error.contains("relay.url"));
+        }
+    }
+
+    #[test]
     fn test_verify_force_rotation_requires_same_machine_id() {
-        let existing = EnrollmentResponse {
+        let existing = Credentials {
             machine_token: "old-token".to_string(),
             machine_id: "machine-1".to_string(),
         };
@@ -446,7 +469,7 @@ sync:
 
     #[test]
     fn test_verify_force_rotation_requires_new_token() {
-        let existing = EnrollmentResponse {
+        let existing = Credentials {
             machine_token: "same-token".to_string(),
             machine_id: "machine-1".to_string(),
         };

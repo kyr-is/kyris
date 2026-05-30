@@ -19,6 +19,14 @@ pub const NATIVE_HOOK_POLL_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub enum Resolution {
     Approved,
     Denied,
+    /// The hold could not be established — kyrisd was unreachable or rejected
+    /// the hold request. The approval dialog was **never rendered**, so the
+    /// human was never asked. Callers may safely fall open / defer to the
+    /// agent's own prompt under `on_daemon_unavailable: allow`.
+    Unreachable,
+    /// The hold *was* established (the dialog rendered) but resolution failed —
+    /// it timed out or the pending entered an unexpected state. The human may
+    /// have been mid-decision, so this must **never** fall open: block.
     Failed(String),
 }
 
@@ -109,7 +117,9 @@ pub async fn hold_poll_resolve_with_timeout(
     match hold_result {
         Ok(ref r) if r.status().is_success() => {}
         _ => {
-            return Resolution::Failed("kyrisd unreachable or rejected hold request".to_string());
+            // Never got the dialog up — distinct from a rendered-then-lost
+            // failure below, so the caller can defer to the agent's own prompt.
+            return Resolution::Unreachable;
         }
     }
 

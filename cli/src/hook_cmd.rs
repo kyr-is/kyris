@@ -178,6 +178,17 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
 
     match result {
         Ok(_) => std::process::exit(0),
+        // Gate 2 of the two-gate flow: an ask that couldn't be rendered because
+        // kyrisd is unreachable, under a fail-open policy → allow + spool. This
+        // is what lets a command the agent-hook already deferred-and-approved
+        // actually run (the agent hook only defers under the same `allow`).
+        // Under `deny` this arm is skipped and we hard-deny below.
+        Err(block)
+            if block.source == "kyrisd_unreachable" && agentpact::allow_on_daemon_unavailable() =>
+        {
+            kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
+            std::process::exit(0);
+        }
         Err(block) => {
             emit_deny(&block.reason);
             std::process::exit(block.exit_code);
@@ -827,6 +838,36 @@ fn drive_per_segment(
             emit_allow(&response);
             std::process::exit(0);
         }
+        Err(block)
+            if block_defers_to_agent(block.source, agentpact::allow_on_daemon_unavailable()) =>
+        {
+            // agentpactd returned a real "ask", but the no-TTY resolution
+            // channel (kyrisd) couldn't render the dialog, AND the policy is
+            // fail-open (`on_daemon_unavailable: allow`). Defer to the AGENT's
+            // own permission UX by emitting the EmptyStdout shape, so the human
+            // still decides via the agent's prompt; the shell-preexec gate also
+            // fails-open under `allow`, so an approved command actually runs.
+            // Spool it so the audit trail shows kyris punted this command.
+            // (Under `deny`, this arm is skipped and we hard-deny below — no
+            // false-hope "approve then shell-deny". A real deny / user denial /
+            // timeout always blocks.)
+            kyris_core::fail_open_log::record(ctx.action, ctx.detail, ctx.agent, ctx.cwd);
+            audit_log_hook(
+                ctx.audit_conn,
+                ctx.hook_id,
+                ctx.agent,
+                ctx.action,
+                ctx.detail,
+                Some(segs.as_slice()),
+                "defer",
+                block.source,
+                None,
+                agent_prompt_for(&AllowResponse::EmptyStdout),
+                ctx.started_at.elapsed(),
+            );
+            emit_allow(&AllowResponse::EmptyStdout);
+            std::process::exit(0);
+        }
         Err(block) => {
             audit_log_hook(
                 ctx.audit_conn,
@@ -845,6 +886,26 @@ fn drive_per_segment(
             std::process::exit(block.exit_code);
         }
     }
+}
+
+/// On the agent-hook path, decide whether a blocked segment should *defer to
+/// the agent's own permission UX* instead of hard-denying.
+///
+/// Deferring is correct ONLY when (a) the block is `kyrisd_unreachable` —
+/// agentpactd returned a real "ask" but the no-TTY resolution channel (kyrisd)
+/// couldn't render the dialog — AND (b) the operator's `on_daemon_unavailable`
+/// is `allow`. The `allow` gate matters because the agent's command is governed
+/// a SECOND time by the shell preexec hook: there, `on_daemon_unavailable:allow`
+/// makes that gate fail-open, so a command the agent prompts-and-approves
+/// actually runs. Under `deny`, the shell gate would re-deny it — so deferring
+/// there only yields a confusing "agent prompts → you approve → shell denies."
+/// Hence under `deny` we hard-deny here too, cleanly and consistently.
+///
+/// Every other source always blocks: a policy deny (`agentpact_deny`), the
+/// developer's own denial (`user_denied`), an unreachable decider
+/// (`agentpact_unreachable`), or a timeout (`user_timeout`).
+fn block_defers_to_agent(source: &str, allow_on_unavailable: bool) -> bool {
+    source == "kyrisd_unreachable" && allow_on_unavailable
 }
 
 /// Classify one segment with a real (token-bearing) request to agentpactd.
@@ -963,12 +1024,31 @@ fn poll_segment(
             source: "user_denied",
             reason: "denied by developer via kyris pending".to_string(),
         },
+        kyris_core::pending::Resolution::Unreachable => {
+            // The dialog never rendered. If the policy is `allow`,
+            // drive_per_segment will DEFER this to the agent's own prompt
+            // (source "kyrisd_unreachable") and the command may then run — so do
+            // NOT deny the agentpactd ask here: recording a deny for a command
+            // that subsequently runs would be an audit lie. Let the pending
+            // expire. Under `deny` we hard-deny, where the deny IS accurate.
+            if !agentpact::allow_on_daemon_unavailable() {
+                deny_ask_immediately(approval_token, sock_path, socket_timeout);
+            }
+            PopupResult::Blocked {
+                exit_code: 2,
+                source: "kyrisd_unreachable",
+                reason: "kyrisd unreachable — could not render approval dialog".to_string(),
+            }
+        }
         kyris_core::pending::Resolution::Failed(reason) => {
+            // The dialog WAS rendered but resolution failed (timed out or an
+            // unexpected pending state). The human may have been mid-decision,
+            // so this never defers — always deny + block.
             deny_ask_immediately(approval_token, sock_path, socket_timeout);
             let source = if reason.contains("timeout") || reason.contains("timed out") {
                 "user_timeout"
             } else {
-                "kyrisd_unreachable"
+                "resolution_failed"
             };
             PopupResult::Blocked {
                 exit_code: 2,
@@ -1913,5 +1993,39 @@ mod tests {
         let (action, detail) = map_payload(Some(&proto), &input);
         assert_eq!(action, "call");
         assert_eq!(detail, r#"{"query":"rust async runtime"}"#);
+    }
+
+    #[test]
+    fn testDeferGatedOnKyrisdUnreachableAndFailOpenPolicy() {
+        // The agent-hook defers ONLY when (a) the dialog couldn't be rendered
+        // (kyrisd down → `kyrisd_unreachable`) AND (b) the policy is fail-open.
+        // Under `allow`, the shell-preexec gate also fails-open so an approved
+        // command runs; under `deny`, deferring would only yield a confusing
+        // "approve → shell denies", so we hard-deny here too.
+        assert!(
+            block_defers_to_agent("kyrisd_unreachable", true),
+            "kyrisd_unreachable under fail-open → defer"
+        );
+        assert!(
+            !block_defers_to_agent("kyrisd_unreachable", false),
+            "kyrisd_unreachable under fail-closed → hard-deny, not defer"
+        );
+        // No other source ever defers, regardless of policy.
+        for source in [
+            "agentpact_deny",
+            "user_denied",
+            "user_timeout",
+            "agentpact_unreachable",
+            "agentpact_auto",
+        ] {
+            assert!(
+                !block_defers_to_agent(source, true),
+                "`{source}` must NOT defer"
+            );
+            assert!(
+                !block_defers_to_agent(source, false),
+                "`{source}` must NOT defer"
+            );
+        }
     }
 }

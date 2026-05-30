@@ -78,6 +78,23 @@ trap '__kyris_preexec "$BASH_COMMAND"' DEBUG
 
 __kyris_preexec() {
     local cmd="$1"
+
+    # Govern the AGENT's commands, not the shell's own startup-file sourcing
+    # (/etc/profile, ~/.bashrc, …). The DEBUG trap (extdebug) fires on those too,
+    # and a per-agent-shell login init would otherwise prompt on path_helper /
+    # `[ -x … ]` etc. on every call. Until the shell's first top-level command
+    # (init complete), skip commands executing from within a sourced file —
+    # `${BASH_SOURCE[1]}` is set only for those. Once a top-level command has
+    # run, govern everything, INCLUDING the agent's own `source x.sh` (its inner
+    # commands run with __KYRIS_INIT_DONE already set), so this is not a bypass.
+    # Not exported: each spawned shell re-decides for its own startup.
+    if [ -z "${__KYRIS_INIT_DONE:-}" ]; then
+        if [ -n "${BASH_SOURCE[1]:-}" ]; then
+            return 0
+        fi
+        __KYRIS_INIT_DONE=1
+    fi
+
     local sock="${AGENTPACT_SOCK:-$HOME/.agentpact/agentpact.sock}"
     local sentinel="$HOME/.kyris/.daemon-unreachable"
 

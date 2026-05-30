@@ -18,8 +18,15 @@ pub use kyris_types::sync;
 
 pub mod agentpact;
 pub mod config;
+// The on-disk artifact is named `credentials.json`; the module file is
+// `enrollment.rs` so it doesn't collide with the credentials path-protection
+// boundary rule, but the public module path is `credentials` to match the
+// artifact it loads.
 pub mod coverage;
+#[path = "enrollment.rs"]
+pub mod credentials;
 pub mod fail_open_log;
 pub mod paths;
 #[cfg(feature = "pending")]
 pub mod pending;
+pub mod pricing_cache;

@@ -37,12 +37,22 @@ circuit_breaker:
   max_tokens: 200000
   session_idle_minutes: 30
 
+# The relay this install talks to. Two uses, neither requiring enrollment:
+#   - pricing: `kyris install` and the daemon fetch the live price table from
+#     `<url>/api/v1/pricing` (public) — so model names and costs work without
+#     enrolling.
+#   - enroll: `kyris enroll` uses this as the relay to enroll against when no
+#     `--relay-url` / `KYRIS_RELAY_URL` is given.
+# The dev patch overrides this to a local relay; `--relay-url` overrides per run.
+relay:
+  url: "https://relay.kyr.is"
+
+# Enrollment lives in credentials.json (run `kyris enroll`), not here.
+# `scope` only narrows which directories' events sync (empty = all).
 sync:
-  enabled: false
   scope: []
 
 pricing:
-  file: "config/pricing.yaml"
   fetch_interval_hours: 6
 
 stats:

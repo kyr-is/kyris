@@ -36,9 +36,6 @@ where
     {
         config.circuit_breaker.session_idle_minutes = n;
     }
-    if let Some(v) = get("KYRIS_SYNC_ENABLED") {
-        config.sync.enabled = v == "true" || v == "1";
-    }
     if let Some(n) = get("KYRIS_PRICING_FETCH_INTERVAL_HOURS").and_then(|v| v.parse().ok()) {
         config.pricing.fetch_interval_hours = n;
     }
@@ -161,7 +158,6 @@ mod tests {
                 ("KYRIS_SERVER_OPERATOR_KEY", "sk-ops-test"),
                 ("KYRIS_SERVER_MAX_REQUEST_BODY_BYTES", "1024"),
                 ("KYRIS_SERVER_DRAIN_TIMEOUT_SECONDS", "10"),
-                ("KYRIS_SYNC_ENABLED", "1"),
                 ("KYRIS_PRICING_FETCH_INTERVAL_HOURS", "12"),
                 ("KYRIS_STATS_RETENTION_DAYS", "14"),
                 ("KYRIS_STATS_CHANNEL_CAPACITY", "5000"),
@@ -173,7 +169,6 @@ mod tests {
         assert_eq!(config.server.operator_key, "sk-ops-test");
         assert_eq!(config.server.max_request_body_bytes, 1024);
         assert_eq!(config.server.drain_timeout_seconds, 10);
-        assert!(config.sync.enabled);
         assert_eq!(config.pricing.fetch_interval_hours, 12);
         assert_eq!(config.stats.retention_days, 14);
         assert_eq!(config.stats.channel_capacity, 5000);

@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-use clap::Args;
 use std::path::PathBuf;
 
 use crate::config_writer::NoopValidator;
@@ -26,15 +25,13 @@ const KYRIS_BASH_ENV_MARKER: &str = "/.kyris/hooks/bash_env.sh";
 const KYRIS_BASH_ENV_LINE: &str = "export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\"";
 const KYRIS_ORIG_CAPTURE: &str = "export _KYRIS_ORIG_BASH_ENV=\"${BASH_ENV:-}\"";
 
-#[derive(Args)]
-pub struct InstallArgs;
-
 // `run` is a top-to-bottom narrative of the install sequence — service plist,
 // shell hooks, agent integrations, manifest writes, post-install verify.
 // Splitting it into helpers would obscure the install transcript (which is
 // the user-facing artifact) without making the logic easier to follow.
+// Install takes no flags: enrollment is the separate explicit `kyris enroll`.
 #[allow(clippy::too_many_lines)]
-pub fn run(_args: InstallArgs) {
+pub fn run() {
     let log = InstallLog::open_install();
     log.info("=== kyris install started ===");
 
@@ -166,10 +163,104 @@ pub fn run(_args: InstallArgs) {
         std::process::exit(1);
     }
 
+    // Fetch the live pricing table now so install yields a fresh, working cost
+    // table (the bundled table is release-stale). Pricing is public — no
+    // enrollment needed. Best-effort: never fails the install.
+    fetch_pricing_at_install(&log);
+
+    // Install succeeded. Report enrollment status — install never enrolls;
+    // `kyris enroll` is a separate explicit step. Standalone is supported and
+    // indicated (here, in status/doctor, and the tray).
+    report_enrollment_status(&log);
+
     log.info("=== kyris install complete ===");
     if !log.path().as_os_str().is_empty() {
         println!("\nInstall log: {}", log.path().display());
     }
+}
+
+/// Fetch the live pricing table at install so the machine has a fresh, working
+/// cost table immediately. The bundled table is release-stale, so a fetched
+/// table is strictly better. Best-effort on every axis: a missing `relay.url`,
+/// an unreachable relay, or a cache-write failure all leave the bundled table
+/// in place until the daemon refreshes — install never fails here.
+fn fetch_pricing_at_install(log: &InstallLog) {
+    let relay_base = match load_or_init_config() {
+        Ok(config) => config.relay.url.trim_end_matches('/').to_string(),
+        Err(e) => {
+            log.warn(&format!("pricing fetch skipped: cannot load config: {e}"));
+            return;
+        }
+    };
+    if relay_base.is_empty() {
+        log.info("pricing fetch skipped: relay.url unset (bundled table until configured)");
+        return;
+    }
+
+    let url = format!("{relay_base}/api/v1/pricing");
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            log.warn(&format!("pricing fetch skipped: cannot build runtime: {e}"));
+            return;
+        }
+    };
+
+    let table = runtime.block_on(async {
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        serde_saphyr::from_str::<kyris_core::pricing::PricingTable>(&body).ok()
+    });
+
+    let Some(table) = table else {
+        log.warn(&format!(
+            "pricing not fetched (relay {relay_base} unreachable); using bundled table until the daemon refreshes"
+        ));
+        println!(
+            "\nCould not fetch pricing from {relay_base} right now — using the built-in table until the daemon refreshes."
+        );
+        return;
+    };
+    match kyris_core::pricing_cache::store(&table) {
+        Ok(()) => {
+            log.info(&format!(
+                "fetched pricing table {} from {relay_base}",
+                table.version
+            ));
+            println!("\nPricing table fetched from {relay_base}.");
+        }
+        Err(e) => log.warn(&format!("fetched pricing but failed to cache it: {e}")),
+    }
+}
+
+/// Final install step: report enrollment status. Install never enrolls —
+/// enrollment is a separate, explicit `kyris enroll` (a GitHub device flow).
+/// Standalone is a supported state, indicated here, in `kyris status`/`doctor`,
+/// and by the tray warning; pricing and model costs work without it.
+fn report_enrollment_status(log: &InstallLog) {
+    if let Some(creds) = kyris_core::credentials::load() {
+        log.info("enrolled");
+        println!("\nEnrolled (machine {}).", creds.machine_id);
+        return;
+    }
+    log.info("standalone (not enrolled)");
+    println!(
+        "\nThis machine is standalone (not enrolled): event sync is disabled.\n\
+         Pricing and model costs work without enrolling.\n\
+         Enable sync later with: kyris enroll"
+    );
 }
 
 fn install_shell_hooks(log: &InstallLog) -> Result<Vec<String>, String> {

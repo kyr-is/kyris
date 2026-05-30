@@ -299,6 +299,24 @@ if [[ -o interactive ]]; then
 else
     TRAPDEBUG() {
         local cmd="$ZSH_DEBUG_CMD"
+
+        # Govern the AGENT's commands, not the shell's own startup-file sourcing
+        # (/etc/zprofile's path_helper, ~/.zshrc, …). TRAPDEBUG fires on those
+        # too. Until the shell's first top-level command (init complete), skip
+        # commands running inside a sourced file — `file` is in
+        # $ZSH_EVAL_CONTEXT only for those; the agent's own command is `cmdarg`
+        # (or `toplevel`). After that, govern everything, INCLUDING the agent's
+        # own `source x.sh` (its inner commands run with __KYRIS_INIT_DONE
+        # already set), so this is not a bypass. The interactive path uses
+        # `preexec`, which already never fires during startup. Not exported:
+        # each spawned shell re-decides for its own startup.
+        if [[ -z "${__KYRIS_INIT_DONE:-}" ]]; then
+            if [[ "$ZSH_EVAL_CONTEXT" == *file* ]]; then
+                return 0
+            fi
+            __KYRIS_INIT_DONE=1
+        fi
+
         local sock="${AGENTPACT_SOCK:-$HOME/.agentpact/agentpact.sock}"
         local sentinel="$HOME/.kyris/.daemon-unreachable"
 

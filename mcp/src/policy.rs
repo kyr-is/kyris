@@ -349,7 +349,10 @@ async fn resolve_ask_via_kyrisd(
     match resolution {
         kyris_core::pending::Resolution::Approved => PactDecision::Allow,
         kyris_core::pending::Resolution::Denied => no_tty_deny(),
-        kyris_core::pending::Resolution::Failed(_) => {
+        // No-TTY MCP has no agent prompt to defer to, so a couldn't-render
+        // (`Unreachable`) and a rendered-then-lost (`Failed`) both deny.
+        kyris_core::pending::Resolution::Unreachable
+        | kyris_core::pending::Resolution::Failed(_) => {
             deny_ask_immediately(approval_token, sock_path, socket_timeout).await
         }
     }

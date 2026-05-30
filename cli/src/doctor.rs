@@ -69,6 +69,7 @@ fn run_checks() -> Vec<CheckResult> {
     let mut checks = vec![
         check_agentpactd(),
         check_kyrisd(),
+        check_enrollment(),
         check_pending_approvals(),
         check_directory_effective_mode(&cwd),
     ];
@@ -203,6 +204,25 @@ fn check_kyrisd() -> CheckResult {
             ok: false,
             detail: format!("/healthz unreachable at {base_url}: {e}"),
             fix: Some("launchctl kickstart gui/$UID/is.kyr.kyrisd (or reinstall)"),
+        },
+    }
+}
+
+fn check_enrollment() -> CheckResult {
+    // Enrolled ⟺ a valid credentials.json is present; standalone otherwise.
+    // Standalone is a normal, visible state — never a hard failure.
+    match kyris_core::credentials::load() {
+        Some(creds) => CheckResult {
+            name: "enrollment",
+            ok: true,
+            detail: format!("enrolled (machine {})", creds.machine_id),
+            fix: None,
+        },
+        None => CheckResult {
+            name: "enrollment",
+            ok: true,
+            detail: "standalone (not enrolled): event sync disabled — run `kyris enroll` (pricing works without enrollment)".to_string(),
+            fix: None,
         },
     }
 }

@@ -141,6 +141,15 @@ pub fn credentials_path() -> PathBuf {
     data_dir().join("credentials.json")
 }
 
+/// `~/.local/share/kyris/pricing.json` — last pricing table fetched from the
+/// relay. Written at install and refreshed by the daemon; safe to delete (it's
+/// re-fetched). Surviving uninstall means a reinstall starts with a recent
+/// table rather than the release-stale bundled one.
+#[must_use]
+pub fn pricing_cache_path() -> PathBuf {
+    data_dir().join("pricing.json")
+}
+
 // --- rotating state (state_dir) --------------------------------------------
 
 /// `~/.local/state/kyris/log/` — log directory for kyris.log plus

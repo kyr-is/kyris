@@ -119,6 +119,11 @@ pub fn save_agent_profile(profile: &crate::agents::profile::AgentProfile) -> Res
 // Config helpers
 // ---------------------------------------------------------------------------
 
+/// The shipped first-run config template, embedded so a fresh install writes
+/// the documented defaults (incl. `relay.url`) — the same file the daemon
+/// writes on its own first run.
+const DEFAULT_CONFIG: &str = include_str!("../../config/default.yaml");
+
 pub fn load_or_init_config() -> Result<KyrisdConfig, String> {
     let path = config_path()?;
     if path.exists() {
@@ -138,8 +143,12 @@ pub fn load_or_init_config() -> Result<KyrisdConfig, String> {
         return Ok(config);
     }
 
-    let mut config: KyrisdConfig =
-        serde_saphyr::from_str("{}").map_err(|e| format!("Cannot create default config: {e}"))?;
+    // Seed first-run config from the shipped `config/default.yaml` template
+    // (the same file the daemon writes on its own first run), NOT from serde
+    // `{}` defaults — otherwise the two init paths diverge (e.g. `relay.url`
+    // would be the template's `relay.kyr.is` from the daemon but empty here).
+    let mut config: KyrisdConfig = serde_saphyr::from_str(DEFAULT_CONFIG)
+        .map_err(|e| format!("Cannot create default config: {e}"))?;
     config.server.inbound_key = generate_key("sk-kyris");
     config.server.operator_key = generate_key("sk-kyris-ops");
     save_config(&config)?;

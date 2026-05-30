@@ -125,6 +125,34 @@ pub async fn run(config: KyrisdConfig) {
         session_idle_minutes,
     ));
 
+    // Single, visible statement of mode at startup, on two independent axes:
+    //   - relay.url (config)  -> live pricing (no enrollment needed)
+    //   - enrollment (creds)  -> event sync + included-vs-overage billing
+    // Each degraded axis is announced; neither is a hard failure.
+    let relay_url = state.config.load().relay.url.clone();
+    if relay_url.trim().is_empty() {
+        tracing::warn!(
+            "no `relay.url` configured: live pricing disabled, using last cached/bundled table"
+        );
+    } else {
+        tracing::info!(relay_url = %relay_url, "live pricing enabled from relay");
+    }
+    if let Some(creds) = kyris_core::credentials::load() {
+        tracing::info!(machine_id = %creds.machine_id, "enrolled: event sync enabled");
+        crate::tray::clear_issue("enrollment");
+    } else {
+        tracing::warn!(
+            "standalone (not enrolled): event sync disabled — run `kyris enroll` (pricing is unaffected)"
+        );
+        // Surface standalone as a tray indicator (warning overlay). It clears on
+        // the next startup after `kyris enroll` (which restarts kyrisd). `doctor`
+        // distinguishes this from real failures by the issue's reason string.
+        crate::tray::report_issue(
+            "enrollment",
+            "standalone (not enrolled) — run `kyris enroll` to enable event sync",
+        );
+    }
+
     tokio::spawn(crate::sync::daemon_sync::run_sync_loop(state.clone()));
     tokio::spawn(crate::pricing_fetch::run_pricing_fetch(state.clone()));
     tokio::spawn(run_pending_prune(state.pending.clone()));

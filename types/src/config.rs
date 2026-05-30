@@ -15,6 +15,8 @@ pub struct KyrisdConfig {
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
     #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
     pub sync: SyncConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
@@ -228,20 +230,32 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// The relay this install talks to. The single home for the relay URL — it is
+/// NOT stored in `credentials.json` (that artifact holds only the machine
+/// identity). Read at runtime by the daemon (`pricing_fetch` GETs
+/// `<url>/api/v1/pricing`; `daemon_sync` POSTs events there, additionally
+/// needing the enrolled `machine_token`), and at enroll time by `kyris enroll`
+/// as the relay to enroll against when no `--relay-url` / `KYRIS_RELAY_URL` is
+/// given. Pricing needs no enrollment. Ships `https://relay.kyr.is` in
+/// `default.yaml`; the dev patch overrides it to a local relay, and
+/// `--relay-url` overrides per `kyris enroll` invocation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayConfig {
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Sync directory scope. Whether sync runs at all is determined by
+/// enrollment (`credentials.json`), not config; this only narrows which
+/// directories' events are synced (empty = all).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncConfig {
     #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
     pub scope: Vec<String>,
-    #[serde(default)]
-    pub relay_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingConfig {
-    #[serde(default = "default_pricing_file")]
-    pub file: String,
     #[serde(default = "default_fetch_interval_hours")]
     pub fetch_interval_hours: u64,
 }
@@ -249,7 +263,6 @@ pub struct PricingConfig {
 impl Default for PricingConfig {
     fn default() -> Self {
         Self {
-            file: default_pricing_file(),
             fetch_interval_hours: default_fetch_interval_hours(),
         }
     }
@@ -354,9 +367,6 @@ fn default_max_tokens() -> u64 {
 fn default_session_idle_minutes() -> u64 {
     30
 }
-fn default_pricing_file() -> String {
-    "config/pricing.yaml".to_string()
-}
 fn default_fetch_interval_hours() -> u64 {
     6
 }
@@ -450,7 +460,7 @@ providers:
         assert_eq!(config.server.listen, "127.0.0.1:4710");
         assert!(config.providers.is_empty());
         assert!(!config.mcp.enabled);
-        assert!(!config.sync.enabled);
+        assert!(config.sync.scope.is_empty());
     }
 
     #[test]
@@ -478,7 +488,6 @@ mcp:
     #[test]
     fn testSyncConfigDefaults() {
         let config = SyncConfig::default();
-        assert!(!config.enabled);
         assert!(config.scope.is_empty());
     }
 

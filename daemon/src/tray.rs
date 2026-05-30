@@ -513,6 +513,15 @@ mod gui {
     /// pre-macOS-11 where the symbol name doesn't resolve). The caller
     /// falls back to the amber recolor in that case.
     fn build_warning_image(normal_template: &NSImage) -> Option<Retained<NSImage>> {
+        // Bottom-right corner-badge geometry knobs (used in the drawing handler
+        // below). BADGE_FRACTION — badge size as a fraction of the icon;
+        // INSET_FRACTION — gap from the right & bottom edges so the badge reads
+        // as a deliberate badge rather than clipped against the edge.
+        // Flush-to-edge (inset 0) at 0.6 looked like it was hanging off the
+        // bottom; 0.5 + a small inset tucks it in cleanly.
+        const BADGE_FRACTION: f64 = 0.5;
+        const INSET_FRACTION: f64 = 0.08;
+
         let symbol = build_warning_symbol()?;
         let base = normal_template.retain();
         let size = NSSize {
@@ -542,13 +551,14 @@ mod gui {
                     1.0,
                 );
 
-                // 3. Overlay: multicolor warning glyph in the
-                //    bottom-right corner at ~55% size.
-                let badge_size = rect.size.width * 0.6;
+                // 3. Overlay: multicolor warning glyph as a bottom-right corner
+                //    badge (geometry knobs declared at the top of the fn).
+                let badge_size = rect.size.width * BADGE_FRACTION;
+                let inset = rect.size.width * INSET_FRACTION;
                 let badge_rect = NSRect {
                     origin: NSPoint {
-                        x: rect.size.width - badge_size,
-                        y: 0.0,
+                        x: rect.size.width - badge_size - inset,
+                        y: inset,
                     },
                     size: NSSize {
                         width: badge_size,

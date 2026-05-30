@@ -54,13 +54,22 @@ circuit_breaker:
   max_tokens: 200000
   session_idle_minutes: 30
 
+# The relay this install talks to (the single home for the relay URL — NOT in
+# credentials.json). Read by the daemon at runtime (pricing fetch from
+# <url>/api/v1/pricing, and event sync), and by `kyris enroll` as the relay to
+# enroll against when no `--relay-url` / `KYRIS_RELAY_URL` is given. Neither use
+# requires enrollment for pricing. Override per `kyris enroll` with `--relay-url`
+# (e.g. dev → local relay, or a self-hosted/enterprise relay).
+relay:
+  url: "https://relay.kyr.is"
+
+# Enrollment lives in credentials.json (run `kyris enroll`), not here.
+# `scope` only narrows which directories' events sync (empty = all).
 sync:
-  enabled: false
   scope: []
-  # After enrollment: enabled: true, scope: ["~/work/*", "~/corp/*"]
+  # Example: scope: ["~/work/*", "~/corp/*"]
 
 pricing:
-  file: "config/pricing.yaml"
   fetch_interval_hours: 6
 
 stats:

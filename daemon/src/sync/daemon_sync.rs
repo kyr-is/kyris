@@ -11,27 +11,6 @@ use kyris_core::sync::SyncCursor;
 use super::event_sync::{EventSyncer, send_batch};
 use crate::server::AppState;
 
-struct Credentials {
-    machine_id: String,
-    machine_token: String,
-}
-
-fn load_credentials() -> Option<Credentials> {
-    let path = if let Ok(p) = std::env::var("KYRIS_CREDENTIALS_PATH") {
-        PathBuf::from(p)
-    } else {
-        kyris_core::paths::credentials_path()
-    };
-    let contents = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    let machine_id = parsed.get("machine_id")?.as_str()?.to_string();
-    let machine_token = parsed.get("machine_token")?.as_str()?.to_string();
-    Some(Credentials {
-        machine_id,
-        machine_token,
-    })
-}
-
 fn agentpact_log_dir() -> PathBuf {
     // agentpact moved its rotating log dir to $XDG_STATE_HOME/agentpact/log
     // per the agentpact XDG migration. AGENTPACT_HOME no longer relocates
@@ -46,27 +25,23 @@ fn agentpact_log_dir() -> PathBuf {
 
 pub async fn run_sync_loop(state: Arc<AppState>) {
     let config = state.config.load();
-    if !config.sync.enabled {
-        tracing::debug!("sync disabled, skipping event sync loop");
-        return;
-    }
-
-    if config.sync.relay_url.is_empty() {
-        tracing::warn!("sync enabled but relay_url not configured");
-        return;
-    }
-    // `sync.relay_url` is the relay base; the ingest endpoint is
-    // `/api/v1/ingest/events`. `send_batch` POSTs to this URL verbatim, so the
-    // full path must be built here (a bare base URL 404s).
-    let relay_url = format!(
-        "{}/api/v1/ingest/events",
-        config.sync.relay_url.trim_end_matches('/')
-    );
-
-    let Some(credentials) = load_credentials() else {
-        tracing::warn!("sync enabled but credentials not found, run `kyris enroll`");
+    let Some(credentials) = kyris_core::credentials::load() else {
+        tracing::info!("standalone (not enrolled): event sync disabled — run `kyris enroll`");
         return;
     };
+
+    // Sync needs both enrollment (the machine token, above) and a relay to send
+    // to (config `relay.url`). The relay URL is config, not part of the
+    // credentials artifact, so guard it explicitly.
+    let relay_base = config.relay.url.trim_end_matches('/');
+    if relay_base.is_empty() {
+        tracing::warn!("enrolled but `relay.url` is unset in kyrisd.yaml: event sync disabled");
+        return;
+    }
+
+    // The ingest endpoint is `/api/v1/ingest/events`. `send_batch` POSTs to this
+    // URL verbatim, so the full path must be built here (a bare base URL 404s).
+    let relay_url = format!("{relay_base}/api/v1/ingest/events");
 
     let cursor = state.db.load_sync_cursor().map_or_else(
         || SyncCursor {
@@ -250,15 +225,6 @@ mod tests {
         }
     }
 
-    fn write_credentials(base: &std::path::Path, body: &str) {
-        // After the XDG migration, credentials live in
-        // $XDG_DATA_HOME/kyris/credentials.json (default
-        // ~/.local/share/kyris/). Mirror that under the tempdir.
-        let creds_dir = base.join(".local").join("share").join("kyris");
-        std::fs::create_dir_all(&creds_dir).unwrap();
-        std::fs::write(creds_dir.join("credentials.json"), body).unwrap();
-    }
-
     #[test]
     fn testAgentpactLogDir() {
         // agentpact's log dir moved under XDG_STATE_HOME with its own XDG
@@ -272,74 +238,6 @@ mod tests {
             dir,
             PathBuf::from("/tmp/test-home/.local/state/agentpact/log")
         );
-    }
-
-    #[test]
-    fn testLoadCredentialsValidFile() {
-        let dir = tempfile::tempdir().unwrap();
-        write_credentials(
-            dir.path(),
-            r#"{"machine_id":"m-123","machine_token":"tok-abc"}"#,
-        );
-
-        unsafe {
-            std::env::set_var("HOME", dir.path().to_str().unwrap());
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
-        }
-        let creds = load_credentials().unwrap();
-        assert_eq!(creds.machine_id, "m-123");
-        assert_eq!(creds.machine_token, "tok-abc");
-    }
-
-    #[test]
-    fn testLoadCredentialsMissingMachineId() {
-        let dir = tempfile::tempdir().unwrap();
-        write_credentials(dir.path(), r#"{"machine_token":"tok-abc"}"#);
-
-        unsafe {
-            std::env::set_var("HOME", dir.path().to_str().unwrap());
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
-        }
-        assert!(load_credentials().is_none());
-    }
-
-    #[test]
-    fn testLoadCredentialsMissingFile() {
-        let dir = tempfile::tempdir().unwrap();
-        unsafe {
-            std::env::set_var("HOME", dir.path().to_str().unwrap());
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
-        }
-        assert!(load_credentials().is_none());
-    }
-
-    #[test]
-    fn testLoadCredentialsInvalidJson() {
-        let dir = tempfile::tempdir().unwrap();
-        write_credentials(dir.path(), "not valid json {{{");
-
-        unsafe {
-            std::env::set_var("HOME", dir.path().to_str().unwrap());
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
-        }
-        assert!(load_credentials().is_none());
-    }
-
-    #[test]
-    fn testLoadCredentialsNonStringValues() {
-        let dir = tempfile::tempdir().unwrap();
-        write_credentials(dir.path(), r#"{"machine_id":123,"machine_token":"tok"}"#);
-
-        unsafe {
-            std::env::set_var("HOME", dir.path().to_str().unwrap());
-            std::env::remove_var("XDG_DATA_HOME");
-            std::env::remove_var("KYRIS_CREDENTIALS_PATH");
-        }
-        assert!(load_credentials().is_none());
     }
 
     #[test]

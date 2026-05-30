@@ -17,8 +17,25 @@ impl Default for CostCalculator {
 
 impl CostCalculator {
     pub fn new() -> Self {
+        // Seed from the on-disk cache (the freshest table the machine has
+        // actually fetched). The bundled table is only a last-resort floor for
+        // a never-fetched / offline-installed machine — release-stale, so it
+        // must never be the first choice when a fetched table exists.
+        let seed = kyris_core::pricing_cache::load().unwrap_or_else(|| {
+            tracing::warn!(
+                "no cached pricing table: using release-bundled table (stale) until first relay fetch"
+            );
+            PricingTable::bundled()
+        });
+        Self::from_table(seed)
+    }
+
+    /// Construct with an explicit table — production seeding goes through
+    /// [`new`]; tests use this to stay hermetic (no on-disk cache dependency).
+    #[must_use]
+    pub fn from_table(table: PricingTable) -> Self {
         Self {
-            pricing: Arc::new(ArcSwap::from_pointee(PricingTable::bundled())),
+            pricing: Arc::new(ArcSwap::from_pointee(table)),
         }
     }
 
@@ -35,16 +52,11 @@ impl CostCalculator {
             .cost(model, tokens_in, tokens_out, cache_create, cache_read)
     }
 
-    pub fn update_pricing(&self, mut table: PricingTable) {
-        // Bundled entries are authoritative for the bare wire model ids agents
-        // actually send (e.g. `claude-opus-4-7`), where litellm catalogs them as
-        // dated/prefixed variants (`claude-opus-4-7-20260416`,
-        // `global.anthropic.claude-opus-4-7`, etc.) that an exact-match lookup
-        // misses. Merge with bundled-wins so a relay refresh fills in the long
-        // tail without dropping the curated bare-id pricing.
-        for (k, v) in PricingTable::bundled().models {
-            table.models.insert(k, v);
-        }
+    pub fn update_pricing(&self, table: PricingTable) {
+        // Replace wholesale — the live table is authoritative. The bare-wire-id
+        // vs dated/prefixed-id gap that the old bundled-wins merge papered over
+        // is now handled at lookup time (`PricingTable::lookup` canonicalizes),
+        // so stale bundled prices never override fresh relay data.
         self.pricing.store(Arc::new(table));
     }
 }
@@ -81,14 +93,12 @@ mod tests {
             version: "test".to_string(),
             models,
         };
-        let calc = CostCalculator::new();
-        calc.update_pricing(table);
-        calc
+        CostCalculator::from_table(table)
     }
 
     #[test]
     fn testCostCalculatorBundledPricing() {
-        let calc = CostCalculator::new();
+        let calc = CostCalculator::from_table(PricingTable::bundled());
         let cost = calc.calculate("gpt-4o", 1_000_000, 500_000, None, None);
         assert!(cost.is_some());
         assert!(cost.unwrap() > 0.0);
@@ -96,7 +106,7 @@ mod tests {
 
     #[test]
     fn testCostCalculatorUnknownModel() {
-        let calc = CostCalculator::new();
+        let calc = CostCalculator::from_table(PricingTable::bundled());
         assert!(
             calc.calculate("nonexistent", 100, 100, None, None)
                 .is_none()
@@ -105,7 +115,7 @@ mod tests {
 
     #[test]
     fn testCostCalculatorUpdatePricing() {
-        let calc = CostCalculator::new();
+        let calc = CostCalculator::from_table(PricingTable::bundled());
         let mut table = PricingTable::bundled();
         table.version = "v99.0.0".to_string();
         calc.update_pricing(table);
@@ -113,18 +123,18 @@ mod tests {
     }
 
     #[test]
-    fn testUpdatePricingPreservesBundledWireIds() {
-        // The relay-fetched pricing (e.g. from litellm) catalogs Anthropic
-        // models as dated/prefixed variants, missing the bare wire ids that
-        // `claude` actually sends. update_pricing must merge with bundled-wins
-        // so a refresh from the relay can't silently drop `claude-opus-4-7` and
-        // leave every Claude Code record with `cost_usd: null`.
-        let calc = CostCalculator::new();
+    fn testRefreshResolvesBareWireIdViaCanonicalMatch() {
+        // The relay-fetched table (from litellm) catalogs Anthropic models as
+        // dated/prefixed variants, missing the bare wire id `claude` sends. With
+        // the bundled-wins merge gone, the bare id still prices — `lookup`
+        // canonicalizes on a miss — so a refresh can't leave `cost_usd: null`,
+        // and stale bundled prices never override the fresh relay table.
+        let calc = CostCalculator::from_table(PricingTable::bundled());
         let mut sparse = PricingTable {
             version: "litellm-2026".to_string(),
             models: std::collections::HashMap::new(),
         };
-        // Simulate a relay table that has only the dated variant.
+        // A relay table that has only the dated variant.
         sparse.models.insert(
             "claude-opus-4-7-20260416".to_string(),
             kyris_core::pricing::ModelPricing {
@@ -137,19 +147,15 @@ mod tests {
         );
         calc.update_pricing(sparse);
         let active = calc.pricing.load();
-        assert!(
-            active.models.contains_key("claude-opus-4-7-20260416"),
-            "relay-fetched models survive"
-        );
-        assert!(
-            active.models.contains_key("claude-opus-4-7"),
-            "bundled wire-id `claude-opus-4-7` must NOT be lost on refresh"
-        );
+        // Wholesale replace: only the relay's keys are present (no bundled bleed).
+        assert!(active.models.contains_key("claude-opus-4-7-20260416"));
+        assert!(!active.models.contains_key("claude-opus-4-7"));
+        // ...yet the bare wire id still prices, via canonical lookup.
         assert!(
             calc.calculate("claude-opus-4-7", 1_000, 500, None, None)
                 .unwrap()
                 > 0.0,
-            "claude-opus-4-7 must price after refresh"
+            "bare wire id must price against the dated relay entry"
         );
     }
 

@@ -481,3 +481,71 @@ fn test_zsh_hook_blocks_unexpected_helper_exit_code() {
 
     assert_eq!(output.status.code(), Some(1));
 }
+
+#[test]
+fn test_zsh_hook_skips_shell_startup_file_commands() {
+    // The hook governs the AGENT's commands, not the shell's own startup-file
+    // sourcing. Faithful layout: `.zshenv` installs the hook (as the real
+    // install does), `.zprofile` runs a startup command (the /etc/zprofile
+    // path_helper analog). A login shell sources .zshenv -> .zprofile -> then
+    // runs the `-c` agent command. The startup command must NOT reach the
+    // daemon; the agent command must.
+    if !Path::new("/bin/zsh").exists() {
+        return;
+    }
+
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let bin_dir = make_helper_path_dir();
+    let socket_path = temp_home.path().join("agentpact.sock");
+    // One ALLOW response — only the agent command should ask. If the startup
+    // command is wrongly governed it consumes this response first and the
+    // assertions below catch it.
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "allow-1",
+            "code": "PACT_OK",
+            "decision": "auto"
+        })],
+    );
+
+    std::fs::write(
+        temp_home.path().join(".zshenv"),
+        format!("source \"{}\"\n", hook_path("zsh_hook.sh").display()),
+    )
+    .expect("write .zshenv");
+    std::fs::write(
+        temp_home.path().join(".zprofile"),
+        "true STARTUP_PROFILE_CMD\n",
+    )
+    .expect("write .zprofile");
+
+    let _output = Command::new("/bin/zsh")
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("ZDOTDIR", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .env("PATH", prepend_path(bin_dir.path()))
+        .env_remove("CLAUDECODE")
+        .env_remove("KYRIS_GOVERNED_SUBPROCESS")
+        .env("KYRIS_HOOK_FORCE", "1")
+        .arg("-lc")
+        .arg("true AGENT_TOPLEVEL_CMD")
+        .output()
+        .expect("run zsh login hook");
+
+    let requests = daemon.finish();
+    let details: Vec<String> = requests
+        .iter()
+        .filter_map(|r| r["detail"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !details.iter().any(|d| d.contains("STARTUP_PROFILE_CMD")),
+        "shell startup-file command must NOT be governed, got: {details:?}"
+    );
+    assert!(
+        details.iter().any(|d| d.contains("AGENT_TOPLEVEL_CMD")),
+        "agent top-level command must be governed, got: {details:?}"
+    );
+}
