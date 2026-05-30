@@ -16,6 +16,20 @@ fn main() {
     // rasterized RGBA when we'll actually link the tray module in.
     if std::env::var_os("CARGO_FEATURE_TRAY").is_some() {
         rasterize_svg("assets/icon.svg", "tray_icon_44.rgba", 44, 44);
+        // Status overlays: same 44×44 canvas, laid directly over the base icon.
+        // Unlike the base (a monochrome template), these keep their own color.
+        rasterize_svg(
+            "assets/icon_warning.svg",
+            "tray_icon_warning_44.rgba",
+            44,
+            44,
+        );
+        rasterize_svg(
+            "assets/icon_disabled.svg",
+            "tray_icon_disabled_44.rgba",
+            44,
+            44,
+        );
     }
 }
 

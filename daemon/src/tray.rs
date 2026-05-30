@@ -35,10 +35,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static ISSUES: Mutex<BTreeMap<&'static str, String>> = Mutex::new(BTreeMap::new());
 
 /// `true` when agentpactd's effective user policy is `mode: log` —
-/// commands are recorded but not mediated. The tray paints a red
-/// horizontal bar across the kyris glyph so the non-enforcing state
-/// is visible at all times. Updated from kyrisd's policy poller (see
-/// `server::policy_mode_poller`); read every tray refresh tick.
+/// commands are recorded but not mediated. The tray overlays a red
+/// prohibition circle on the kyris glyph (the disabled icon) so the
+/// non-enforcing state is visible at all times. Updated from kyrisd's
+/// policy poller (see `server::policy_mode_poller`); read every tray
+/// refresh tick.
 static LOG_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Push the current "is the user policy in log mode?" state. Called by
@@ -178,15 +179,22 @@ mod gui {
     use objc2::{AnyThread as _, MainThreadMarker, MainThreadOnly, Message as _, msg_send};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationPolicy, NSBitmapImageRep, NSColor,
-        NSCompositingOperation, NSDeviceRGBColorSpace, NSImage, NSImageSymbolConfiguration,
-        NSStatusBar,
+        NSCompositingOperation, NSDeviceRGBColorSpace, NSImage, NSStatusBar,
     };
-    use objc2_foundation::{NSObject, NSPoint, NSRect, NSSize, NSString, NSTimer};
+    use objc2_foundation::{NSObject, NSRect, NSSize, NSTimer};
     use std::cell::RefCell;
     use std::sync::Mutex;
     use std::thread::JoinHandle;
 
     const TRAY_ICON_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tray_icon_44.rgba"));
+    // Status overlays, same 44×44 canvas as the base icon: an orange "!" for
+    // warning (issues present) and a red prohibition circle for disabled (log
+    // mode). Each is mostly transparent — only the colored mark — and is drawn
+    // directly over the theme-tinted base, keeping its own color.
+    const TRAY_ICON_WARNING_RGBA: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/tray_icon_warning_44.rgba"));
+    const TRAY_ICON_DISABLED_RGBA: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/tray_icon_disabled_44.rgba"));
     // Pixel dimensions of the rasterized RGBA buffer.
     const TRAY_ICON_PIXEL_SIZE: isize = 44;
     // Logical point size for NSImage — half the pixel size so macOS treats
@@ -400,13 +408,11 @@ mod gui {
 
         let normal_image =
             build_normal_image().expect("kyris icon RGBA failed to materialize as NSImage");
-        // Primary path: theme-aware overlay composite. Falls back to
-        // the static amber recolor if the SF Symbol isn't available
-        // (pre-macOS-11 — vanishingly rare on the current target).
-        let warning_image = build_warning_image(&normal_image)
-            .or_else(build_warning_image_fallback)
-            .expect("warning icon failed to materialize as NSImage");
-        let logmode_image = build_logmode_image(&normal_image);
+        // Warning (issues) and disabled (log mode) are the same composite: the
+        // theme-tinted kyris glyph with a full-size colored status overlay laid
+        // on top — orange "!" and red prohibition circle respectively.
+        let warning_image = build_overlay_image(&normal_image, TRAY_ICON_WARNING_RGBA);
+        let logmode_image = build_overlay_image(&normal_image, TRAY_ICON_DISABLED_RGBA);
 
         // Initial state: assume healthy. The first refresh tick will
         // correct if the issue set is already populated.
@@ -489,154 +495,35 @@ mod gui {
         Some(image)
     }
 
-    /// Warning icon: a true overlay composite drawn at render time so
-    /// it stays theme-aware.
+    /// Status icon: the kyris glyph (theme-tinted) with a full-size colored
+    /// overlay laid directly on top — used for both warning (`icon_warning`,
+    /// orange "!") and disabled/log-mode (`icon_disabled`, red prohibition
+    /// circle). The overlay SVGs are the same 44×44 canvas as the base and are
+    /// mostly transparent, so the kyris glyph shows through around the mark.
     ///
-    /// Three layers, drawn into a 22×22 `NSImage` via
-    /// `imageWithSize:flipped:drawingHandler:` (which re-runs the block
-    /// every time the image is composited to a context — so
-    /// `NSColor.labelColor` always reflects the *current* menu-bar
-    /// appearance):
+    /// Drawn at render time via `imageWithSize:flipped:drawingHandler:`, which
+    /// re-runs the block on every composite — so `labelColor` is sampled fresh
+    /// and the base glyph tracks the menu-bar light/dark theme automatically:
     ///
-    ///   1. Fill the rect with `labelColor` (white on dark mode, black
-    ///      on light mode — the right "tint" for menu-bar glyphs).
-    ///   2. Draw the kyris template with `DestinationIn` compositing —
-    ///      this keeps the labelColor only where the kyris A has
-    ///      pixels, effectively tinting the glyph.
-    ///   3. Draw the multicolor SF Symbol `exclamationmark.triangle.fill`
-    ///      in the bottom-right corner with `SourceOver`. The symbol
-    ///      renders in its canonical colors (yellow + black) regardless
-    ///      of the menu-bar theme — exactly what a warning glyph should
-    ///      do.
-    ///
-    /// Returns `None` if the SF Symbol API call fails (e.g. running on
-    /// pre-macOS-11 where the symbol name doesn't resolve). The caller
-    /// falls back to the amber recolor in that case.
-    fn build_warning_image(normal_template: &NSImage) -> Option<Retained<NSImage>> {
-        // Bottom-right corner-badge geometry knobs (used in the drawing handler
-        // below). BADGE_FRACTION — badge size as a fraction of the icon;
-        // INSET_FRACTION — gap from the right & bottom edges so the badge reads
-        // as a deliberate badge rather than clipped against the edge.
-        // Flush-to-edge (inset 0) at 0.6 looked like it was hanging off the
-        // bottom; 0.5 + a small inset tucks it in cleanly.
-        const BADGE_FRACTION: f64 = 0.5;
-        const INSET_FRACTION: f64 = 0.08;
-
-        let symbol = build_warning_symbol()?;
+    ///   1. Fill with `labelColor`, then `DestinationIn` the kyris glyph — keeps
+    ///      the theme color only where the glyph has pixels (a tinted glyph).
+    ///   2. Draw the overlay RGBA over it with `SourceOver`. The result is NOT a
+    ///      template, so the overlay keeps its own color (orange / red) rather
+    ///      than being auto-tinted to a single menu-bar foreground color.
+    fn build_overlay_image(
+        normal_template: &NSImage,
+        overlay_rgba: &'static [u8],
+    ) -> Retained<NSImage> {
         let base = normal_template.retain();
+        let overlay = build_ns_image(overlay_rgba, TRAY_ICON_PIXEL_SIZE, TRAY_ICON_LOGICAL_PTS)
+            .expect("status overlay RGBA failed to materialize as NSImage");
         let size = NSSize {
             width: TRAY_ICON_LOGICAL_PTS,
             height: TRAY_ICON_LOGICAL_PTS,
         };
 
-        // The drawing handler must be `'static + Fn` — captured values
-        // (base + symbol) are `Retained<NSImage>` clones, ref-counted so
-        // the originals stay alive as long as the block does. Block is
-        // re-invoked on every draw — labelColor is sampled fresh each
-        // time, so the composite tracks dark/light mode automatically.
-        let block = RcBlock::new(move |rect: NSRect| -> Bool {
-            unsafe {
-                // 1. Fill rect with labelColor (theme-aware).
-                let label_color = NSColor::labelColor();
-                label_color.set();
-                NSRectFill(rect);
-
-                // 2. Mask: keep the fill only where the kyris glyph has
-                //    pixels. Destination-in compositing intersects the
-                //    existing content with the new image's alpha.
-                base.drawInRect_fromRect_operation_fraction(
-                    rect,
-                    NSRect::ZERO,
-                    NSCompositingOperation::DestinationIn,
-                    1.0,
-                );
-
-                // 3. Overlay: multicolor warning glyph as a bottom-right corner
-                //    badge (geometry knobs declared at the top of the fn).
-                let badge_size = rect.size.width * BADGE_FRACTION;
-                let inset = rect.size.width * INSET_FRACTION;
-                let badge_rect = NSRect {
-                    origin: NSPoint {
-                        x: rect.size.width - badge_size - inset,
-                        y: inset,
-                    },
-                    size: NSSize {
-                        width: badge_size,
-                        height: badge_size,
-                    },
-                };
-                symbol.drawInRect_fromRect_operation_fraction(
-                    badge_rect,
-                    NSRect::ZERO,
-                    NSCompositingOperation::SourceOver,
-                    1.0,
-                );
-            }
-            Bool::YES
-        });
-
-        let composite = NSImage::imageWithSize_flipped_drawingHandler(size, false, &block);
-        // NOT a template — the multicolor SF Symbol must render in its
-        // own palette, not be auto-tinted to one color by macOS.
-        unsafe {
-            let _: () = msg_send![&*composite, setTemplate: false];
-        }
-        Some(composite)
-    }
-
-    /// Resolve the multicolor warning SF Symbol. Returns `None` on
-    /// older macOS where the API or the symbol name doesn't exist —
-    /// callers should fall back to the recolored RGBA.
-    fn build_warning_symbol() -> Option<Retained<NSImage>> {
-        let name = NSString::from_str("exclamationmark.triangle.fill");
-        let accessibility = NSString::from_str("warning");
-        let base = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &name,
-            Some(&accessibility),
-        )?;
-        // configurationPreferringMulticolor is macOS 12+. If the call
-        // returns a usable configuration, request multicolor rendering;
-        // otherwise fall back to whatever the system gives us (still a
-        // valid symbol image, just monochrome).
-        let multicolor = NSImageSymbolConfiguration::configurationPreferringMulticolor();
-        Some(
-            base.imageWithSymbolConfiguration(&multicolor)
-                .unwrap_or(base),
-        )
-    }
-
-    /// Log-mode icon: kyris glyph (theme-tinted) with a long red
-    /// horizontal bar drawn through the vertical center. Signals
-    /// "agentpactd is auditing but not enforcing" — commands run
-    /// unmediated until the user flips the user policy from
-    /// `mode: log` to `mode: enforce`.
-    ///
-    /// Drawn at render time (`imageWithSize:flipped:drawingHandler:`)
-    /// for the same theme-awareness reason as the warning composite:
-    /// the labelColor mask tracks dark/light mode automatically. The
-    /// red bar uses `systemRedColor`, which macOS desaturates slightly
-    /// in dark mode on its own.
-    fn build_logmode_image(normal_template: &NSImage) -> Retained<NSImage> {
-        let base = normal_template.retain();
-        let size = NSSize {
-            width: TRAY_ICON_LOGICAL_PTS,
-            height: TRAY_ICON_LOGICAL_PTS,
-        };
-
-        // Bar geometry: full-width, ~2.5pt thick, vertically centered.
-        // 2.5pt at 22pt logical is the smallest stroke that remains
-        // visible at @2x without being heavy. Centering uses the icon
-        // mid-line (11pt) ± half thickness.
-        let bar_thickness = 2.5_f64;
-        let bar_y = (TRAY_ICON_LOGICAL_PTS - bar_thickness) / 2.0;
-        let bar_rect = NSRect {
-            origin: NSPoint { x: 0.0, y: bar_y },
-            size: NSSize {
-                width: TRAY_ICON_LOGICAL_PTS,
-                height: bar_thickness,
-            },
-        };
-
+        // The drawing handler must be `'static + Fn` — `base` and `overlay` are
+        // ref-counted `Retained<NSImage>` clones that outlive the block.
         let block = RcBlock::new(move |rect: NSRect| -> Bool {
             unsafe {
                 // 1. Theme-aware tint mask for the kyris glyph.
@@ -650,35 +537,24 @@ mod gui {
                     1.0,
                 );
 
-                // 2. Red horizontal bar drawn on top with SourceOver.
-                //    systemRedColor adapts slightly in dark mode; no
-                //    need for a custom dark-mode variant.
-                let red = NSColor::systemRedColor();
-                red.set();
-                NSRectFill(bar_rect);
+                // 2. Full-size colored status overlay on top, in its own palette.
+                overlay.drawInRect_fromRect_operation_fraction(
+                    rect,
+                    NSRect::ZERO,
+                    NSCompositingOperation::SourceOver,
+                    1.0,
+                );
             }
             Bool::YES
         });
 
         let composite = NSImage::imageWithSize_flipped_drawingHandler(size, false, &block);
-        // NOT a template — the red bar must render as red, not be
-        // auto-tinted to a single menu-bar foreground color.
+        // NOT a template — the overlay must render in its own color, not be
+        // auto-tinted to one menu-bar foreground color by macOS.
         unsafe {
             let _: () = msg_send![&*composite, setTemplate: false];
         }
         composite
-    }
-
-    /// Pre-macOS-11 fallback: the legacy amber recolor. Static (no
-    /// theme awareness) but always available since it's pure pixel
-    /// math on the existing kyris RGBA.
-    fn build_warning_image_fallback() -> Option<Retained<NSImage>> {
-        let rgba = degraded_icon_rgba();
-        let image = build_ns_image(&rgba, TRAY_ICON_PIXEL_SIZE, TRAY_ICON_LOGICAL_PTS)?;
-        unsafe {
-            let _: () = msg_send![&*image, setTemplate: false];
-        }
-        Some(image)
     }
 
     // AppKit's NSRectFill is a C function (not a method) — declare its
@@ -736,19 +612,6 @@ mod gui {
         Some(image)
     }
 
-    fn degraded_icon_rgba() -> Vec<u8> {
-        let mut rgba = TRAY_ICON_RGBA.to_vec();
-        for pixel in rgba.chunks_exact_mut(4) {
-            if pixel[3] == 0 {
-                continue;
-            }
-            pixel[0] = ((u16::from(pixel[0]) * 2) / 5 + (255_u16 * 3) / 5) as u8;
-            pixel[1] = ((u16::from(pixel[1]) * 2) / 5 + (191_u16 * 3) / 5) as u8;
-            pixel[2] = (u16::from(pixel[2]) / 3) as u8;
-        }
-        rgba
-    }
-
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -775,8 +638,28 @@ mod gui {
         }
 
         #[test]
-        fn testDegradedIconRgbaLengthMatches() {
-            assert_eq!(degraded_icon_rgba().len(), TRAY_ICON_RGBA.len());
+        fn testStatusOverlaysMatchBaseIconBufferSize() {
+            // Overlays composite 1:1 over the base, so they must rasterize to
+            // the exact same 44×44 RGBA buffer.
+            assert_eq!(TRAY_ICON_WARNING_RGBA.len(), TRAY_ICON_RGBA.len());
+            assert_eq!(TRAY_ICON_DISABLED_RGBA.len(), TRAY_ICON_RGBA.len());
+        }
+
+        #[test]
+        fn testStatusOverlaysCarryColor() {
+            // The whole point of the overlays is that they keep their own color
+            // (unlike the monochrome base template). Each must have at least one
+            // opaque, non-greyscale pixel — i.e. an actual colored mark, not an
+            // empty or purely-grey buffer.
+            for (name, rgba) in [
+                ("warning", TRAY_ICON_WARNING_RGBA),
+                ("disabled", TRAY_ICON_DISABLED_RGBA),
+            ] {
+                let has_color = rgba
+                    .chunks_exact(4)
+                    .any(|px| px[3] > 0 && (px[0] != px[1] || px[1] != px[2]));
+                assert!(has_color, "{name} overlay should contain a colored mark");
+            }
         }
 
         #[test]
@@ -793,19 +676,6 @@ mod gui {
                 equal,
                 "pixel size must be 2× logical points for @2x Retina rendering ({lhs} vs {rhs})"
             );
-        }
-
-        #[test]
-        fn testDegradedIconDiffersFromNormal() {
-            // The amber overlay must change at least one byte for a non-transparent icon.
-            let has_opaque = TRAY_ICON_RGBA.chunks_exact(4).any(|px| px[3] > 0);
-            if has_opaque {
-                assert_ne!(
-                    degraded_icon_rgba().as_slice(),
-                    TRAY_ICON_RGBA,
-                    "degraded icon should differ from normal"
-                );
-            }
         }
     }
 }
