@@ -230,6 +230,9 @@ impl AgentDescriptor for CodexCli {
             &script_path,
             &hooks_path,
             true,
+            // Codex's PreToolUse default is 600s (and its config field is
+            // `timeout_sec`, not `timeout`), so no JSON-hook override here.
+            None,
         )?;
 
         let mut config = read_or_empty_codex_config(&config_path)?;

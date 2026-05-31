@@ -39,6 +39,11 @@ SKIP_AGENTPACT=0
 NO_BREW=0
 RESET_DATA=0
 
+# Name of the auth-key store subdir under DATA_DIR. The local hook<->daemon
+# secrets live here as 0600 files; must match kyris_core::paths::secret_dir()
+# (its leaf component). Preserved even by --reset-data so keys never regenerate.
+SECRET_SUBDIR="secret"
+
 # Bundle layout. Only kyrisd (the long-running daemon) is wrapped in a
 # .app bundle — the bundle gives macOS a stable CFBundleIdentifier so
 # notifications, SMAppService, and TCC can attribute the daemon
@@ -625,11 +630,15 @@ Usage: install.sh [--user] [--local <dir>] [--no-agentpact] [--no-brew]
                  removes them directly. Propagates to agentpact's cascaded
                  uninstall too (script path: --reset-data; brew path: --zap)
                  so a full wipe of kyris is a full wipe of agentpact.
+                 Does NOT touch the auth keys — those live under
+                 ~/.local/share/kyris/secret/ and are preserved (to rotate
+                 them, delete that directory: rm -rf ~/.local/share/kyris/secret).
 
 File layout (XDG Base Directory):
   ~/.kyris/                      install-managed runtime (manifest, hooks, env)
   ~/.config/kyris/               kyrisd.yaml
   ~/.local/share/kyris/          credentials.json, kyrisd.duckdb (event log)
+  ~/.local/share/kyris/secret/   inbound_key, operator_key (auth keys, 0600)
   ~/.local/state/kyris/          log/, crash/, diagnostics/, fail-open.jsonl,
                                  approvals.jsonl
 
@@ -638,6 +647,8 @@ What --uninstall removes (default):
   plist, ~/.kyris/ runtime dir, package receipt.
 What --uninstall keeps (use --reset-data to also wipe):
   ~/.config/kyris/  ~/.local/share/kyris/  ~/.local/state/kyris/
+What survives even --reset-data:
+  ~/.local/share/kyris/secret/ (auth keys; rm it to rotate)
 
 Examples (install):
   install.sh                                  # standard install (auto-detects brew)
@@ -645,8 +656,8 @@ Examples (install):
   install.sh --no-brew                        # force script path even if brew is present
 
 Examples (uninstall — prefer the cached installer for a version-matched run):
-  ~/.kyris/installer.sh --uninstall              # remove binaries; preserve config/data/state
-  ~/.kyris/installer.sh --uninstall --reset-data # remove everything, including user data
+  ~/.kyris/installer.sh --uninstall              # remove binaries; preserve config/data/state + keys
+  ~/.kyris/installer.sh --uninstall --reset-data # wipe config/data/state; keep auth keys (~/.local/share/kyris/secret)
   brew uninstall --cask kyr-is/tap/kyris         # brew equivalent of --uninstall
   brew uninstall --cask --zap kyr-is/tap/kyris   # brew equivalent of --uninstall --reset-data
 
@@ -1140,14 +1151,24 @@ uninstall_all() {
     info "  State:  $STATE_DIR (logs, crash dumps)"
     info "Run with --reset-data to wipe them too."
   fi
+  # The auth keys live under $DATA_DIR/$SECRET_SUBDIR and are preserved even by
+  # --reset-data, so they never regenerate (no daemon/hook drift). Note it so
+  # it isn't a surprise on reinstall.
+  info "Auth keys preserved at $DATA_DIR/$SECRET_SUBDIR."
 }
 
-# Wipe the XDG dirs that uninstall_all preserves by default. Only invoked
-# when --reset-data is passed alongside --uninstall.
+# Wipe the XDG dirs that uninstall_all preserves by default. Only invoked when
+# --reset-data is passed alongside --uninstall. The auth-key store
+# ($DATA_DIR/$SECRET_SUBDIR) is deliberately PRESERVED: the keys must survive a
+# data reset so the daemon and hook never drift / lock out. To rotate them,
+# delete that directory explicitly.
 reset_data() {
-  info "--reset-data: wiping user data dirs..."
+  info "--reset-data: wiping user data dirs (auth keys under $SECRET_SUBDIR/ preserved)..."
   remove_path "$CONFIG_DIR"
-  remove_path "$DATA_DIR"
+  # Wipe DATA_DIR's contents but keep the secret store.
+  if [ -d "$DATA_DIR" ]; then
+    find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name "$SECRET_SUBDIR" -exec rm -rf {} +
+  fi
   remove_path "$STATE_DIR"
 }
 

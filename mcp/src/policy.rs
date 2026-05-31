@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use kyris_agentpact_client::{
-    self as agentpact, ApprovalResponse as UserApprovalResponse, McpContext, ToolAnnotations,
+    self as pact_client, ApprovalResponse as UserApprovalResponse, McpContext, ToolAnnotations,
 };
 
 pub use kyris_core::agentpact::DenyCode;
@@ -18,12 +18,12 @@ pub enum PactDecision {
     },
 }
 
-type PermissionRequestOutcome = agentpact::McpPermissionDecision;
+type PermissionRequestOutcome = pact_client::McpPermissionDecision;
 
 fn daemon_unavailable_deny() -> PactDecision {
     PactDecision::Deny {
         code: DenyCode::DaemonUnreachable,
-        reason: agentpact::daemon_unavailable_message(),
+        reason: pact_client::daemon_unavailable_message(),
         hint: None,
     }
 }
@@ -40,7 +40,7 @@ fn no_tty_deny() -> PactDecision {
 }
 
 fn agentpact_socket_path() -> String {
-    agentpact::default_socket_path().display().to_string()
+    pact_client::default_socket_path().display().to_string()
 }
 
 fn current_working_dir() -> Option<String> {
@@ -66,7 +66,7 @@ fn send_permission_request_with_socket(
         mcp_operation: mcp_operation.map(str::to_owned),
         annotations: annotations.clone(),
     };
-    agentpact::request_mcp_tool_permission_with_id(
+    pact_client::request_mcp_tool_permission_with_id(
         sock_path,
         "kyris-mcp",
         server_name,
@@ -85,7 +85,7 @@ fn send_permission_response_with_socket(
     // The optional advisory warning (e.g. an "always" grant that could not be
     // persisted) is logged by agentpactd; the MCP wrapper has no inline channel
     // to surface it, so discard it here.
-    agentpact::send_permission_response(
+    pact_client::send_permission_response(
         sock_path,
         "kyris-mcp-resp",
         approval_token,
@@ -170,7 +170,7 @@ pub async fn check_permission_with_socket(
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
-    if let Err(msg) = agentpact::check_protocol_compatibility() {
+    if let Err(msg) = pact_client::check_protocol_compatibility() {
         return PactDecision::Deny {
             code: DenyCode::PolicyError,
             reason: msg,
@@ -379,7 +379,7 @@ async fn deny_ask_immediately(
 }
 
 fn allow_on_daemon_unavailable() -> bool {
-    agentpact::allow_on_daemon_unavailable()
+    pact_client::allow_on_daemon_unavailable()
 }
 
 #[cfg(test)]
@@ -394,11 +394,11 @@ mod tests {
 
     #[test]
     fn testBuildPermissionRequest() {
-        let req = agentpact::build_mcp_permission_request(
+        let req = pact_client::build_mcp_permission_request(
             "kyris-mcp",
             "github",
             "read_file",
-            &agentpact::McpContext {
+            &pact_client::McpContext {
                 working_dir: Some("/tmp/repo".to_string()),
                 mcp_operation: Some("tools/call".to_string()),
                 annotations: ToolAnnotations {
@@ -420,7 +420,7 @@ mod tests {
 
     #[test]
     fn testBuildPermissionRespondRequest() {
-        let req = agentpact::build_permission_respond_request(
+        let req = pact_client::build_permission_respond_request(
             "kyris-mcp-resp",
             "apt_123",
             UserApprovalResponse::Always,
@@ -436,7 +436,7 @@ mod tests {
         let response =
             serde_json::json!({"code": "PACT_OK", "decision": "auto", "mode": "enforce"});
         assert_eq!(
-            agentpact::parse_mcp_permission_response(&response),
+            pact_client::parse_mcp_permission_response(&response),
             PermissionRequestOutcome::Allow {
                 mode: Mode::Enforce
             }
@@ -447,7 +447,7 @@ mod tests {
     fn testParsePermissionRequestResponseDenied() {
         let response = serde_json::json!({"code": "PACT_DENIED", "reason": "blocked by policy"});
         assert_eq!(
-            agentpact::parse_mcp_permission_response(&response),
+            pact_client::parse_mcp_permission_response(&response),
             PermissionRequestOutcome::Deny {
                 code: DenyCode::PolicyDenied,
                 reason: "blocked by policy".to_string(),
@@ -464,7 +464,7 @@ mod tests {
             "approval_token": "apt_123"
         });
         assert_eq!(
-            agentpact::parse_mcp_permission_response(&response),
+            pact_client::parse_mcp_permission_response(&response),
             PermissionRequestOutcome::Ask {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
@@ -477,7 +477,7 @@ mod tests {
     fn testParsePermissionRequestResponseInvalid() {
         let response = serde_json::json!({"result": "UNKNOWN"});
         assert_eq!(
-            agentpact::parse_mcp_permission_response(&response),
+            pact_client::parse_mcp_permission_response(&response),
             PermissionRequestOutcome::Deny {
                 code: DenyCode::PolicyError,
                 reason: "invalid response from agentpactd".to_string(),

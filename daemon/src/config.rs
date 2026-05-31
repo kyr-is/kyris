@@ -23,6 +23,7 @@ pub fn try_load_config() -> Result<KyrisdConfig, String> {
         tracing::warn!("config has no providers configured");
     }
 
+    populate_keys(&mut config)?;
     kyris_core::config::apply_env_overrides(&mut config);
     Ok(config)
 }
@@ -51,21 +52,24 @@ pub fn load_config_from(config_path: &Path) -> KyrisdConfig {
         std::process::exit(1);
     });
 
-    let mut changed = false;
-    if config.server.inbound_key.is_empty() {
-        config.server.inbound_key = generate_inbound_key();
-        changed = true;
-    }
-    if config.server.operator_key.is_empty() {
-        config.server.operator_key = generate_operator_key();
-        changed = true;
-    }
-    if changed {
-        save_config(&config_path.to_path_buf(), &config);
-    }
+    populate_keys(&mut config).unwrap_or_else(|e| {
+        tracing::error!(error = %e, "failed to load auth keys from the secret store");
+        std::process::exit(1);
+    });
 
     kyris_core::config::apply_env_overrides(&mut config);
     config
+}
+
+/// Populate the secret bearer keys from the on-disk secret store — the single
+/// source of truth (see `kyris_core::secret`). They're minted on first use and
+/// reused thereafter, so they survive `--reset-data` and never drift from the
+/// keys the hook reads.
+fn populate_keys(config: &mut KyrisdConfig) -> Result<(), String> {
+    use kyris_core::secret::{ACCOUNT_INBOUND, ACCOUNT_OPERATOR, get_or_create};
+    config.server.inbound_key = get_or_create(ACCOUNT_INBOUND, "sk-kyris")?;
+    config.server.operator_key = get_or_create(ACCOUNT_OPERATOR, "sk-kyris-ops")?;
+    Ok(())
 }
 
 fn config_path() -> PathBuf {
@@ -118,35 +122,6 @@ fn validate_permissions(path: &Path) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn generate_inbound_key() -> String {
-    let mut buf = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut buf).expect("generate random bytes");
-    let hex: String = buf.iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    });
-    format!("sk-kyris-{hex}")
-}
-
-fn generate_operator_key() -> String {
-    let mut buf = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut buf).expect("generate random bytes");
-    let hex: String = buf.iter().fold(String::new(), |mut s, b| {
-        use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
-        s
-    });
-    format!("sk-kyris-ops-{hex}")
-}
-
-fn save_config(path: &PathBuf, config: &KyrisdConfig) {
-    let contents = serde_saphyr::to_string(config).expect("serialize config");
-    std::fs::write(path, contents).unwrap_or_else(|e| {
-        tracing::error!(path = %path.display(), error = %e, "failed to save config");
-    });
 }
 
 #[cfg(test)]

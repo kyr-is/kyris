@@ -60,14 +60,6 @@ fn server_config() -> Value {
                 "default": "127.0.0.1:4710",
                 "description": "Address and port for the HTTP listener"
             },
-            "inbound_key": {
-                "type": "string",
-                "description": "Bearer token required on inbound API requests"
-            },
-            "operator_key": {
-                "type": "string",
-                "description": "Bearer token for operator endpoints (stats, health)"
-            },
             "max_request_body_bytes": {
                 "type": "integer",
                 "minimum": 0,
@@ -162,8 +154,8 @@ fn mcp_config() -> Value {
             "pending_timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "default": 60,
-                "description": "Seconds before a pending MCP permission request times out"
+                "default": 900,
+                "description": "Seconds before a pending approval (MCP or no-TTY hook) times out; kept above kyris's 590s no-TTY poll window"
             },
             "socket_timeout_ms": {
                 "type": "integer",

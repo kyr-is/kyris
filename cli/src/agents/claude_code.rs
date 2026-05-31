@@ -160,6 +160,12 @@ impl AgentDescriptor for ClaudeCode {
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
     }
+    fn launch_dir_env(&self) -> Option<&'static str> {
+        // Claude Code's PreToolUse payload `cwd` is the LIVE working directory
+        // (moves with `cd`); `$CLAUDE_PROJECT_DIR` is the fixed session root and
+        // is the correct permitted-domain anchor.
+        Some("CLAUDE_PROJECT_DIR")
+    }
     fn configure_execution(
         &self,
         _base_url: &str,
@@ -176,6 +182,9 @@ impl AgentDescriptor for ClaudeCode {
             &script_path,
             &settings_path,
             true,
+            // Claude's PreToolUse default is 600s, which already clears kyris's
+            // ~590s no-TTY poll window — no explicit override needed.
+            None,
         )
     }
     fn configure_burn_control(

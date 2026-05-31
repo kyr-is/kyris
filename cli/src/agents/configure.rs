@@ -67,6 +67,10 @@ pub(super) fn install_live_hook_adapter(
     script_path: &std::path::Path,
     hooks_file_path: &std::path::Path,
     nested: bool,
+    // Per-hook timeout in the agent's units; see `ensure_json_command_hook`.
+    // Set it when the agent's default hook timeout is below kyris's ~590s
+    // no-TTY approval window (e.g. Gemini's 60s default).
+    hook_timeout: Option<i64>,
 ) -> Result<Vec<String>, String> {
     let script_source = hook_script_source(agent_id);
     let mut changes = Vec::new();
@@ -83,7 +87,13 @@ pub(super) fn install_live_hook_adapter(
     }
 
     let mut hooks = read_json_value(hooks_file_path)?;
-    if ensure_json_command_hook(&mut hooks, hook_phase, &shell_command(script_path), nested) {
+    if ensure_json_command_hook(
+        &mut hooks,
+        hook_phase,
+        &shell_command(script_path),
+        nested,
+        hook_timeout,
+    ) {
         // Hooks file format varies per agent (claude/cline/codex/gemini have
         // different shapes); well-formedness is the safe baseline. Per-agent
         // shape validators can be added incrementally.

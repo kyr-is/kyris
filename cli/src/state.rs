@@ -126,32 +126,27 @@ const DEFAULT_CONFIG: &str = include_str!("../../config/default.yaml");
 
 pub fn load_or_init_config() -> Result<KyrisdConfig, String> {
     let path = config_path()?;
-    if path.exists() {
-        let mut config = load_config()?;
-        let mut changed = false;
-        if config.server.inbound_key.is_empty() {
-            config.server.inbound_key = generate_key("sk-kyris");
-            changed = true;
-        }
-        if config.server.operator_key.is_empty() {
-            config.server.operator_key = generate_key("sk-kyris-ops");
-            changed = true;
-        }
-        if changed {
-            save_config(&config)?;
-        }
-        return Ok(config);
-    }
+    let mut config = if path.exists() {
+        load_config()?
+    } else {
+        // Seed first-run config from the shipped `config/default.yaml` template
+        // (the same file the daemon writes on its own first run), NOT from serde
+        // `{}` defaults — otherwise the two init paths diverge (e.g. `relay.url`
+        // would be the template's `relay.kyr.is` from the daemon but empty here).
+        let config: KyrisdConfig = serde_saphyr::from_str(DEFAULT_CONFIG)
+            .map_err(|e| format!("Cannot create default config: {e}"))?;
+        save_config(&config)?;
+        config
+    };
 
-    // Seed first-run config from the shipped `config/default.yaml` template
-    // (the same file the daemon writes on its own first run), NOT from serde
-    // `{}` defaults — otherwise the two init paths diverge (e.g. `relay.url`
-    // would be the template's `relay.kyr.is` from the daemon but empty here).
-    let mut config: KyrisdConfig = serde_saphyr::from_str(DEFAULT_CONFIG)
-        .map_err(|e| format!("Cannot create default config: {e}"))?;
-    config.server.inbound_key = generate_key("sk-kyris");
-    config.server.operator_key = generate_key("sk-kyris-ops");
-    save_config(&config)?;
+    // Secret bearer keys live in the on-disk secret store (single source of
+    // truth), never in kyrisd.yaml — so they survive `--reset-data` and stay
+    // identical to what the daemon reads, instead of being regenerated on every
+    // reinstall.
+    config.server.inbound_key =
+        kyris_core::secret::get_or_create(kyris_core::secret::ACCOUNT_INBOUND, "sk-kyris")?;
+    config.server.operator_key =
+        kyris_core::secret::get_or_create(kyris_core::secret::ACCOUNT_OPERATOR, "sk-kyris-ops")?;
     Ok(config)
 }
 
@@ -693,17 +688,6 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-fn generate_key(prefix: &str) -> String {
-    let mut buf = [0u8; 32];
-    aws_lc_rs::rand::fill(&mut buf).expect("generate random bytes");
-    let hex: String = buf.iter().fold(String::new(), |mut out, byte| {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-        out
-    });
-    format!("{prefix}-{hex}")
-}
-
 pub fn find_in_path(cmd: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -722,13 +706,6 @@ pub fn find_in_path(cmd: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn testGenerateKeyPrefix() {
-        let key = generate_key("sk-kyris");
-        assert!(key.starts_with("sk-kyris-"));
-        assert!(key.len() > "sk-kyris-".len());
-    }
 
     #[test]
     fn testEnsureLineAppendsAndRecords() {

@@ -86,6 +86,12 @@ pub fn ensure_json_command_hook(
     phase: &str,
     command: &str,
     nested: bool,
+    // Optional per-hook execution timeout in the agent's own units (Claude &
+    // Gemini both use a `timeout` field — seconds and milliseconds
+    // respectively). Set it when the agent's default hook timeout is shorter
+    // than kyris's no-TTY approval poll window, so the agent doesn't kill the
+    // hook mid-wait. `None` leaves the agent's default.
+    timeout: Option<i64>,
 ) -> bool {
     let object = as_json_object(root);
     let hooks = object
@@ -104,13 +110,14 @@ pub fn ensure_json_command_hook(
         return false;
     }
 
+    let mut inner = json!({"type": "command", "command": command});
+    if let Some(t) = timeout {
+        inner["timeout"] = json!(t);
+    }
     let entry = if nested {
-        json!({
-            "matcher": "",
-            "hooks": [{"type": "command", "command": command}]
-        })
+        json!({ "matcher": "", "hooks": [inner] })
     } else {
-        json!({"type": "command", "command": command})
+        inner
     };
     hooks_array.push(entry);
     true
@@ -377,12 +384,14 @@ mod tests {
             &mut root,
             "PreToolUse",
             "bash /tmp/hook.sh",
-            true
+            true,
+            Some(600),
         ));
         let entry = &root["hooks"]["PreToolUse"][0];
         assert_eq!(entry["matcher"], "");
         assert_eq!(entry["hooks"][0]["type"], "command");
         assert_eq!(entry["hooks"][0]["command"], "bash /tmp/hook.sh");
+        assert_eq!(entry["hooks"][0]["timeout"], 600);
     }
 
     #[test]
@@ -392,13 +401,15 @@ mod tests {
             &mut root,
             "BeforeTool",
             "bash /tmp/hook.sh",
-            false
+            false,
+            Some(600_000),
         ));
         let entry = &root["hooks"]["BeforeTool"][0];
         assert_eq!(entry["type"], "command");
         assert_eq!(entry["command"], "bash /tmp/hook.sh");
         assert!(entry.get("matcher").is_none());
         assert!(entry.get("hooks").is_none());
+        assert_eq!(entry["timeout"], 600_000);
     }
 
     #[test]
@@ -408,34 +419,50 @@ mod tests {
             &mut root,
             "PreToolUse",
             "bash /tmp/a.sh",
-            true
+            true,
+            None,
         ));
         assert!(!ensure_json_command_hook(
             &mut root,
             "PreToolUse",
             "bash /tmp/a.sh",
-            true
+            true,
+            None,
         ));
+        // None leaves no timeout field — agent default applies.
+        assert!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]
+                .get("timeout")
+                .is_none()
+        );
 
         let mut root = json!({});
         assert!(ensure_json_command_hook(
             &mut root,
             "BeforeTool",
             "bash /tmp/b.sh",
-            false
+            false,
+            None,
         ));
         assert!(!ensure_json_command_hook(
             &mut root,
             "BeforeTool",
             "bash /tmp/b.sh",
-            false
+            false,
+            None,
         ));
     }
 
     #[test]
     fn testRemoveNestedHook() {
         let mut root = json!({});
-        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/kyris_hook.sh", true);
+        ensure_json_command_hook(
+            &mut root,
+            "PreToolUse",
+            "bash /tmp/kyris_hook.sh",
+            true,
+            None,
+        );
         assert!(remove_json_command_hook(
             &mut root,
             "PreToolUse",
@@ -447,7 +474,13 @@ mod tests {
     #[test]
     fn testRemoveFlatHook() {
         let mut root = json!({});
-        ensure_json_command_hook(&mut root, "BeforeTool", "bash /tmp/kyris_hook.sh", false);
+        ensure_json_command_hook(
+            &mut root,
+            "BeforeTool",
+            "bash /tmp/kyris_hook.sh",
+            false,
+            None,
+        );
         assert!(remove_json_command_hook(
             &mut root,
             "BeforeTool",
@@ -459,8 +492,8 @@ mod tests {
     #[test]
     fn testRemoveHookLeavesOtherEntries() {
         let mut root = json!({});
-        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/kyris.sh", true);
-        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/other.sh", true);
+        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/kyris.sh", true, None);
+        ensure_json_command_hook(&mut root, "PreToolUse", "bash /tmp/other.sh", true, None);
         assert!(remove_json_command_hook(&mut root, "PreToolUse", "kyris"));
         assert_eq!(root["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
     }

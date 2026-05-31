@@ -126,6 +126,12 @@ impl AgentDescriptor for GeminiCli {
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
     }
+    fn launch_dir_env(&self) -> Option<&'static str> {
+        // Gemini CLI's hook payload `cwd` is already the fixed launch dir, but
+        // it also exports `GEMINI_PROJECT_DIR` — use it as the explicit, stable
+        // permitted-domain anchor.
+        Some("GEMINI_PROJECT_DIR")
+    }
     fn configure_execution(
         &self,
         _base_url: &str,
@@ -146,6 +152,10 @@ impl AgentDescriptor for GeminiCli {
             &script_path,
             &settings_path,
             false,
+            // Gemini's default hook timeout is 60s — below kyris's ~590s no-TTY
+            // poll window — so it would kill the hook mid-wait. Pin it to 600s
+            // (Gemini's `timeout` is in milliseconds).
+            Some(600_000),
         )?;
 
         match crate::compile_policy::compile_gemini_permissions(None) {

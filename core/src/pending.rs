@@ -7,13 +7,23 @@
 use crate::config::KyrisdConnection;
 
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+const POLL_TIMEOUT: std::time::Duration = NATIVE_HOOK_POLL_TIMEOUT;
 
-/// Stay under Claude Code's 60s `PreToolUse` hook timeout. If we let the
-/// poll run to its full 60s ceiling, Claude Code's timeout fires first and
-/// falls back to its native permission prompt — producing the double-prompt
-/// symptom even when kyris would have resolved the request cleanly.
-pub const NATIVE_HOOK_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(55);
+/// How long the no-TTY resolver waits for a developer to answer before giving
+/// up — kept **as large as possible** so a developer can start a command, walk
+/// away, and still approve it on return.
+///
+/// The hard ceiling is the agent's own hook timeout: Claude Code (and Codex)
+/// kill a `PreToolUse` hook at **600s** (10 min — raised from 60s in Claude
+/// 2.1.3); if our poll outran that, the agent would kill the hook first and
+/// fall back to its own prompt (the double-prompt symptom). So we sit just
+/// under it at 590s. (Gemini's default hook timeout is 60s, so its adapter sets
+/// an explicit longer hook `timeout`; see the gemini-cli agent config.)
+///
+/// The rest of the approval chain must clear this window or it would bind
+/// first: kyrisd's pending TTL (`mcp.pending_timeout_seconds`) and agentpact's
+/// `approval_token.ttl_secs` are both defaulted above 590s.
+pub const NATIVE_HOOK_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(590);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Resolution {

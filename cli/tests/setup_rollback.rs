@@ -21,9 +21,12 @@ fn write_kyrisd_config(home: &Path) {
     // $XDG_CONFIG_HOME/kyris/ (default $HOME/.config/kyris/).
     let config_dir = home.join(".config").join("kyris");
     fs::create_dir_all(&config_dir).expect("create kyris config dir");
+    // Keys are not in the yaml — they live in the secret store under HOME
+    // (~/.local/share/kyris/secret). listen :1 forces "kyrisd unreachable" at
+    // the health check.
     fs::write(
         config_dir.join("kyrisd.yaml"),
-        "server:\n  listen: \"127.0.0.1:1\"\n  inbound_key: sk-kyris-test\n  operator_key: sk-kyris-ops-test\n",
+        "server:\n  listen: \"127.0.0.1:1\"\n",
     )
     .expect("write kyrisd config");
 }

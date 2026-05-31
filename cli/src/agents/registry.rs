@@ -15,6 +15,17 @@ pub trait AgentDescriptor {
     fn kyris_content_markers(&self) -> &'static [&'static str];
     fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)>;
     fn expected_surfaces(&self) -> (bool, bool, bool);
+    /// Environment variable carrying the agent's FIXED launch/project directory
+    /// into its hook subprocess (e.g. `CLAUDE_PROJECT_DIR`). When set,
+    /// `kyris hook check` uses it as the permitted-domain anchor instead of the
+    /// hook payload's `cwd` — which for some agents (notably Claude Code) is the
+    /// LIVE working directory that moves when the agent runs `cd`, and so must
+    /// not define the workspace boundary. `None` → fall back to the payload
+    /// `cwd` (already fixed at session start for agents like Codex and Gemini).
+    /// See `crate::hook_cmd::derive_session_cwd`.
+    fn launch_dir_env(&self) -> Option<&'static str> {
+        None
+    }
     /// Per-surface design ceiling (exec, tool, burn). `Some(Compiled)` means
     /// the agent has no path beyond compiled-policy for that surface — so
     /// realizing Compiled is `ok`, not a degradation. Default: `None` for all

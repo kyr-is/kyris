@@ -141,6 +141,17 @@ pub fn credentials_path() -> PathBuf {
     data_dir().join("credentials.json")
 }
 
+/// `$XDG_DATA_HOME/kyris/secret/` (default `~/.local/share/kyris/secret/`) —
+/// the local hook<->daemon auth keys (see [`crate::secret`]). The most durable
+/// kyris-owned state: it survives uninstall AND `--reset-data` (the installer's
+/// data wipe deliberately preserves this subdir), so the keys never regenerate
+/// and the daemon and hook never drift. A file store, not a native OS keychain,
+/// so it works in Docker / CI / headless contexts too.
+#[must_use]
+pub fn secret_dir() -> PathBuf {
+    data_dir().join("secret")
+}
+
 /// `~/.local/share/kyris/pricing.json` — last pricing table fetched from the
 /// relay. Written at install and refreshed by the daemon; safe to delete (it's
 /// re-fetched). Surviving uninstall means a reinstall starts with a recent
@@ -266,6 +277,7 @@ mod tests {
                 credentials_path(),
                 PathBuf::from("/h/.local/share/kyris/credentials.json")
             );
+            assert_eq!(secret_dir(), PathBuf::from("/h/.local/share/kyris/secret"));
             assert_eq!(
                 log_path(),
                 PathBuf::from("/h/.local/state/kyris/log/kyris.log")

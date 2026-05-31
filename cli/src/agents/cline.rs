@@ -275,10 +275,13 @@ impl AgentDescriptor for Cline {
 
         let mut changes = Vec::new();
 
-        // Shell env file for terminal Cline CLI
+        // Shell env file for terminal Cline CLI. The value must be properly
+        // single-quoted: `\'` does NOT escape a quote inside POSIX single
+        // quotes (backslash is literal there), so JSON containing an apostrophe
+        // would terminate the string early and break sourcing.
         let contents = format!(
-            "# SPDX-License-Identifier: Apache-2.0\nexport CLINE_COMMAND_PERMISSIONS='{}'\n",
-            json.replace('\'', "\\'")
+            "# SPDX-License-Identifier: Apache-2.0\nexport CLINE_COMMAND_PERMISSIONS={}\n",
+            super::prestage::shell_single_quote(&json)
         );
         let loader_changes = super::prestage::ensure_env_loader()?;
         changes.extend(loader_changes);

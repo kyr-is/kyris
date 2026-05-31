@@ -64,9 +64,14 @@ fn default_log_verbose_filter() -> String {
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
-    #[serde(default)]
+    // Secret bearer keys are NOT persisted to kyrisd.yaml. They live in the
+    // login Keychain (see `kyris_core::keychain`) and are populated into these
+    // in-memory fields at config-load time, so they survive `--reset-data` and
+    // can't drift between the daemon and the hook. `#[serde(skip)]` keeps them
+    // out of both the parsed file and any rewrite of it.
+    #[serde(skip)]
     pub inbound_key: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub operator_key: String,
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
@@ -353,7 +358,10 @@ fn default_streaming_timeout_seconds() -> u64 {
     300
 }
 fn default_pending_timeout_seconds() -> u64 {
-    60
+    // kyrisd expires a held approval after this long. Kept above kyris's 590s
+    // no-TTY poll window so the pending dialog outlives the wait rather than
+    // vanishing mid-poll. See kyris-core `NATIVE_HOOK_POLL_TIMEOUT`.
+    900
 }
 fn default_socket_timeout_ms() -> u64 {
     50
@@ -431,8 +439,12 @@ circuit_breaker:
 "#;
         let config: KyrisdConfig = serde_saphyr::from_str(yaml_str).unwrap();
         assert_eq!(config.server.listen, "127.0.0.1:4710");
-        assert_eq!(config.server.inbound_key, "sk-kyris-test");
-        assert_eq!(config.server.operator_key, "sk-kyris-ops-test");
+        // Secret keys are NOT sourced from the yaml — they live in the on-disk
+        // secret store (see `kyris_core::secret`). A yaml that still carries the
+        // old key lines parses fine (they're ignored), and the in-memory fields
+        // stay empty until a store-populating load path fills them.
+        assert!(config.server.inbound_key.is_empty());
+        assert!(config.server.operator_key.is_empty());
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.providers[0].name, "anthropic");
         assert_eq!(config.providers[0].format, ProviderFormat::Anthropic);

@@ -64,10 +64,30 @@ fn exports_to_shell(exports: &[(String, String)]) -> String {
         contents.push_str("export ");
         contents.push_str(key);
         contents.push('=');
-        contents.push_str(value);
+        contents.push_str(&shell_single_quote(value));
         contents.push('\n');
     }
     contents
+}
+
+/// Single-quote a value for POSIX `sh`/`bash`/`zsh` so spaces and shell
+/// metacharacters survive `export KEY=VALUE` when the file is sourced.
+/// Without this, a value like `x-kyris-inbound: <key>` (note the space) parses
+/// as `export KEY=x-kyris-inbound:` plus a stray word, silently truncating the
+/// header and breaking the agent's auth to kyrisd. Embedded single quotes use
+/// the standard `'\''` close-escape-reopen idiom.
+pub(crate) fn shell_single_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn prestage_env(
@@ -127,4 +147,46 @@ pub fn ensure_env_loader() -> Result<Vec<String>, String> {
     }
 
     Ok(changes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testShellSingleQuoteWrapsPlainValue() {
+        assert_eq!(
+            shell_single_quote("http://127.0.0.1:4710"),
+            "'http://127.0.0.1:4710'"
+        );
+    }
+
+    #[test]
+    fn testShellSingleQuotePreservesSpaces() {
+        // The original regression: a space-bearing value must survive sourcing
+        // as a single token, not split into `KEY=word1` + a stray `word2`.
+        assert_eq!(
+            shell_single_quote("x-kyris-inbound: sk-test"),
+            "'x-kyris-inbound: sk-test'"
+        );
+    }
+
+    #[test]
+    fn testShellSingleQuoteEscapesEmbeddedQuote() {
+        // `'\''` close-escape-reopen, never a bare `\'` (invalid in sh).
+        assert_eq!(shell_single_quote("a'b"), r"'a'\''b'");
+    }
+
+    #[test]
+    fn testExportsToShellQuotesHeaderValue() {
+        let exports = vec![(
+            "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+            "x-kyris-inbound: sk-test".to_string(),
+        )];
+        let out = exports_to_shell(&exports);
+        assert!(
+            out.contains("export ANTHROPIC_CUSTOM_HEADERS='x-kyris-inbound: sk-test'"),
+            "header export must be single-quoted, got: {out}"
+        );
+    }
 }

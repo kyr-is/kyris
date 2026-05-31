@@ -14,11 +14,11 @@ fn write_kyrisd_config(home: &Path, listen: &str) {
     // tempdir/.config/kyris/kyrisd.yaml.
     let config_dir = home.join(".config").join("kyris");
     fs::create_dir_all(&config_dir).expect("create kyris config dir");
+    // Keys are not in the yaml (they live in the secret store); `status`
+    // doesn't read them, so the config only needs `listen`.
     fs::write(
         config_dir.join("kyrisd.yaml"),
-        format!(
-            "server:\n  listen: \"{listen}\"\n  inbound_key: sk-kyris-test\n  operator_key: sk-kyris-ops-test\n"
-        ),
+        format!("server:\n  listen: \"{listen}\"\n"),
     )
     .expect("write kyrisd config");
 }

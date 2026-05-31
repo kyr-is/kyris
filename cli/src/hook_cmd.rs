@@ -12,7 +12,7 @@
 use clap::Args;
 use std::io::Read as _;
 
-use kyris_agentpact_client::{self as agentpact, ApprovalResponse, McpPermissionDecision};
+use kyris_agentpact_client::{self as pact_client, ApprovalResponse, McpPermissionDecision};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
 use crate::agents::registry::{self, AllowResponse, HookProtocol, ToolMapping};
@@ -95,7 +95,7 @@ pub fn run(args: HookArgs) {
 fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     let sock_path = args
         .socket
-        .unwrap_or_else(|| agentpact::default_socket_path().display().to_string());
+        .unwrap_or_else(|| pact_client::default_socket_path().display().to_string());
     let socket_timeout = std::time::Duration::from_secs(5);
     let cwd = args.cwd.as_deref();
     let action = "execute";
@@ -109,7 +109,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     // presented one component at a time and audited/accounted segment by
     // segment in agentpactd (`classify_segment`), never short-circuited here
     // on a side-effect-free preview.
-    let (_decision, segments) = match agentpact::request_hook_permission_preview(
+    let (_decision, segments) = match pact_client::request_hook_permission_preview(
         &sock_path,
         "kyris-hook",
         action,
@@ -120,7 +120,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     ) {
         Ok(pair) => pair,
         Err(reason) => {
-            if agentpact::allow_on_daemon_unavailable() {
+            if pact_client::allow_on_daemon_unavailable() {
                 kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
                 std::process::exit(0);
             }
@@ -153,7 +153,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
 
     let result = run_segments(
         &segs,
-        agentpact::allow_on_daemon_unavailable(),
+        pact_client::allow_on_daemon_unavailable(),
         |seg| classify_segment(&ctx, None, seg),
         |approval_id, approval_token, seg, allow_always| match tty.as_ref() {
             Some(tty) => tty_prompt_segment(
@@ -184,7 +184,8 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
         // actually run (the agent hook only defers under the same `allow`).
         // Under `deny` this arm is skipped and we hard-deny below.
         Err(block)
-            if block.source == "kyrisd_unreachable" && agentpact::allow_on_daemon_unavailable() =>
+            if block.source == "kyrisd_unreachable"
+                && pact_client::allow_on_daemon_unavailable() =>
         {
             kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
             std::process::exit(0);
@@ -295,7 +296,7 @@ fn tty_prompt_segment(
         _ => (ApprovalResponse::Denied, "user_denied"),
     };
 
-    match agentpact::send_permission_response(
+    match pact_client::send_permission_response(
         sock_path,
         "kyris-hook-tty",
         approval_token,
@@ -327,7 +328,7 @@ fn tty_prompt_segment(
 fn run_hold(args: HookHoldArgs) {
     let sock_path = args
         .socket
-        .unwrap_or_else(|| agentpact::default_socket_path().display().to_string());
+        .unwrap_or_else(|| pact_client::default_socket_path().display().to_string());
     let socket_timeout = std::time::Duration::from_secs(5);
 
     // Reuse poll_segment: it holds the request in kyrisd's pending system,
@@ -362,7 +363,7 @@ fn run_hold(args: HookHoldArgs) {
 }
 
 fn discover_agent_pid() -> Option<u32> {
-    let sig_table = ::agentpact::attribution::signatures::SignatureTable::default_phase1();
+    let sig_table = agentpact::attribution::signatures::SignatureTable::default_phase1();
     let refresh_kind = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::OnlyIfNotSet)
         .with_cmd(UpdateKind::OnlyIfNotSet);
@@ -425,16 +426,15 @@ fn run_check(args: HookCheckArgs) {
     // response to read), and we use `cwd=None` because the
     // pass-through fast-path and fail-open arm don't have a working
     // dir to evaluate against.
-    // `agentpact` is locally aliased to `kyris_agentpact_client`
-    // (the wire-types crate); reach the real agentpact server lib
-    // via the fully-qualified `::agentpact` path.
+    // `agentpact` is the upstream agentpact library (policy/protocol);
+    // `pact_client` (above) is kyris's UDS client to agentpactd.
     let log_mode = std::env::current_dir()
         .ok()
         .as_deref()
-        .and_then(::agentpact::policy::resolution::resolve_mode_at)
-        .is_some_and(|r| r.mode == ::agentpact::protocol::types::Mode::Log);
+        .and_then(agentpact::policy::resolution::resolve_mode_at)
+        .is_some_and(|r| r.mode == agentpact::protocol::types::Mode::Log);
 
-    if let Err(msg) = agentpact::check_protocol_compatibility() {
+    if let Err(msg) = pact_client::check_protocol_compatibility() {
         // No action/detail known yet — protocol mismatch happens
         // before payload-mapping. Audit anyway so the log shows the
         // hook tried to fire and was rejected at the protocol layer.
@@ -485,7 +485,13 @@ fn run_check(args: HookCheckArgs) {
         );
     }
 
-    let cwd = derive_session_cwd(&hook_input);
+    // The permitted-domain anchor: the agent's FIXED launch dir from its
+    // launch_dir_env var (inherited by this hook subprocess), resolved here so
+    // derive_session_cwd stays pure/testable.
+    let launch_dir = registry::agent_by_id(agent)
+        .and_then(|a| a.launch_dir_env())
+        .and_then(|var| std::env::var(var).ok());
+    let cwd = derive_session_cwd(launch_dir.as_deref(), &hook_input);
     // For file actions, if the agent gave a relative path, resolve it
     // against the cwd we just picked so agentpactd's lexical fallback
     // (boundaries::is_path_inside) can match it correctly.
@@ -493,7 +499,7 @@ fn run_check(args: HookCheckArgs) {
 
     let seed_pid = discover_agent_pid();
 
-    let sock_path = agentpact::default_socket_path().display().to_string();
+    let sock_path = pact_client::default_socket_path().display().to_string();
     let socket_timeout = std::time::Duration::from_secs(5);
 
     // Classify the whole command with a side-effect-free PREVIEW first:
@@ -501,7 +507,7 @@ fn run_check(args: HookCheckArgs) {
     // parsed, without issuing a token. We then drive per-segment popups
     // off that split (the hook never parses shell itself). See
     // `dispatch_preview_outcome`.
-    let outcome = agentpact::request_hook_permission_preview(
+    let outcome = pact_client::request_hook_permission_preview(
         &sock_path,
         "kyris-hook",
         &action,
@@ -656,7 +662,7 @@ fn dispatch_preview_outcome(
                 matches!(&decision, McpPermissionDecision::Allow { mode } if mode.is_log());
             drive_per_segment(ctx, seed_pid, segments, log_mode);
         }
-        Err(_) if agentpact::allow_on_daemon_unavailable() => {
+        Err(_) if pact_client::allow_on_daemon_unavailable() => {
             let response =
                 effective_allow_response(ctx.native_allow_response, ctx.log_mode_fallback);
             kyris_core::fail_open_log::record(ctx.action, ctx.detail, ctx.agent, ctx.cwd);
@@ -804,7 +810,7 @@ fn drive_per_segment(
 
     let result = run_segments(
         &segs,
-        agentpact::allow_on_daemon_unavailable(),
+        pact_client::allow_on_daemon_unavailable(),
         |seg| classify_segment(ctx, seed_pid, seg),
         |approval_id, approval_token, seg, allow_always| {
             poll_segment(
@@ -839,7 +845,7 @@ fn drive_per_segment(
             std::process::exit(0);
         }
         Err(block)
-            if block_defers_to_agent(block.source, agentpact::allow_on_daemon_unavailable()) =>
+            if block_defers_to_agent(block.source, pact_client::allow_on_daemon_unavailable()) =>
         {
             // agentpactd returned a real "ask", but the no-TTY resolution
             // channel (kyrisd) couldn't render the dialog, AND the policy is
@@ -926,7 +932,7 @@ fn classify_segment(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>, seg: &str) -
     let anchor_pid = Some(std::os::unix::process::parent_id());
     #[cfg(not(unix))]
     let anchor_pid: Option<u32> = None;
-    match agentpact::request_hook_permission(
+    match pact_client::request_hook_permission(
         ctx.sock_path,
         "kyris-hook",
         ctx.action,
@@ -970,8 +976,18 @@ fn poll_segment(
     seg: &str,
     allow_always: bool,
 ) -> PopupResult {
+    // For a file action `seg` is a path — render it home-relative for the popup
+    // and the fail-open spool (display/privacy only; the decision already ran on
+    // the absolute path, and approval identity rides in approval_id/token, not
+    // `seg`). Command segments (execute/shell) are shown verbatim.
+    let seg_display = if is_file_action(server) {
+        kyris_core::path_display::home_relative(seg)
+    } else {
+        seg.to_string()
+    };
+    let seg = seg_display.as_str();
     let Some(conn) = kyris_core::config::load_kyrisd_connection() else {
-        if agentpact::allow_on_daemon_unavailable() {
+        if pact_client::allow_on_daemon_unavailable() {
             kyris_core::fail_open_log::record(server, seg, "kyris-hook", None);
             return PopupResult::Approved {
                 source: "kyrisd_unreachable",
@@ -1031,7 +1047,7 @@ fn poll_segment(
             // NOT deny the agentpactd ask here: recording a deny for a command
             // that subsequently runs would be an audit lie. Let the pending
             // expire. Under `deny` we hard-deny, where the deny IS accurate.
-            if !agentpact::allow_on_daemon_unavailable() {
+            if !pact_client::allow_on_daemon_unavailable() {
                 deny_ask_immediately(approval_token, sock_path, socket_timeout);
             }
             PopupResult::Blocked {
@@ -1090,7 +1106,7 @@ fn deny_ask_immediately(
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) {
-    let _ = agentpact::send_permission_response(
+    let _ = pact_client::send_permission_response(
         sock_path,
         "kyris-hook-deny",
         approval_token,
@@ -1099,23 +1115,31 @@ fn deny_ask_immediately(
     );
 }
 
-/// Pick the session cwd to send to agentpactd. Prefer the cwd the agent
-/// reports in its hook payload (Claude Code, Codex CLI and Gemini CLI all
-/// include this) — it's the authoritative session cwd, and the hook
-/// process's own cwd may diverge. Without this, inside-CWD reads can be
-/// misclassified as outside-CWD — see
-/// `agentpact/src/policy/boundaries.rs:43`.
-fn derive_session_cwd(hook_input: &serde_json::Value) -> Option<String> {
+/// Pick the workspace anchor to send to agentpactd as `working_dir`. This is
+/// the permitted-domain root — the directory tree the agent may touch — so it
+/// must be the agent's FIXED launch/project dir, never a value that moves when
+/// the agent runs `cd`.
+///
+/// Resolution order:
+///   1. `launch_dir` — the agent's fixed launch/project dir, already resolved
+///      by the caller from the agent's `launch_dir_env` var (e.g.
+///      `CLAUDE_PROJECT_DIR`). Stable across the agent's own `cd` — unlike
+///      Claude Code's payload `cwd`, which is the LIVE working directory.
+///   2. The hook payload's `cwd` (already fixed at session start for Codex and
+///      Gemini; for Claude a fallback only if the env var is absent).
+///   3. `None`. We deliberately do NOT fall back to the hook process's own
+///      `current_dir()` — that is the kyris-hook process, not the agent, and
+///      would anchor the permitted domain to the wrong tree. agentpactd fails
+///      safe (asks) when the workspace is unknown.
+fn derive_session_cwd(launch_dir: Option<&str>, hook_input: &serde_json::Value) -> Option<String> {
+    if let Some(dir) = launch_dir.filter(|s| !s.trim().is_empty()) {
+        return Some(dir.to_string());
+    }
     hook_input
         .get("cwd")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-        })
 }
 
 /// Resolve a relative file path against the session cwd for `read`/`write`
@@ -1184,6 +1208,13 @@ fn post_hook_log_blocking(conn: &kyris_core::config::KyrisdConnection, body: ser
     });
 }
 
+/// Actions whose `detail` is a single filesystem path (not a command string).
+/// These are rendered home-relative for display/logging; `execute` details are
+/// command text and are left verbatim.
+fn is_file_action(action: &str) -> bool {
+    matches!(action, "read" | "write" | "delete")
+}
+
 /// Single audit call per hook. Sends one combined payload to kyrisd's
 /// `/api/hook/log`, which emits a single `hook resolved` log line. No-op
 /// when kyrisd isn't configured/reachable — audit is best-effort, the
@@ -1216,6 +1247,13 @@ fn audit_log_hook(
     let Some(conn) = conn else { return };
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_ms = elapsed.as_millis() as u64;
+    // Log file paths home-relative (display/privacy only — the decision already
+    // ran on the absolute path). Command `detail`/`segments` are left verbatim.
+    let detail = if is_file_action(action) {
+        kyris_core::path_display::home_relative(detail)
+    } else {
+        detail.to_string()
+    };
     let mut body = serde_json::json!({
         "hook_id": hook_id,
         "agent": agent,
@@ -1357,6 +1395,67 @@ fn emit_deny(reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- workspace anchor resolution (`derive_session_cwd`) ---
+
+    #[test]
+    fn testDeriveSessionCwdPrefersLaunchDirOverPayloadCwd() {
+        // The fixed launch dir (from launch_dir_env) wins over the payload cwd,
+        // which for Claude Code is the mutable live cwd that must NOT anchor the
+        // permitted domain.
+        let input = serde_json::json!({ "cwd": "/live/cwd/after/cd" });
+        assert_eq!(
+            derive_session_cwd(Some("/project/root"), &input),
+            Some("/project/root".to_string())
+        );
+    }
+
+    #[test]
+    fn testDeriveSessionCwdFallsBackToPayloadCwd() {
+        // No launch dir (agents whose payload cwd is already fixed, e.g. Codex).
+        let input = serde_json::json!({ "cwd": "/session/launch/dir" });
+        assert_eq!(
+            derive_session_cwd(None, &input),
+            Some("/session/launch/dir".to_string())
+        );
+    }
+
+    #[test]
+    fn testDeriveSessionCwdBlankLaunchDirFallsThrough() {
+        let input = serde_json::json!({ "cwd": "/payload/cwd" });
+        assert_eq!(
+            derive_session_cwd(Some("   "), &input),
+            Some("/payload/cwd".to_string())
+        );
+    }
+
+    #[test]
+    fn testDeriveSessionCwdUnknownIsNoneNotProcessCwd() {
+        // No launch dir and no payload cwd → None. Critically, we do NOT fall
+        // back to the hook process's current_dir(), which would anchor the
+        // domain to the wrong tree; agentpactd fails safe on a None workspace.
+        let input = serde_json::json!({ "tool_name": "Bash" });
+        assert_eq!(derive_session_cwd(None, &input), None);
+    }
+
+    #[test]
+    fn testLaunchDirEnvWiredForLiveHookAgents() {
+        use crate::agents::registry;
+        // Claude Code's payload cwd is mutable → must use CLAUDE_PROJECT_DIR.
+        assert_eq!(
+            registry::agent_by_id("claude-code").and_then(|a| a.launch_dir_env()),
+            Some("CLAUDE_PROJECT_DIR")
+        );
+        assert_eq!(
+            registry::agent_by_id("gemini-cli").and_then(|a| a.launch_dir_env()),
+            Some("GEMINI_PROJECT_DIR")
+        );
+        // Codex's payload cwd is already the fixed session dir → no env needed.
+        assert_eq!(
+            registry::agent_by_id("codex-cli").and_then(|a| a.launch_dir_env()),
+            None
+        );
+    }
 
     // --- per-segment aggregation driver (`run_segments`) ---
     //

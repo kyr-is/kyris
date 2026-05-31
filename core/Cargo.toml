@@ -26,6 +26,9 @@ chrono = { workspace = true }
 # integration. Used for kyrisd.yaml config parsing in the shared I/O layer.
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }
+# CSPRNG for minting the local hook<->daemon auth secrets in the file-backed
+# secret store (see `secret.rs`) — the same RNG the daemon/cli standardize on.
+aws-lc-rs = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"], optional = true }
 reqwest = { workspace = true, features = ["rustls", "json"], optional = true }
 
