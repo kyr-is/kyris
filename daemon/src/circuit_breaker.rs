@@ -41,6 +41,16 @@ impl CircuitBreaker {
         entry.last_activity = Instant::now();
     }
 
+    /// Record a completed call's tokens against its session and report whether
+    /// that pushed the session to/over its cap. Because already-tripped
+    /// sessions are rejected pre-flight (they never reach a record path), a
+    /// `true` here marks the *crossing* call — the single call recorded as
+    /// `circuit_breaker`. Subsequent calls are 429'd pre-flight and unrecorded.
+    pub fn record_and_is_tripped(&self, session_id: &str, tokens: i64, max_tokens: i64) -> bool {
+        self.record_tokens(session_id, tokens, max_tokens);
+        self.is_tripped(session_id)
+    }
+
     pub fn is_tripped(&self, session_id: &str) -> bool {
         let sessions = self.sessions.read().expect("lock sessions");
         sessions

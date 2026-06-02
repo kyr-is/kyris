@@ -557,7 +557,19 @@ pub fn allow_on_daemon_unavailable() -> bool {
 ///
 /// Returns a human-readable upgrade instruction when versions diverge.
 pub fn check_protocol_compatibility() -> Result<(), String> {
-    let Some(state) = read_daemon_state() else {
+    match daemon_state_path() {
+        Some(path) => check_protocol_compatibility_at(&path),
+        None => Ok(()),
+    }
+}
+
+/// Read `daemon.state` at `path` and check its `protocol_version`. A missing or
+/// unparseable file passes through as compatible (the daemon may not have
+/// written it yet). Split out from [`check_protocol_compatibility`] so the file
+/// read + parse path is testable against a real on-disk state file without
+/// depending on process-global env (`AGENTPACT_SOCK` / `XDG_STATE_HOME`).
+fn check_protocol_compatibility_at(path: &std::path::Path) -> Result<(), String> {
+    let Some(state) = read_daemon_state_at(path) else {
         return Ok(());
     };
     check_daemon_protocol_version(&state)
@@ -593,8 +605,11 @@ pub fn check_daemon_protocol_version(state: &serde_json::Value) -> Result<(), St
 }
 
 fn read_daemon_state() -> Option<serde_json::Value> {
-    let path = daemon_state_path()?;
-    let contents = std::fs::read_to_string(&path).ok()?;
+    read_daemon_state_at(&daemon_state_path()?)
+}
+
+fn read_daemon_state_at(path: &std::path::Path) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
 }
 
@@ -626,16 +641,41 @@ fn send_daemon_request_with_retry(
     request: &serde_json::Value,
     socket_timeout: Duration,
 ) -> Result<serde_json::Value, String> {
-    let mut attempts = RETRY_BACKOFFS.iter().copied().peekable();
+    drive_retry(
+        RETRY_BACKOFFS,
+        || send_daemon_request_to_socket(socket_path, request, Some(socket_timeout)),
+        |backoff_ms| {
+            // On a connection failure, bounce the daemon and back off before the
+            // next attempt.
+            let _ = restart_agentpactd();
+            std::thread::sleep(Duration::from_millis(backoff_ms));
+        },
+    )
+}
+
+/// Drive the retry sequence: call `attempt`; on error run `recover(backoff_ms)`
+/// then retry, once per entry in `backoffs`, returning the last error if all are
+/// exhausted. The retry side effects (restarting agentpactd, sleeping the
+/// backoff) live in the injected `recover` closure so the retry/backoff logic is
+/// unit-testable without touching `launchctl` or the clock.
+fn drive_retry<A, R>(
+    backoffs: &[u64],
+    mut attempt: A,
+    mut recover: R,
+) -> Result<serde_json::Value, String>
+where
+    A: FnMut() -> Result<serde_json::Value, String>,
+    R: FnMut(u64),
+{
+    let mut backoff_iter = backoffs.iter().copied();
     loop {
-        match send_daemon_request_to_socket(socket_path, request, Some(socket_timeout)) {
+        match attempt() {
             Ok(response) => return Ok(response),
             Err(error) => {
-                let Some(backoff_ms) = attempts.next() else {
+                let Some(backoff_ms) = backoff_iter.next() else {
                     return Err(error);
                 };
-                let _ = restart_agentpactd();
-                std::thread::sleep(Duration::from_millis(backoff_ms));
+                recover(backoff_ms);
             }
         }
     }
@@ -705,6 +745,115 @@ fn restart_agentpactd() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- retry/backoff/restart logic (drive_retry) --------------------------
+    // Exercises the [50,100,250]ms retry-then-restart sequence without touching
+    // launchctl or the clock: `attempt` scripts the send results, `recover`
+    // records the backoffs it would have slept (and stands in for the restart).
+
+    #[test]
+    fn testDriveRetrySucceedsAfterTransientFailures() {
+        let backoffs = [50u64, 100, 250];
+        let mut attempt_n = 0;
+        let mut recovered: Vec<u64> = Vec::new();
+        let result = drive_retry(
+            &backoffs,
+            || {
+                attempt_n += 1;
+                if attempt_n < 3 {
+                    Err("connection refused".to_string())
+                } else {
+                    Ok(serde_json::json!({"code": "PACT_OK"}))
+                }
+            },
+            |backoff_ms| recovered.push(backoff_ms),
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempt_n, 3, "two failures then a success");
+        assert_eq!(
+            recovered,
+            vec![50, 100],
+            "restarted+backed off before each retry"
+        );
+    }
+
+    #[test]
+    fn testDriveRetryExhaustsBackoffsThenReturnsLastError() {
+        let backoffs = [50u64, 100, 250];
+        let mut attempt_n = 0;
+        let mut restarts = 0;
+        let result = drive_retry(
+            &backoffs,
+            || {
+                attempt_n += 1;
+                Err(format!("fail {attempt_n}"))
+            },
+            |_| restarts += 1,
+        );
+        // 1 initial attempt + 3 retries = 4 attempts; the final error is returned.
+        assert_eq!(result, Err("fail 4".to_string()));
+        assert_eq!(attempt_n, 4);
+        assert_eq!(restarts, 3, "one restart before each of the three retries");
+    }
+
+    #[test]
+    fn testDriveRetryNoRestartWhenFirstAttemptSucceeds() {
+        let mut restarts = 0;
+        let result = drive_retry(
+            &[50u64, 100, 250],
+            || Ok(serde_json::json!({"ok": true})),
+            |_| restarts += 1,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            restarts, 0,
+            "a working first attempt never restarts the daemon"
+        );
+    }
+
+    // --- protocol handshake against a real on-disk daemon.state -------------
+
+    #[test]
+    fn testCheckProtocolCompatibilityAtMatchingVersionFile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.state");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "protocol_version": PROTOCOL_VERSION }).to_string(),
+        )
+        .unwrap();
+        assert!(check_protocol_compatibility_at(&path).is_ok());
+    }
+
+    #[test]
+    fn testCheckProtocolCompatibilityAtNewerVersionFileErrs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.state");
+        std::fs::write(
+            &path,
+            serde_json::json!({ "protocol_version": PROTOCOL_VERSION + 1 }).to_string(),
+        )
+        .unwrap();
+        let err = check_protocol_compatibility_at(&path).unwrap_err();
+        assert!(
+            err.contains("brew upgrade kyris"),
+            "newer daemon → upgrade kyris: {err}"
+        );
+    }
+
+    #[test]
+    fn testCheckProtocolCompatibilityAtMissingFileIsOk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_protocol_compatibility_at(&dir.path().join("absent.state")).is_ok());
+    }
+
+    #[test]
+    fn testCheckProtocolCompatibilityAtMalformedFileIsOk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.state");
+        std::fs::write(&path, "not json {{{").unwrap();
+        assert!(check_protocol_compatibility_at(&path).is_ok());
+    }
 
     #[test]
     fn testReexportedTypesAccessible() {

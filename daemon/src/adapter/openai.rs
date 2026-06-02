@@ -89,10 +89,16 @@ async fn handle_completions(
         .cloned()
         .unwrap_or_else(|| {
             // Fresh-install passthrough: no `providers[]` configured -> route to
-            // the canonical OpenAI upstream with an empty fallback key.
+            // the canonical OpenAI upstream.
             kyris_core::config::ProviderConfig::default_for(ProviderFormat::OpenAI)
         });
     let provider_name = provider.name.clone();
+
+    // Pure passthrough: forward the caller's `authorization` header or fail
+    // fast. kyrisd holds no provider credential of its own.
+    let Some(authorization) = headers.get("authorization").cloned() else {
+        return Ok(no_credential_error(&trace_id));
+    };
 
     let clients = state.provider_clients.load();
     let client = clients
@@ -112,22 +118,21 @@ async fn handle_completions(
         provider.timeout_seconds
     };
 
-    // Spine event 1/3: provider selection. (OpenAI adapter always
-    // uses the configured api_key — no credential passthrough today,
-    // so credential_mode is fixed.)
+    // Spine event 1/3: provider selection. kyrisd always forwards the
+    // caller's `authorization` credential.
     tracing::debug!(
         provider = %provider_name,
         upstream = %provider.upstream,
         model = %model,
         is_stream,
-        credential_mode = "config_api_key",
+        credential_mode = "passthrough",
         "provider_selected"
     );
 
     let response = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("authorization", format!("Bearer {}", provider.api_key))
+        .header("authorization", &authorization)
         .header("content-type", "application/json")
         .body(outbound_body)
         .send()
@@ -193,14 +198,18 @@ async fn handle_completions(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
+    };
 
     let working_dir = match trace_token.as_deref() {
         Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
@@ -218,10 +227,12 @@ async fn handle_completions(
             cache_read: 0,
             cost,
             latency_ms,
-            status: if status.is_success() {
-                "success".to_string()
-            } else {
+            status: if !status.is_success() {
                 "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
             },
             session_id: Some(session_id.clone()),
             mcp_server: None,
@@ -265,7 +276,7 @@ async fn handle_responses(
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let mut body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+    let body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
         tracing::warn!(error = %e, "failed to parse OpenAI responses request body");
         StatusCode::BAD_REQUEST
     })?;
@@ -276,10 +287,12 @@ async fn handle_responses(
         .unwrap_or("unknown")
         .to_string();
 
+    // OpenAI's Responses API defaults `stream` to false; honor that. Defaulting
+    // to streaming made a plain (non-stream) request take the SSE path.
     let is_stream = body_value
         .get("stream")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let trace_id = trace_id_ext.map_or_else(
         || uuid::Uuid::now_v7().to_string(),
@@ -305,9 +318,10 @@ async fn handle_responses(
         return Ok(circuit_breaker_error(&trace_id, count));
     }
 
-    if is_stream {
-        inject_responses_stream_usage(&mut body_value);
-    }
+    // No body rewriting: the Responses API returns token usage natively (in the
+    // response object / the streaming `response.completed` event), so kyrisd
+    // forwards the request as-is. (The old `include: ["usage"]` injection is an
+    // invalid `include` value the API rejects with 400.)
 
     let config = state.config.load();
     let provider = config
@@ -317,10 +331,16 @@ async fn handle_responses(
         .cloned()
         .unwrap_or_else(|| {
             // Fresh-install passthrough: no `providers[]` configured -> route to
-            // the canonical OpenAI upstream with an empty fallback key.
+            // the canonical OpenAI upstream.
             kyris_core::config::ProviderConfig::default_for(ProviderFormat::OpenAI)
         });
     let provider_name = provider.name.clone();
+
+    // Pure passthrough: forward the caller's `authorization` header or fail
+    // fast. kyrisd holds no provider credential of its own.
+    let Some(authorization) = headers.get("authorization").cloned() else {
+        return Ok(no_credential_error(&trace_id));
+    };
 
     let clients = state.provider_clients.load();
     let client = clients
@@ -343,7 +363,7 @@ async fn handle_responses(
     let response = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("authorization", format!("Bearer {}", provider.api_key))
+        .header("authorization", &authorization)
         .header("content-type", "application/json")
         .body(outbound_body)
         .send()
@@ -389,14 +409,18 @@ async fn handle_responses(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
+    };
 
     let working_dir = match trace_token.as_deref() {
         Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
@@ -414,10 +438,12 @@ async fn handle_responses(
             cache_read: 0,
             cost,
             latency_ms,
-            status: if status.is_success() {
-                "success".to_string()
-            } else {
+            status: if !status.is_success() {
                 "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
             },
             session_id: Some(session_id.clone()),
             mcp_server: None,
@@ -557,10 +583,17 @@ fn relay_responses_sse_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "error": {
                                     "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
@@ -570,22 +603,6 @@ fn relay_responses_sse_stream(
                             });
                             breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
                         }
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
-                        }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -783,10 +800,17 @@ fn relay_sse_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "error": {
                                     "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
@@ -796,22 +820,6 @@ fn relay_sse_stream(
                             });
                             breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
                         }
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
-                        }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -916,6 +924,22 @@ fn circuit_breaker_error(trace_id: &str, token_count: i64) -> Response {
         .expect("build circuit breaker error response")
 }
 
+/// Fail-fast response (401) when the caller supplied no `authorization`
+/// credential. kyrisd is a pure passthrough — it forwards the caller's
+/// credential and stores none — so there is nothing to send upstream.
+fn no_credential_error(trace_id: &str) -> Response {
+    let payload = serde_json::json!({
+        "error": "no provider credential supplied; kyrisd forwards your agent's credential and stores none"
+    });
+
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-kyris-trace-id", trace_id)
+        .body(Body::from(payload.to_string()))
+        .expect("build no-credential error response")
+}
+
 fn inject_stream_usage(body: &mut serde_json::Value) {
     let explicitly_false = body
         .get("stream_options")
@@ -951,21 +975,6 @@ fn extract_tokens_from_sse_json(json: &str) -> Option<TokenCounts> {
         input: usage["prompt_tokens"].as_i64().unwrap_or(0),
         output: usage["completion_tokens"].as_i64().unwrap_or(0),
     })
-}
-
-fn inject_responses_stream_usage(body: &mut serde_json::Value) {
-    let include = body.get("include").and_then(|v| v.as_array());
-    let already_has_usage =
-        include.is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("usage")));
-    if !already_has_usage {
-        let mut arr = body
-            .get("include")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        arr.push(serde_json::json!("usage"));
-        body["include"] = serde_json::Value::Array(arr);
-    }
 }
 
 fn extract_responses_tokens_from_body(body: &[u8]) -> Option<TokenCounts> {
@@ -1117,7 +1126,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1134,9 +1142,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
+        // The caller supplies its own credential; kyrisd forwards exactly that
+        // `authorization` header to the upstream.
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
             .header("x-kyris-session-id", "sess-123")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1169,7 +1180,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
-            Some("Bearer upstream-key")
+            Some("Bearer caller-key")
         );
         assert_eq!(
             request.headers.get("content-type").map(String::as_str),
@@ -1200,7 +1211,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1221,6 +1231,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
             .header("x-kyris-session-id", "sess-stream")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1269,7 +1280,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1289,6 +1299,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1305,6 +1316,7 @@ mod tests {
 
         let response2 = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1317,6 +1329,52 @@ mod tests {
                 .unwrap()
                 .contains("circuit_breaker")
         );
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOpenAiRouteFailsFastWhenNoAuthorizationAndDoesNotHitUpstream() {
+        let recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/v1/chat/completions", post(record_upstream_request))
+            .with_state(recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "openai".to_string(),
+            format: ProviderFormat::OpenAI,
+            upstream: upstream_url.clone(),
+            models: vec!["gpt-4o".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        // No `authorization` header: kyrisd has nothing to forward and must fail
+        // fast without hitting the upstream.
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("no provider credential supplied"), "{body}");
+        assert!(recorded.lock().unwrap().is_none(), "upstream was hit");
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());
@@ -1483,34 +1541,6 @@ mod tests {
         assert!(extract_responses_tokens_from_sse_json("not json").is_none());
     }
 
-    #[test]
-    fn testInjectResponsesStreamUsage() {
-        let mut body = serde_json::json!({"model": "gpt-4o", "input": "hello"});
-        inject_responses_stream_usage(&mut body);
-        let include = body["include"].as_array().unwrap();
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
-    }
-
-    #[test]
-    fn testInjectResponsesStreamUsagePreservesExisting() {
-        let mut body = serde_json::json!({"model": "gpt-4o", "include": ["usage", "reasoning"]});
-        inject_responses_stream_usage(&mut body);
-        let include = body["include"].as_array().unwrap();
-        assert_eq!(include.len(), 2);
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
-        assert!(include.iter().any(|v| v.as_str() == Some("reasoning")));
-    }
-
-    #[test]
-    fn testInjectResponsesStreamUsageAppendsToExistingArray() {
-        let mut body = serde_json::json!({"model": "gpt-4o", "include": ["reasoning"]});
-        inject_responses_stream_usage(&mut body);
-        let include = body["include"].as_array().unwrap();
-        assert_eq!(include.len(), 2);
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
-        assert!(include.iter().any(|v| v.as_str() == Some("reasoning")));
-    }
-
     #[tokio::test]
     async fn testResponsesRouteForwardsRequestAndEmitsStats() {
         let recorded = Arc::new(Mutex::new(None));
@@ -1523,7 +1553,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1541,9 +1570,12 @@ mod tests {
             "input": "hello"
         });
 
+        // The caller supplies its own credential; kyrisd forwards exactly that
+        // `authorization` header to the upstream.
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/responses"))
             .header("x-kyris-session-id", "sess-resp-1")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1576,7 +1608,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
-            Some("Bearer upstream-key")
+            Some("Bearer caller-key")
         );
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["model"], "gpt-4o");
@@ -1603,7 +1635,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1617,12 +1648,14 @@ mod tests {
 
         let request_body = serde_json::json!({
             "model": "gpt-4o",
+            "stream": true,
             "input": "hello"
         });
 
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/responses"))
             .header("x-kyris-session-id", "sess-resp-stream")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1643,8 +1676,10 @@ mod tests {
 
         let request = recorded.lock().unwrap().clone().unwrap();
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-        let include = forwarded_json["include"].as_array().unwrap();
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
+        // Forwarded as-is — no `include: ["usage"]` injection (the Responses API
+        // rejects it; usage arrives natively in the streamed `response.completed`).
+        assert!(forwarded_json.get("include").is_none(), "{forwarded_json}");
+        assert_eq!(forwarded_json["model"], "gpt-4o");
 
         let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
             .await

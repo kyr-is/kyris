@@ -38,6 +38,14 @@ jobs:
         with:
           tool: cargo-deny,cargo-llvm-cov
 
+      # BUILD-TIME NETWORK FETCH (intentional, no fallback): kyris-types'
+      # build.rs fetches the live LiteLLM pricing feed and bakes it into the
+      # binary (PricingTable::bundled). Every compile step below therefore
+      # requires outbound network to raw.githubusercontent.com, and the build
+      # FAILS BY DESIGN if the feed is unreachable — there is no fallback URL and
+      # no hand-maintained table. GitHub-hosted runners have network, so no setup
+      # is needed here; do NOT "fix" a fetch failure with --offline, a cached
+      # snapshot, or a fallback source — a failed fetch is meant to fail the build.
       - name: Format check
         run: cargo fmt --check
 

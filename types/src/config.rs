@@ -149,7 +149,6 @@ pub enum ProviderFormat {
 pub struct ProviderConfig {
     pub name: String,
     pub format: ProviderFormat,
-    pub api_key: String,
     pub upstream: String,
     #[serde(default)]
     pub models: Vec<String>,
@@ -164,7 +163,8 @@ impl ProviderConfig {
     /// with no `providers[]` configured is still a usable transparent proxy —
     /// the agent brings its own credential and kyrisd forwards it to the
     /// standard upstream. Explicit `providers[]` entries only matter when you
-    /// want to override the upstream or supply a fallback API key.
+    /// want to override the upstream. kyrisd holds no provider credential of
+    /// its own — it forwards the caller's and stores none.
     #[must_use]
     pub fn default_for(format: ProviderFormat) -> Self {
         let (name, upstream) = match format {
@@ -175,7 +175,6 @@ impl ProviderConfig {
         Self {
             name: name.to_string(),
             format,
-            api_key: String::new(),
             upstream: upstream.to_string(),
             models: Vec::new(),
             timeout_seconds: default_timeout_seconds(),
@@ -430,7 +429,6 @@ server:
 providers:
   - name: anthropic
     format: anthropic
-    api_key: "sk-ant-test"
     upstream: "https://api.anthropic.com"
     models:
       - claude-4-opus
@@ -458,7 +456,6 @@ circuit_breaker:
 providers:
   - name: bedrock-claude
     format: anthropic
-    api_key: ""
     upstream: "https://bedrock-runtime.us-east-1.amazonaws.com"
 "#;
         let config: KyrisdConfig = serde_saphyr::from_str(yaml_str).unwrap();

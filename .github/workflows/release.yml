@@ -57,6 +57,10 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
+      # Requires outbound network: kyris-types' build.rs fetches the live LiteLLM
+      # pricing feed at build time (PricingTable::bundled) and FAILS BY DESIGN if
+      # it's unreachable — no fallback. So a release is cut against the pricing
+      # table current as of build time.
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 

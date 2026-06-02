@@ -17,3 +17,7 @@ kyris-core = { workspace = true }
 agentpact-types = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+# Integration tests bind a fake-agentpactd UDS in a tempdir.
+tempfile = "3"

@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
+# SPDX-License-Identifier: Apache-2.0
+#
+# Canonical LiteLLM pricing feed URL — the single source of truth for the
+# external pricing source. `types/build.rs` reads it to fetch the bundled
+# snapshot at build time, and the relay's `relay.yaml` `pricing.source_url`
+# must match it (guarded by a test). Not a hardcoded Rust constant.
+litellm_url: "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"

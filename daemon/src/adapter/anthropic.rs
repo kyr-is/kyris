@@ -136,28 +136,25 @@ async fn handle_messages(
         provider.timeout_seconds
     };
 
-    // Pass through the agent's own credential (subscription OAuth or its own API
-    // key) when present; fall back to the configured key only if it sent none.
-    // The cost class follows the auth mode (OAuth -> Included, else Overage).
+    // kyrisd is a pure passthrough: it forwards the caller's own credential
+    // (subscription OAuth or its own API key) and holds none of its own. If the
+    // caller sent neither `authorization` nor `x-api-key`, fail fast — there is
+    // nothing to forward. The cost class follows the auth mode (OAuth ->
+    // Included, else Overage).
     let plan_status = anthropic_plan_status(&headers);
-    let forward_credential =
-        headers.contains_key("authorization") || headers.contains_key("x-api-key");
-    let credential_mode = if forward_credential {
-        "passthrough"
-    } else {
-        "config_api_key"
-    };
+    if !headers.contains_key("authorization") && !headers.contains_key("x-api-key") {
+        return Ok(no_credential_response(&trace_id));
+    }
 
-    // Spine event 1/3: provider selection + credential mode. Answers
-    // "did we route to the right upstream?" and "did we forward the
-    // caller's credential or fall back to ours?" without anyone
-    // having to instrument those decision points by hand.
+    // Spine event 1/3: provider selection. Answers "did we route to the
+    // right upstream?" without anyone having to instrument that decision
+    // point by hand. kyrisd always forwards the caller's credential.
     tracing::debug!(
         provider = %provider_name,
         upstream = %provider.upstream,
         model = %model,
         is_stream,
-        credential_mode,
+        credential_mode = "passthrough",
         plan_status = ?plan_status,
         "provider_selected"
     );
@@ -169,15 +166,11 @@ async fn handle_messages(
         .header("anthropic-version", "2023-06-01")
         .body(body.to_vec());
 
-    if forward_credential {
-        if let Some(v) = headers.get("authorization") {
-            req = req.header("authorization", v);
-        }
-        if let Some(v) = headers.get("x-api-key") {
-            req = req.header("x-api-key", v);
-        }
-    } else {
-        req = req.header("x-api-key", &provider.api_key);
+    if let Some(v) = headers.get("authorization") {
+        req = req.header("authorization", v);
+    }
+    if let Some(v) = headers.get("x-api-key") {
+        req = req.header("x-api-key", v);
     }
 
     for (key, value) in &headers {
@@ -268,14 +261,18 @@ async fn handle_messages(
         },
     );
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
+    };
 
     let working_dir = match trace_token.as_deref() {
         Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
@@ -293,10 +290,12 @@ async fn handle_messages(
             cache_read,
             cost,
             latency_ms,
-            status: if status.is_success() {
-                "success".to_string()
-            } else {
+            status: if !status.is_success() {
                 "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
             },
             session_id: Some(session_id.clone()),
             mcp_server: None,
@@ -471,14 +470,17 @@ fn relay_sse_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "type": "error",
                                 "error": {
@@ -489,8 +491,6 @@ fn relay_sse_stream(
                             let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
                             breaker_chunk = Some(Bytes::from(err_chunk));
                         }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -585,10 +585,15 @@ async fn handle_count_tokens(
         .cloned()
         .unwrap_or_else(|| {
             // Fresh-install passthrough: no `providers[]` configured -> route to
-            // the canonical Anthropic upstream with an empty fallback key. The
-            // agent's own credential (OAuth or API key) is what gets forwarded.
+            // the canonical Anthropic upstream. The agent's own credential
+            // (OAuth or API key) is what gets forwarded.
             kyris_core::config::ProviderConfig::default_for(ProviderFormat::Anthropic)
         });
+
+    // Pure passthrough: forward the caller's credential or fail fast.
+    if !headers.contains_key("authorization") && !headers.contains_key("x-api-key") {
+        return Ok(no_credential_response(&uuid::Uuid::now_v7().to_string()));
+    }
 
     let clients = state.provider_clients.load();
     let client = clients
@@ -597,8 +602,6 @@ async fn handle_count_tokens(
         .unwrap_or_else(reqwest::Client::new);
     let upstream_url = format!("{}/v1/messages/count_tokens", provider.upstream);
 
-    let forward_credential =
-        headers.contains_key("authorization") || headers.contains_key("x-api-key");
     let mut req = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(provider.timeout_seconds))
@@ -606,15 +609,11 @@ async fn handle_count_tokens(
         .header("anthropic-version", "2023-06-01")
         .body(body.to_vec());
 
-    if forward_credential {
-        if let Some(v) = headers.get("authorization") {
-            req = req.header("authorization", v);
-        }
-        if let Some(v) = headers.get("x-api-key") {
-            req = req.header("x-api-key", v);
-        }
-    } else {
-        req = req.header("x-api-key", &provider.api_key);
+    if let Some(v) = headers.get("authorization") {
+        req = req.header("authorization", v);
+    }
+    if let Some(v) = headers.get("x-api-key") {
+        req = req.header("x-api-key", v);
     }
 
     for (key, value) in &headers {
@@ -723,6 +722,23 @@ fn circuit_breaker_response(trace_id: &str, token_count: i64) -> Response {
             .to_string(),
         ))
         .expect("build circuit breaker response")
+}
+
+/// Fail-fast response (401) when the caller supplied no provider credential.
+/// kyrisd is a pure passthrough — it forwards the caller's credential and
+/// stores none — so there is nothing to send upstream.
+fn no_credential_response(trace_id: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-kyris-trace-id", trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "error": "no provider credential supplied; kyrisd forwards your agent's credential and stores none"
+            })
+            .to_string(),
+        ))
+        .expect("build no-credential response")
 }
 
 #[cfg(test)]
@@ -874,7 +890,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -893,9 +908,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
+        // The caller supplies its own credential; kyrisd forwards exactly that
+        // `x-api-key` value to the upstream.
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic")
+            .header("x-api-key", "caller-key")
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .json(&request_body)
             .send()
@@ -933,7 +951,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("x-api-key").map(String::as_str),
-            Some("anthropic-secret")
+            Some("caller-key")
         );
         assert_eq!(
             request.headers.get("anthropic-version").map(String::as_str),
@@ -965,7 +983,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -987,6 +1004,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic-stream")
+            .header("x-api-key", "caller-key")
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .json(&request_body)
             .send()
@@ -1026,7 +1044,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("x-api-key").map(String::as_str),
-            Some("anthropic-secret")
+            Some("caller-key")
         );
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["stream"], true);
@@ -1044,7 +1062,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: "http://127.0.0.1:9".to_string(), // unreachable — breaker fires first
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -1100,7 +1117,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: "http://127.0.0.1:9".to_string(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -1169,7 +1185,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -1192,6 +1207,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic-threshold")
+            .header("x-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1208,6 +1224,53 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["stream"], true);
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testAnthropicRouteFailsFastWhenNoCredentialAndDoesNotHitUpstream() {
+        let recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/v1/messages", post(record_upstream_request))
+            .with_state(recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            upstream: upstream_url.clone(),
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        // No `authorization` and no `x-api-key`: kyrisd has nothing to forward
+        // and must fail fast without hitting the upstream.
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("no provider credential supplied"), "{body}");
+        assert!(recorded.lock().unwrap().is_none(), "upstream was hit");
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());

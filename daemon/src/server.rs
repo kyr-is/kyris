@@ -1335,7 +1335,6 @@ async fn healthz(
 fn provider_configs_match(old: &ProviderConfig, new: &ProviderConfig) -> bool {
     old.name == new.name
         && old.format == new.format
-        && old.api_key == new.api_key
         && old.upstream == new.upstream
         && old.models == new.models
         && old.timeout_seconds == new.timeout_seconds
@@ -1786,7 +1785,7 @@ mod tests {
         }
     }
 
-    fn make_provider(name: &str, api_key: &str, upstream: &str) -> ProviderConfig {
+    fn make_provider(name: &str, upstream: &str) -> ProviderConfig {
         let format = match name {
             "anthropic" => ProviderFormat::Anthropic,
             "google" => ProviderFormat::Google,
@@ -1795,7 +1794,6 @@ mod tests {
         ProviderConfig {
             name: name.to_string(),
             format,
-            api_key: api_key.to_string(),
             upstream: upstream.to_string(),
             models: vec![format!("{name}-model")],
             timeout_seconds: 30,
@@ -1925,7 +1923,7 @@ mod tests {
     async fn testReloadLoopKeepsOldConfigActiveUntilNewConfigLoads() {
         let dir = tempfile::tempdir().unwrap();
         let mut initial_config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        initial_config.providers = vec![make_provider("openai", "old-key", "https://old.example")];
+        initial_config.providers = vec![make_provider("openai", "https://old.example")];
         let initial_clients = build_provider_clients(&initial_config);
         let state = make_test_state(initial_config, dir.path());
         state.provider_clients.store(Arc::new(initial_clients));
@@ -1936,8 +1934,8 @@ mod tests {
         let next_config = {
             let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
             config.providers = vec![
-                make_provider("openai", "new-key", "https://new.example"),
-                make_provider("anthropic", "anth-key", "https://anth.example"),
+                make_provider("openai", "https://new.example"),
+                make_provider("anthropic", "https://anth.example"),
             ];
             config
         };
@@ -1964,14 +1962,19 @@ mod tests {
 
         reload_tx.send(()).await.unwrap();
         started.notified().await;
-        assert_eq!(state.config.load().providers[0].api_key, "old-key");
+        assert_eq!(
+            state.config.load().providers[0].upstream,
+            "https://old.example"
+        );
 
         gate.notify_waiters();
         drop(reload_tx);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let loaded = state.config.load();
-                if loaded.providers.len() == 2 && loaded.providers[0].api_key == "new-key" {
+                if loaded.providers.len() == 2
+                    && loaded.providers[0].upstream == "https://new.example"
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1983,7 +1986,7 @@ mod tests {
 
         let loaded = state.config.load();
         assert_eq!(loaded.providers.len(), 2);
-        assert_eq!(loaded.providers[0].api_key, "new-key");
+        assert_eq!(loaded.providers[0].upstream, "https://new.example");
         let clients = state.provider_clients.load();
         assert!(clients.contains_key("openai"));
         assert!(clients.contains_key("anthropic"));
@@ -1993,7 +1996,7 @@ mod tests {
     async fn testReloadLoopKeepsCurrentConfigOnLoadFailure() {
         let dir = tempfile::tempdir().unwrap();
         let mut initial_config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        initial_config.providers = vec![make_provider("google", "old-key", "https://old.example")];
+        initial_config.providers = vec![make_provider("google", "https://old.example")];
         let initial_clients = build_provider_clients(&initial_config);
         let state = make_test_state(initial_config, dir.path());
         state.provider_clients.store(Arc::new(initial_clients));
@@ -2013,7 +2016,7 @@ mod tests {
         let loaded = state.config.load();
         assert_eq!(loaded.providers.len(), 1);
         assert_eq!(loaded.providers[0].name, "google");
-        assert_eq!(loaded.providers[0].api_key, "old-key");
+        assert_eq!(loaded.providers[0].upstream, "https://old.example");
         let clients = state.provider_clients.load();
         assert_eq!(clients.len(), 1);
         assert!(clients.contains_key("google"));
@@ -2023,7 +2026,7 @@ mod tests {
     async fn testHealthzReadyWithProviders() {
         let dir = tempfile::tempdir().unwrap();
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        config.providers = vec![make_provider("openai", "key", "http://localhost")];
+        config.providers = vec![make_provider("openai", "http://localhost")];
         let state = make_test_state(config, dir.path());
 
         let app = Router::new().route("/healthz", axum::routing::get(healthz).with_state(state));

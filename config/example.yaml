@@ -16,8 +16,10 @@ tls:
   key_path: ""
 
 providers:
+  # kyrisd holds no provider credential of its own — it forwards the caller's
+  # (your agent's) credential to the upstream and stores none. Configure only
+  # the upstream here.
   - name: anthropic
-    api_key: "sk-ant-..."
     upstream: "https://api.anthropic.com"
     models:
       - claude-4-opus
@@ -26,14 +28,12 @@ providers:
     streaming_timeout_seconds: 300
 
   - name: openai
-    api_key: "sk-..."
     upstream: "https://api.openai.com"
     models:
       - gpt-4o
       - gpt-4o-mini
 
   - name: google
-    api_key: "AIza..."
     upstream: "https://generativelanguage.googleapis.com"
     models:
       - gemini-2.5-pro

@@ -1172,6 +1172,18 @@ reset_data() {
   remove_path "$STATE_DIR"
 }
 
+# Residue left under DATA_DIR after `--reset-data`: everything EXCEPT the
+# preserved auth-key store ($secret). Echoes the offending paths, one per line
+# (empty output = clean). Pure (no globals, no side effects) so it's unit-
+# testable by sourcing this script — see kyris/cli/tests/install_reset_data.rs.
+# `verify_uninstall` uses it instead of requiring DATA_DIR to be entirely gone,
+# since the secret store survives --reset-data by design.
+data_dir_reset_residue() {
+  local data_dir="$1" secret="$2"
+  [ -d "$data_dir" ] || return 0
+  find "$data_dir" -mindepth 1 -maxdepth 1 ! -name "$secret" 2>/dev/null
+}
+
 # Place Kyrisd.app at $APP_PATH and wire up the launchd service to load
 # kyrisd from inside the bundle, then symlink ALL FOUR CLI binaries
 # (kyrisd, kyris, kyris-mcp, kyris-hook) from inside the bundle into
@@ -1404,12 +1416,25 @@ verify_uninstall() {
   done
 
   if [ "$RESET_DATA" -eq 1 ]; then
-    for path in "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR"; do
+    # CONFIG_DIR and STATE_DIR must be wiped entirely.
+    for path in "$CONFIG_DIR" "$STATE_DIR"; do
       if [ -e "$path" ] || [ -L "$path" ]; then
         info "FAIL: --reset-data left residue at $path"
         failures=$((failures + 1))
       fi
     done
+    # DATA_DIR is NOT required to be gone: reset_data() deliberately preserves
+    # the auth-key store ($DATA_DIR/$SECRET_SUBDIR) so keys never regenerate.
+    # The directory legitimately remains to hold it. Residue = anything under
+    # DATA_DIR OTHER than the secret store (see data_dir_reset_residue).
+    if [ -d "$DATA_DIR" ]; then
+      residue="$(data_dir_reset_residue "$DATA_DIR" "$SECRET_SUBDIR")"
+      if [ -n "$residue" ]; then
+        info "FAIL: --reset-data left residue under $DATA_DIR (only $SECRET_SUBDIR/ should remain):"
+        info "$residue"
+        failures=$((failures + 1))
+      fi
+    fi
   fi
 
   for bin in kyris kyrisd kyris-mcp kyris-hook; do
@@ -1528,4 +1553,24 @@ main() {
   configure_and_verify
 }
 
-main "$@"
+# Optional local override hook (permanent). Any *.sh dropped into
+# install.sh.local.d/ next to this script is sourced here — AFTER every function
+# is defined, so it can redefine one (the kyris-dev override repoints
+# `ensure_agentpact_installed` at a sibling agentpact checkout). Absent in normal
+# brew/curl installs → a silent no-op. This hook lives here permanently so the
+# dev toggle is just a dropped file, never an install.sh patch hunk that breaks
+# whenever this tail changes.
+__ovr_dir="$(dirname "${BASH_SOURCE[0]:-$0}")/install.sh.local.d"
+if [ -d "$__ovr_dir" ]; then
+  for __ovr in "$__ovr_dir"/*.sh; do
+    [ -f "$__ovr" ] && source "$__ovr"
+  done
+fi
+unset __ovr_dir __ovr
+
+# Run main only when EXECUTED, not when sourced — so tests can source this
+# script to exercise individual functions (e.g. data_dir_reset_residue) without
+# running the installer. Bash sets BASH_SOURCE[0]==$0 only on direct execution.
+if [ "${BASH_SOURCE[0]:-$0}" = "${0}" ]; then
+  main "$@"
+fi

@@ -32,5 +32,14 @@ serde-saphyr = { workspace = true }
 utoipa = { version = "5.4", optional = true }
 schemars = { version = "1.2", optional = true }
 
+# Build-time only: fetch the LiteLLM pricing feed and bake it into the binary
+# for `PricingTable::bundled()` (see build.rs). Mirrors the workspace TLS stack
+# (reqwest rustls-no-provider + aws-lc-rs) so `cargo deny` sees no new backend.
+[build-dependencies]
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"

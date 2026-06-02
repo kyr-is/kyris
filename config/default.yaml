@@ -16,10 +16,10 @@ server:
 tls:
   enabled: false
 
-# Add at least one provider to start accepting LLM requests.
+# Add a provider only to override its upstream URL. kyrisd holds no provider
+# credential of its own — it forwards your agent's credential and stores none.
 # providers:
 #   - name: anthropic
-#     api_key: "sk-ant-..."
 #     upstream: "https://api.anthropic.com"
 #     models:
 #       - claude-4-opus
