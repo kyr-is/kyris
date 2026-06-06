@@ -11,6 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agentpact"
 version = "0.1.5"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.5#4ad063bacb5c88b185f4734ea32633942d358b16"
 dependencies = [
  "agentpact-types",
  "arc-swap",
@@ -38,6 +39,7 @@ dependencies = [
 [[package]]
 name = "agentpact-types"
 version = "0.1.5"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.5#4ad063bacb5c88b185f4734ea32633942d358b16"
 dependencies = [
  "schemars",
  "serde",
