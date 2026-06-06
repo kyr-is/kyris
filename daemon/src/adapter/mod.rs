@@ -39,6 +39,61 @@ pub fn extract_agent_id(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
+/// Connection-level + body-framing headers that describe the UPSTREAM hop and
+/// must never be relayed verbatim. kyrisd buffers the body and re-serves it over
+/// its own connection, so hyper recomputes content-length/framing for the bytes
+/// it actually writes; relaying these makes the declared framing contradict the
+/// re-served body and hyper resets the connection (client sees `RemoteDisconnected`).
+/// Hop-by-hop set per RFC 7230 §6.1.
+///
+/// `content-encoding` is intentionally NOT here: kyrisd's reqwest is built
+/// WITHOUT gzip/brotli/deflate, so the body is byte-identical to upstream and its
+/// content-encoding stays valid. If client-side decompression is ever enabled,
+/// add `content-encoding` (the body would then be decoded plaintext).
+const NON_RELAYABLE_HEADERS: &[&str] = &[
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+    "proxy-authenticate",
+    "proxy-authorization",
+];
+
+/// Relay `upstream` response headers onto `builder`, dropping the connection /
+/// body-framing headers ([`NON_RELAYABLE_HEADERS`]) plus any header named in the
+/// upstream `Connection` header (RFC 7230 §6.1). Everything else (`content-type`,
+/// `content-encoding`, rate-limit / request-id / app headers) is relayed verbatim.
+/// Used by every adapter relay path so a buffered upstream response is re-framed
+/// correctly instead of resetting the client connection.
+#[must_use]
+pub fn relay_upstream_headers(
+    mut builder: axum::http::response::Builder,
+    upstream: &HeaderMap,
+) -> axum::http::response::Builder {
+    let connection_listed: Vec<String> = upstream
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    for (key, value) in upstream {
+        let name = key.as_str().to_ascii_lowercase();
+        if NON_RELAYABLE_HEADERS.contains(&name.as_str())
+            || connection_listed.iter().any(|c| c == &name)
+        {
+            continue;
+        }
+        builder = builder.header(key, value);
+    }
+    builder
+}
+
 pub fn relay_trace_attach_sync(
     state: &AppState,
     trace_token: &str,
@@ -54,7 +109,7 @@ pub fn relay_trace_attach_sync(
     ) {
         Ok(working_dir) => working_dir,
         Err(e) => {
-            tracing::debug!(error = %e, "trace.attach relay failed");
+            tracing::warn!(error = %e, "trace.attach relay failed");
             None
         }
     }
@@ -81,24 +136,18 @@ pub async fn relay_trace_attach(
     {
         Ok(Ok(working_dir)) => working_dir,
         Ok(Err(e)) => {
-            tracing::debug!(error = %e, "trace.attach relay failed");
+            tracing::warn!(error = %e, "trace.attach relay failed");
             None
         }
         Err(e) => {
-            tracing::debug!(error = %e, "trace.attach spawn_blocking failed");
+            tracing::warn!(error = %e, "trace.attach spawn_blocking failed");
             None
         }
     }
 }
 
 pub fn write_native_seen_breadcrumb(agent_id: &str) {
-    let Ok(home) = std::env::var("HOME") else {
-        return;
-    };
-    let dir = std::path::PathBuf::from(home)
-        .join(".kyris")
-        .join("agents")
-        .join(".native-seen");
+    let dir = kyris_core::paths::agents_dir().join(".native-seen");
     let path = dir.join(agent_id);
     if path.exists() {
         return;
@@ -107,15 +156,71 @@ pub fn write_native_seen_breadcrumb(agent_id: &str) {
     let _ = std::fs::write(&path, chrono::Utc::now().to_rfc3339());
 }
 
-pub async fn resolve_peer_working_dir(peer_addr: SocketAddr) -> Option<String> {
-    tokio::task::spawn_blocking(move || kyris_peer_cwd::resolve(peer_addr))
-        .await
-        .ok()
-        .flatten()
+/// CWD and agent attribution for the process owning a peer connection, resolved
+/// from a single OS PID scan. Used on the non-conformant path (no
+/// `x-kyris-trace-token`): the CWD seeds `working_dir`, and — only when the
+/// agent did not send an `x-kyris-agent-id` header (`need_agent`) — `kyrisd`
+/// asks `agentpactd` to attribute the owning agent from the PID. The header is
+/// authoritative when present (Claude Code), so we skip the daemon round-trip
+/// for it. Both fields are best-effort and independently `None`.
+pub struct PeerAttribution {
+    pub working_dir: Option<String>,
+    pub agent: Option<String>,
 }
 
-pub fn resolve_peer_working_dir_sync(peer_addr: SocketAddr) -> Option<String> {
-    kyris_peer_cwd::resolve(peer_addr)
+fn resolve_peer_attribution_blocking(
+    socket: Option<String>,
+    peer_addr: SocketAddr,
+    need_agent: bool,
+) -> PeerAttribution {
+    let Some((pid, working_dir)) = kyris_peer_cwd::resolve_with_pid(peer_addr) else {
+        return PeerAttribution {
+            working_dir: None,
+            agent: None,
+        };
+    };
+    let agent = if need_agent {
+        socket.and_then(|socket| {
+            let pid = u32::try_from(pid).ok()?;
+            kyris_agentpact_client::resolve_agent(
+                &socket,
+                pid,
+                Some(std::time::Duration::from_secs(2)),
+            )
+        })
+    } else {
+        None
+    };
+    PeerAttribution { working_dir, agent }
+}
+
+pub async fn resolve_peer_attribution(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    need_agent: bool,
+) -> PeerAttribution {
+    let socket = state
+        .resolve_agentpact_socket()
+        .map(|p| p.display().to_string());
+    tokio::task::spawn_blocking(move || {
+        resolve_peer_attribution_blocking(socket, peer_addr, need_agent)
+    })
+    .await
+    .unwrap_or(PeerAttribution {
+        working_dir: None,
+        agent: None,
+    })
+}
+
+pub fn resolve_peer_attribution_sync(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    need_agent: bool,
+) -> PeerAttribution {
+    let socket = state
+        .resolve_agentpact_socket()
+        .map(|p| p.display().to_string());
+    resolve_peer_attribution_blocking(socket, peer_addr, need_agent)
 }
 
 pub fn routes(state: Arc<AppState>) -> Router {
@@ -229,9 +334,60 @@ mod tests {
     }
 
     #[test]
+    fn testRelayUpstreamHeadersDropsFramingKeepsContent() {
+        use axum::http::Response;
+
+        let mut upstream = HeaderMap::new();
+        upstream.insert("content-length", HeaderValue::from_static("123"));
+        upstream.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        upstream.insert("connection", HeaderValue::from_static("keep-alive"));
+        upstream.insert("content-type", HeaderValue::from_static("application/json"));
+        upstream.insert("content-encoding", HeaderValue::from_static("gzip"));
+
+        let builder = relay_upstream_headers(Response::builder().status(200), &upstream);
+        let response = builder.body(()).expect("build response");
+        let out = response.headers();
+
+        assert_eq!(
+            out.get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            out.get("content-encoding").and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        assert!(!out.contains_key("content-length"));
+        assert!(!out.contains_key("transfer-encoding"));
+        assert!(!out.contains_key("connection"));
+    }
+
+    #[test]
+    fn testRelayUpstreamHeadersDropsConnectionListed() {
+        use axum::http::Response;
+
+        let mut upstream = HeaderMap::new();
+        upstream.insert("connection", HeaderValue::from_static("x-custom-hop"));
+        upstream.insert("x-custom-hop", HeaderValue::from_static("drop-me"));
+        upstream.insert("x-keep", HeaderValue::from_static("keep-me"));
+
+        let builder = relay_upstream_headers(Response::builder().status(200), &upstream);
+        let response = builder.body(()).expect("build response");
+        let out = response.headers();
+
+        assert!(!out.contains_key("x-custom-hop"));
+        assert_eq!(
+            out.get("x-keep").and_then(|v| v.to_str().ok()),
+            Some("keep-me")
+        );
+    }
+
+    #[test]
     fn testWriteNativeSeenBreadcrumb() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        unsafe { std::env::set_var("HOME", temp.path()) };
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::remove_var("KYRIS_HOME");
+        }
         let dir = temp
             .path()
             .join(".kyris")

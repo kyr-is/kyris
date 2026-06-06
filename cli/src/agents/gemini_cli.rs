@@ -6,7 +6,8 @@ use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{read_json_value, write_json_value};
 
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_mcp_wrap, not_detected,
+    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
+    json_has_mcp_wrap, not_detected,
 };
 use super::registry::{
     AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation,
@@ -61,6 +62,9 @@ impl AgentDescriptor for GeminiCli {
         let has_mcp_wrap = settings_path
             .as_deref()
             .is_some_and(|p| json_has_mcp_wrap(p, "mcpServers"));
+        let has_any_mcp_servers = settings_path
+            .as_deref()
+            .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
 
         let has_compiled_policy = gemini_policies_dir()
             .ok()
@@ -77,6 +81,8 @@ impl AgentDescriptor for GeminiCli {
         };
         let tool = if has_mcp_wrap {
             SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+        } else if !has_any_mcp_servers {
+            SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
@@ -120,6 +126,12 @@ impl AgentDescriptor for GeminiCli {
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
     }
+    fn launch_dir_env(&self) -> Option<&'static str> {
+        // Gemini CLI's hook payload `cwd` is already the fixed launch dir, but
+        // it also exports `GEMINI_PROJECT_DIR` — use it as the explicit, stable
+        // permitted-domain anchor.
+        Some("GEMINI_PROJECT_DIR")
+    }
     fn configure_execution(
         &self,
         _base_url: &str,
@@ -140,6 +152,10 @@ impl AgentDescriptor for GeminiCli {
             &script_path,
             &settings_path,
             false,
+            // Gemini's default hook timeout is 60s — below kyris's ~590s no-TTY
+            // poll window — so it would kill the hook mid-wait. Pin it to 600s
+            // (Gemini's `timeout` is in milliseconds).
+            Some(600_000),
         )?;
 
         match crate::compile_policy::compile_gemini_permissions(None) {
@@ -215,6 +231,10 @@ impl AgentDescriptor for GeminiCli {
         Ok(changes)
     }
     fn undo(&self) -> Result<(), String> {
+        // Remove MCP upstreams before restoring settings.json.
+        let mcp_names = super::configure::mcp_server_names_from_agent(self);
+        super::configure::remove_mcp_upstreams(&mcp_names)?;
+
         let settings_path = gemini_settings_path()?;
         if crate::state::restore_manifest_entry(&settings_path)? {
             println!("Reverted {}", settings_path.display());
@@ -275,6 +295,16 @@ impl AgentDescriptor for GeminiCli {
                     action: "write".to_string(),
                     detail_key: Some("file_path".to_string()),
                 },
+            ],
+            // Gemini CLI internal coordination tools: skip the daemon. See
+            // claude_code.rs and hook_cmd.rs for the design rationale.
+            pass_through_tools: vec![
+                "google_search".to_string(),
+                "save_memory".to_string(),
+                "list_directory".to_string(),
+                "glob".to_string(),
+                "search_file_content".to_string(),
+                "web_fetch".to_string(),
             ],
             default_action: "call".to_string(),
             allow_response: AllowResponse::Json {

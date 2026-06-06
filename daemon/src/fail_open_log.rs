@@ -66,7 +66,15 @@ mod tests {
     use std::io::Write;
     use std::sync::Mutex;
 
+    // fail_open_log::log_path() reads $XDG_STATE_HOME (or $HOME) at call
+    // time. These tests set both — XDG_STATE_HOME to point at the tempdir
+    // and HOME as a defense-in-depth fallback — and serialize via the
+    // mutex so they don't race each other.
     static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fail_open_log_path_under(base: &std::path::Path) -> std::path::PathBuf {
+        base.join("kyris").join("fail-open.jsonl")
+    }
 
     fn write_event(
         path: &std::path::Path,
@@ -103,20 +111,22 @@ mod tests {
     fn testReadReturnsEventsAndCount() {
         let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("fail-open.jsonl");
+        let log_path = fail_open_log_path_under(dir.path());
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
 
-        write_event(&path, "execute", "ls", "", "/work/a");
-        write_event(&path, "call", "write_file", "mcp-server", "/work/b");
+        write_event(&log_path, "execute", "ls", "", "/work/a");
+        write_event(&log_path, "call", "write_file", "mcp-server", "/work/b");
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
-        std::fs::create_dir_all(dir.path().join(".kyris")).unwrap();
-        std::fs::copy(&path, dir.path().join(".kyris/fail-open.jsonl")).unwrap();
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::set_var("XDG_STATE_HOME", dir.path().to_str().unwrap());
+        }
 
         let (events, count) = read();
         assert_eq!(events.len(), 2);
         assert_eq!(count, 2);
 
-        let content = std::fs::read_to_string(dir.path().join(".kyris/fail-open.jsonl")).unwrap();
+        let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(!content.trim().is_empty(), "read() should not truncate");
     }
 
@@ -124,15 +134,18 @@ mod tests {
     fn testDrainAllRemovesAllLines() {
         let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".kyris")).unwrap();
-        let path = dir.path().join(".kyris/fail-open.jsonl");
+        let log_path = fail_open_log_path_under(dir.path());
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
 
-        write_event(&path, "execute", "ls", "", "/work/a");
+        write_event(&log_path, "execute", "ls", "", "/work/a");
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::set_var("XDG_STATE_HOME", dir.path().to_str().unwrap());
+        }
         drain(1);
 
-        let content = std::fs::read_to_string(&path).unwrap();
+        let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.is_empty());
     }
 
@@ -140,14 +153,17 @@ mod tests {
     fn testDrainPreservesNewLines() {
         let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".kyris")).unwrap();
-        let path = dir.path().join(".kyris/fail-open.jsonl");
+        let log_path = fail_open_log_path_under(dir.path());
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
 
-        write_event(&path, "execute", "ls", "", "/work/a");
-        write_event(&path, "call", "write_file", "mcp", "/work/b");
-        write_event(&path, "read", "cat", "mcp", "/work/c");
+        write_event(&log_path, "execute", "ls", "", "/work/a");
+        write_event(&log_path, "call", "write_file", "mcp", "/work/b");
+        write_event(&log_path, "read", "cat", "mcp", "/work/c");
 
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::set_var("XDG_STATE_HOME", dir.path().to_str().unwrap());
+        }
         drain(2);
 
         let (events, count) = read();
@@ -161,8 +177,11 @@ mod tests {
     fn testReadEmptyFile() {
         let _lock = HOME_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".kyris")).unwrap();
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        std::fs::create_dir_all(fail_open_log_path_under(dir.path()).parent().unwrap()).unwrap();
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::set_var("XDG_STATE_HOME", dir.path().to_str().unwrap());
+        }
 
         let (events, count) = read();
         assert!(events.is_empty());

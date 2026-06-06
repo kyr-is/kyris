@@ -9,10 +9,17 @@
 //! Gemini CLI `BeforeTool`) use `kyris hook check` in the CLI binary — that
 //! binary has tokio + reqwest and can run the hold-poll-resolve pattern for
 //! `PACT_ASK` approval delegation.
-#![cfg_attr(not(test), forbid(unsafe_code))]
+// The hook helper is unsafe-free *except* for the `ppid_chain` module,
+// which needs a single FFI call on macOS to walk parent PIDs (so the
+// daemon can match anchored exec_tokens). That module opts in
+// explicitly via `#[allow(unsafe_code)]`; everything else stays
+// strictly safe.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![cfg_attr(test, allow(non_snake_case))]
+
+mod ppid_chain;
 
 use std::io::{Read, Write};
 use std::process::ExitCode;
@@ -52,11 +59,27 @@ fn main() -> ExitCode {
     }
 }
 
+/// Hard ceiling (bytes) on a command we will even send to agentpactd. Mirrors
+/// `agentpact_types::MAX_COMMAND_LENGTH_CEILING`; kept as a literal because
+/// this helper is intentionally stdlib-only and takes no agentpact dependency.
+/// A command longer than this cannot fit the daemon's socket message limit, so
+/// we deny it locally rather than risk a transport error that fails open.
+const MAX_COMMAND_LENGTH_CEILING: usize = 10_240;
+
 fn cmd_check(args: &[String]) -> ExitCode {
     let (command, cwd, socket_path) = parse_check_args(args);
 
+    if command.len() > MAX_COMMAND_LENGTH_CEILING {
+        eprintln!(
+            "[agentpact] denied: command exceeds the {MAX_COMMAND_LENGTH_CEILING}-byte governance ceiling (length {}); split it into smaller commands",
+            command.len()
+        );
+        return ExitCode::from(1);
+    }
+
     if let Err(msg) = check_protocol_version(&socket_path) {
         eprintln!("[agentpact] {msg}");
+        log_error(&msg);
         return ExitCode::from(10);
     }
 
@@ -64,8 +87,20 @@ fn cmd_check(args: &[String]) -> ExitCode {
         .ok()
         .filter(|t| !t.is_empty());
 
+    // Always include the ancestor chain (cheap to compute, bounded by
+    // `MAX_CHAIN_LEN`). When the agent's native PreToolUse hook already
+    // approved the parent command and the daemon issued an exec_token
+    // anchored to the agent's PID, this chain lets the daemon find and
+    // consume that token without `AGENTPACT_EXEC_TOKEN` being in env —
+    // which it isn't, because Claude Code & co. have no API to
+    // propagate hook outputs into spawned-tool envs. Empty chain (we
+    // could not even find our own parent) is omitted by the wire side
+    // rather than serialized as `[]`.
+    let ppid_chain = ppid_chain::current_chain();
+
+    let request_id = generate_id();
     let mut request = serde_json::json!({
-        "id": generate_id(),
+        "id": request_id.clone(),
         "method": "permission.request",
         "action": "execute",
         "detail": command,
@@ -76,6 +111,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
     if let Some(ref token) = exec_token {
         request["exec_token"] = serde_json::Value::String(token.clone());
     }
+    if !ppid_chain.is_empty() {
+        request["ppid_chain"] = serde_json::json!(ppid_chain);
+    }
 
     let Ok(response) = send_request(&socket_path, &request) else {
         if daemon_state_allows(&socket_path) {
@@ -85,6 +123,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
         return ExitCode::from(10);
     };
 
+    // Step 2 error-tracing: recover the agentpactd request id from the echoed
+    // response (falling back to the id we sent) so a deny/error can be traced
+    // back to the matching agentpact governance event.
+    let traced_id = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| request_id.clone(), str::to_string);
+
     match parse_check_response(&response) {
         CheckResponse::Allow { inform_reason } => {
             if let Some(reason) = inform_reason {
@@ -93,6 +139,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
             ExitCode::from(0)
         }
         CheckResponse::Deny { reason } => {
+            log_error(&format!(
+                "denied (agentpactd id={traced_id}): {}",
+                reason.as_deref().unwrap_or("no reason")
+            ));
             if let Some(reason) = reason {
                 eprintln!("[agentpact] denied: {reason}");
             }
@@ -104,15 +154,25 @@ fn cmd_check(args: &[String]) -> ExitCode {
             breaker_count,
         } => {
             if let Some(count) = breaker_count {
+                // Circuit breaker is a session-level gate ("too many commands
+                // without human input"), not a per-command split — so it keeps
+                // its dedicated whole-command prompt. The shell reads these
+                // fields to drive that prompt.
                 print!("{approval_id}\t{approval_token}\t{count}");
                 ExitCode::from(3)
             } else {
-                print!("{approval_id}\t{approval_token}");
+                // Normal ask. This real request minted a whole-command approval
+                // token; the shell hands off to `kyris hook resolve-shell`,
+                // which re-derives the compound split and prompts per segment,
+                // minting its own per-segment tokens. Void this whole-command
+                // token so it does not linger as a stale `kyris pending` entry.
+                void_token(&socket_path, &approval_token);
                 ExitCode::from(2)
             }
         }
         CheckResponse::Invalid(reason) => {
             eprintln!("[agentpact] {reason}");
+            log_error(&format!("(agentpactd id={traced_id}): {reason}"));
             ExitCode::from(1)
         }
     }
@@ -245,6 +305,21 @@ fn cmd_respond(args: &[String]) -> ExitCode {
     }
 }
 
+/// Release a minted approval token without approving it, so it does not
+/// linger as a pending entry. Sent when `check` got a normal `PACT_ASK` for
+/// a command the shell will re-resolve per segment via `kyris hook
+/// resolve-shell`. Best-effort: a failure here only means the whole-command
+/// token expires on its own TTL.
+fn void_token(socket_path: &str, approval_token: &str) {
+    let request = serde_json::json!({
+        "id": generate_id(),
+        "method": "permission.respond",
+        "approval_token": approval_token,
+        "response": "voided",
+    });
+    let _ = send_request(socket_path, &request);
+}
+
 fn cmd_send(args: &[String]) -> ExitCode {
     if args.len() < 2 {
         eprintln!("Usage: kyris-hook send <socket_path> <json_message>");
@@ -333,9 +408,40 @@ fn send_request(
     ))
 }
 
+fn xdg_state_dir() -> String {
+    std::env::var("XDG_STATE_HOME").map_or_else(
+        |_| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{home}/.local/state/kyris")
+        },
+        |s| format!("{s}/kyris"),
+    )
+}
+
+fn log_error(msg: &str) {
+    let dir = xdg_state_dir();
+    let log_dir = format!("{dir}/log");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let path = format!("{log_dir}/kyris.log");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts = format_utc_timestamp(secs);
+    let _ = writeln!(file, "{ts} [kyris-hook] [ERROR] {msg}");
+}
+
 fn write_fail_open_event(action: &str, detail: &str, working_dir: &str) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = format!("{home}/.kyris/fail-open.jsonl");
+    let dir = xdg_state_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{dir}/fail-open.jsonl");
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -648,13 +754,17 @@ mod tests {
     #[test]
     fn testWriteFailOpenEvent() {
         let dir = tempfile::tempdir().unwrap();
-        let kyris_dir = dir.path().join(".kyris");
-        std::fs::create_dir_all(&kyris_dir).unwrap();
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
+        // fail-open log lives under $XDG_STATE_HOME/kyris/ after the XDG
+        // migration. Set both HOME (fallback) and XDG_STATE_HOME to point
+        // at the tempdir so the new path resolves there.
+        unsafe {
+            std::env::set_var("HOME", dir.path().to_str().unwrap());
+            std::env::set_var("XDG_STATE_HOME", dir.path().to_str().unwrap());
+        }
 
         write_fail_open_event("execute", "rm -rf /", "/home/user/project");
 
-        let path = kyris_dir.join("fail-open.jsonl");
+        let path = dir.path().join("kyris").join("fail-open.jsonl");
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value =
             serde_json::from_str(content.lines().next().unwrap()).unwrap();

@@ -1,11 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+//! `kyris daemon` — inspect kyrisd's service state.
+//!
+//! Today this is a single-subcommand shape (`kyris daemon status`).
+//! Start/stop are no longer kyris's job — the launchd plists keep the
+//! daemons up. Use `kyris disable` / `kyris enable` to toggle the
+//! enforcement mode without touching daemon lifecycle, or `kyris
+//! uninstall` for a real teardown. Log
+//! discovery moved to top-level `kyris logs`. What's left here is
+//! the focused "is the launchd plist loaded and is /healthz happy?"
+//! probe — it's narrow enough that we keep the `daemon` namespace
+//! for future kyrisd-specific introspection without rewriting it.
 use clap::Args;
-use std::io::Read;
 
-use crate::service::{
-    ServiceKind, candidate_log_paths, service_state, start_service, stop_service,
-};
+use crate::service::{ServiceKind, service_state};
 use crate::state::load_config;
 
 #[derive(Args)]
@@ -16,18 +24,12 @@ pub struct DaemonArgs {
 
 #[derive(clap::Subcommand)]
 pub enum DaemonCommand {
-    Start,
-    Stop,
     Status,
-    Logs,
 }
 
 pub fn run(args: DaemonArgs) {
     match args.command {
-        DaemonCommand::Start => start(),
-        DaemonCommand::Stop => stop(),
         DaemonCommand::Status => status(),
-        DaemonCommand::Logs => logs(),
     }
 }
 
@@ -36,30 +38,6 @@ fn configured_base_url() -> String {
         |_| "http://127.0.0.1:4710".to_string(),
         |config| config.base_url(),
     )
-}
-
-fn start() {
-    match start_service(ServiceKind::Kyrisd) {
-        Ok(()) => {
-            println!("kyrisd started.");
-        }
-        Err(error) => {
-            eprintln!("Failed to start kyrisd: {error}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn stop() {
-    match stop_service(ServiceKind::Kyrisd) {
-        Ok(()) => {
-            println!("kyrisd stopped.");
-        }
-        Err(error) => {
-            eprintln!("Failed to stop kyrisd: {error}");
-            std::process::exit(1);
-        }
-    }
 }
 
 fn status() {
@@ -89,72 +67,6 @@ fn status() {
     }
 }
 
-fn logs() {
-    let Some(log_path) = candidate_log_paths(ServiceKind::Kyrisd)
-        .into_iter()
-        .find(|path| path.exists())
-    else {
-        eprintln!("No kyrisd log file found.");
-        std::process::exit(1);
-    };
-
-    // Read last 8KB of the log file (roughly last ~100 lines)
-    let file = std::fs::File::open(&log_path).unwrap_or_else(|e| {
-        eprintln!("Cannot open {}: {e}", log_path.display());
-        std::process::exit(1);
-    });
-
-    let metadata = file.metadata().unwrap_or_else(|e| {
-        eprintln!("Cannot stat {}: {e}", log_path.display());
-        std::process::exit(1);
-    });
-
-    let size = metadata.len();
-    let offset = size.saturating_sub(8192);
-
-    let mut reader = std::io::BufReader::new(file);
-    if offset > 0 {
-        use std::io::Seek;
-        reader
-            .seek(std::io::SeekFrom::Start(offset))
-            .unwrap_or_else(|e| {
-                eprintln!("Cannot seek in {}: {e}", log_path.display());
-                std::process::exit(1);
-            });
-    }
-
-    let mut buf = String::new();
-    reader.read_to_string(&mut buf).unwrap_or_else(|e| {
-        eprintln!("Cannot read {}: {e}", log_path.display());
-        std::process::exit(1);
-    });
-
-    // If we seeked into the middle of a line, skip the partial first line
-    if offset > 0
-        && let Some(pos) = buf.find('\n')
-    {
-        buf = buf[pos + 1..].to_string();
-    }
-
-    print!("{buf}");
-}
-
-#[cfg(test)]
-fn tail_log_content(content: &[u8], max_bytes: usize) -> String {
-    let len = content.len();
-    if len <= max_bytes {
-        return String::from_utf8_lossy(content).to_string();
-    }
-    let offset = len - max_bytes;
-    let slice = &content[offset..];
-    let text = String::from_utf8_lossy(slice);
-    if let Some(pos) = text.find('\n') {
-        text[pos + 1..].to_string()
-    } else {
-        text.to_string()
-    }
-}
-
 fn health_status(base_url: &str) -> Result<reqwest::StatusCode, String> {
     let url = format!("{base_url}/healthz");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -168,37 +80,4 @@ fn health_status(base_url: &str) -> Result<reqwest::StatusCode, String> {
             .map(|response| response.status())
             .map_err(|e| e.to_string())
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn testTailLogContentShortContent() {
-        let content = b"line1\nline2\nline3\n";
-        let result = tail_log_content(content, 1024);
-        assert_eq!(result, "line1\nline2\nline3\n");
-    }
-
-    #[test]
-    fn testTailLogContentTruncatesAndSkipsPartialLine() {
-        let content = b"aaaa\nbbbb\ncccc\ndddd\n";
-        // 20 bytes, last 10 = "cccc\ndddd\n", partial first line "cccc" skipped
-        let result = tail_log_content(content, 10);
-        assert_eq!(result, "dddd\n");
-    }
-
-    #[test]
-    fn testTailLogContentExactSize() {
-        let content = b"hello\n";
-        let result = tail_log_content(content, 6);
-        assert_eq!(result, "hello\n");
-    }
-
-    #[test]
-    fn testTailLogContentEmpty() {
-        let result = tail_log_content(b"", 1024);
-        assert_eq!(result, "");
-    }
 }

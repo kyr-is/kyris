@@ -9,18 +9,24 @@ use crate::server::AppState;
 
 pub async fn run_pricing_fetch(state: Arc<AppState>) {
     let config = state.config.load();
-    let relay_url = config.sync.relay_url.clone();
-    if relay_url.is_empty() {
-        tracing::debug!("no relay_url configured, skipping pricing fetch");
+    // Pricing is public reference data — gated on a configured relay, NOT on
+    // enrollment. A dev who never enrolls still gets live pricing from the
+    // relay's public `/api/v1/pricing`.
+    let relay_base = config.relay.url.trim_end_matches('/').to_string();
+    if relay_base.is_empty() {
+        tracing::warn!(
+            "no `relay.url` configured: live pricing disabled, using last cached/bundled table"
+        );
         return;
     }
 
     let fetch_interval_hours = config.pricing.fetch_interval_hours;
     let client = reqwest::Client::new();
-    let pricing_url = format!("{relay_url}/api/pricing");
+    let pricing_url = format!("{relay_base}/api/v1/pricing");
 
     if let Some(table) = fetch_pricing(&client, &pricing_url).await {
         tracing::info!(version = %table.version, "loaded pricing table from relay");
+        cache_table(&table);
         state.cost_calculator.update_pricing(table);
     }
 
@@ -31,8 +37,17 @@ pub async fn run_pricing_fetch(state: Arc<AppState>) {
         interval.tick().await;
         if let Some(table) = fetch_pricing(&client, &pricing_url).await {
             tracing::info!(version = %table.version, "updated pricing table from relay");
+            cache_table(&table);
             state.cost_calculator.update_pricing(table);
         }
+    }
+}
+
+/// Persist the freshest table so a restart (or an offline daemon) starts from
+/// the last table actually seen rather than the release-stale bundled one.
+fn cache_table(table: &PricingTable) {
+    if let Err(e) = kyris_core::pricing_cache::store(table) {
+        tracing::warn!(error = %e, "failed to write pricing cache");
     }
 }
 

@@ -99,6 +99,18 @@ fn run_zsh_trapdebug(
         .env("AGENTPACT_SOCK", socket_path)
         .env("PATH", path_env)
         .env("HOOK_PATH", hook_path("zsh_hook.sh"))
+        // The hook installs the trap *only* inside a governed agent's
+        // process tree (env vars CLAUDECODE / KYRIS_GOVERNED_SUBPROCESS,
+        // or `claude`/`codex`/… anywhere in the parent process chain).
+        // The test environment is ambiguous — clearing the env vars isn't
+        // enough because the parent process walk may still find the
+        // agent that spawned `cargo test` (or, after the guard
+        // inversion, the absence of any marker would itself suppress
+        // the trap). `KYRIS_HOOK_FORCE=1` is the dedicated test escape
+        // hatch that bypasses the guard either way.
+        .env_remove("CLAUDECODE")
+        .env_remove("KYRIS_GOVERNED_SUBPROCESS")
+        .env("KYRIS_HOOK_FORCE", "1")
         .arg("-fc")
         .arg(format!("source \"$HOOK_PATH\"; {command}"))
         .output()
@@ -143,6 +155,103 @@ fn test_zsh_hook_blocks_denied_command_via_kyris_hook() {
 }
 
 #[test]
+fn test_kyris_hook_request_carries_ppid_chain_for_anchor_lookup() {
+    // The shell hook's outgoing request MUST include `ppid_chain` —
+    // that's how agentpactd matches the request to an exec_token the
+    // native PreToolUse hook anchored to the agent's PID. Without it,
+    // every segment of a compound the agent already approved would
+    // re-prompt the user.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "chain-1",
+            "code": "PACT_OK",
+            "decision": "auto"
+        })],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg("git status")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+    assert_eq!(output.status.code(), Some(0));
+
+    let requests = daemon.finish();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+
+    let chain = request["ppid_chain"]
+        .as_array()
+        .expect("ppid_chain present in wire request");
+    assert!(
+        !chain.is_empty(),
+        "ppid_chain must contain at least the direct parent"
+    );
+    // First entry is the immediate parent — this test runner spawns
+    // kyris-hook as its child, so the direct parent is *this* test
+    // process. Cross-check against `std::process::id()`.
+    let first = chain[0].as_u64().expect("chain entries are integers");
+    assert_eq!(
+        first,
+        u64::from(std::process::id()),
+        "chain index 0 must be the direct parent (this test process)"
+    );
+}
+
+#[test]
+fn test_kyris_hook_request_carries_exec_token_when_env_set() {
+    // The env-based AGENTPACT_EXEC_TOKEN path (the relay-conventional
+    // shape from the agentpact README) must still work alongside the
+    // new chain path. Both fields can ride on the same request; the
+    // daemon prefers the precise string token, falls back to chain.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "tok-1",
+            "code": "PACT_OK",
+            "decision": "auto"
+        })],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .env("AGENTPACT_EXEC_TOKEN", "ext_test_token_42")
+        .arg("check")
+        .arg("git status")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+    assert_eq!(output.status.code(), Some(0));
+
+    let requests = daemon.finish();
+    let request = &requests[0];
+    assert_eq!(request["exec_token"], "ext_test_token_42");
+    assert!(
+        request["ppid_chain"].is_array(),
+        "ppid_chain must still be present alongside the env token"
+    );
+}
+
+#[test]
 fn test_kyris_hook_allows_command_via_agentpact_socket() {
     let temp_home = TempDir::new().expect("temp home");
     std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
@@ -181,6 +290,126 @@ fn test_kyris_hook_allows_command_via_agentpact_socket() {
     assert_eq!(
         request["context"]["working_dir"],
         temp_home.path().display().to_string()
+    );
+}
+
+#[test]
+fn test_kyris_hook_voids_token_and_exits_2_on_normal_ask() {
+    // A normal PACT_ASK is no longer answered with one whole-command token.
+    // The helper voids that token (so it does not linger as a pending entry)
+    // and exits 2, signaling the shell to hand off to `kyris hook
+    // resolve-shell` for per-segment approval. Stdout carries nothing.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![
+            serde_json::json!({
+                "id": "ask-1",
+                "code": "PACT_ASK",
+                "approval_id": "apr_1",
+                "approval_token": "apt_1"
+            }),
+            serde_json::json!({ "id": "void-1", "code": "PACT_OK" }),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg("safe_tool && mystery_tool")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "");
+
+    let requests = daemon.finish();
+    assert_eq!(requests.len(), 2, "expected request + void: {requests:?}");
+    assert_eq!(requests[0]["method"], "permission.request");
+    assert_eq!(requests[1]["method"], "permission.respond");
+    assert_eq!(requests[1]["response"], "voided");
+    assert_eq!(requests[1]["approval_token"], "apt_1");
+}
+
+#[test]
+fn test_kyris_hook_breaker_ask_still_returns_token_and_exits_3() {
+    // The circuit breaker is a session-level gate, not a per-command split,
+    // so it keeps its dedicated whole-command prompt: the helper returns the
+    // token (+ breaker count) and exits 3 without voiding.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "breaker-1",
+            "code": "PACT_ASK",
+            "approval_id": "apr_b",
+            "approval_token": "apt_b",
+            "extensions": { "circuit_breaker": { "count": 50 } }
+        })],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg("git status")
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "apr_b\tapt_b\t50"
+    );
+
+    let requests = daemon.finish();
+    assert_eq!(requests.len(), 1, "breaker ask must not void: {requests:?}");
+    assert_eq!(requests[0]["method"], "permission.request");
+}
+
+#[test]
+fn test_kyris_hook_denies_oversized_command_locally() {
+    // A command past the 10240-byte ceiling is denied by the helper itself,
+    // before any socket contact — so a monster command can never race the
+    // socket limit into a fail-open. No daemon is started here on purpose.
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let socket_path = temp_home.path().join("agentpact.sock");
+
+    let big = format!("echo {}", "a".repeat(10_241));
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris-hook"))
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .arg("check")
+        .arg(&big)
+        .arg("--cwd")
+        .arg(temp_home.path())
+        .arg("--socket")
+        .arg(&socket_path)
+        .output()
+        .expect("run kyris-hook");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("governance ceiling"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -251,4 +480,72 @@ fn test_zsh_hook_blocks_unexpected_helper_exit_code() {
     );
 
     assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn test_zsh_hook_skips_shell_startup_file_commands() {
+    // The hook governs the AGENT's commands, not the shell's own startup-file
+    // sourcing. Faithful layout: `.zshenv` installs the hook (as the real
+    // install does), `.zprofile` runs a startup command (the /etc/zprofile
+    // path_helper analog). A login shell sources .zshenv -> .zprofile -> then
+    // runs the `-c` agent command. The startup command must NOT reach the
+    // daemon; the agent command must.
+    if !Path::new("/bin/zsh").exists() {
+        return;
+    }
+
+    let temp_home = TempDir::new().expect("temp home");
+    std::fs::create_dir_all(temp_home.path().join(".kyris")).expect("create .kyris");
+    let bin_dir = make_helper_path_dir();
+    let socket_path = temp_home.path().join("agentpact.sock");
+    // One ALLOW response — only the agent command should ask. If the startup
+    // command is wrongly governed it consumes this response first and the
+    // assertions below catch it.
+    let daemon = FakeDaemon::start(
+        &socket_path,
+        vec![serde_json::json!({
+            "id": "allow-1",
+            "code": "PACT_OK",
+            "decision": "auto"
+        })],
+    );
+
+    std::fs::write(
+        temp_home.path().join(".zshenv"),
+        format!("source \"{}\"\n", hook_path("zsh_hook.sh").display()),
+    )
+    .expect("write .zshenv");
+    std::fs::write(
+        temp_home.path().join(".zprofile"),
+        "true STARTUP_PROFILE_CMD\n",
+    )
+    .expect("write .zprofile");
+
+    let _output = Command::new("/bin/zsh")
+        .current_dir(temp_home.path())
+        .env("HOME", temp_home.path())
+        .env("ZDOTDIR", temp_home.path())
+        .env("AGENTPACT_SOCK", &socket_path)
+        .env("PATH", prepend_path(bin_dir.path()))
+        .env_remove("CLAUDECODE")
+        .env_remove("KYRIS_GOVERNED_SUBPROCESS")
+        .env("KYRIS_HOOK_FORCE", "1")
+        .arg("-lc")
+        .arg("true AGENT_TOPLEVEL_CMD")
+        .output()
+        .expect("run zsh login hook");
+
+    let requests = daemon.finish();
+    let details: Vec<String> = requests
+        .iter()
+        .filter_map(|r| r["detail"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !details.iter().any(|d| d.contains("STARTUP_PROFILE_CMD")),
+        "shell startup-file command must NOT be governed, got: {details:?}"
+    );
+    assert!(
+        details.iter().any(|d| d.contains("AGENT_TOPLEVEL_CMD")),
+        "agent top-level command must be governed, got: {details:?}"
+    );
 }

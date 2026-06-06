@@ -1,14 +1,59 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+//
+// AgentPact wire types shared across the kyris workspace. The wire-message
+// *builders* and the response parser live in `kyris-agentpact-client` — per
+// BOUNDARY.md only that crate may construct or interpret agentpactd wire
+// messages. The types below are read-only value types that other kyris
+// crates need without ever talking to the daemon directly.
 use std::path::PathBuf;
+
+/// Re-export of the canonical [`agentpact_types::Mode`] so kyris-core
+/// consumers that already import from this module keep working
+/// after the type was extracted to its own crate. The wire value is
+/// defined once, in `agentpact-types` — see
+/// [`McpPermissionDecision::Allow`] for where the parser surfaces it.
+pub use agentpact_types::Mode;
+
+/// Machine-readable cause code for a governance denial (I-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyCode {
+    /// `PACT_DENIED` — tool blocked by policy.
+    PolicyDenied,
+    /// `PACT_CAP_EXCEEDED` — spend / rate cap exceeded.
+    CapExceeded,
+    /// `PACT_POLICY_ERROR` / `PACT_PROTOCOL_ERROR` — policy or protocol misconfiguration.
+    PolicyError,
+    /// Daemon unreachable (connection error, not a daemon response code).
+    DaemonUnreachable,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpPermissionDecision {
-    Allow,
-    Deny(String),
+    Allow {
+        /// Effective mode the daemon was in for this request. Hook
+        /// adapters MUST check this and switch their allow shape to
+        /// `EmptyStdout` (defer to agent) when the value is
+        /// [`Mode::Log`] — otherwise log mode silently overrides the
+        /// agent's permission UX, which is the bug log mode exists to
+        /// avoid.
+        mode: Mode,
+    },
+    Deny {
+        code: DenyCode,
+        reason: String,
+        /// Daemon-supplied recovery hint. `None` → caller uses static I-05 table.
+        hint: Option<String>,
+    },
     Ask {
         approval_id: String,
         approval_token: String,
+        /// Authoritative server signal: whether answering "Always" would
+        /// actually persist a standing override. UX surfaces offer "Always"
+        /// only when this is `true`. Defaults to `false` when the daemon omits
+        /// it (older daemon / malformed response) — conservative: a missing
+        /// signal means don't advertise a grant that may not stick.
+        allow_always: bool,
     },
 }
 
@@ -62,291 +107,9 @@ pub fn default_socket_path() -> PathBuf {
     PathBuf::from(format!("{home}/.agentpact/agentpact.sock"))
 }
 
-#[must_use]
-pub fn build_hook_permission_request(
-    request_id_prefix: &str,
-    action: &str,
-    detail: &str,
-    working_dir: Option<&str>,
-    seed_boundary_pid: Option<u32>,
-) -> serde_json::Value {
-    let mut context = serde_json::json!({});
-    if let Some(dir) = working_dir {
-        context["working_dir"] = serde_json::json!(dir);
-    }
-    let mut request = serde_json::json!({
-        "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
-        "method": "permission.request",
-        "action": action,
-        "detail": detail,
-        "context": context,
-    });
-    if let Some(pid) = seed_boundary_pid {
-        request["seed_boundary_pid"] = serde_json::json!(pid);
-    }
-    request
-}
-
-#[must_use]
-pub fn build_mcp_permission_request(
-    request_id_prefix: &str,
-    server_name: &str,
-    tool_name: &str,
-    mcp_ctx: &McpContext,
-) -> serde_json::Value {
-    let mut context = serde_json::json!({
-        "mcp_server": server_name,
-    });
-    if let Some(ref dir) = mcp_ctx.working_dir {
-        context["working_dir"] = serde_json::json!(dir);
-    }
-    if let Some(ref op) = mcp_ctx.mcp_operation {
-        context["mcp_operation"] = serde_json::json!(op);
-    }
-    if let Some(ro) = mcp_ctx.annotations.read_only_hint {
-        context["read_only_hint"] = serde_json::json!(ro);
-    }
-    if let Some(d) = mcp_ctx.annotations.destructive_hint {
-        context["destructive_hint"] = serde_json::json!(d);
-    }
-    serde_json::json!({
-        "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
-        "method": "permission.request",
-        "action": "call",
-        "detail": tool_name,
-        "context": context,
-    })
-}
-
-#[must_use]
-pub fn build_permission_respond_request(
-    request_id_prefix: &str,
-    approval_token: &str,
-    response: ApprovalResponse,
-) -> serde_json::Value {
-    serde_json::json!({
-        "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
-        "method": "permission.respond",
-        "approval_token": approval_token,
-        "response": response.as_agentpact_response(),
-    })
-}
-
-#[must_use]
-pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermissionDecision {
-    match response.get("code").and_then(|code| code.as_str()) {
-        Some("PACT_OK") => McpPermissionDecision::Allow,
-        Some("PACT_DENIED") => {
-            let reason = response
-                .get("reason")
-                .or_else(|| response.get("error"))
-                .and_then(|value| value.as_str())
-                .unwrap_or("denied by policy")
-                .to_string();
-            McpPermissionDecision::Deny(reason)
-        }
-        Some("PACT_ASK") => {
-            let approval_id = response
-                .get("approval_id")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let approval_token = response
-                .get("approval_token")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .to_string();
-            if approval_id.is_empty() || approval_token.is_empty() {
-                McpPermissionDecision::Deny("invalid approval response from agentpactd".to_string())
-            } else {
-                McpPermissionDecision::Ask {
-                    approval_id,
-                    approval_token,
-                }
-            }
-        }
-        Some("PACT_POLICY_ERROR" | "PACT_PROTOCOL_ERROR" | "PACT_CAP_EXCEEDED") => {
-            let error = response
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            let hint = response.get("recovery_hint").and_then(|v| v.as_str());
-            let reason = match hint {
-                Some(h) => format!("{error} ({h})"),
-                None => error.to_string(),
-            };
-            McpPermissionDecision::Deny(reason)
-        }
-        _ => McpPermissionDecision::Deny("invalid response from agentpactd".to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn testBuildMcpPermissionRequest() {
-        let request = build_mcp_permission_request(
-            "kyris-mcp",
-            "github",
-            "read_file",
-            &McpContext {
-                working_dir: Some("/tmp/repo".to_string()),
-                mcp_operation: Some("tools/call".to_string()),
-                annotations: ToolAnnotations {
-                    read_only_hint: Some(true),
-                    destructive_hint: None,
-                },
-            },
-        );
-        assert_eq!(request["method"], "permission.request");
-        assert_eq!(request["action"], "call");
-        assert_eq!(request["detail"], "read_file");
-        assert_eq!(request["context"]["mcp_server"], "github");
-        assert_eq!(request["context"]["working_dir"], "/tmp/repo");
-        assert_eq!(request["context"]["mcp_operation"], "tools/call");
-        assert_eq!(request["context"]["read_only_hint"], true);
-        assert!(request["context"]["destructive_hint"].is_null());
-        assert!(
-            request["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("kyris-mcp-"))
-        );
-    }
-
-    #[test]
-    fn testBuildHookPermissionRequest() {
-        let request = build_hook_permission_request(
-            "kyris-hook",
-            "execute",
-            "ls -la",
-            Some("/tmp/repo"),
-            None,
-        );
-        assert_eq!(request["method"], "permission.request");
-        assert_eq!(request["action"], "execute");
-        assert_eq!(request["detail"], "ls -la");
-        assert_eq!(request["context"]["working_dir"], "/tmp/repo");
-        assert!(request["context"]["mcp_server"].is_null());
-        assert!(request["seed_boundary_pid"].is_null());
-        assert!(
-            request["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("kyris-hook-"))
-        );
-    }
-
-    #[test]
-    fn testBuildHookPermissionRequestNoWorkingDir() {
-        let request = build_hook_permission_request("kyris-hook", "call", "unknown", None, None);
-        assert_eq!(request["action"], "call");
-        assert!(request["context"]["working_dir"].is_null());
-    }
-
-    #[test]
-    fn testBuildHookPermissionRequestWithSeedPid() {
-        let request = build_hook_permission_request(
-            "kyris-hook",
-            "execute",
-            "git status",
-            Some("/tmp"),
-            Some(12345),
-        );
-        assert_eq!(request["seed_boundary_pid"], 12345);
-    }
-
-    #[test]
-    fn testBuildPermissionRespondRequest() {
-        let request =
-            build_permission_respond_request("kyris-mcp-resp", "apt_123", ApprovalResponse::Always);
-        assert_eq!(request["method"], "permission.respond");
-        assert_eq!(request["approval_token"], "apt_123");
-        assert_eq!(request["response"], "always");
-        assert!(
-            request["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("kyris-mcp-resp-"))
-        );
-    }
-
-    #[test]
-    fn testParseMcpPermissionResponseAllow() {
-        let response = serde_json::json!({"code": "PACT_OK", "decision": "auto"});
-        assert_eq!(
-            parse_mcp_permission_response(&response),
-            McpPermissionDecision::Allow
-        );
-    }
-
-    #[test]
-    fn testParseMcpPermissionResponseDeny() {
-        let response = serde_json::json!({"code": "PACT_DENIED", "reason": "blocked by policy"});
-        assert_eq!(
-            parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny("blocked by policy".to_string())
-        );
-    }
-
-    #[test]
-    fn testParseMcpPermissionResponseAsk() {
-        let response = serde_json::json!({
-            "code": "PACT_ASK",
-            "approval_id": "req-42",
-            "approval_token": "apt_123"
-        });
-        assert_eq!(
-            parse_mcp_permission_response(&response),
-            McpPermissionDecision::Ask {
-                approval_id: "req-42".to_string(),
-                approval_token: "apt_123".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn testParsePolicyErrorSurfacesErrorAndHint() {
-        let response = serde_json::json!({
-            "code": "PACT_POLICY_ERROR",
-            "error": "malformed pact.yaml",
-            "recovery_hint": "Fix policy files: run agentpactd schema to validate"
-        });
-        assert_eq!(
-            parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny(
-                "malformed pact.yaml (Fix policy files: run agentpactd schema to validate)"
-                    .to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn testParseProtocolErrorSurfacesError() {
-        let response = serde_json::json!({
-            "code": "PACT_PROTOCOL_ERROR",
-            "error": "missing method field"
-        });
-        assert_eq!(
-            parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny("missing method field".to_string())
-        );
-    }
-
-    #[test]
-    fn testParseCapExceededSurfacesError() {
-        let response = serde_json::json!({
-            "code": "PACT_CAP_EXCEEDED",
-            "error": "daily premium cap reached",
-            "recovery_hint": "Wait until 2026-01-02T00:00:00Z or adjust caps policy"
-        });
-        assert_eq!(
-            parse_mcp_permission_response(&response),
-            McpPermissionDecision::Deny(
-                "daily premium cap reached (Wait until 2026-01-02T00:00:00Z or adjust caps policy)"
-                    .to_string()
-            )
-        );
-    }
 
     #[test]
     fn testApprovalResponseAllowsExecution() {
@@ -354,4 +117,10 @@ mod tests {
         assert!(ApprovalResponse::Always.allows_execution());
         assert!(!ApprovalResponse::Denied.allows_execution());
     }
+
+    // Mode is now re-exported from `agentpact-types`; its
+    // from_wire/as_wire/is_log/Display tests live in that crate.
+    // Don't duplicate them here — the re-export is statically
+    // verified to compile and tests on the canonical home cover
+    // the wire-form contract.
 }

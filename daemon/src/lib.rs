@@ -4,7 +4,12 @@
 //! token metering, cost tracking, circuit breaking, and streaming relay.
 //! Also routes MCP tool calls through policy and syncs events to the
 //! relay. `DuckDB`-backed local storage; config hot-reloaded via `ArcSwap`.
-#![cfg_attr(not(test), forbid(unsafe_code))]
+// Crate is `deny(unsafe_code)` rather than `forbid` so the macOS UN
+// center binding in `notify_macos` can opt in to the few unsafe
+// blocks objc2 requires. Every other module remains unsafe-free;
+// `notify_macos` carries an explicit `#[allow(unsafe_code)]`
+// scoped to its objc2 entry points.
+#![cfg_attr(not(test), deny(unsafe_code))]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![allow(
@@ -20,14 +25,22 @@
 #![cfg_attr(test, allow(non_snake_case))]
 
 pub mod adapter;
+pub mod approvals_log;
 pub mod auth;
+pub mod build_info;
 pub mod circuit_breaker;
 pub mod config;
 pub mod cost;
+pub mod crash;
 pub mod fail_open_log;
+pub mod logging;
 pub mod mcp_routing;
 pub mod metering;
 pub mod notify;
+#[cfg(target_os = "macos")]
+pub mod notify_macos;
+#[cfg(target_os = "macos")]
+pub mod notify_macos_highlight;
 pub mod pending;
 pub mod pricing_fetch;
 pub mod reconcile_watcher;
@@ -35,4 +48,6 @@ pub mod server;
 pub mod storage;
 pub mod streaming;
 pub mod sync;
+pub mod timeline;
+pub mod trace_id;
 pub mod tray;

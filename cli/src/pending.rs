@@ -21,6 +21,11 @@ struct PendingRequest {
     tool: Option<String>,
     state: String,
     held_since_ms: u64,
+    /// Daemon's authoritative signal: whether answering "always" would persist
+    /// a standing override. Defaults to false when absent so we never advertise
+    /// a grant that would not stick.
+    #[serde(default)]
+    allow_always: bool,
 }
 
 pub fn run(_args: PendingArgs) {
@@ -127,12 +132,13 @@ fn prompt_decision<R: BufRead, W: Write>(
     writer: &mut W,
 ) -> Option<&'static str> {
     let tool = request.tool.as_deref().unwrap_or("unknown");
-    write!(
-        writer,
-        "Approve {} / {}? [y/n/always/skip] ",
-        request.server, tool
-    )
-    .ok()?;
+    // Offer "always" only when the daemon says a grant would actually persist.
+    let choices = if request.allow_always {
+        "[y/n/always/skip]"
+    } else {
+        "[y/n/skip]"
+    };
+    write!(writer, "Approve {} / {}? {choices} ", request.server, tool).ok()?;
     writer.flush().ok()?;
 
     let mut input = String::new();
@@ -140,14 +146,16 @@ fn prompt_decision<R: BufRead, W: Write>(
         return None;
     }
 
-    parse_decision(&input)
+    parse_decision(&input, request.allow_always)
 }
 
-fn parse_decision(input: &str) -> Option<&'static str> {
+fn parse_decision(input: &str, allow_always: bool) -> Option<&'static str> {
     match input.trim().to_lowercase().as_str() {
         "y" | "yes" => Some("approved"),
         "n" | "no" => Some("denied"),
-        "a" | "always" => Some("always"),
+        // "always" sticks only when persistable; otherwise the daemon would
+        // refuse to persist anyway, so honor it as a one-time approval.
+        "a" | "always" => Some(if allow_always { "always" } else { "approved" }),
         _ => None,
     }
 }
@@ -158,31 +166,39 @@ mod tests {
 
     #[test]
     fn testParseDecisionApproved() {
-        assert_eq!(parse_decision("y"), Some("approved"));
-        assert_eq!(parse_decision("yes"), Some("approved"));
-        assert_eq!(parse_decision("  Y  "), Some("approved"));
-        assert_eq!(parse_decision("YES"), Some("approved"));
+        assert_eq!(parse_decision("y", true), Some("approved"));
+        assert_eq!(parse_decision("yes", true), Some("approved"));
+        assert_eq!(parse_decision("  Y  ", true), Some("approved"));
+        assert_eq!(parse_decision("YES", true), Some("approved"));
     }
 
     #[test]
     fn testParseDecisionDenied() {
-        assert_eq!(parse_decision("n"), Some("denied"));
-        assert_eq!(parse_decision("no"), Some("denied"));
-        assert_eq!(parse_decision("  NO  "), Some("denied"));
+        assert_eq!(parse_decision("n", true), Some("denied"));
+        assert_eq!(parse_decision("no", true), Some("denied"));
+        assert_eq!(parse_decision("  NO  ", true), Some("denied"));
     }
 
     #[test]
-    fn testParseDecisionAlways() {
-        assert_eq!(parse_decision("a"), Some("always"));
-        assert_eq!(parse_decision("always"), Some("always"));
-        assert_eq!(parse_decision("ALWAYS"), Some("always"));
+    fn testParseDecisionAlwaysWhenPersistable() {
+        assert_eq!(parse_decision("a", true), Some("always"));
+        assert_eq!(parse_decision("always", true), Some("always"));
+        assert_eq!(parse_decision("ALWAYS", true), Some("always"));
+    }
+
+    #[test]
+    fn testParseDecisionAlwaysWhenNotPersistableMapsToApproved() {
+        // The daemon won't persist this grant, so "always" can only mean
+        // approve-once — never a standing override.
+        assert_eq!(parse_decision("a", false), Some("approved"));
+        assert_eq!(parse_decision("always", false), Some("approved"));
     }
 
     #[test]
     fn testParseDecisionSkipReturnsNone() {
-        assert_eq!(parse_decision("skip"), None);
-        assert_eq!(parse_decision(""), None);
-        assert_eq!(parse_decision("maybe"), None);
+        assert_eq!(parse_decision("skip", true), None);
+        assert_eq!(parse_decision("", true), None);
+        assert_eq!(parse_decision("maybe", true), None);
     }
 
     #[test]
@@ -203,21 +219,46 @@ mod tests {
     }
 
     fn fixture(server: &str, tool: Option<&str>) -> PendingRequest {
+        fixture_aa(server, tool, true)
+    }
+
+    fn fixture_aa(server: &str, tool: Option<&str>, allow_always: bool) -> PendingRequest {
         PendingRequest {
             id: "req-1".to_string(),
             server: server.to_string(),
             tool: tool.map(str::to_string),
             state: "held".to_string(),
             held_since_ms: 0,
+            allow_always,
         }
     }
 
     fn run_prompt(server: &str, tool: Option<&str>, input: &str) -> (Option<&'static str>, String) {
-        let req = fixture(server, tool);
+        run_prompt_req(fixture(server, tool), input)
+    }
+
+    fn run_prompt_req(req: PendingRequest, input: &str) -> (Option<&'static str>, String) {
         let mut reader = std::io::Cursor::new(input.as_bytes().to_vec());
         let mut writer: Vec<u8> = Vec::new();
         let decision = prompt_decision(&req, &mut reader, &mut writer);
         (decision, String::from_utf8(writer).expect("utf8"))
+    }
+
+    #[test]
+    fn testPromptHidesAlwaysWhenNotPersistable() {
+        // allow_always=false → the prompt must not advertise "always", and an
+        // "always" answer collapses to a one-time approval.
+        let (decision, displayed) =
+            run_prompt_req(fixture_aa("github", Some("read_file"), false), "always\n");
+        assert!(
+            displayed.contains("[y/n/skip]"),
+            "must hide always when not persistable: {displayed}"
+        );
+        assert!(
+            !displayed.contains("always"),
+            "must not advertise always: {displayed}"
+        );
+        assert_eq!(decision, Some("approved"));
     }
 
     #[test]

@@ -8,6 +8,9 @@ use super::registry::AgentDescriptor;
 const STALE_THRESHOLD_MINUTES: i64 = 30;
 
 fn format_surface_short(state: &SurfaceState) -> String {
+    if state.not_applicable {
+        return "n/a".to_string();
+    }
     match state.level {
         CapLevel::None => "-".to_string(),
         CapLevel::Native => "native".to_string(),
@@ -42,12 +45,22 @@ pub fn print_summary(agents: &[(Box<dyn AgentDescriptor>, AgentProfile)]) {
             continue;
         }
         let (need_exec, need_tool, need_burn) = descriptor.expected_surfaces();
-        let exec_met = !need_exec || profile.execution.level != CapLevel::None;
-        let tool_met = !need_tool || profile.tool.level != CapLevel::None;
-        let burn_met = !need_burn || profile.burn_control.level != CapLevel::None;
-        let has_compiled_only = profile.execution.is_compiled_only()
-            || profile.tool.is_compiled_only()
-            || profile.burn_control.is_compiled_only();
+        let exec_met = !need_exec
+            || profile.execution.level != CapLevel::None
+            || profile.execution.not_applicable;
+        let tool_met =
+            !need_tool || profile.tool.level != CapLevel::None || profile.tool.not_applicable;
+        let burn_met = !need_burn
+            || profile.burn_control.level != CapLevel::None
+            || profile.burn_control.not_applicable;
+        let (design_exec_ceiling, design_tool_ceiling, design_burn_ceiling) =
+            descriptor.surface_design_ceilings();
+        let is_compiled_degradation = |state: &SurfaceState, design: Option<_>| {
+            state.is_compiled_only() && design != Some(super::profile::CoverageCeiling::Compiled)
+        };
+        let has_compiled_only = is_compiled_degradation(&profile.execution, design_exec_ceiling)
+            || is_compiled_degradation(&profile.tool, design_tool_ceiling)
+            || is_compiled_degradation(&profile.burn_control, design_burn_ceiling);
         let is_stale = profile
             .last_reconciled
             .is_some_and(|ts| (Utc::now() - ts).num_minutes() > STALE_THRESHOLD_MINUTES);
@@ -139,6 +152,9 @@ pub fn print_detail(descriptor: &dyn AgentDescriptor, profile: &AgentProfile) {
 }
 
 fn format_control_line(state: &SurfaceState) -> String {
+    if state.not_applicable {
+        return "n/a (nothing to mediate)".to_string();
+    }
     match state.level {
         CapLevel::None => "-".to_string(),
         CapLevel::Native => "active (native)".to_string(),

@@ -32,12 +32,15 @@ pub fn routes(state: Arc<AppState>) -> Router {
 async fn handle_completions(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let mut body_value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "failed to parse OpenAI chat completions request body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let model = body_value
         .get("model")
@@ -50,7 +53,10 @@ async fn handle_completions(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let trace_id = uuid::Uuid::now_v7().to_string();
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -80,17 +86,31 @@ async fn handle_completions(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::OpenAI)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical OpenAI upstream.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::OpenAI)
+        });
     let provider_name = provider.name.clone();
+
+    // Pure passthrough: forward the caller's `authorization` header or fail
+    // fast. kyrisd holds no provider credential of its own.
+    let Some(authorization) = headers.get("authorization").cloned() else {
+        return Ok(no_credential_error(&trace_id));
+    };
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!("{}/v1/chat/completions", provider.upstream);
 
-    let outbound_body = serde_json::to_vec(&body_value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let outbound_body = serde_json::to_vec(&body_value).map_err(|e| {
+        tracing::warn!(error = %e, "failed to serialize OpenAI chat completions outbound body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let timeout_secs = if is_stream {
         provider.streaming_timeout_seconds
@@ -98,21 +118,49 @@ async fn handle_completions(
         provider.timeout_seconds
     };
 
+    // Spine event 1/3: provider selection. kyrisd always forwards the
+    // caller's `authorization` credential.
+    tracing::debug!(
+        provider = %provider_name,
+        upstream = %provider.upstream,
+        model = %model,
+        is_stream,
+        credential_mode = "passthrough",
+        "provider_selected"
+    );
+
     let response = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("authorization", format!("Bearer {}", provider.api_key))
+        .header("authorization", &authorization)
         .header("content-type", "application/json")
         .body(outbound_body)
         .send()
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "upstream request failed");
+            tracing::error!(
+                upstream = %provider.upstream,
+                error = %e,
+                "upstream_request_failed"
+            );
             StatusCode::BAD_GATEWAY
         })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
+    tracing::debug!(
+        upstream_status = status.as_u16(),
+        content_length = ?resp_headers.get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        content_encoding = ?resp_headers.get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        transfer_encoding = ?resp_headers.get(axum::http::header::TRANSFER_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        content_type = ?resp_headers.get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        is_stream,
+        "upstream_response"
+    );
 
     if is_stream {
         return relay_sse_stream(
@@ -125,6 +173,7 @@ async fn handle_completions(
             provider_name,
             session_id,
             trace_token,
+            agent_id,
             peer_addr,
             start,
         );
@@ -133,7 +182,10 @@ async fn handle_completions(
     let resp_body = response
         .bytes()
         .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to read OpenAI chat completions upstream response body");
+            StatusCode::BAD_GATEWAY
+        })?;
 
     let parsed_tokens = extract_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
@@ -147,61 +199,95 @@ async fn handle_completions(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
-
-    let working_dir = match trace_token.as_deref() {
-        Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
-        None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
-    let _ = state.stats_tx.try_send(StatsEvent {
-        trace_id: trace_id.clone(),
-        provider: provider_name,
-        model: model.clone(),
-        tokens,
-        cache_create: 0,
-        cache_read: 0,
-        cost,
-        latency_ms,
-        status: if status.is_success() {
-            "success".to_string()
-        } else {
-            "error".to_string()
-        },
-        session_id: Some(session_id.clone()),
-        mcp_server: None,
-        mcp_tool: None,
-        metering,
-        working_dir,
-    });
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.clone().or(peer_agent);
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        builder = builder.header(key, value);
+    if state
+        .stats_tx
+        .try_send(StatsEvent {
+            trace_id: trace_id.clone(),
+            provider: provider_name,
+            model: model.clone(),
+            tokens,
+            cache_create: 0,
+            cache_read: 0,
+            cost,
+            latency_ms,
+            status: if !status.is_success() {
+                "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
+            },
+            session_id: Some(session_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            metering,
+            plan_status: kyris_core::record::PlanStatus::Overage,
+            working_dir,
+            agent,
+        })
+        .is_err()
+    {
+        crate::storage::record_dropped(1);
     }
+
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    let response_body_bytes = resp_body.len();
+    let header_names: Vec<&str> = resp_headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .collect();
+    tracing::debug!(
+        response_status = status.as_u16(),
+        response_body_bytes,
+        header_names = ?header_names,
+        "response_built"
+    );
+
+    builder.body(Body::from(resp_body)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI chat completions response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn handle_responses(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let mut body_value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "failed to parse OpenAI responses request body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let model = body_value
         .get("model")
@@ -209,12 +295,17 @@ async fn handle_responses(
         .unwrap_or("unknown")
         .to_string();
 
+    // OpenAI's Responses API defaults `stream` to false; honor that. Defaulting
+    // to streaming made a plain (non-stream) request take the SSE path.
     let is_stream = body_value
         .get("stream")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
 
-    let trace_id = uuid::Uuid::now_v7().to_string();
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -235,26 +326,41 @@ async fn handle_responses(
         return Ok(circuit_breaker_error(&trace_id, count));
     }
 
-    if is_stream {
-        inject_responses_stream_usage(&mut body_value);
-    }
+    // No body rewriting: the Responses API returns token usage natively (in the
+    // response object / the streaming `response.completed` event), so kyrisd
+    // forwards the request as-is. (The old `include: ["usage"]` injection is an
+    // invalid `include` value the API rejects with 400.)
 
     let config = state.config.load();
     let provider = config
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::OpenAI)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical OpenAI upstream.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::OpenAI)
+        });
     let provider_name = provider.name.clone();
+
+    // Pure passthrough: forward the caller's `authorization` header or fail
+    // fast. kyrisd holds no provider credential of its own.
+    let Some(authorization) = headers.get("authorization").cloned() else {
+        return Ok(no_credential_error(&trace_id));
+    };
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!("{}/v1/responses", provider.upstream);
 
-    let outbound_body = serde_json::to_vec(&body_value).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let outbound_body = serde_json::to_vec(&body_value).map_err(|e| {
+        tracing::warn!(error = %e, "failed to serialize OpenAI responses outbound body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let timeout_secs = if is_stream {
         provider.streaming_timeout_seconds
@@ -265,13 +371,13 @@ async fn handle_responses(
     let response = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("authorization", format!("Bearer {}", provider.api_key))
+        .header("authorization", &authorization)
         .header("content-type", "application/json")
         .body(outbound_body)
         .send()
         .await
         .map_err(|e| {
-            tracing::error!(error = %e, "upstream request failed");
+            tracing::error!(error = %e, "OpenAI responses upstream request failed");
             StatusCode::BAD_GATEWAY
         })?;
 
@@ -289,15 +395,16 @@ async fn handle_responses(
             provider_name,
             session_id,
             trace_token,
+            agent_id,
             peer_addr,
             start,
         );
     }
 
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read OpenAI responses upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let parsed_tokens = extract_responses_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
@@ -311,50 +418,69 @@ async fn handle_responses(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
-
-    let working_dir = match trace_token.as_deref() {
-        Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
-        None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
-    let _ = state.stats_tx.try_send(StatsEvent {
-        trace_id: trace_id.clone(),
-        provider: provider_name,
-        model: model.clone(),
-        tokens,
-        cache_create: 0,
-        cache_read: 0,
-        cost,
-        latency_ms,
-        status: if status.is_success() {
-            "success".to_string()
-        } else {
-            "error".to_string()
-        },
-        session_id: Some(session_id.clone()),
-        mcp_server: None,
-        mcp_tool: None,
-        metering,
-        working_dir,
-    });
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.clone().or(peer_agent);
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        builder = builder.header(key, value);
+    if state
+        .stats_tx
+        .try_send(StatsEvent {
+            trace_id: trace_id.clone(),
+            provider: provider_name,
+            model: model.clone(),
+            tokens,
+            cache_create: 0,
+            cache_read: 0,
+            cost,
+            latency_ms,
+            status: if !status.is_success() {
+                "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
+            },
+            session_id: Some(session_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            metering,
+            plan_status: kyris_core::record::PlanStatus::Overage,
+            working_dir,
+            agent,
+        })
+        .is_err()
+    {
+        crate::storage::record_dropped(1);
     }
+
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from(resp_body)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI responses response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -368,6 +494,7 @@ fn relay_responses_sse_stream(
     provider_name: String,
     session_id: String,
     trace_token: Option<String>,
+    agent_id: Option<String>,
     peer_addr: SocketAddr,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
@@ -473,10 +600,17 @@ fn relay_responses_sse_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "error": {
                                     "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
@@ -486,22 +620,6 @@ fn relay_responses_sse_stream(
                             });
                             breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
                         }
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
-                        }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -512,27 +630,42 @@ fn relay_responses_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = match trace_token.as_deref() {
-                Some(token) => super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                None => super::resolve_peer_working_dir_sync(peer_addr),
+            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+                (
+                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
+                    None,
+                )
+            } else {
+                let attr =
+                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
+                (attr.working_dir, attr.agent)
             };
+            let agent = agent_id.clone().or(peer_agent);
 
-            let _ = state.stats_tx.try_send(StatsEvent {
-                trace_id: trace_id_for_stream.clone(),
-                provider: provider_name_for_stream.clone(),
-                model: model_for_stream.clone(),
-                tokens,
-                cache_create: 0,
-                cache_read: 0,
-                cost,
-                latency_ms,
-                status: status.to_string(),
-                session_id: Some(session_id_for_stream.clone()),
-                mcp_server: None,
-                mcp_tool: None,
-                metering: stream_metering,
-                working_dir,
-            });
+            if state
+                .stats_tx
+                .try_send(StatsEvent {
+                    trace_id: trace_id_for_stream.clone(),
+                    provider: provider_name_for_stream.clone(),
+                    model: model_for_stream.clone(),
+                    tokens,
+                    cache_create: 0,
+                    cache_read: 0,
+                    cost,
+                    latency_ms,
+                    status: status.to_string(),
+                    session_id: Some(session_id_for_stream.clone()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    metering: stream_metering,
+                    plan_status: kyris_core::record::PlanStatus::Overage,
+                    working_dir,
+                    agent,
+                })
+                .is_err()
+            {
+                crate::storage::record_dropped(1);
+            }
 
             breaker_chunk
         };
@@ -566,21 +699,14 @@ fn relay_responses_sse_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from_stream(full_stream)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI responses SSE stream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -594,6 +720,7 @@ fn relay_sse_stream(
     provider_name: String,
     session_id: String,
     trace_token: Option<String>,
+    agent_id: Option<String>,
     peer_addr: SocketAddr,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
@@ -699,10 +826,17 @@ fn relay_sse_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "error": {
                                     "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
@@ -712,22 +846,6 @@ fn relay_sse_stream(
                             });
                             breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
                         }
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
-                        }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -738,27 +856,42 @@ fn relay_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = match trace_token.as_deref() {
-                Some(token) => super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                None => super::resolve_peer_working_dir_sync(peer_addr),
+            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+                (
+                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
+                    None,
+                )
+            } else {
+                let attr =
+                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
+                (attr.working_dir, attr.agent)
             };
+            let agent = agent_id.clone().or(peer_agent);
 
-            let _ = state.stats_tx.try_send(StatsEvent {
-                trace_id: trace_id_for_stream.clone(),
-                provider: provider_name_for_stream.clone(),
-                model: model_for_stream.clone(),
-                tokens,
-                cache_create: 0,
-                cache_read: 0,
-                cost,
-                latency_ms,
-                status: status.to_string(),
-                session_id: Some(session_id_for_stream.clone()),
-                mcp_server: None,
-                mcp_tool: None,
-                metering: stream_metering,
-                working_dir,
-            });
+            if state
+                .stats_tx
+                .try_send(StatsEvent {
+                    trace_id: trace_id_for_stream.clone(),
+                    provider: provider_name_for_stream.clone(),
+                    model: model_for_stream.clone(),
+                    tokens,
+                    cache_create: 0,
+                    cache_read: 0,
+                    cost,
+                    latency_ms,
+                    status: status.to_string(),
+                    session_id: Some(session_id_for_stream.clone()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    metering: stream_metering,
+                    plan_status: kyris_core::record::PlanStatus::Overage,
+                    working_dir,
+                    agent,
+                })
+                .is_err()
+            {
+                crate::storage::record_dropped(1);
+            }
 
             breaker_chunk
         };
@@ -792,21 +925,14 @@ fn relay_sse_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from_stream(full_stream)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build OpenAI chat completions SSE stream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 fn circuit_breaker_message(token_count: i64) -> String {
@@ -830,6 +956,22 @@ fn circuit_breaker_error(trace_id: &str, token_count: i64) -> Response {
         .header("x-kyris-trace-id", trace_id)
         .body(Body::from(payload.to_string()))
         .expect("build circuit breaker error response")
+}
+
+/// Fail-fast response (401) when the caller supplied no `authorization`
+/// credential. kyrisd is a pure passthrough — it forwards the caller's
+/// credential and stores none — so there is nothing to send upstream.
+fn no_credential_error(trace_id: &str) -> Response {
+    let payload = serde_json::json!({
+        "error": "no provider credential supplied; kyrisd forwards your agent's credential and stores none"
+    });
+
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-kyris-trace-id", trace_id)
+        .body(Body::from(payload.to_string()))
+        .expect("build no-credential error response")
 }
 
 fn inject_stream_usage(body: &mut serde_json::Value) {
@@ -867,21 +1009,6 @@ fn extract_tokens_from_sse_json(json: &str) -> Option<TokenCounts> {
         input: usage["prompt_tokens"].as_i64().unwrap_or(0),
         output: usage["completion_tokens"].as_i64().unwrap_or(0),
     })
-}
-
-fn inject_responses_stream_usage(body: &mut serde_json::Value) {
-    let include = body.get("include").and_then(|v| v.as_array());
-    let already_has_usage =
-        include.is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some("usage")));
-    if !already_has_usage {
-        let mut arr = body
-            .get("include")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        arr.push(serde_json::json!("usage"));
-        body["include"] = serde_json::Value::Array(arr);
-    }
 }
 
 fn extract_responses_tokens_from_body(body: &[u8]) -> Option<TokenCounts> {
@@ -1033,7 +1160,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1050,9 +1176,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
+        // The caller supplies its own credential; kyrisd forwards exactly that
+        // `authorization` header to the upstream.
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
             .header("x-kyris-session-id", "sess-123")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1085,7 +1214,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
-            Some("Bearer upstream-key")
+            Some("Bearer caller-key")
         );
         assert_eq!(
             request.headers.get("content-type").map(String::as_str),
@@ -1116,7 +1245,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1137,6 +1265,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
             .header("x-kyris-session-id", "sess-stream")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1185,7 +1314,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1205,6 +1333,7 @@ mod tests {
 
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1221,6 +1350,7 @@ mod tests {
 
         let response2 = reqwest::Client::new()
             .post(format!("{router_url}/v1/chat/completions"))
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1233,6 +1363,52 @@ mod tests {
                 .unwrap()
                 .contains("circuit_breaker")
         );
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOpenAiRouteFailsFastWhenNoAuthorizationAndDoesNotHitUpstream() {
+        let recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/v1/chat/completions", post(record_upstream_request))
+            .with_state(recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "openai".to_string(),
+            format: ProviderFormat::OpenAI,
+            upstream: upstream_url.clone(),
+            models: vec!["gpt-4o".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        // No `authorization` header: kyrisd has nothing to forward and must fail
+        // fast without hitting the upstream.
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("no provider credential supplied"), "{body}");
+        assert!(recorded.lock().unwrap().is_none(), "upstream was hit");
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());
@@ -1319,6 +1495,7 @@ mod tests {
             stats_tx,
             db,
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: crate::server::build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
             mcp_annotation_cache: crate::mcp_routing::AnnotationCache::default(),
@@ -1399,34 +1576,6 @@ mod tests {
         assert!(extract_responses_tokens_from_sse_json("not json").is_none());
     }
 
-    #[test]
-    fn testInjectResponsesStreamUsage() {
-        let mut body = serde_json::json!({"model": "gpt-4o", "input": "hello"});
-        inject_responses_stream_usage(&mut body);
-        let include = body["include"].as_array().unwrap();
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
-    }
-
-    #[test]
-    fn testInjectResponsesStreamUsagePreservesExisting() {
-        let mut body = serde_json::json!({"model": "gpt-4o", "include": ["usage", "reasoning"]});
-        inject_responses_stream_usage(&mut body);
-        let include = body["include"].as_array().unwrap();
-        assert_eq!(include.len(), 2);
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
-        assert!(include.iter().any(|v| v.as_str() == Some("reasoning")));
-    }
-
-    #[test]
-    fn testInjectResponsesStreamUsageAppendsToExistingArray() {
-        let mut body = serde_json::json!({"model": "gpt-4o", "include": ["reasoning"]});
-        inject_responses_stream_usage(&mut body);
-        let include = body["include"].as_array().unwrap();
-        assert_eq!(include.len(), 2);
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
-        assert!(include.iter().any(|v| v.as_str() == Some("reasoning")));
-    }
-
     #[tokio::test]
     async fn testResponsesRouteForwardsRequestAndEmitsStats() {
         let recorded = Arc::new(Mutex::new(None));
@@ -1439,7 +1588,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1457,9 +1605,12 @@ mod tests {
             "input": "hello"
         });
 
+        // The caller supplies its own credential; kyrisd forwards exactly that
+        // `authorization` header to the upstream.
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/responses"))
             .header("x-kyris-session-id", "sess-resp-1")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1492,7 +1643,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
-            Some("Bearer upstream-key")
+            Some("Bearer caller-key")
         );
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["model"], "gpt-4o");
@@ -1519,7 +1670,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "openai".to_string(),
             format: ProviderFormat::OpenAI,
-            api_key: "upstream-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gpt-4o".to_string()],
             timeout_seconds: 30,
@@ -1533,12 +1683,14 @@ mod tests {
 
         let request_body = serde_json::json!({
             "model": "gpt-4o",
+            "stream": true,
             "input": "hello"
         });
 
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/responses"))
             .header("x-kyris-session-id", "sess-resp-stream")
+            .header("authorization", "Bearer caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1559,8 +1711,10 @@ mod tests {
 
         let request = recorded.lock().unwrap().clone().unwrap();
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-        let include = forwarded_json["include"].as_array().unwrap();
-        assert!(include.iter().any(|v| v.as_str() == Some("usage")));
+        // Forwarded as-is — no `include: ["usage"]` injection (the Responses API
+        // rejects it; usage arrives natively in the streamed `response.completed`).
+        assert!(forwarded_json.get("include").is_none(), "{forwarded_json}");
+        assert_eq!(forwarded_json["model"], "gpt-4o");
 
         let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
             .await

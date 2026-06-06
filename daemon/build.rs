@@ -5,7 +5,54 @@ use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    rasterize_svg("assets/icon.svg", "tray_icon_44.rgba", 44, 44);
+    // Rebuild when the git commit changes. Three paths cover all cases:
+    // HEAD — branch switches; refs/heads/ — new commits on current branch;
+    // packed-refs — refs compacted by `git gc` or remote fetch operations.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/refs/heads/");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    emit_build_metadata();
+    // Tray icon is opt-in via `--features tray`; only generate the
+    // rasterized RGBA when we'll actually link the tray module in.
+    if std::env::var_os("CARGO_FEATURE_TRAY").is_some() {
+        rasterize_svg("assets/icon.svg", "tray_icon_44.rgba", 44, 44);
+        // Status overlays: same 44×44 canvas, laid directly over the base icon.
+        // Unlike the base (a monochrome template), these keep their own color.
+        rasterize_svg(
+            "assets/icon_warning.svg",
+            "tray_icon_warning_44.rgba",
+            44,
+            44,
+        );
+        rasterize_svg(
+            "assets/icon_disabled.svg",
+            "tray_icon_disabled_44.rgba",
+            44,
+            44,
+        );
+    }
+}
+
+fn emit_build_metadata() {
+    let date = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%d"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!("cargo:rustc-env=KYRIS_BUILD_DATE={date}");
+
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!("cargo:rustc-env=KYRIS_COMMIT={commit}");
 }
 
 fn rasterize_svg(svg_path: &str, out_name: &str, width: u32, height: u32) {

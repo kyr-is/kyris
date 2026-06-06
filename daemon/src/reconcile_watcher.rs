@@ -9,8 +9,7 @@ use notify_debouncer_mini::new_debouncer;
 use crate::server::AppState;
 
 fn agent_profile_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".kyris").join("agents")
+    kyris_core::paths::agents_dir()
 }
 
 fn watch_paths() -> Vec<PathBuf> {
@@ -63,11 +62,10 @@ fn run_reconcile() -> bool {
 }
 
 fn kyris_binary() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let bin = PathBuf::from(&home)
-        .join(".kyris")
-        .join("bin")
-        .join("kyris");
+    // ~/.kyris/bin/kyris is the install-managed fallback location used by
+    // the install.sh script when the user opted out of the ~/.local/bin
+    // shim. Both that and the PATH lookup are install-managed.
+    let bin = kyris_core::paths::runtime_dir().join("bin").join("kyris");
     if bin.exists() {
         return bin;
     }
@@ -131,9 +129,12 @@ pub async fn run_reconcile_loop(state: Arc<AppState>) {
 
         if repaired {
             crate::notify::agent_drift_repaired_toast();
-            crate::tray::set_state(crate::tray::TrayState::Degraded);
+            // Surface the drift in the tray for a brief observation
+            // window. The repair already happened — this is just a
+            // "we did something you should know about" signal.
+            crate::tray::report_issue("agent_drift_repaired", "agent integration was repaired");
             tokio::time::sleep(Duration::from_secs(30)).await;
-            crate::tray::set_state(crate::tray::TrayState::Normal);
+            crate::tray::clear_issue("agent_drift_repaired");
         }
     }
 }
@@ -144,14 +145,20 @@ mod tests {
 
     #[test]
     fn testKyrisBinaryFallsBackToPathLookup() {
-        unsafe { std::env::set_var("HOME", "/nonexistent") };
+        unsafe {
+            std::env::set_var("HOME", "/nonexistent");
+            std::env::remove_var("KYRIS_HOME");
+        }
         let bin = kyris_binary();
         assert_eq!(bin, PathBuf::from("kyris"));
     }
 
     #[test]
-    fn testAgentProfileDirUsesHome() {
-        unsafe { std::env::set_var("HOME", "/tmp/test-home") };
+    fn testAgentProfileDirUsesRuntimeDir() {
+        unsafe {
+            std::env::set_var("HOME", "/tmp/test-home");
+            std::env::remove_var("KYRIS_HOME");
+        }
         let dir = agent_profile_dir();
         assert_eq!(dir, PathBuf::from("/tmp/test-home/.kyris/agents"));
     }

@@ -13,6 +13,7 @@ pub mod probe;
 pub mod profile;
 pub mod reconcile;
 pub mod registry;
+pub mod shim;
 pub mod undo;
 
 use clap::{Args, Subcommand};
@@ -75,7 +76,7 @@ pub fn run(args: AgentsArgs) {
 }
 
 fn run_status(agent: Option<String>) -> Result<(), String> {
-    let results = reconcile::reconcile_all(true)?;
+    let results = reconcile::reconcile_all(true, None)?;
 
     if let Some(agent_id) = agent {
         let (descriptor, profile) = results
@@ -104,7 +105,7 @@ fn run_reconcile(agent: Option<String>, auto: bool) -> Result<(), String> {
             registry::agent_by_id(&agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
         display::print_detail(descriptor.as_ref(), &profile);
     } else {
-        let results = reconcile::reconcile_all(auto)?;
+        let results = reconcile::reconcile_all(auto, None)?;
         if !auto {
             let refs: Vec<_> = results
                 .iter()
@@ -140,11 +141,15 @@ fn run_setup(agent: Option<String>, auto: bool, settings: Vec<String>) -> Result
         if !agent_specific.is_empty() {
             return Err("--set cannot be used with --auto".to_string());
         }
-        prestage::prestage_all()?;
+        prestage::prestage_all(None)?;
         for agent in registry::all_agents() {
             if agent.is_installed()
-                && let Err(e) =
-                    configure::configure_agent(agent.id(), &std::collections::HashMap::new(), false)
+                && let Err(e) = configure::configure_agent(
+                    agent.id(),
+                    &std::collections::HashMap::new(),
+                    false,
+                    None,
+                )
             {
                 eprintln!("{e}");
             }

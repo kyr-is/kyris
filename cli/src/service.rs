@@ -76,32 +76,6 @@ pub fn service_state(kind: ServiceKind) -> ServiceState {
     }
 }
 
-pub fn candidate_log_paths(kind: ServiceKind) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        match kind {
-            ServiceKind::Kyrisd => {
-                paths.push(home.join(".kyris").join("kyrisd.stderr.log"));
-                paths.push(home.join("Library").join("Logs").join("kyrisd.log"));
-            }
-            ServiceKind::Agentpactd => {
-                paths.push(home.join(".agentpact").join("agentpactd.log"));
-                paths.push(home.join("Library").join("Logs").join("agentpactd.log"));
-            }
-        }
-    }
-
-    for prefix in ["/opt/homebrew", "/usr/local"] {
-        let prefix = PathBuf::from(prefix);
-        if prefix.exists() {
-            paths.push(prefix.join("var").join("log").join(kind.log_filename()));
-        }
-    }
-
-    paths
-}
-
 fn homebrew_prefix_for(kind: ServiceKind) -> Option<String> {
     let output = std::process::Command::new("brew")
         .args(["list", kind.formula_name()])
@@ -191,17 +165,10 @@ impl ServiceKind {
         }
     }
 
-    fn launchd_label(self) -> &'static str {
+    pub fn launchd_label(self) -> &'static str {
         match self {
             Self::Kyrisd => "is.kyr.kyrisd",
             Self::Agentpactd => "is.kyr.agentpactd",
-        }
-    }
-
-    fn log_filename(self) -> &'static str {
-        match self {
-            Self::Kyrisd => "kyrisd.log",
-            Self::Agentpactd => "agentpact.log",
         }
     }
 }

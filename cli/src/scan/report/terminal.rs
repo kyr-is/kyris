@@ -33,6 +33,7 @@ pub fn render(findings: &[Finding]) {
             FindingCategory::DegradedAgent,
             "Degraded Agent Integrations",
         ),
+        (FindingCategory::VendorNativeAgent, "Vendor-Governed Agents"),
         (FindingCategory::UngoverndMcp, "Ungoverned MCP Servers"),
         (FindingCategory::LlmTraffic, "LLM Traffic"),
     ];

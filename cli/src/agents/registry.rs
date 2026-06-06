@@ -5,15 +5,58 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use super::probe::ProbeResult;
+use super::profile::CoverageCeiling;
 
 pub trait AgentDescriptor {
     fn id(&self) -> &'static str;
+    /// Canonical `vendor/product` agent id — the form agentpact's attribution
+    /// emits into governance events (see agentpact `defaults/agents.yaml`).
+    /// `id()` is the bare kyris CLI/registry handle (`claude-code`); this is the
+    /// form that must land in the timeline `agent` field — both the
+    /// `x-kyris-agent-id` header kyrisd writes onto a gateway record and the
+    /// `attribution.resolve` result — so kyrisd-only records unify with
+    /// governance events instead of appearing as a second, differently-named
+    /// agent. Keep this match in sync with agentpact's `agents.yaml`.
+    fn canonical_id(&self) -> &'static str {
+        match self.id() {
+            "claude-code" => "anthropic/claude-code",
+            "codex-cli" => "openai/codex-cli",
+            "gemini-cli" => "google/gemini-cli",
+            "opencode" => "opencode/opencode",
+            "cline" => "cline/cline",
+            other => other,
+        }
+    }
     fn display_name(&self) -> &'static str;
     fn is_installed(&self) -> bool;
     fn probe(&self) -> ProbeResult;
     fn kyris_content_markers(&self) -> &'static [&'static str];
     fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)>;
     fn expected_surfaces(&self) -> (bool, bool, bool);
+    /// Environment variable carrying the agent's FIXED launch/project directory
+    /// into its hook subprocess (e.g. `CLAUDE_PROJECT_DIR`). When set,
+    /// `kyris hook check` uses it as the permitted-domain anchor instead of the
+    /// hook payload's `cwd` — which for some agents (notably Claude Code) is the
+    /// LIVE working directory that moves when the agent runs `cd`, and so must
+    /// not define the workspace boundary. `None` → fall back to the payload
+    /// `cwd` (already fixed at session start for agents like Codex and Gemini).
+    /// See `crate::hook_cmd::derive_session_cwd`.
+    fn launch_dir_env(&self) -> Option<&'static str> {
+        None
+    }
+    /// Per-surface design ceiling (exec, tool, burn). `Some(Compiled)` means
+    /// the agent has no path beyond compiled-policy for that surface — so
+    /// realizing Compiled is `ok`, not a degradation. Default: `None` for all
+    /// surfaces (any Compiled outcome is treated as a degradation).
+    fn surface_design_ceilings(
+        &self,
+    ) -> (
+        Option<CoverageCeiling>,
+        Option<CoverageCeiling>,
+        Option<CoverageCeiling>,
+    ) {
+        (None, None, None)
+    }
     fn configure_execution(
         &self,
         _base_url: &str,
@@ -68,7 +111,19 @@ pub struct ToolMapping {
 pub struct HookProtocol {
     pub tool_name_field: String,
     pub detail_fields: Vec<String>,
+    /// Tools that route through `agentpactd` for policy enforcement
+    /// (Bash → execute, Read → read, MCP servers → call, …).
     pub tool_mappings: Vec<ToolMapping>,
+    /// Tools that are allowed without contacting `agentpactd` — LLM
+    /// coordination primitives with no governable side effect
+    /// (`AskUserQuestion`, `TodoWrite`, `ExitPlanMode`, etc.). Skipping the
+    /// daemon is required because the daemon contract for `action=call`
+    /// demands `context.mcp_server`, which these tools cannot supply.
+    /// Tools not in this list and not in `tool_mappings` are *unmapped*: kyris
+    /// emits a stderr warning and defers to the agent's own permission system
+    /// (the `EmptyStdout` "no decision" shape), behaving as if it were not
+    /// installed — it never suppresses the agent's prompt for an unknown tool.
+    pub pass_through_tools: Vec<String>,
     pub default_action: String,
     pub allow_response: AllowResponse,
 }
@@ -155,6 +210,28 @@ mod tests {
     #[test]
     fn testAgentByIdUnknown() {
         assert!(agent_by_id("nonexistent").is_none());
+    }
+
+    #[test]
+    fn testCanonicalIdsMatchAgentpactVendorProduct() {
+        // Lock the kyris bare-id → agentpact `vendor/product` mapping. These MUST
+        // equal the `agent_id` values in agentpact `defaults/agents.yaml`, or the
+        // `agent` field on gateway records (which carry `canonical_id()` via the
+        // `x-kyris-agent-id` header) will not unify with governance events.
+        let expect = [
+            ("claude-code", "anthropic/claude-code"),
+            ("codex-cli", "openai/codex-cli"),
+            ("gemini-cli", "google/gemini-cli"),
+            ("opencode", "opencode/opencode"),
+            ("cline", "cline/cline"),
+        ];
+        for (bare, canonical) in expect {
+            let agent = agent_by_id(bare).expect("known agent");
+            assert_eq!(agent.canonical_id(), canonical, "canonical_id for {bare}");
+            // Canonical form is namespaced and embeds the bare product id.
+            assert!(agent.canonical_id().contains('/'));
+            assert!(agent.canonical_id().ends_with(bare));
+        }
     }
 
     #[test]

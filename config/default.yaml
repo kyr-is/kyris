@@ -1,20 +1,25 @@
 # SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
-# Default kyrisd configuration. Copied to ~/.kyris/kyrisd.yaml on first run.
+# Default kyrisd configuration. Copied to $XDG_CONFIG_HOME/kyris/kyrisd.yaml
+# on first run (default $HOME/.config/kyris/kyrisd.yaml). See
+# kyris-core/src/paths.rs for the full XDG-aware layout.
 
 server:
   listen: "127.0.0.1:4710"
-  # inbound_key is generated on first run if absent
+  # The inbound/operator auth keys are NOT stored here. They live as 0600 files
+  # under $XDG_DATA_HOME/kyris/secret/ (default ~/.local/share/kyris/secret/),
+  # minted on first run, preserved across uninstall/--reset-data, and read by
+  # both kyrisd and the hook (single source of truth).
   max_request_body_bytes: 10485760
   drain_timeout_seconds: 30
 
 tls:
   enabled: false
 
-# Add at least one provider to start accepting LLM requests.
+# Add a provider only to override its upstream URL. kyrisd holds no provider
+# credential of its own — it forwards your agent's credential and stores none.
 # providers:
 #   - name: anthropic
-#     api_key: "sk-ant-..."
 #     upstream: "https://api.anthropic.com"
 #     models:
 #       - claude-4-opus
@@ -22,7 +27,7 @@ tls:
 
 mcp:
   enabled: false
-  pending_timeout_seconds: 60
+  pending_timeout_seconds: 900
   # Each HTTP MCP server that may receive tools/call must set working_dir.
   # Kyris does not infer this from client connections.
   # servers:
@@ -35,12 +40,34 @@ circuit_breaker:
   max_tokens: 200000
   session_idle_minutes: 30
 
+# The relay this install talks to. Two uses, neither requiring enrollment:
+#   - pricing: `kyris install` and the daemon fetch the live price table from
+#     `<url>/api/v1/pricing` (public) — so model names and costs work without
+#     enrolling.
+#   - enroll: `kyris enroll` uses this as the relay to enroll against when no
+#     `--relay-url` / `KYRIS_RELAY_URL` is given.
+# The dev patch overrides this to a local relay; `--relay-url` overrides per run.
+relay:
+  url: "https://relay.kyr.is"
+
+# GitHub App for `kyris enroll`'s device flow. `client_id` is PUBLIC (it appears
+# in the authorize URL), so it lives here; the dev patch overrides it to the dev
+# app. `GITHUB_CLIENT_ID` env overrides per run. The client SECRET is never here
+# — only the relay (server-side) needs it.
+github:
+  client_id: "Iv23liLeYbum0sNojXLs"
+
+# Enrollment lives in credentials.json (run `kyris enroll`), not here.
+# Sync is default-on for governed directories. Conventionally-private locations
+# are always excluded: hidden/dot-prefixed dirs (~/.ssh, ~/.config, ~/.local…),
+# owner-only (0700) dirs, and the macOS personal folders (~/Documents,
+# ~/Downloads, ~/Pictures, ~/Music, ~/Movies, ~/Desktop, ~/Library, …).
+# An empty `scope` syncs every other governed dir; set it to NARROW further,
+# e.g. `["~/work", "~/src/myrepo"]`. See forest/design/kyris.md §5.8.
 sync:
-  enabled: false
   scope: []
 
 pricing:
-  file: "config/pricing.yaml"
   fetch_interval_hours: 6
 
 stats:

@@ -37,6 +37,11 @@ pub struct SurfaceState {
     pub mechanism: Option<AdaptedMechanism>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<CoverageCeiling>,
+    // True when the surface has nothing to do for this agent in the current
+    // user environment (e.g., claude-code's MCP wrap when settings.json has
+    // no mcpServers). Treated as "met" by completeness checks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applicable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +94,16 @@ impl SurfaceState {
             level: CapLevel::None,
             mechanism: None,
             ceiling: None,
+            not_applicable: false,
+        }
+    }
+
+    pub fn not_applicable() -> Self {
+        Self {
+            level: CapLevel::None,
+            mechanism: None,
+            ceiling: None,
+            not_applicable: true,
         }
     }
 
@@ -97,6 +112,7 @@ impl SurfaceState {
             level: CapLevel::Adapted,
             mechanism: Some(mechanism),
             ceiling: None,
+            not_applicable: false,
         }
     }
 
@@ -105,6 +121,7 @@ impl SurfaceState {
             level: CapLevel::Native,
             mechanism: None,
             ceiling: None,
+            not_applicable: false,
         }
     }
 

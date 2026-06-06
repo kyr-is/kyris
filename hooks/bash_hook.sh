@@ -1,8 +1,72 @@
 # SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
+# shellcheck shell=bash
 # Kyris Bash hook: extdebug + DEBUG trap. Requires kyris-hook on PATH.
 # Compatible with macOS system Bash (3.2) and modern Bash (5.x).
 # No Bash 4+ features (no associative arrays, no readarray, no ${var,,}).
+#
+# This file is sourced (not executed); the shellcheck shell directive
+# above tells shellcheck which dialect to apply without polluting the
+# file with a shebang that would mislead "is this script executable?"
+# tooling.
+
+# Kyris governs commands spawned *by* agents, not commands the human
+# types into their own terminal. Source-from-rc is the only delivery
+# vehicle we have for non-interactive agent subshells (BASH_ENV /
+# .zshenv reach those), but rc files are read by the human's shell too.
+# So this detector decides whether the current shell is inside a
+# governed agent's process tree — only then do we install the trap.
+# Fast path: env markers set by `kyris agents setup <agent>`'s shim
+# (KYRIS_GOVERNED_SUBPROCESS=<id>) or by the agent itself (CLAUDECODE).
+# Slow path: a bounded walk up the ppid chain for known agent comms,
+# covering agents launched before the shim was installed.
+__kyris_running_under_governed_agent() {
+    # Cache: once this shell decides, its descendants inherit the
+    # answer via env and skip the walk. Saves the per-shell `ps` cost
+    # (5–30ms on macOS) across heavy fan-out workloads — `make -j`,
+    # recursive shell tests, anything that forks subshells. The cache
+    # value is one of `1` (governed) or `0` (not), so `[ "$v" = "1" ]`
+    # works at either decision.
+    if [ -n "${__KYRIS_GUARD_RESULT:-}" ]; then
+        [ "$__KYRIS_GUARD_RESULT" = "1" ] && return 0 || return 1
+    fi
+
+    # Fast path: env vars known to be injected by specific agents.
+    # CLAUDECODE=1 is the canonical Claude Code marker (verified via
+    # `env | grep CLAUDE` inside a Claude-spawned subprocess).
+    # KYRIS_GOVERNED_SUBPROCESS is the universal override set by the
+    # `kyris agents setup <agent>` shim for the other four agents.
+    if [ -n "${CLAUDECODE:-}" ] || [ -n "${KYRIS_GOVERNED_SUBPROCESS:-}" ]; then
+        export __KYRIS_GUARD_RESULT=1
+        return 0
+    fi
+
+    # Slow path (only reached when env vars don't match): walk the
+    # parent process chain looking for known agent binaries. Bounded
+    # to 32 hops so we don't loop on a degenerate ancestry. One-time
+    # cost at trap-install time, NOT per command.
+    local _kyris_pid _kyris_comm _kyris_hops=0
+    _kyris_pid="${PPID:-0}"
+    while [ "$_kyris_pid" -gt 1 ] && [ "$_kyris_hops" -lt 32 ]; do
+        _kyris_comm=$(ps -p "$_kyris_pid" -o comm= 2>/dev/null | tr -d ' ')
+        _kyris_comm="${_kyris_comm##*/}"
+        case "$_kyris_comm" in
+            claude|claude-code|codex|gemini|opencode|cline)
+                export __KYRIS_GUARD_RESULT=1
+                return 0
+                ;;
+        esac
+        _kyris_pid=$(ps -p "$_kyris_pid" -o ppid= 2>/dev/null | tr -d ' ')
+        [ -z "$_kyris_pid" ] && break
+        _kyris_hops=$((_kyris_hops + 1))
+    done
+    export __KYRIS_GUARD_RESULT=0
+    return 1
+}
+
+if ! __kyris_running_under_governed_agent; then
+    return 0 2>/dev/null || exit 0
+fi
 
 if command -v kyris >/dev/null 2>&1; then
     kyris agents reconcile --auto >/dev/null 2>&1 &
@@ -14,6 +78,23 @@ trap '__kyris_preexec "$BASH_COMMAND"' DEBUG
 
 __kyris_preexec() {
     local cmd="$1"
+
+    # Govern the AGENT's commands, not the shell's own startup-file sourcing
+    # (/etc/profile, ~/.bashrc, …). The DEBUG trap (extdebug) fires on those too,
+    # and a per-agent-shell login init would otherwise prompt on path_helper /
+    # `[ -x … ]` etc. on every call. Until the shell's first top-level command
+    # (init complete), skip commands executing from within a sourced file —
+    # `${BASH_SOURCE[1]}` is set only for those. Once a top-level command has
+    # run, govern everything, INCLUDING the agent's own `source x.sh` (its inner
+    # commands run with __KYRIS_INIT_DONE already set), so this is not a bypass.
+    # Not exported: each spawned shell re-decides for its own startup.
+    if [ -z "${__KYRIS_INIT_DONE:-}" ]; then
+        if [ -n "${BASH_SOURCE[1]:-}" ]; then
+            return 0
+        fi
+        __KYRIS_INIT_DONE=1
+    fi
+
     local sock="${AGENTPACT_SOCK:-$HOME/.agentpact/agentpact.sock}"
     local sentinel="$HOME/.kyris/.daemon-unreachable"
 
@@ -29,7 +110,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         }
     fi
@@ -57,7 +138,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         }
         output=$(kyris-hook check "$cmd" --cwd "$PWD" --socket "$sock")
@@ -69,7 +150,7 @@ __kyris_preexec() {
                 return 0
             fi
             __kyris_write_sentinel "$sentinel"
-            printf '\033[31m[agentpact]\033[0m daemon unreachable — run `agentpactd` or set on_daemon_unavailable: allow\n' >&2
+            printf '\033[31m[agentpact]\033[0m daemon unreachable — run agentpactd or set on_daemon_unavailable: allow\n' >&2
             return 1
         fi
     fi
@@ -78,10 +159,10 @@ __kyris_preexec() {
         0|11) return 0 ;;
         1) return 1 ;;
         2)
-            local req_id token
-            req_id=$(printf '%s' "$output" | cut -f1)
-            token=$(printf '%s' "$output" | cut -f2)
-            __kyris_prompt_user "$cmd" "$sock" "$req_id" "$token"
+            # Normal PACT_ASK: resolve per compound segment (kyris-hook has
+            # already voided the whole-command token). resolve-shell prompts
+            # on the TTY per segment, or delegates to kyrisd when there is none.
+            __kyris_resolve_shell "$cmd" "$sock"
             return $?
             ;;
         3)
@@ -99,8 +180,32 @@ __kyris_preexec() {
     esac
 }
 
+__kyris_have_tty() {
+    # A TUI agent (Claude Code et al.) owns the controlling terminal in raw
+    # mode with focus/mouse reporting enabled. A second reader on /dev/tty here
+    # would steal the agent's input bytes (focus events, keystrokes), desync its
+    # TUI, and leak `\e[I`/`\e[O` into its input line (frozen input). Report "no
+    # TTY" so approval delegates to kyrisd's out-of-band pending flow instead.
+    if [ -n "${CLAUDECODE:-}" ] || [ -n "${KYRIS_GOVERNED_SUBPROCESS:-}" ]; then
+        return 1
+    fi
+    [ -e /dev/tty ] && { exec 3</dev/tty; } 2>/dev/null && exec 3>&-
+}
+
 __kyris_circuit_breaker_prompt() {
     local cmd="$1" sock="$2" req_id="$3" token="$4" count="$5"
+    if ! __kyris_have_tty; then
+        if command -v kyris >/dev/null 2>&1; then
+            kyris hook hold --req-id "$req_id" --token "$token" \
+                --display "circuit-breaker (${count} commands): $cmd" \
+                --socket "$sock" 2>/dev/null
+            return $?
+        else
+            kyris-hook respond --socket "$sock" --req-id "$req_id" \
+                --token "$token" --response denied 2>/dev/null
+            return 1
+        fi
+    fi
     printf '\033[33m[kyris] circuit breaker:\033[0m %s commands without human input. Review: kyris timeline --last 10. [y/n] ' "$count" >&2
     read -r answer < /dev/tty
     case "$answer" in
@@ -118,35 +223,29 @@ __kyris_circuit_breaker_prompt() {
     esac
 }
 
-__kyris_prompt_user() {
-    local cmd="$1" sock="$2" req_id="$3" token="$4"
-    printf '\033[33m[kyris] allow?\033[0m %s [y/n/always] ' "$cmd" >&2
-    read -r answer < /dev/tty
-    case "$answer" in
-        y|Y|yes)
-            if kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response approved; then
-                return 0
-            else
-                printf '\033[31m[kyris] approval rejected by daemon\033[0m\n' >&2; return 1
-            fi
-            ;;
-        a|A|always)
-            if kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response always; then
-                return 0
-            else
-                printf '\033[31m[kyris] approval rejected by daemon\033[0m\n' >&2; return 1
-            fi
-            ;;
-        *)
-            kyris-hook respond --socket "$sock" --req-id "$req_id" --token "$token" --response denied 2>/dev/null
-            return 1
-            ;;
-    esac
+# Hand a normal PACT_ASK to `kyris hook resolve-shell`, which re-derives the
+# compound split and prompts per segment (on the TTY when present, else via
+# kyrisd's pending-approval popup). The fast `kyris-hook check` path has
+# already voided the whole-command token, so there is nothing to clean up
+# here when kyris is absent — just deny.
+__kyris_resolve_shell() {
+    local cmd="$1" sock="$2"
+    if command -v kyris >/dev/null 2>&1; then
+        kyris hook resolve-shell --cmd "$cmd" --cwd "$PWD" --socket "$sock"
+        return $?
+    fi
+    printf '\033[31m[agentpact]\033[0m kyris not on PATH — cannot resolve approval\n' >&2
+    return 1
 }
 
 __kyris_record_fail_open() {
     local cmd="$1"
-    local log="$HOME/.kyris/fail-open.jsonl"
+    # fail-open log lives under $XDG_STATE_HOME/kyris/ after the XDG
+    # migration (default $HOME/.local/state/kyris/fail-open.jsonl). The
+    # daemon's reader resolves the same path, so writer and reader agree.
+    local log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/kyris"
+    local log="$log_dir/fail-open.jsonl"
+    mkdir -p "$log_dir" 2>/dev/null
     local id ts esc_cmd esc_pwd
     id=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || return
     ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)

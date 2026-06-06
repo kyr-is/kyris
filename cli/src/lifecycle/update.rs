@@ -9,6 +9,7 @@ use crate::config_writer::NoopValidator;
 use crate::service::{ServiceKind, restart_service, service_state};
 use crate::state::write_managed_bytes;
 
+use super::log::InstallLog;
 use super::release;
 
 #[derive(Args)]
@@ -187,10 +188,15 @@ async fn run_update(mode: UpdateMode) -> Result<(), String> {
 
     // Phase 3 — display + optionally apply (extracted into helpers to keep
     // run_update under the clippy too_many_lines threshold).
+    let log = if mode == UpdateMode::Apply {
+        Some(InstallLog::open_update())
+    } else {
+        None
+    };
     let mut updates_available = 0;
     let mut updates_applied = 0;
     for (repo, status) in repos.iter().zip(statuses.iter()) {
-        match apply_or_report(repo, status, mode, target).await? {
+        match apply_or_report(repo, status, mode, target, log.as_ref()).await? {
             ApplyOutcome::UpdateAvailable { applied } => {
                 updates_available += 1;
                 if applied {
@@ -220,6 +226,7 @@ async fn apply_or_report(
     status: &RepoUpdateStatus,
     mode: UpdateMode,
     target: &str,
+    log: Option<&InstallLog>,
 ) -> Result<ApplyOutcome, String> {
     match status.channel.as_str() {
         "brew" => {
@@ -282,6 +289,9 @@ async fn apply_or_report(
         // Replacing a binary on disk — no schema check.
         if write_managed_bytes(&path, &contents, "update", Some(0o755), &NoopValidator)? {
             println!("  replaced {}", path.display());
+            if let Some(log) = log {
+                log.replaced(&path.display().to_string());
+            }
             replaced_any = true;
         }
     }

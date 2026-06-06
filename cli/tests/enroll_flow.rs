@@ -11,8 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kyris_core::config::KyrisdConfig;
-use kyris_core::sync::EnrollmentResponse;
+use kyris_core::credentials::Credentials;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -198,10 +197,16 @@ fn test_enroll_force_uses_stubbed_device_flow_and_persists_credentials() {
     let home = temp_home.path();
 
     write_fake_binary(fake_bin.path(), "agentpactd", "9.9.9");
-    fs::create_dir_all(home.join(".kyris")).expect("create .kyris");
+    // After the XDG migration: credentials live under
+    // $XDG_DATA_HOME/kyris/ (default $HOME/.local/share/kyris/). The
+    // test's HOME is the tempdir, so credentials land under
+    // tempdir/.local/share/kyris/credentials.json.
+    let credentials_dir = home.join(".local").join("share").join("kyris");
+    fs::create_dir_all(&credentials_dir).expect("create credentials dir");
+    let (base_url, recorded, handle) = spawn_mock_server();
     fs::write(
-        home.join(".kyris").join("credentials.json"),
-        serde_json::to_string_pretty(&EnrollmentResponse {
+        credentials_dir.join("credentials.json"),
+        serde_json::to_string_pretty(&Credentials {
             machine_token: "old-token".to_string(),
             machine_id: "machine-1".to_string(),
         })
@@ -209,7 +214,6 @@ fn test_enroll_force_uses_stubbed_device_flow_and_persists_credentials() {
     )
     .expect("write old credentials");
 
-    let (base_url, recorded, handle) = spawn_mock_server();
     let output = run_enroll(home, fake_bin.path(), &base_url);
     handle.join().expect("join mock server");
 
@@ -218,20 +222,14 @@ fn test_enroll_force_uses_stubbed_device_flow_and_persists_credentials() {
     assert!(stdout.contains("Enrollment complete."), "{stdout}");
     assert!(stdout.contains("Machine enrolled as machine-1"), "{stdout}");
 
-    let credentials: EnrollmentResponse = serde_json::from_str(
-        &fs::read_to_string(home.join(".kyris").join("credentials.json"))
-            .expect("read credentials"),
+    // credentials.json holds only the machine identity issued by the relay;
+    // the relay URL is a config setting, not part of this artifact.
+    let credentials: Credentials = serde_json::from_str(
+        &fs::read_to_string(credentials_dir.join("credentials.json")).expect("read credentials"),
     )
     .expect("parse credentials");
     assert_eq!(credentials.machine_id, "machine-1");
     assert_eq!(credentials.machine_token, "new-token");
-
-    let config: KyrisdConfig = serde_saphyr::from_str(
-        &fs::read_to_string(home.join(".kyris").join("kyrisd.yaml")).expect("read config"),
-    )
-    .expect("parse config");
-    assert!(config.sync.enabled);
-    assert_eq!(config.sync.relay_url, base_url);
 
     let requests = recorded.lock().expect("lock requests");
     assert_eq!(requests.len(), 3);

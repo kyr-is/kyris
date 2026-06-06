@@ -6,15 +6,16 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, RawQuery, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::post,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 
 use kyris_core::config::ProviderFormat;
+use kyris_core::record::PlanStatus;
 
 use crate::metering::{StatsEvent, TokenCounts};
 use crate::server::AppState;
@@ -32,15 +33,38 @@ pub fn routes(state: Arc<AppState>) -> Router {
         )
 }
 
+/// Classify the cost-coverage of a request from the agent's inbound credential.
+/// A subscription OAuth credential (Anthropic `sk-ant-oat…` bearer, or an
+/// `oauth-` beta) is plan-covered (Included); anything else is billed (Overage).
+fn anthropic_plan_status(headers: &HeaderMap) -> PlanStatus {
+    let beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let authz = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if beta.contains("oauth") || authz.contains("sk-ant-oat") {
+        PlanStatus::Included
+    } else {
+        PlanStatus::Overage
+    }
+}
+
 async fn handle_messages(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let body_value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let body_value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+        tracing::warn!(error = %e, "failed to parse Anthropic messages request body");
+        StatusCode::BAD_REQUEST
+    })?;
 
     let model = body_value
         .get("model")
@@ -53,7 +77,15 @@ async fn handle_messages(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    let trace_id = uuid::Uuid::now_v7().to_string();
+    // Unified trace_id: prefer the one stamped by the outer
+    // trace_id_middleware (production path) so this id matches what
+    // request_log_middleware logs, what we echo as x-kyris-trace-id,
+    // and what the gateway record stores. Mint a fresh one only for
+    // direct-handler unit tests that bypass the middleware.
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -71,10 +103,7 @@ async fn handle_messages(
     {
         let count = state.circuit_breaker.get_token_count(&session_id);
         crate::notify::circuit_breaker_toast(count);
-        if is_stream {
-            return Ok(circuit_breaker_sse_error(&trace_id, count));
-        }
-        return Ok(circuit_breaker_error(&trace_id, count).into_response());
+        return Ok(circuit_breaker_response(&trace_id, count));
     }
 
     let config = state.config.load();
@@ -82,15 +111,24 @@ async fn handle_messages(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Anthropic)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Anthropic upstream with an empty fallback key. The
+            // agent's own credential (OAuth or API key) is what gets forwarded.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Anthropic)
+        });
     let provider_name = provider.name.clone();
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
-    let upstream_url = format!("{}/v1/messages", provider.upstream);
+        .unwrap_or_else(|| state.default_provider_client.clone());
+    let upstream_url = match raw_query.as_deref() {
+        Some(q) if !q.is_empty() => format!("{}/v1/messages?{q}", provider.upstream),
+        _ => format!("{}/v1/messages", provider.upstream),
+    };
 
     let timeout_secs = if is_stream {
         provider.streaming_timeout_seconds
@@ -98,28 +136,81 @@ async fn handle_messages(
         provider.timeout_seconds
     };
 
+    // kyrisd is a pure passthrough: it forwards the caller's own credential
+    // (subscription OAuth or its own API key) and holds none of its own. If the
+    // caller sent neither `authorization` nor `x-api-key`, fail fast — there is
+    // nothing to forward. The cost class follows the auth mode (OAuth ->
+    // Included, else Overage).
+    let plan_status = anthropic_plan_status(&headers);
+    if !headers.contains_key("authorization") && !headers.contains_key("x-api-key") {
+        return Ok(no_credential_response(&trace_id));
+    }
+
+    // Spine event 1/3: provider selection. Answers "did we route to the
+    // right upstream?" without anyone having to instrument that decision
+    // point by hand. kyrisd always forwards the caller's credential.
+    tracing::debug!(
+        provider = %provider_name,
+        upstream = %provider.upstream,
+        model = %model,
+        is_stream,
+        credential_mode = "passthrough",
+        plan_status = ?plan_status,
+        "provider_selected"
+    );
+
     let mut req = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("x-api-key", &provider.api_key)
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
         .body(body.to_vec());
 
+    if let Some(v) = headers.get("authorization") {
+        req = req.header("authorization", v);
+    }
+    if let Some(v) = headers.get("x-api-key") {
+        req = req.header("x-api-key", v);
+    }
+
     for (key, value) in &headers {
         let name = key.as_str().to_lowercase();
-        if name.starts_with("anthropic-") && name != "anthropic-version" {
+        if (name.starts_with("anthropic-") && name != "anthropic-version") || name == "user-agent" {
             req = req.header(key, value);
         }
     }
 
     let response = req.send().await.map_err(|e| {
-        tracing::error!(error = %e, "upstream request failed");
+        tracing::error!(
+            upstream = %provider.upstream,
+            error = %e,
+            "upstream_request_failed"
+        );
         StatusCode::BAD_GATEWAY
     })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
+
+    // Spine event 2/3: upstream framing. The five fields below are
+    // exactly what a "why did this response not reach the client?"
+    // investigation needs — they pin the framing-conflict failure
+    // mode (e.g. `transfer-encoding: chunked` from the upstream
+    // copied verbatim onto our own collected-Bytes body) to a
+    // single log line instead of requiring a packet capture.
+    tracing::debug!(
+        upstream_status = status.as_u16(),
+        content_length = ?resp_headers.get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok()),
+        content_encoding = ?resp_headers.get(axum::http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        transfer_encoding = ?resp_headers.get(axum::http::header::TRANSFER_ENCODING)
+            .and_then(|v| v.to_str().ok()),
+        content_type = ?resp_headers.get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        is_stream,
+        "upstream_response"
+    );
 
     if is_stream {
         return relay_sse_stream(
@@ -132,15 +223,17 @@ async fn handle_messages(
             provider_name,
             session_id,
             trace_token,
+            agent_id,
             peer_addr,
             start,
+            plan_status,
         );
     }
 
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read Anthropic messages upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
     let usage = extract_usage_from_body(&resp_body);
     let metering = if usage.is_some() {
         kyris_core::record::Metering::Available
@@ -169,50 +262,87 @@ async fn handle_messages(
         },
     );
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
-
-    let working_dir = match trace_token.as_deref() {
-        Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
-        None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
-    let _ = state.stats_tx.try_send(StatsEvent {
-        trace_id: trace_id.clone(),
-        provider: provider_name,
-        model: model.clone(),
-        tokens,
-        cache_create: cache_creation,
-        cache_read,
-        cost,
-        latency_ms,
-        status: if status.is_success() {
-            "success".to_string()
-        } else {
-            "error".to_string()
-        },
-        session_id: Some(session_id.clone()),
-        mcp_server: None,
-        mcp_tool: None,
-        metering,
-        working_dir,
-    });
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.clone().or(peer_agent);
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        builder = builder.header(key, value);
+    if state
+        .stats_tx
+        .try_send(StatsEvent {
+            trace_id: trace_id.clone(),
+            provider: provider_name,
+            model: model.clone(),
+            tokens,
+            cache_create: cache_creation,
+            cache_read,
+            cost,
+            latency_ms,
+            status: if !status.is_success() {
+                "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
+            },
+            session_id: Some(session_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            metering,
+            plan_status,
+            working_dir,
+            agent,
+        })
+        .is_err()
+    {
+        crate::storage::record_dropped(1);
     }
+
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    // Spine event 3/3: response we're about to hand hyper. Header
+    // names (not values — values can carry secrets) + body byte
+    // count make the framing situation observable: if upstream sent
+    // `transfer-encoding: chunked` and we're emitting a fixed-size
+    // body, both names appear here AND the response_framing_check
+    // middleware will ERROR with the exact reason.
+    let response_body_bytes = resp_body.len();
+    let header_names: Vec<&str> = resp_headers
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .collect();
+    tracing::debug!(
+        response_status = status.as_u16(),
+        response_body_bytes,
+        header_names = ?header_names,
+        "response_built"
+    );
+
+    builder.body(Body::from(resp_body)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build Anthropic messages response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -226,8 +356,10 @@ fn relay_sse_stream(
     provider_name: String,
     session_id: String,
     trace_token: Option<String>,
+    agent_id: Option<String>,
     peer_addr: SocketAddr,
     start: std::time::Instant,
+    plan_status: PlanStatus,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(StreamTokenCounts::default()));
     let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
@@ -347,14 +479,17 @@ fn relay_sse_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "type": "error",
                                 "error": {
@@ -365,8 +500,6 @@ fn relay_sse_stream(
                             let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
                             breaker_chunk = Some(Bytes::from(err_chunk));
                         }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -377,27 +510,42 @@ fn relay_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = match trace_token.as_deref() {
-                Some(token) => super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                None => super::resolve_peer_working_dir_sync(peer_addr),
+            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+                (
+                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
+                    None,
+                )
+            } else {
+                let attr =
+                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
+                (attr.working_dir, attr.agent)
             };
+            let agent = agent_id.clone().or(peer_agent);
 
-            let _ = state.stats_tx.try_send(StatsEvent {
-                trace_id: trace_id_for_stream.clone(),
-                provider: provider_name_for_stream.clone(),
-                model: model_for_stream.clone(),
-                tokens,
-                cache_create: stream_tokens.cache_creation_input,
-                cache_read: stream_tokens.cache_read_input,
-                cost,
-                latency_ms,
-                status: status.to_string(),
-                session_id: Some(session_id_for_stream.clone()),
-                mcp_server: None,
-                mcp_tool: None,
-                metering: stream_metering,
-                working_dir,
-            });
+            if state
+                .stats_tx
+                .try_send(StatsEvent {
+                    trace_id: trace_id_for_stream.clone(),
+                    provider: provider_name_for_stream.clone(),
+                    model: model_for_stream.clone(),
+                    tokens,
+                    cache_create: stream_tokens.cache_creation_input,
+                    cache_read: stream_tokens.cache_read_input,
+                    cost,
+                    latency_ms,
+                    status: status.to_string(),
+                    session_id: Some(session_id_for_stream.clone()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    metering: stream_metering,
+                    plan_status,
+                    working_dir,
+                    agent,
+                })
+                .is_err()
+            {
+                crate::storage::record_dropped(1);
+            }
 
             breaker_chunk
         };
@@ -431,21 +579,14 @@ fn relay_sse_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
-    builder
-        .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    builder.body(Body::from_stream(full_stream)).map_err(|e| {
+        tracing::error!(error = %e, "failed to build Anthropic messages SSE stream response");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn handle_count_tokens(
@@ -458,26 +599,43 @@ async fn handle_count_tokens(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Anthropic)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Anthropic upstream. The agent's own credential
+            // (OAuth or API key) is what gets forwarded.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Anthropic)
+        });
+
+    // Pure passthrough: forward the caller's credential or fail fast.
+    if !headers.contains_key("authorization") && !headers.contains_key("x-api-key") {
+        return Ok(no_credential_response(&uuid::Uuid::now_v7().to_string()));
+    }
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider.name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!("{}/v1/messages/count_tokens", provider.upstream);
 
     let mut req = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(provider.timeout_seconds))
-        .header("x-api-key", &provider.api_key)
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
         .body(body.to_vec());
 
+    if let Some(v) = headers.get("authorization") {
+        req = req.header("authorization", v);
+    }
+    if let Some(v) = headers.get("x-api-key") {
+        req = req.header("x-api-key", v);
+    }
+
     for (key, value) in &headers {
         let name = key.as_str().to_lowercase();
-        if name.starts_with("anthropic-") && name != "anthropic-version" {
+        if (name.starts_with("anthropic-") && name != "anthropic-version") || name == "user-agent" {
             req = req.header(key, value);
         }
     }
@@ -488,16 +646,19 @@ async fn handle_count_tokens(
     })?;
 
     let status = response.status();
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read Anthropic count_tokens upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build Anthropic count_tokens response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 struct BodyUsage {
@@ -558,34 +719,43 @@ fn circuit_breaker_message(token_count: i64) -> String {
     )
 }
 
-fn circuit_breaker_error(trace_id: &str, token_count: i64) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "circuit_breaker",
-            "message": circuit_breaker_message(token_count),
-        },
-        "x-kyris-trace-id": trace_id,
-    }))
+/// Pre-request circuit breaker response (429). Used for both streaming and
+/// non-streaming requests: the SSE connection has not been established yet,
+/// so a plain HTTP 429 is the correct response regardless of stream mode.
+/// Mid-stream circuit breaker injection (once SSE is active) remains 200.
+fn circuit_breaker_response(trace_id: &str, token_count: i64) -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .header("x-kyris-trace-id", trace_id)
+        .body(Body::from(
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "circuit_breaker",
+                    "message": circuit_breaker_message(token_count),
+                },
+            })
+            .to_string(),
+        ))
+        .expect("build circuit breaker response")
 }
 
-fn circuit_breaker_sse_error(trace_id: &str, token_count: i64) -> Response {
-    let payload = serde_json::json!({
-        "type": "error",
-        "error": {
-            "type": "circuit_breaker",
-            "message": circuit_breaker_message(token_count),
-        },
-        "x-kyris-trace-id": trace_id,
-    });
-    let chunk = format!("event: error\ndata: {payload}\n\n");
-
+/// Fail-fast response (401) when the caller supplied no provider credential.
+/// kyrisd is a pure passthrough — it forwards the caller's credential and
+/// stores none — so there is nothing to send upstream.
+fn no_credential_response(trace_id: &str) -> Response {
     Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
         .header("x-kyris-trace-id", trace_id)
-        .body(Body::from(chunk))
-        .expect("build circuit breaker SSE response")
+        .body(Body::from(
+            serde_json::json!({
+                "error": "no provider credential supplied; kyrisd forwards your agent's credential and stores none"
+            })
+            .to_string(),
+        ))
+        .expect("build no-credential response")
 }
 
 #[cfg(test)]
@@ -600,6 +770,32 @@ mod tests {
     use bytes::Bytes;
     use kyris_core::config::{KyrisdConfig, ProviderConfig, ProviderFormat};
     use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn testPlanStatusSubscriptionOauthIsIncluded() {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer sk-ant-oat01-abc".parse().unwrap());
+        assert_eq!(anthropic_plan_status(&h), PlanStatus::Included);
+
+        let mut beta = HeaderMap::new();
+        beta.insert(
+            "anthropic-beta",
+            "claude-code-20250219,oauth-2025-04-20".parse().unwrap(),
+        );
+        assert_eq!(anthropic_plan_status(&beta), PlanStatus::Included);
+    }
+
+    #[test]
+    fn testPlanStatusApiKeyAndFallbackAreOverage() {
+        let mut key = HeaderMap::new();
+        key.insert("x-api-key", "sk-ant-api03-xyz".parse().unwrap());
+        assert_eq!(anthropic_plan_status(&key), PlanStatus::Overage);
+        // No agent credential -> kyrisd substitutes its configured key -> billed.
+        assert_eq!(
+            anthropic_plan_status(&HeaderMap::new()),
+            PlanStatus::Overage
+        );
+    }
 
     use crate::{
         circuit_breaker::CircuitBreaker, cost::CostCalculator, metering::StatsEvent,
@@ -711,7 +907,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -730,9 +925,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         });
 
+        // The caller supplies its own credential; kyrisd forwards exactly that
+        // `x-api-key` value to the upstream.
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic")
+            .header("x-api-key", "caller-key")
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .json(&request_body)
             .send()
@@ -770,7 +968,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("x-api-key").map(String::as_str),
-            Some("anthropic-secret")
+            Some("caller-key")
         );
         assert_eq!(
             request.headers.get("anthropic-version").map(String::as_str),
@@ -802,7 +1000,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -824,6 +1021,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic-stream")
+            .header("x-api-key", "caller-key")
             .header("anthropic-beta", "prompt-caching-2024-07-31")
             .json(&request_body)
             .send()
@@ -863,7 +1061,7 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
             request.headers.get("x-api-key").map(String::as_str),
-            Some("anthropic-secret")
+            Some("caller-key")
         );
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["stream"], true);
@@ -876,12 +1074,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn testAnthropicNonStreamRouteReturns429WhenBreakerTripped() {
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            upstream: "http://127.0.0.1:9".to_string(), // unreachable — breaker fires first
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        state
+            .circuit_breaker
+            .record_tokens("sess-anthropic-nonstream-tripped", 1, 1);
+        let app = routes(state);
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .header("x-kyris-session-id", "sess-anthropic-nonstream-tripped")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "circuit_breaker");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("kyris continue")
+        );
+
+        let _ = router_shutdown.send(());
+        router_handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn testAnthropicStreamRouteReturnsSseBreakerErrorWhenSessionIsTripped() {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: "http://127.0.0.1:9".to_string(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -911,19 +1163,24 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        // Pre-request circuit breaker: SSE connection not yet established,
+        // so the response is a plain 429 JSON (not a 200 SSE stream).
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             response
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("text/event-stream")
+            Some("application/json")
         );
-        let streamed_body = response.text().await.unwrap();
-        assert!(streamed_body.contains("event: error"), "{streamed_body}");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "circuit_breaker");
         assert!(
-            streamed_body.contains("\"type\":\"circuit_breaker\""),
-            "{streamed_body}"
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("kyris continue"),
+            "{body}"
         );
 
         let _ = router_shutdown.send(());
@@ -945,7 +1202,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            api_key: "anthropic-secret".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
@@ -968,6 +1224,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic-threshold")
+            .header("x-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
@@ -984,6 +1241,53 @@ mod tests {
         let request = recorded.lock().unwrap().clone().unwrap();
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["stream"], true);
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testAnthropicRouteFailsFastWhenNoCredentialAndDoesNotHitUpstream() {
+        let recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/v1/messages", post(record_upstream_request))
+            .with_state(recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            upstream: upstream_url.clone(),
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        // No `authorization` and no `x-api-key`: kyrisd has nothing to forward
+        // and must fail fast without hitting the upstream.
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "claude-3-5-sonnet-20241022",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("no provider credential supplied"), "{body}");
+        assert!(recorded.lock().unwrap().is_none(), "upstream was hit");
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());
@@ -1110,6 +1414,7 @@ mod tests {
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: crate::server::build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
             mcp_annotation_cache: crate::mcp_routing::AnnotationCache::default(),

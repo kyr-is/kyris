@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "kyris-types"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,15 +11,35 @@ description = "Pure schema and serialization types for the Kyris workspace. No I
 
 [features]
 openapi = ["utoipa"]
-schema = ["schemars"]
+# Forwards to agentpact-types so the shared `Action` and
+# `AttributionMethod` enums get `schemars::JsonSchema` derives when
+# downstream tooling (`cargo xtask schemas`) builds with this feature.
+schema = ["schemars", "agentpact-types/schema"]
 
 [dependencies]
+# Shared wire value types defined by agentpact (Action,
+# AttributionMethod, Mode). Re-exported from `event.rs` so existing
+# `kyris_types::event::Action` imports keep working.
+agentpact-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# Explicitly authorized GA exception per forest/03-architecture.md §0.4 #1.
+# serde-saphyr is still 0.0.x; no GA alternative provides the same YAML+serde
+# integration. Used here only for test fixtures and the bundled pricing
+# include_str! parsing — no production runtime dependency.
 serde-saphyr = { workspace = true }
 utoipa = { version = "5.4", optional = true }
 schemars = { version = "1.2", optional = true }
+
+# Build-time only: fetch the LiteLLM pricing feed and bake it into the binary
+# for `PricingTable::bundled()` (see build.rs). Mirrors the workspace TLS stack
+# (reqwest rustls-no-provider + aws-lc-rs) so `cargo deny` sees no new backend.
+[build-dependencies]
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

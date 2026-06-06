@@ -15,6 +15,10 @@ pub struct KyrisdConfig {
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
     #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
+    pub github: GithubConfig,
+    #[serde(default)]
     pub sync: SyncConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
@@ -22,15 +26,54 @@ pub struct KyrisdConfig {
     pub stats: StatsConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
+    #[serde(default)]
+    pub spend: SpendConfig,
+    #[serde(default)]
+    pub log: LogConfig,
+}
+
+/// Operational logging configuration. `filter` is the baseline
+/// `EnvFilter` directive applied at startup (overridden by
+/// `KYRIS_LOG` / `RUST_LOG` env vars when present). `verbose_filter`
+/// is what `SIGUSR2` toggles to and back from — typically something
+/// like `kyrisd::adapter=trace,kyrisd=debug` for one-off forensics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_filter")]
+    pub filter: String,
+    #[serde(default = "default_log_verbose_filter")]
+    pub verbose_filter: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            filter: default_log_filter(),
+            verbose_filter: default_log_verbose_filter(),
+        }
+    }
+}
+
+fn default_log_filter() -> String {
+    "kyrisd=info".to_string()
+}
+
+fn default_log_verbose_filter() -> String {
+    "kyrisd::adapter=trace,kyrisd::auth=debug,kyrisd=debug".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_listen")]
     pub listen: String,
-    #[serde(default)]
+    // Secret bearer keys are NOT persisted to kyrisd.yaml. They live in the
+    // login Keychain (see `kyris_core::keychain`) and are populated into these
+    // in-memory fields at config-load time, so they survive `--reset-data` and
+    // can't drift between the daemon and the hook. `#[serde(skip)]` keeps them
+    // out of both the parsed file and any rewrite of it.
+    #[serde(skip)]
     pub inbound_key: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub operator_key: String,
     #[serde(default = "default_max_request_body_bytes")]
     pub max_request_body_bytes: usize,
@@ -108,7 +151,6 @@ pub enum ProviderFormat {
 pub struct ProviderConfig {
     pub name: String,
     pub format: ProviderFormat,
-    pub api_key: String,
     pub upstream: String,
     #[serde(default)]
     pub models: Vec<String>,
@@ -116,6 +158,31 @@ pub struct ProviderConfig {
     pub timeout_seconds: u64,
     #[serde(default = "default_streaming_timeout_seconds")]
     pub streaming_timeout_seconds: u64,
+}
+
+impl ProviderConfig {
+    /// Canonical defaults for each well-known format: a fresh-install kyrisd
+    /// with no `providers[]` configured is still a usable transparent proxy —
+    /// the agent brings its own credential and kyrisd forwards it to the
+    /// standard upstream. Explicit `providers[]` entries only matter when you
+    /// want to override the upstream. kyrisd holds no provider credential of
+    /// its own — it forwards the caller's and stores none.
+    #[must_use]
+    pub fn default_for(format: ProviderFormat) -> Self {
+        let (name, upstream) = match format {
+            ProviderFormat::Anthropic => ("anthropic", "https://api.anthropic.com"),
+            ProviderFormat::OpenAI => ("openai", "https://api.openai.com"),
+            ProviderFormat::Google => ("google", "https://generativelanguage.googleapis.com"),
+        };
+        Self {
+            name: name.to_string(),
+            format,
+            upstream: upstream.to_string(),
+            models: Vec::new(),
+            timeout_seconds: default_timeout_seconds(),
+            streaming_timeout_seconds: default_streaming_timeout_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,20 +236,46 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// The relay this install talks to. The single home for the relay URL — it is
+/// NOT stored in `credentials.json` (that artifact holds only the machine
+/// identity). Read at runtime by the daemon (`pricing_fetch` GETs
+/// `<url>/api/v1/pricing`; `daemon_sync` POSTs events there, additionally
+/// needing the enrolled `machine_token`), and at enroll time by `kyris enroll`
+/// as the relay to enroll against when no `--relay-url` / `KYRIS_RELAY_URL` is
+/// given. Pricing needs no enrollment. Ships `https://relay.kyr.is` in
+/// `default.yaml`; the dev patch overrides it to a local relay, and
+/// `--relay-url` overrides per `kyris enroll` invocation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RelayConfig {
+    #[serde(default)]
+    pub url: String,
+}
+
+/// GitHub App used for `kyris enroll`'s device flow. `client_id` is PUBLIC (it
+/// appears in the authorize URL), so it lives in committed config: the committed
+/// value is the prod app, and the `kyris-dev` patch overrides it to the dev app.
+/// The `GITHUB_CLIENT_ID` env var overrides config per run. The client SECRET is
+/// never here — only the relay (server-side) needs it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GithubConfig {
+    #[serde(default)]
+    pub client_id: String,
+}
+
+/// Sync directory scope. Whether sync runs at all is determined by
+/// enrollment (`credentials.json`), not config. Sync is default-on for
+/// governed directories that are not conventionally private (hidden/dot-prefixed
+/// dirs, owner-only `0700` dirs, and the macOS personal folders are always
+/// excluded — see `daemon::sync::scope`). An empty `scope` syncs every such
+/// directory; a non-empty `scope` additionally *narrows* to the listed paths.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncConfig {
     #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
     pub scope: Vec<String>,
-    #[serde(default)]
-    pub relay_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingConfig {
-    #[serde(default = "default_pricing_file")]
-    pub file: String,
     #[serde(default = "default_fetch_interval_hours")]
     pub fetch_interval_hours: u64,
 }
@@ -190,7 +283,6 @@ pub struct PricingConfig {
 impl Default for PricingConfig {
     fn default() -> Self {
         Self {
-            file: default_pricing_file(),
             fetch_interval_hours: default_fetch_interval_hours(),
         }
     }
@@ -233,6 +325,34 @@ impl Default for AgentsConfig {
     }
 }
 
+/// Spend warning configuration. Toasts fire when the rolling spend total
+/// crosses any threshold. Default: no thresholds (warnings disabled).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendConfig {
+    /// Dollar amounts at which to fire a toast notification. Each threshold
+    /// fires once when the rolling window total crosses it upward; resets
+    /// when spend drops back below (e.g. after the window rolls over).
+    /// Example: `[10.0, 50.0, 100.0]`
+    #[serde(default)]
+    pub warn_thresholds_usd: Vec<f64>,
+    /// Rolling window for spend aggregation in hours. Default: 24.
+    #[serde(default = "default_spend_window_hours")]
+    pub window_hours: u64,
+}
+
+impl Default for SpendConfig {
+    fn default() -> Self {
+        Self {
+            warn_thresholds_usd: Vec::new(),
+            window_hours: default_spend_window_hours(),
+        }
+    }
+}
+
+fn default_spend_window_hours() -> u64 {
+    24
+}
+
 fn default_reconcile_interval_minutes() -> u64 {
     15
 }
@@ -253,7 +373,10 @@ fn default_streaming_timeout_seconds() -> u64 {
     300
 }
 fn default_pending_timeout_seconds() -> u64 {
-    60
+    // kyrisd expires a held approval after this long. Kept above kyris's 590s
+    // no-TTY poll window so the pending dialog outlives the wait rather than
+    // vanishing mid-poll. See kyris-core `NATIVE_HOOK_POLL_TIMEOUT`.
+    900
 }
 fn default_socket_timeout_ms() -> u64 {
     50
@@ -266,9 +389,6 @@ fn default_max_tokens() -> u64 {
 }
 fn default_session_idle_minutes() -> u64 {
     30
-}
-fn default_pricing_file() -> String {
-    "config/pricing.yaml".to_string()
 }
 fn default_fetch_interval_hours() -> u64 {
     6
@@ -325,7 +445,6 @@ server:
 providers:
   - name: anthropic
     format: anthropic
-    api_key: "sk-ant-test"
     upstream: "https://api.anthropic.com"
     models:
       - claude-4-opus
@@ -334,8 +453,12 @@ circuit_breaker:
 "#;
         let config: KyrisdConfig = serde_saphyr::from_str(yaml_str).unwrap();
         assert_eq!(config.server.listen, "127.0.0.1:4710");
-        assert_eq!(config.server.inbound_key, "sk-kyris-test");
-        assert_eq!(config.server.operator_key, "sk-kyris-ops-test");
+        // Secret keys are NOT sourced from the yaml — they live in the on-disk
+        // secret store (see `kyris_core::secret`). A yaml that still carries the
+        // old key lines parses fine (they're ignored), and the in-memory fields
+        // stay empty until a store-populating load path fills them.
+        assert!(config.server.inbound_key.is_empty());
+        assert!(config.server.operator_key.is_empty());
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.providers[0].name, "anthropic");
         assert_eq!(config.providers[0].format, ProviderFormat::Anthropic);
@@ -349,7 +472,6 @@ circuit_breaker:
 providers:
   - name: bedrock-claude
     format: anthropic
-    api_key: ""
     upstream: "https://bedrock-runtime.us-east-1.amazonaws.com"
 "#;
         let config: KyrisdConfig = serde_saphyr::from_str(yaml_str).unwrap();
@@ -363,7 +485,7 @@ providers:
         assert_eq!(config.server.listen, "127.0.0.1:4710");
         assert!(config.providers.is_empty());
         assert!(!config.mcp.enabled);
-        assert!(!config.sync.enabled);
+        assert!(config.sync.scope.is_empty());
     }
 
     #[test]
@@ -391,7 +513,6 @@ mcp:
     #[test]
     fn testSyncConfigDefaults() {
         let config = SyncConfig::default();
-        assert!(!config.enabled);
         assert!(config.scope.is_empty());
     }
 

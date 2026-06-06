@@ -52,8 +52,24 @@ pub fn run(args: VerifyArgs) {
         print_human(&checks, mode);
     }
 
-    if (args.post_install || args.post_uninstall) && !all_passed {
+    if args.post_uninstall && !all_passed {
         std::process::exit(1);
+    }
+    if args.post_install {
+        // Only gate on binaries + core services (kyrisd, agentpactd).
+        // Hooks, shell-rc, and is.kyr.env are configured by `kyris install`,
+        // not by install.sh — their absence at this point is expected.
+        let critical_passed = checks
+            .iter()
+            .filter(|c| {
+                c.component == "binaries"
+                    || (c.component == "services"
+                        && matches!(c.name, "is.kyr.kyrisd" | "is.kyr.agentpactd"))
+            })
+            .all(|c| c.passed);
+        if !critical_passed {
+            std::process::exit(1);
+        }
     }
 }
 
@@ -180,6 +196,21 @@ fn installed_checks() -> Vec<Check> {
         },
     });
 
+    // is.kyr.env sets BASH_ENV for non-interactive shells via launchd.
+    // install_bash_env_launchd writes and bootstraps it; verify that
+    // bootstrap actually succeeded, not just that the plist file exists.
+    let env_loaded = launchd_loaded("is.kyr.env");
+    checks.push(Check {
+        name: "is.kyr.env",
+        component: "services",
+        passed: env_loaded,
+        detail: if env_loaded {
+            "loaded".into()
+        } else {
+            "not loaded in launchd (BASH_ENV will not apply to GUI apps)".into()
+        },
+    });
+
     // Shell hooks
     let hooks_dir = PathBuf::from(&home).join(".kyris").join("hooks");
     for hook in [
@@ -260,6 +291,7 @@ fn installed_checks() -> Vec<Check> {
 
 // --- Post-uninstall checks: NONE of these should exist ---
 
+#[allow(clippy::too_many_lines)]
 fn clean_checks() -> Vec<Check> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut checks = Vec::new();
@@ -354,6 +386,106 @@ fn clean_checks() -> Vec<Check> {
             },
         });
     }
+
+    // Agent hook scripts kyris installs into per-agent config dirs.
+    for rel in super::uninstall::WELL_KNOWN_HOOK_PATHS {
+        let path = PathBuf::from(&home).join(rel);
+        let exists = path.exists();
+        checks.push(Check {
+            name: rel,
+            component: "agent-hooks",
+            passed: !exists,
+            detail: if exists {
+                format!("residue: {}", path.display())
+            } else {
+                "removed".into()
+            },
+        });
+    }
+
+    // Agent JSON / TOML config files — must not contain any kyris markers.
+    // These are the files kyris surgically modifies (hooks, MCP servers,
+    // base URLs).  If they still contain kyris content, uninstall was
+    // incomplete.
+    let kyris_markers = [
+        "kyris-mcp",
+        "kyris-hook",
+        "kyris_pretooluse",
+        "agentpact_pretooluse",
+        "agentpact_beforetool",
+        "/.kyris/",
+    ];
+
+    // Relative-to-HOME paths for agents with stable dot-directory configs.
+    let agent_configs: &[(&str, &str)] = &[
+        (".claude/settings.json", "claude-code"),
+        (".codex/hooks.json", "codex-cli"),
+        (".gemini/settings.json", "gemini-cli"),
+        (".cline/data/globalState.json", "cline (global state)"),
+        (".config/opencode/opencode.json", "opencode"),
+    ];
+    for (rel, label) in agent_configs {
+        let path = PathBuf::from(&home).join(rel);
+        if !path.exists() {
+            continue; // absent is clean
+        }
+        let has_residue = kyris_markers.iter().any(|m| file_contains(&path, m));
+        checks.push(Check {
+            name: label,
+            component: "agent-configs",
+            passed: !has_residue,
+            detail: if has_residue {
+                format!("kyris entries remain in {}", path.display())
+            } else {
+                "clean".into()
+            },
+        });
+    }
+
+    // Cline MCP settings live in VS Code extension global storage — not
+    // under HOME directly, so path-join separately with the full relative path.
+    let cline_mcp = PathBuf::from(&home)
+        .join("Library")
+        .join("Application Support")
+        .join("Code")
+        .join("User")
+        .join("globalStorage")
+        .join("saoudrizwan.claude-dev")
+        .join("cline_mcp_settings.json");
+    if cline_mcp.exists() {
+        let has_residue = kyris_markers.iter().any(|m| file_contains(&cline_mcp, m));
+        checks.push(Check {
+            name: "cline (MCP settings)",
+            component: "agent-configs",
+            passed: !has_residue,
+            detail: if has_residue {
+                format!("kyris entries remain in {}", cline_mcp.display())
+            } else {
+                "clean".into()
+            },
+        });
+    }
+
+    // Package registry — must be gone so agentpact does not see kyris as installed.
+    let registry_path = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .map_or_else(
+            || PathBuf::from(&home).join(".local").join("share"),
+            PathBuf::from,
+        )
+        .join("kyr-packages")
+        .join("kyris.json");
+    let registry_exists = registry_path.exists();
+    checks.push(Check {
+        name: "package registry",
+        component: "registry",
+        passed: !registry_exists,
+        detail: if registry_exists {
+            format!("residue: {}", registry_path.display())
+        } else {
+            "removed".into()
+        },
+    });
 
     checks
 }
@@ -481,9 +613,43 @@ fn print_human(checks: &[Check], mode: Mode) {
     if failed.is_empty() {
         println!("All checks passed.");
     } else {
-        println!("{} check(s) failed:", failed.len());
-        for check in failed {
-            println!("  - {}: {}", check.name, check.detail);
+        // For PostInstall mode: distinguish critical failures from pending
+        // configuration that `kyris install` will supply.
+        let pending: Vec<_> = failed
+            .iter()
+            .filter(|c| {
+                matches!(c.component, "hooks" | "shell-rc" | "runtime")
+                    || (c.component == "services" && c.name == "is.kyr.env")
+            })
+            .collect();
+        let critical: Vec<_> = failed
+            .iter()
+            .filter(|c| {
+                !(matches!(c.component, "hooks" | "shell-rc" | "runtime")
+                    || (c.component == "services" && c.name == "is.kyr.env"))
+            })
+            .collect();
+
+        if !critical.is_empty() {
+            println!("{} critical check(s) failed:", critical.len());
+            for check in &critical {
+                println!("  - {}: {}", check.name, check.detail);
+            }
+        }
+        if !pending.is_empty() {
+            if mode == Mode::PostInstall {
+                println!("{} check(s) pending `kyris install`:", pending.len());
+            } else {
+                println!("{} check(s) failed:", pending.len());
+            }
+            for check in &pending {
+                println!("  - {}: {}", check.name, check.detail);
+            }
+        }
+        if mode == Mode::PostInstall && critical.is_empty() && !pending.is_empty() {
+            println!(
+                "\nBinary install complete. Run `kyris install` to configure shell hooks and agent integrations."
+            );
         }
     }
 }

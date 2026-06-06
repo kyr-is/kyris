@@ -6,6 +6,19 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
+// Crate-level allows. These are deliberate trade-offs for a CLI binary
+// rather than a general-purpose library:
+// - needless_pass_by_value: every `run(args: XArgs)` handler consumes its
+//   Args struct top-to-bottom; passing by reference would force lifetime
+//   annotations everywhere with no ergonomic gain.
+// - missing_errors_doc / missing_panics_doc: pedantic lints intended for
+//   library APIs that downstream crates document. `kyris` is a binary; the
+//   public-ish `pub fn run(...)` surface is internal to this crate and is
+//   only invoked from `main`. Adding `# Errors` / `# Panics` sections to
+//   every internal entry point would be docs-cargo-culting.
+// - must_use_candidate: `Result`-returning helpers are always consumed by
+//   `?` or explicit match in the same crate; tagging them `#[must_use]`
+//   adds noise without catching real bugs.
 #![allow(
     clippy::needless_pass_by_value,
     clippy::missing_errors_doc,
@@ -20,16 +33,23 @@ mod check;
 mod compile_policy;
 mod config_writer;
 mod continue_cmd;
+mod diag_cmd;
+mod doctor;
+mod headline;
 mod hook_cmd;
 mod integration;
+mod json_patch_ops;
 mod lifecycle;
+mod logs_cmd;
 mod mcp_cmd;
+mod operator;
 mod pending;
 mod query;
 mod scan;
 mod service;
 mod state;
 mod status;
+mod toml_patch;
 mod version;
 
 use clap::{Parser, Subcommand};
@@ -45,21 +65,27 @@ struct Cli {
 enum Command {
     Agents(agents::AgentsArgs),
     Always(always_cmd::AlwaysArgs),
+    Approvals(query::approvals::ApprovalsArgs),
     Timeline(query::timeline::TimelineArgs),
     Replay(query::replay::ReplayArgs),
     Stats(query::stats::StatsArgs),
     History(query::history::HistoryArgs),
     Check(check::CheckArgs),
     CompilePolicy(compile_policy::CompilePolicyArgs),
+    Diag(diag_cmd::DiagArgs),
     Hook(hook_cmd::HookArgs),
     Pending(pending::PendingArgs),
     Continue(continue_cmd::ContinueArgs),
+    Doctor(doctor::DoctorArgs),
     Scan(scan::ScanArgs),
-    Install(lifecycle::install::InstallArgs),
+    Install,
     Enroll(lifecycle::enroll::EnrollArgs),
     Update(lifecycle::update::UpdateArgs),
     Daemon(lifecycle::daemon_cmd::DaemonArgs),
+    Logs(logs_cmd::LogsArgs),
     Mcp(mcp_cmd::McpArgs),
+    Disable(lifecycle::run_state::DisableArgs),
+    Enable(lifecycle::run_state::EnableArgs),
     Uninstall(lifecycle::uninstall::UninstallArgs),
     Verify(lifecycle::verify::VerifyArgs),
     Status(status::StatusArgs),
@@ -72,21 +98,27 @@ fn main() {
     match cli.command {
         Command::Agents(args) => agents::run(args),
         Command::Always(args) => always_cmd::run(args),
+        Command::Approvals(args) => query::approvals::run(args),
         Command::Timeline(args) => query::timeline::run(args),
         Command::Replay(args) => query::replay::run(args),
         Command::Stats(args) => query::stats::run(args),
         Command::History(args) => query::history::run(args),
         Command::Check(args) => check::run(args),
         Command::CompilePolicy(args) => compile_policy::run(args),
+        Command::Diag(args) => diag_cmd::run(args),
         Command::Hook(args) => hook_cmd::run(args),
         Command::Pending(args) => pending::run(args),
         Command::Continue(args) => continue_cmd::run(args),
+        Command::Doctor(args) => doctor::run(args),
         Command::Scan(args) => scan::run(args),
-        Command::Install(args) => lifecycle::install::run(args),
+        Command::Install => lifecycle::install::run(),
         Command::Enroll(args) => lifecycle::enroll::run(args),
         Command::Update(args) => lifecycle::update::run(args),
         Command::Daemon(args) => lifecycle::daemon_cmd::run(args),
+        Command::Logs(args) => logs_cmd::run(args),
         Command::Mcp(args) => mcp_cmd::run(args),
+        Command::Disable(args) => lifecycle::run_state::run_disable(args),
+        Command::Enable(args) => lifecycle::run_state::run_enable(args),
         Command::Uninstall(args) => lifecycle::uninstall::run(args),
         Command::Verify(args) => lifecycle::verify::run(args),
         Command::Status(args) => status::run(args),
@@ -119,8 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn testParseContinue() {
-        assert!(try_parse(&["continue"]).is_err());
+    fn testParseContinueNoArgsResetsAll() {
+        // No session arg = reset every currently-tripped session.
+        assert!(try_parse(&["continue"]).is_ok());
     }
 
     #[test]
@@ -161,6 +194,52 @@ mod tests {
     #[test]
     fn testParseHookCheckMissingAgent() {
         assert!(try_parse(&["hook", "check"]).is_err());
+    }
+
+    #[test]
+    fn testParseDisable() {
+        assert!(try_parse(&["disable"]).is_ok());
+    }
+
+    #[test]
+    fn testParseEnable() {
+        assert!(try_parse(&["enable"]).is_ok());
+    }
+
+    #[test]
+    fn testParseStopAndStartAreGone() {
+        // Renamed to `disable`/`enable` when the sentinel mechanism
+        // was retired in favor of a pure `mode: log` ↔ `mode: enforce`
+        // toggle. Old verbs must not silently accept.
+        assert!(try_parse(&["stop"]).is_err());
+        assert!(try_parse(&["start"]).is_err());
+    }
+
+    #[test]
+    fn testParseDaemonOnlyHasStatus() {
+        // `kyris daemon start|stop` were replaced by top-level
+        // `kyris disable|enable` (policy mode toggle). `kyris daemon
+        // logs` was replaced by top-level `kyris logs` (all log files).
+        // What remains is the focused kyrisd service probe.
+        assert!(try_parse(&["daemon", "start"]).is_err());
+        assert!(try_parse(&["daemon", "stop"]).is_err());
+        assert!(try_parse(&["daemon", "logs"]).is_err());
+        assert!(try_parse(&["daemon", "status"]).is_ok());
+    }
+
+    #[test]
+    fn testParseDoctor() {
+        assert!(try_parse(&["doctor"]).is_ok());
+    }
+
+    #[test]
+    fn testParseLogs() {
+        assert!(try_parse(&["logs"]).is_ok());
+    }
+
+    #[test]
+    fn testParseLogsTrace() {
+        assert!(try_parse(&["logs", "trace", "abc-123"]).is_ok());
     }
 
     #[test]

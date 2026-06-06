@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 [package]
 name = "kyris-core"
-version = "0.1.1"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,11 +14,21 @@ pending = ["tokio", "reqwest"]
 
 [dependencies]
 kyris-types = { workspace = true }
+# Wire value types defined by agentpact. Re-exported from
+# `core::agentpact` so consumers can import `Mode` through kyris-core
+# without touching the agentpact server crate.
+agentpact-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+# Explicitly authorized GA exception per forest/03-architecture.md §0.4 #1.
+# serde-saphyr is still 0.0.x; no GA alternative provides the same YAML+serde
+# integration. Used for kyrisd.yaml config parsing in the shared I/O layer.
 serde-saphyr = { workspace = true }
 uuid = { workspace = true }
+# CSPRNG for minting the local hook<->daemon auth secrets in the file-backed
+# secret store (see `secret.rs`) — the same RNG the daemon/cli standardize on.
+aws-lc-rs = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"], optional = true }
 reqwest = { workspace = true, features = ["rustls", "json"], optional = true }
 

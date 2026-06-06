@@ -2,6 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 name: CI
 
+# Runs on every PR and on every push to main. Both triggers run the
+# same job so a commit that lands via PR is re-validated after merge
+# (belt-and-suspenders against branch-protection misconfig or commits
+# pushed directly to main).
+#
+# release.yml handles release-mode compilation + .app bundling +
+# notarization + GitHub Release upload on tagged builds. CI doesn't
+# touch release artifacts.
 on:
   pull_request:
   push:
@@ -21,27 +29,160 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy, llvm-tools-preview
 
+      # Registry-only: cache ~/.cargo (dependency source tarballs + git-dep
+      # clones) so we don't re-download/re-clone every run. We deliberately do
+      # NOT cache ./target — compilation caching (including the bundled-duckdb
+      # C++) is sccache's job; the target blob is large, churns on Cargo.lock,
+      # and would just compete with the sccache store for the 10 GB cache budget.
       - if: env.ACT != 'true'
         uses: Swatinem/rust-cache@v2
         with:
+          cache-targets: "false"
           cache-all-crates: "true"
 
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-llvm-cov
+          tool: cargo-deny,cargo-llvm-cov,sccache
 
+      # sccache caches each compiler invocation by content hash, so the heavy
+      # bundled-duckdb C++ build (libduckdb-sys) is reused across clippy + build
+      # + tests and only recompiles when duckdb's version changes — a versioned
+      # black box. Wrappers are set via $GITHUB_ENV (not a job-level `env:`) so
+      # they don't collide with the kyris-dev patch's ci.yml hunk (lines 19-25).
+      - name: Configure sccache
+        id: sccache
+        run: |
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CC=sccache cc"
+            echo "CXX=sccache c++"
+            # Pin a quiet log level so an inherited SCCACHE_LOG=debug (e.g. from a
+            # stale server or the host env under act) can't flood the run; `warn`
+            # still surfaces real cache errors.
+            echo "SCCACHE_LOG=warn"
+            # sccache can't cache `-C incremental` builds (they return
+            # UnhandledCompile), so incremental MUST be off. Real CI gets this
+            # from rust-cache, but act skips rust-cache — set it explicitly so
+            # both behave the same.
+            echo "CARGO_INCREMENTAL=0"
+            # Relativize absolute paths in compile commands so the duckdb C++
+            # objects hit regardless of the workspace path (which changes every
+            # run under act: …/act/<hash>/hostexecutor/…).
+            echo "SCCACHE_BASEDIR=${{ github.workspace }}"
+          } >> "$GITHUB_ENV"
+          # SCCACHE_DIR: on real runners the workspace is native + writable; under
+          # act it's a Docker bind mount where sccache writes FAIL (≈thousands of
+          # cache_write_errors), so use a container-native path there instead.
+          if [ "${ACT:-}" = "true" ]; then
+            echo "SCCACHE_DIR=/tmp/sccache" >> "$GITHUB_ENV"
+          else
+            echo "SCCACHE_DIR=${{ github.workspace }}/.sccache" >> "$GITHUB_ENV"
+          fi
+          # libduckdb-sys version drives the cache key — bump it and only then
+          # does the duckdb C++ recompile.
+          ver=$(awk '/^name = "libduckdb-sys"/{getline; gsub(/[" ]/,"",$3); print $3; exit}' Cargo.lock)
+          echo "duckdb_ver=$ver" >> "$GITHUB_OUTPUT"
+
+      # Persist the sccache store keyed on the duckdb version ONLY (not the whole
+      # Cargo.lock): a code change never evicts the compiled-duckdb black box, and
+      # a version bump rotates it. restore-keys lets a code-only change reuse the
+      # prior store (duckdb hits; changed crates recompile + re-cache). NOTE: this
+      # is a GitHub cache, so it gives main->branch reuse, not branch->main — an
+      # S3/R2 sccache backend would be needed to share across all branches.
+      - if: env.ACT != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ runner.os }}-duckdb${{ steps.sccache.outputs.duckdb_ver }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-duckdb${{ steps.sccache.outputs.duckdb_ver }}-
+
+      # Start the server explicitly AFTER the env + cache restore, so it reads
+      # SCCACHE_DIR/SCCACHE_BASEDIR at startup. (A server already running without
+      # these would silently ignore them — that's the "Base directories (none)"
+      # / 0% hit trap.)
+      - name: Start sccache server
+        run: |
+          sccache --stop-server || true
+          sccache --start-server
+
+      # BUILD-TIME NETWORK FETCH (intentional, no fallback): kyris-types'
+      # build.rs fetches the live LiteLLM pricing feed and bakes it into the
+      # binary (PricingTable::bundled). Every compile step below therefore
+      # requires outbound network to raw.githubusercontent.com, and the build
+      # FAILS BY DESIGN if the feed is unreachable — there is no fallback URL and
+      # no hand-maintained table. GitHub-hosted runners have network, so no setup
+      # is needed here; do NOT "fix" a fetch failure with --offline, a cached
+      # snapshot, or a fallback source — a failed fetch is meant to fail the build.
       - name: Format check
         run: cargo fmt --check
 
+      # Clippy and cargo-llvm-cov use different rustc drivers (clippy
+      # has its own driver; llvm-cov sets coverage RUSTFLAGS), so the
+      # two cannot share build artifacts. We pay for both compiles
+      # because each catches things the other can't:
+      #   - clippy catches lint regressions on every PR (style + perf
+      #     + correctness lints that tests don't cover)
+      #   - cargo-llvm-cov runs tests AND produces coverage data in
+      #     one go, so coverage data is available on every PR
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Deny check
         run: cargo deny check
 
-      - name: Test with coverage
+      # `--all-targets` builds AND runs every target — including the criterion
+      # benches (harness=false), which run once each in "test mode" under
+      # `cargo test`. So this single step also serves as the bench-build + smoke
+      # check (design/kyris.md §12.1), in the same compilation as the tests — no
+      # separate, differently-compiled `cargo bench` pass needed.
+      - name: Tests with coverage
         run: cargo llvm-cov --all-features --all-targets
 
+      # Cache effectiveness — after a warm run the duckdb C++ objects should show
+      # as hits (≈0 compile requests for them). `--show-stats` is cumulative since
+      # the sccache server started, so this reflects fmt + clippy + tests.
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+      # Verifies build-app-bundle.sh + Info.plist.template produce a
+      # structurally valid Kyrisd.app. Uses the kyrisd binary that
+      # cargo-llvm-cov just built — no extra compile. The instrumented
+      # binary is a normal Mach-O as far as codesign + Info.plist
+      # lookup are concerned.
+      - name: Bundle smoke test
+        env:
+          BINARY: target/llvm-cov-target/debug/kyrisd
+          VERSION: "0.0.0-ci"
+          COMMIT: ${{ github.sha }}
+          OUT_DIR: target/bundle-smoke
+        run: |
+          set -euo pipefail
+          mkdir -p target/bundle-smoke
+          bash scripts/build-app-bundle.sh
+          APP=target/bundle-smoke/Kyrisd.app
+          test -d "$APP" || { echo "::error::bundle directory missing"; exit 1; }
+          test -f "$APP/Contents/Info.plist" || { echo "::error::Info.plist missing"; exit 1; }
+          test -x "$APP/Contents/MacOS/kyrisd" || { echo "::error::binary missing or non-executable"; exit 1; }
+          test -f "$APP/Contents/Resources/is.kyr.kyrisd.plist" || { echo "::error::launchd template missing from Resources"; exit 1; }
+          test -f "$APP/Contents/Resources/Cargo.toml" || { echo "::error::Cargo.toml missing from Resources"; exit 1; }
+          grep -qE '^agentpact\s*=' "$APP/Contents/Resources/Cargo.toml" \
+            || { echo "::error::bundled Cargo.toml is missing the agentpact dependency entry"; exit 1; }
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")
+          test "$BUNDLE_ID" = "is.kyr.kyrisd" || { echo "::error::CFBundleIdentifier wrong: $BUNDLE_ID"; exit 1; }
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+          test "$VER" = "0.0.0-ci" || { echo "::error::version substitution failed: $VER"; exit 1; }
+          LSUI=$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist")
+          test "$LSUI" = "true" || { echo "::error::LSUIElement not set"; exit 1; }
+          codesign --verify --strict --verbose=2 "$APP"
+          "$APP/Contents/MacOS/kyrisd" --version
+          echo "bundle validation OK"
+
+      # Coverage gist only updates on pushes to main, never on PR
+      # builds. PR coverage runs but doesn't write — the gist reflects
+      # the coverage of the latest merged code, not whatever a PR
+      # happened to land.
       - name: Update coverage gist
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:

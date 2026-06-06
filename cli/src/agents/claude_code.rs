@@ -6,13 +6,24 @@ use crate::config_writer::WellFormedJsonValidator;
 use crate::integration::{read_json_value, write_json_value};
 
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_mcp_wrap, not_detected,
+    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
+    json_has_mcp_wrap, not_detected,
 };
 use super::registry::{
     AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation, ToolMapping,
 };
 
 pub struct ClaudeCode;
+
+/// True iff the installed hook-launcher script at `path` matches what
+/// `super::configure::hook_script_source(agent_id)` would write today.
+/// Missing file or read error → `false` (drift).
+fn script_matches_template(path: &std::path::Path, agent_id: &str) -> bool {
+    let Ok(actual) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    actual == super::configure::hook_script_source(agent_id)
+}
 
 pub fn claude_settings_path() -> Result<PathBuf, String> {
     let home = crate::integration::home_dir()?;
@@ -24,11 +35,27 @@ pub fn claude_hooks_dir() -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("hooks"))
 }
 
-fn claude_code_env_exports(base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
+fn claude_code_env_exports(
+    base_url: &str,
+    inbound_key: &str,
+    agent_id: &str,
+) -> Vec<(String, String)> {
     vec![
         ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
-        ("ANTHROPIC_API_KEY".to_string(), inbound_key.to_string()),
-        ("ANTHROPIC_AUTH_TOKEN".to_string(), inbound_key.to_string()),
+        // Deliver the kyrisd gate secret in a dedicated header (parsed by Claude
+        // Code's ANTHROPIC_CUSTOM_HEADERS) so the agent's OWN credential —
+        // subscription OAuth or the user's API key — flows through to the
+        // provider untouched. That lets kyrisd forward it and classify usage as
+        // included (subscription/burn-only) vs overage (API key). We deliberately
+        // do NOT set ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, which would override
+        // the subscription OAuth.
+        (
+            "ANTHROPIC_CUSTOM_HEADERS".to_string(),
+            // Two newline-separated headers (Claude Code's documented format for
+            // multiple): the kyrisd gate secret, and the agent id so kyrisd can
+            // attribute the model-call burn to this agent on the gateway record.
+            format!("x-kyris-inbound: {inbound_key}\nx-kyris-agent-id: {agent_id}"),
+        ),
         (
             "ANTHROPIC_BEDROCK_BASE_URL".to_string(),
             base_url.to_string(),
@@ -74,9 +101,25 @@ impl AgentDescriptor for ClaudeCode {
                 serialized.contains("agentpact_pretooluse")
             })
         });
+
+        // Drift check: if the hook is registered in settings.json but the
+        // on-disk script differs from what the current kyris would write,
+        // treat the surface as not-adapted so `kyris status` flags it and
+        // the user knows to re-run `kyris install` / `kyris agents reconcile`.
+        // Without this, an older kyris version's hook script (which may have
+        // emitted empty stdout, causing the double-prompt symptom) stays in
+        // place silently forever.
+        let hook_script_drifted = has_hook
+            && claude_hooks_dir().is_ok_and(|d| {
+                !script_matches_template(&d.join("agentpact_pretooluse.sh"), "claude-code")
+            });
+        let has_hook = has_hook && !hook_script_drifted;
         let has_mcp_wrap = settings_path
             .as_deref()
             .is_some_and(|p| json_has_mcp_wrap(p, "mcpServers"));
+        let has_any_mcp_servers = settings_path
+            .as_deref()
+            .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
 
         let execution = if has_hook {
             SurfaceState::adapted(AdaptedMechanism::LiveHook)
@@ -85,6 +128,11 @@ impl AgentDescriptor for ClaudeCode {
         };
         let tool = if has_mcp_wrap {
             SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+        } else if !has_any_mcp_servers {
+            // Nothing in settings.json to wrap — wrap surface is structurally
+            // inert until the user adds an MCP server. Treat as N/A so the
+            // agent isn't flagged "incomplete" for a non-issue.
+            SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
@@ -114,10 +162,16 @@ impl AgentDescriptor for ClaudeCode {
         &["agentpact_pretooluse", "kyris-mcp"]
     }
     fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
-        claude_code_env_exports(base_url, inbound_key)
+        claude_code_env_exports(base_url, inbound_key, self.canonical_id())
     }
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
+    }
+    fn launch_dir_env(&self) -> Option<&'static str> {
+        // Claude Code's PreToolUse payload `cwd` is the LIVE working directory
+        // (moves with `cd`); `$CLAUDE_PROJECT_DIR` is the fixed session root and
+        // is the correct permitted-domain anchor.
+        Some("CLAUDE_PROJECT_DIR")
     }
     fn configure_execution(
         &self,
@@ -135,6 +189,9 @@ impl AgentDescriptor for ClaudeCode {
             &script_path,
             &settings_path,
             true,
+            // Claude's PreToolUse default is 600s, which already clears kyris's
+            // ~590s no-TTY poll window — no explicit override needed.
+            None,
         )
     }
     fn configure_burn_control(
@@ -173,6 +230,11 @@ impl AgentDescriptor for ClaudeCode {
         Ok(changes)
     }
     fn undo(&self) -> Result<(), String> {
+        // Remove MCP upstreams before restoring settings.json to its
+        // pre-kyris state (server names become unreadable after restore).
+        let mcp_names = super::configure::mcp_server_names_from_agent(self);
+        super::configure::remove_mcp_upstreams(&mcp_names)?;
+
         let settings_path = claude_settings_path()?;
         if crate::state::restore_manifest_entry(&settings_path)? {
             println!("Reverted {}", settings_path.display());
@@ -182,6 +244,8 @@ impl AgentDescriptor for ClaudeCode {
         Ok(())
     }
     fn undo_burn_control(&self) -> Result<(), String> {
+        // MCP cleanup is handled in undo(); undo_burn_control handles
+        // the remaining burn-control artifacts.
         for path in self.burn_control_config_paths() {
             if crate::state::restore_manifest_entry(&path)? {
                 println!("Reverted {}", path.display());
@@ -248,8 +312,49 @@ impl AgentDescriptor for ClaudeCode {
                     detail_key: Some("file_path".to_string()),
                 },
             ],
+            // LLM coordination primitives and read-only views. These have no
+            // governable side effect; skip the agentpactd round-trip entirely
+            // (the daemon contract for action=call requires context.mcp_server,
+            // which built-ins cannot supply). New Claude built-ins not listed
+            // here will warn-and-defer at run time — kyris hands them to
+            // Claude's own permission prompt rather than suppressing it. See
+            // hook_cmd.rs.
+            pass_through_tools: vec![
+                "AskUserQuestion".to_string(),
+                "TodoWrite".to_string(),
+                "ExitPlanMode".to_string(),
+                "EnterPlanMode".to_string(),
+                "Task".to_string(),
+                "Agent".to_string(),
+                "Glob".to_string(),
+                "Grep".to_string(),
+                "NotebookEdit".to_string(),
+                "BashOutput".to_string(),
+                "KillShell".to_string(),
+                "KillBash".to_string(),
+                "ToolSearch".to_string(),
+                "Skill".to_string(),
+                "Monitor".to_string(),
+                "ScheduleWakeup".to_string(),
+                "WebFetch".to_string(),
+                "WebSearch".to_string(),
+                "ShareOnboardingGuide".to_string(),
+            ],
             default_action: "call".to_string(),
-            allow_response: AllowResponse::EmptyStdout,
+            // Claude Code's PreToolUse hook treats exit-0 with empty stdout as
+            // "no decision" and falls back to its own permission prompt — which
+            // double-prompts after AgentPact already approved. Emitting the
+            // hookSpecificOutput shape with permissionDecision=allow suppresses
+            // Claude's prompt entirely.
+            allow_response: AllowResponse::Json {
+                body: serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "permissionDecisionReason": "approved by AgentPact policy"
+                    }
+                }),
+            },
         })
     }
 }
@@ -259,8 +364,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn testClaudeCodeAllowEmitsHookSpecificOutput() {
+        // Regression test: Claude Code's PreToolUse hook ignores exit-0 with
+        // empty stdout and falls back to its own permission prompt, causing a
+        // double-prompt after AgentPact already approved. The allow response
+        // must use the hookSpecificOutput shape with permissionDecision=allow.
+        let proto = ClaudeCode
+            .hook_protocol()
+            .expect("claude-code hook protocol");
+        match proto.allow_response {
+            AllowResponse::Json { body } => {
+                let hso = body
+                    .get("hookSpecificOutput")
+                    .expect("hookSpecificOutput present");
+                assert_eq!(
+                    hso.get("hookEventName").and_then(|v| v.as_str()),
+                    Some("PreToolUse")
+                );
+                assert_eq!(
+                    hso.get("permissionDecision").and_then(|v| v.as_str()),
+                    Some("allow")
+                );
+            }
+            AllowResponse::EmptyStdout => {
+                panic!(
+                    "Claude Code allow must emit JSON, not empty stdout — would cause double prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn testScriptMatchesTemplateMatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.sh");
+        let expected = super::super::configure::hook_script_source("claude-code");
+        std::fs::write(&path, &expected).unwrap();
+        assert!(script_matches_template(&path, "claude-code"));
+    }
+
+    #[test]
+    fn testScriptMatchesTemplateDriftDetected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("hook.sh");
+        std::fs::write(&path, "#!/bin/bash\n# stale older script\nexit 0\n").unwrap();
+        assert!(!script_matches_template(&path, "claude-code"));
+    }
+
+    #[test]
+    fn testScriptMatchesTemplateMissingFileIsDrift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.sh");
+        assert!(!script_matches_template(&path, "claude-code"));
+    }
+
+    #[test]
     fn testClaudeCodeExportsMultiBackend() {
-        let exports = claude_code_env_exports("http://127.0.0.1:4710", "sk-test");
+        let exports =
+            claude_code_env_exports("http://127.0.0.1:4710", "sk-test", "anthropic/claude-code");
         let keys: Vec<&str> = exports.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"ANTHROPIC_BASE_URL"));
         assert!(keys.contains(&"ANTHROPIC_BEDROCK_BASE_URL"));
@@ -269,6 +430,19 @@ mod tests {
         assert!(keys.contains(&"ANTHROPIC_BEDROCK_MANTLE_BASE_URL"));
         assert!(keys.contains(&"CLAUDE_CODE_SKIP_BEDROCK_AUTH"));
         assert!(keys.contains(&"CLAUDE_CODE_SKIP_VERTEX_AUTH"));
-        assert!(keys.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        // The gate secret rides in a custom header; the agent's own credential
+        // is left untouched (no forced ANTHROPIC_API_KEY/AUTH_TOKEN).
+        assert!(keys.contains(&"ANTHROPIC_CUSTOM_HEADERS"));
+        assert!(!keys.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!keys.contains(&"ANTHROPIC_AUTH_TOKEN"));
+        let custom = exports
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_CUSTOM_HEADERS")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            custom,
+            "x-kyris-inbound: sk-test\nx-kyris-agent-id: anthropic/claude-code"
+        );
     }
 }

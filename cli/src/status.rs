@@ -6,14 +6,18 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use crate::service::{ServiceKind, service_state};
-use crate::state::{bin_dir, credentials_path, load_config};
+use crate::state::{bin_dir, load_config};
 
 #[derive(Args)]
 pub struct StatusArgs {}
 
 pub fn run(_args: StatusArgs) {
-    println!("Kyris Status");
-    println!("============");
+    // Headline first — single-line summary of effective enforcement
+    // posture (enforcing, log-only, errored, kill-switched). Replaces
+    // the old "Kyris Status / ============" header and the separate
+    // "[!] DISABLED via …" banner: the headline already encodes both.
+    println!("{}", crate::headline::render());
+    println!();
 
     check_agentpactd();
     check_kyrisd();
@@ -145,7 +149,7 @@ fn check_compiled_policy_degradation() {
 }
 
 fn check_enrollment() {
-    let enrolled = credentials_path().is_ok_and(|path| path.exists());
+    let enrolled = kyris_core::credentials::load().is_some();
     println!("  [{}] enrolled", status_marker(enrolled));
 }
 

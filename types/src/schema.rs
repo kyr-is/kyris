@@ -20,9 +20,13 @@ pub fn generate() -> Value {
             },
             "mcp": { "$ref": "#/$defs/McpConfig" },
             "circuit_breaker": { "$ref": "#/$defs/CircuitBreakerConfig" },
+            "relay": { "$ref": "#/$defs/RelayConfig" },
             "sync": { "$ref": "#/$defs/SyncConfig" },
             "pricing": { "$ref": "#/$defs/PricingConfig" },
-            "stats": { "$ref": "#/$defs/StatsConfig" }
+            "stats": { "$ref": "#/$defs/StatsConfig" },
+            "agents": { "$ref": "#/$defs/AgentsConfig" },
+            "spend": { "$ref": "#/$defs/SpendConfig" },
+            "log": { "$ref": "#/$defs/LogConfig" }
         },
         "$defs": defs()
     })
@@ -36,9 +40,13 @@ fn defs() -> Value {
     defs.insert("McpConfig".into(), mcp_config());
     defs.insert("McpServerConfig".into(), mcp_server_config());
     defs.insert("CircuitBreakerConfig".into(), circuit_breaker_config());
+    defs.insert("RelayConfig".into(), relay_config());
     defs.insert("SyncConfig".into(), sync_config());
     defs.insert("PricingConfig".into(), pricing_config());
     defs.insert("StatsConfig".into(), stats_config());
+    defs.insert("AgentsConfig".into(), agents_config());
+    defs.insert("SpendConfig".into(), spend_config());
+    defs.insert("LogConfig".into(), log_config());
     Value::Object(defs)
 }
 
@@ -51,14 +59,6 @@ fn server_config() -> Value {
                 "type": "string",
                 "default": "127.0.0.1:4710",
                 "description": "Address and port for the HTTP listener"
-            },
-            "inbound_key": {
-                "type": "string",
-                "description": "Bearer token required on inbound API requests"
-            },
-            "operator_key": {
-                "type": "string",
-                "description": "Bearer token for operator endpoints (stats, health)"
             },
             "max_request_body_bytes": {
                 "type": "integer",
@@ -100,7 +100,7 @@ fn tls_config() -> Value {
 fn provider_config() -> Value {
     json!({
         "type": "object",
-        "required": ["name", "format", "api_key", "upstream"],
+        "required": ["name", "format", "upstream"],
         "additionalProperties": false,
         "properties": {
             "name": {
@@ -111,10 +111,6 @@ fn provider_config() -> Value {
                 "type": "string",
                 "enum": ["anthropic", "openai", "google"],
                 "description": "Wire format for this provider (anthropic, openai, or google)"
-            },
-            "api_key": {
-                "type": "string",
-                "description": "API key for the upstream provider"
             },
             "upstream": {
                 "type": "string",
@@ -154,8 +150,8 @@ fn mcp_config() -> Value {
             "pending_timeout_seconds": {
                 "type": "integer",
                 "minimum": 1,
-                "default": 60,
-                "description": "Seconds before a pending MCP permission request times out"
+                "default": 900,
+                "description": "Seconds before a pending approval (MCP or no-TTY hook) times out; kept above kyris's 590s no-TTY poll window"
             },
             "socket_timeout_ms": {
                 "type": "integer",
@@ -215,24 +211,28 @@ fn circuit_breaker_config() -> Value {
     })
 }
 
+fn relay_config() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Base URL of the kyris-relay this install talks to (pricing fetch and `kyris enroll`). Read at enroll time and at runtime by the daemon; not part of credentials.json."
+            }
+        }
+    })
+}
+
 fn sync_config() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "enabled": {
-                "type": "boolean",
-                "default": false
-            },
             "scope": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Directory globs to sync"
-            },
-            "relay_url": {
-                "type": "string",
-                "format": "uri",
-                "description": "URL of the kyris-relay server"
+                "description": "Directory globs to sync (empty = all). Whether sync runs at all is determined by enrollment (credentials.json), not config."
             }
         }
     })
@@ -243,11 +243,6 @@ fn pricing_config() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "file": {
-                "type": "string",
-                "default": "config/pricing.yaml",
-                "description": "Path to the bundled pricing table"
-            },
             "fetch_interval_hours": {
                 "type": "integer",
                 "minimum": 1,
@@ -291,6 +286,60 @@ fn stats_config() -> Value {
     })
 }
 
+fn agents_config() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "reconcile_interval_minutes": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 15,
+                "description": "Minutes between agent-config reconciliation passes"
+            }
+        }
+    })
+}
+
+fn spend_config() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "warn_thresholds_usd": {
+                "type": "array",
+                "items": { "type": "number", "minimum": 0 },
+                "description": "Dollar amounts at which to fire a spend toast (each fires once per upward crossing of the rolling-window total)"
+            },
+            "window_hours": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 24,
+                "description": "Rolling window for spend aggregation, in hours"
+            }
+        }
+    })
+}
+
+fn log_config() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "filter": {
+                "type": "string",
+                "default": "kyrisd=info",
+                "description": "Default tracing EnvFilter directive for the daemon log"
+            },
+            "verbose_filter": {
+                "type": "string",
+                "default": "kyrisd::adapter=trace,kyrisd::auth=debug,kyrisd=debug",
+                "description": "Tracing EnvFilter directive used when verbose logging is enabled"
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,9 +364,13 @@ mod tests {
             "providers",
             "mcp",
             "circuit_breaker",
+            "relay",
             "sync",
             "pricing",
             "stats",
+            "agents",
+            "spend",
+            "log",
         ] {
             assert!(props.contains_key(section), "missing section: {section}");
         }
@@ -334,9 +387,13 @@ mod tests {
             "McpConfig",
             "McpServerConfig",
             "CircuitBreakerConfig",
+            "RelayConfig",
             "SyncConfig",
             "PricingConfig",
             "StatsConfig",
+            "AgentsConfig",
+            "SpendConfig",
+            "LogConfig",
         ] {
             assert!(defs.contains_key(def), "missing $def: {def}");
         }
@@ -348,7 +405,7 @@ mod tests {
         let required = schema["$defs"]["ProviderConfig"]["required"]
             .as_array()
             .unwrap();
-        for field in ["name", "format", "api_key", "upstream"] {
+        for field in ["name", "format", "upstream"] {
             assert!(
                 required.contains(&json!(field)),
                 "missing required: {field}"

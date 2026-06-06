@@ -41,6 +41,16 @@ impl CircuitBreaker {
         entry.last_activity = Instant::now();
     }
 
+    /// Record a completed call's tokens against its session and report whether
+    /// that pushed the session to/over its cap. Because already-tripped
+    /// sessions are rejected pre-flight (they never reach a record path), a
+    /// `true` here marks the *crossing* call — the single call recorded as
+    /// `circuit_breaker`. Subsequent calls are 429'd pre-flight and unrecorded.
+    pub fn record_and_is_tripped(&self, session_id: &str, tokens: i64, max_tokens: i64) -> bool {
+        self.record_tokens(session_id, tokens, max_tokens);
+        self.is_tripped(session_id)
+    }
+
     pub fn is_tripped(&self, session_id: &str) -> bool {
         let sessions = self.sessions.read().expect("lock sessions");
         sessions
@@ -57,6 +67,23 @@ impl CircuitBreaker {
         } else {
             false
         }
+    }
+
+    /// Clear every session that's at or above its token cap. Returns
+    /// the IDs that were actually tripped (and are now reset) so the
+    /// caller can report which sessions resumed.
+    pub fn reset_all_tripped(&self) -> Vec<String> {
+        let mut sessions = self.sessions.write().expect("lock sessions");
+        let now = Instant::now();
+        let mut cleared = Vec::new();
+        for (id, state) in sessions.iter_mut() {
+            if state.total_tokens >= state.max_tokens {
+                state.total_tokens = 0;
+                state.last_activity = now;
+                cleared.push(id.clone());
+            }
+        }
+        cleared
     }
 
     pub fn prune_idle(&self, idle_timeout: std::time::Duration) {

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::{
     Router,
     body::Body,
-    extract::{ConnectInfo, Path, State},
+    extract::{ConnectInfo, Path, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
@@ -35,21 +35,58 @@ enum GoogleAction {
 async fn handle_model_action(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    trace_id_ext: Option<axum::Extension<crate::trace_id::TraceId>>,
     headers: HeaderMap,
     Path(model_action): Path<String>,
+    RawQuery(raw_query): RawQuery,
     body: Bytes,
 ) -> Result<Response, StatusCode> {
     let Some((model, action)) = parse_model_action(&model_action) else {
         return Err(StatusCode::NOT_FOUND);
     };
+    let trace_id = trace_id_ext.map_or_else(
+        || uuid::Uuid::now_v7().to_string(),
+        |axum::Extension(t)| t.as_str().to_string(),
+    );
+    // Pure passthrough: kyrisd holds no provider credential. The caller's key
+    // arrives either as the `x-goog-api-key` header or the `?key=` query param;
+    // we forward whichever is present, and fail fast if neither is.
+    let caller_key = caller_api_key(&headers, raw_query.as_deref());
     match action {
         GoogleAction::GenerateContent => {
-            handle_generate_content(state, headers, model, peer_addr, body).await
+            handle_generate_content(state, headers, model, peer_addr, body, trace_id, caller_key)
+                .await
         }
         GoogleAction::StreamGenerateContent => {
-            handle_stream_generate_content(state, headers, model, peer_addr, body).await
+            handle_stream_generate_content(
+                state, headers, model, peer_addr, body, trace_id, caller_key,
+            )
+            .await
         }
     }
+}
+
+/// Extract the caller's Google API key: prefer the `x-goog-api-key` header,
+/// otherwise the `key` query parameter. Returns `None` if neither is present
+/// (or present but empty), which triggers a fail-fast response.
+fn caller_api_key(headers: &HeaderMap, raw_query: Option<&str>) -> Option<String> {
+    if let Some(v) = headers
+        .get("x-goog-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(v.to_string());
+    }
+    let query = raw_query?;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("key=")
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn parse_model_action(model_action: &str) -> Option<(String, GoogleAction)> {
@@ -68,9 +105,10 @@ async fn handle_generate_content(
     model: String,
     peer_addr: SocketAddr,
     body: Bytes,
+    trace_id: String,
+    caller_key: Option<String>,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let trace_id = uuid::Uuid::now_v7().to_string();
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -96,17 +134,27 @@ async fn handle_generate_content(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Google)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Google upstream.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Google)
+        });
     let provider_name = provider.name.clone();
+
+    // Pure passthrough: forward the caller's key or fail fast.
+    let Some(caller_key) = caller_key else {
+        return Ok(no_credential_error(&trace_id));
+    };
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!(
         "{}/v1beta/models/{}:generateContent?key={}",
-        provider.upstream, model, provider.api_key
+        provider.upstream, model, caller_key
     );
 
     let response = client
@@ -122,10 +170,10 @@ async fn handle_generate_content(
         })?;
 
     let status = response.status();
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let resp_body = response.bytes().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to read Google generateContent upstream response body");
+        StatusCode::BAD_GATEWAY
+    })?;
     let parsed_tokens = extract_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
         kyris_core::record::Metering::Available
@@ -139,47 +187,70 @@ async fn handle_generate_content(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
-    {
+    let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
             let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
-            state.circuit_breaker.record_tokens(&session_id, total, max);
+            state
+                .circuit_breaker
+                .record_and_is_tripped(&session_id, total, max)
+        } else {
+            false
         }
-    }
-
-    let working_dir = match trace_token.as_deref() {
-        Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
-        None => super::resolve_peer_working_dir(peer_addr).await,
     };
 
-    let _ = state.stats_tx.try_send(StatsEvent {
-        trace_id: trace_id.clone(),
-        provider: provider_name,
-        model: model.clone(),
-        tokens,
-        cache_create: 0,
-        cache_read: 0,
-        cost,
-        latency_ms,
-        status: if status.is_success() {
-            "success".to_string()
-        } else {
-            "error".to_string()
-        },
-        session_id: Some(session_id.clone()),
-        mcp_server: None,
-        mcp_tool: None,
-        metering,
-        working_dir,
-    });
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.clone().or(peer_agent);
+
+    if state
+        .stats_tx
+        .try_send(StatsEvent {
+            trace_id: trace_id.clone(),
+            provider: provider_name,
+            model: model.clone(),
+            tokens,
+            cache_create: 0,
+            cache_read: 0,
+            cost,
+            latency_ms,
+            status: if !status.is_success() {
+                "error".to_string()
+            } else if breaker_crossed {
+                "circuit_breaker".to_string()
+            } else {
+                "success".to_string()
+            },
+            session_id: Some(session_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            metering,
+            plan_status: kyris_core::record::PlanStatus::Overage,
+            working_dir,
+            agent,
+        })
+        .is_err()
+    {
+        crate::storage::record_dropped(1);
+    }
 
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
         .header("x-kyris-trace-id", &trace_id)
         .body(Body::from(resp_body))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build Google generateContent response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn handle_stream_generate_content(
@@ -188,9 +259,10 @@ async fn handle_stream_generate_content(
     model: String,
     peer_addr: SocketAddr,
     body: Bytes,
+    trace_id: String,
+    caller_key: Option<String>,
 ) -> Result<Response, StatusCode> {
     let start = std::time::Instant::now();
-    let trace_id = uuid::Uuid::now_v7().to_string();
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
@@ -216,17 +288,27 @@ async fn handle_stream_generate_content(
         .providers
         .iter()
         .find(|p| p.format == ProviderFormat::Google)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fresh-install passthrough: no `providers[]` configured -> route to
+            // the canonical Google upstream.
+            kyris_core::config::ProviderConfig::default_for(ProviderFormat::Google)
+        });
     let provider_name = provider.name.clone();
+
+    // Pure passthrough: forward the caller's key or fail fast.
+    let Some(caller_key) = caller_key else {
+        return Ok(no_credential_error(&trace_id));
+    };
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!(
         "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
-        provider.upstream, model, provider.api_key
+        provider.upstream, model, caller_key
     );
 
     let response = client
@@ -256,6 +338,7 @@ async fn handle_stream_generate_content(
         provider_name,
         session_id,
         trace_token,
+        agent_id,
         peer_addr,
         start,
     )
@@ -272,6 +355,7 @@ fn relay_ndjson_stream(
     provider_name: String,
     session_id: String,
     trace_token: Option<String>,
+    agent_id: Option<String>,
     peer_addr: SocketAddr,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
@@ -383,14 +467,17 @@ fn relay_ndjson_stream(
                 if config.circuit_breaker.enabled {
                     let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
+                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
+                    if state
+                        .circuit_breaker
+                        .record_and_is_tripped(&session_id, total, max)
+                    {
                         status = "circuit_breaker";
-                    } else if total > max {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
-                        breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                        status = "circuit_breaker";
-                        if emit_breaker_chunk {
+                        // The mid-stream relay already injects the breaker chunk
+                        // when the cap is crossed during the stream; only append
+                        // one here on a natural end-of-stream crossing that
+                        // wasn't already signalled.
+                        if emit_breaker_chunk && !already {
                             let payload = serde_json::json!({
                                 "error": {
                                     "code": 429,
@@ -400,8 +487,6 @@ fn relay_ndjson_stream(
                             });
                             breaker_chunk = Some(Bytes::from(format!("{payload}\n")));
                         }
-                    } else {
-                        state.circuit_breaker.record_tokens(&session_id, total, max);
                     }
                 }
             }
@@ -412,27 +497,42 @@ fn relay_ndjson_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = match trace_token.as_deref() {
-                Some(token) => super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                None => super::resolve_peer_working_dir_sync(peer_addr),
+            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+                (
+                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
+                    None,
+                )
+            } else {
+                let attr =
+                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
+                (attr.working_dir, attr.agent)
             };
+            let agent = agent_id.clone().or(peer_agent);
 
-            let _ = state.stats_tx.try_send(StatsEvent {
-                trace_id: trace_id_for_stream.clone(),
-                provider: provider_name_for_stream.clone(),
-                model: model_for_stream.clone(),
-                tokens,
-                cache_create: 0,
-                cache_read: 0,
-                cost,
-                latency_ms,
-                status: status.to_string(),
-                session_id: Some(session_id_for_stream.clone()),
-                mcp_server: None,
-                mcp_tool: None,
-                metering: stream_metering,
-                working_dir,
-            });
+            if state
+                .stats_tx
+                .try_send(StatsEvent {
+                    trace_id: trace_id_for_stream.clone(),
+                    provider: provider_name_for_stream.clone(),
+                    model: model_for_stream.clone(),
+                    tokens,
+                    cache_create: 0,
+                    cache_read: 0,
+                    cost,
+                    latency_ms,
+                    status: status.to_string(),
+                    session_id: Some(session_id_for_stream.clone()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    metering: stream_metering,
+                    plan_status: kyris_core::record::PlanStatus::Overage,
+                    working_dir,
+                    agent,
+                })
+                .is_err()
+            {
+                crate::storage::record_dropped(1);
+            }
 
             breaker_chunk
         };
@@ -466,21 +566,16 @@ fn relay_ndjson_stream(
         }
     });
 
-    let mut builder = Response::builder().status(status);
-    for (key, value) in &resp_headers {
-        let name = key.as_str();
-        if name.eq_ignore_ascii_case("content-length")
-            || name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            continue;
-        }
-        builder = builder.header(key, value);
-    }
+    let mut builder =
+        super::relay_upstream_headers(Response::builder().status(status), &resp_headers);
     builder = builder.header("x-kyris-trace-id", &trace_id);
 
     builder
         .body(Body::from_stream(full_stream))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to build Google streamGenerateContent SSE stream response");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 fn circuit_breaker_message(token_count: i64) -> String {
@@ -504,6 +599,22 @@ fn circuit_breaker_error(trace_id: &str, token_count: i64) -> Response {
         .header("x-kyris-trace-id", trace_id)
         .body(Body::from(payload.to_string()))
         .expect("build circuit breaker error response")
+}
+
+/// Fail-fast response (401) when the caller supplied no Google API key (neither
+/// `x-goog-api-key` header nor `?key=` query). kyrisd is a pure passthrough —
+/// it forwards the caller's credential and stores none.
+fn no_credential_error(trace_id: &str) -> Response {
+    let payload = serde_json::json!({
+        "error": "no provider credential supplied; kyrisd forwards your agent's credential and stores none"
+    });
+
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header("content-type", "application/json")
+        .header("x-kyris-trace-id", trace_id)
+        .body(Body::from(payload.to_string()))
+        .expect("build no-credential error response")
 }
 
 /// Split NDJSON buffer into complete lines and a trailing partial line.
@@ -683,7 +794,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "google".to_string(),
             format: ProviderFormat::Google,
-            api_key: "google-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gemini-2.0-flash".to_string()],
             timeout_seconds: 30,
@@ -703,9 +813,11 @@ mod tests {
             }]
         });
 
+        // The caller supplies its own key as the `?key=` query param; kyrisd
+        // forwards exactly that value to the upstream.
         let response = reqwest::Client::new()
             .post(format!(
-                "{router_url}/v1beta/models/gemini-2.0-flash:generateContent"
+                "{router_url}/v1beta/models/gemini-2.0-flash:generateContent?key=caller-key"
             ))
             .header("x-kyris-session-id", "sess-google")
             .json(&request_body)
@@ -741,7 +853,7 @@ mod tests {
         assert_eq!(request.model, "gemini-2.0-flash");
         assert_eq!(
             request.query.get("key").map(String::as_str),
-            Some("google-key")
+            Some("caller-key")
         );
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["contents"][0]["parts"][0]["text"], "hi");
@@ -767,7 +879,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "google".to_string(),
             format: ProviderFormat::Google,
-            api_key: "google-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gemini-2.0-flash".to_string()],
             timeout_seconds: 30,
@@ -786,11 +897,14 @@ mod tests {
             }]
         });
 
+        // The caller supplies its own key via the `x-goog-api-key` header;
+        // kyrisd forwards exactly that value into the upstream `?key=` query.
         let response = reqwest::Client::new()
             .post(format!(
                 "{router_url}/v1beta/models/gemini-2.0-flash:streamGenerateContent"
             ))
             .header("x-kyris-session-id", "sess-google-stream")
+            .header("x-goog-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
@@ -830,7 +944,7 @@ mod tests {
         assert_eq!(request.model, "gemini-2.0-flash");
         assert_eq!(
             request.query.get("key").map(String::as_str),
-            Some("google-key")
+            Some("caller-key")
         );
         assert_eq!(request.query.get("alt").map(String::as_str), Some("sse"));
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
@@ -848,7 +962,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "google".to_string(),
             format: ProviderFormat::Google,
-            api_key: "google-key".to_string(),
             upstream: "http://127.0.0.1:9".to_string(),
             models: vec!["gemini-2.0-flash".to_string()],
             timeout_seconds: 30,
@@ -911,7 +1024,6 @@ mod tests {
         config.providers = vec![ProviderConfig {
             name: "google".to_string(),
             format: ProviderFormat::Google,
-            api_key: "google-key".to_string(),
             upstream: upstream_url.clone(),
             models: vec!["gemini-2.0-flash".to_string()],
             timeout_seconds: 30,
@@ -936,6 +1048,7 @@ mod tests {
                 "{router_url}/v1beta/models/gemini-2.0-flash:streamGenerateContent"
             ))
             .header("x-kyris-session-id", "sess-google-threshold")
+            .header("x-goog-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
@@ -951,6 +1064,56 @@ mod tests {
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(request.query.get("alt").map(String::as_str), Some("sse"));
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testGoogleRouteFailsFastWhenNoCallerKeyAndDoesNotHitUpstream() {
+        let recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route(
+                "/v1beta/models/{model_action}",
+                post(record_generate_content_request),
+            )
+            .with_state(recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "google".to_string(),
+            format: ProviderFormat::Google,
+            upstream: upstream_url.clone(),
+            models: vec!["gemini-2.0-flash".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        // No `x-goog-api-key` header and no `?key=` query: kyrisd has nothing to
+        // forward and must fail fast without hitting the upstream.
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{router_url}/v1beta/models/gemini-2.0-flash:generateContent"
+            ))
+            .json(&serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("no provider credential supplied"), "{body}");
+        assert!(recorded.lock().unwrap().is_none(), "upstream was hit");
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());
@@ -1058,6 +1221,7 @@ mod tests {
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: crate::server::build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
             mcp_annotation_cache: crate::mcp_routing::AnnotationCache::default(),

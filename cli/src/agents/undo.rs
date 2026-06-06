@@ -4,13 +4,21 @@ use std::path::Path;
 
 use crate::state::{env_dir, load_agent_profile, restore_manifest_entry, save_agent_profile};
 
-use super::registry;
+use super::{registry, shim};
 
 pub fn undo_agent(agent_id: &str) -> Result<(), String> {
     let agent =
         registry::agent_by_id(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
 
     agent.undo()?;
+    // undo_burn_control handles MCP upstream removal and burn-control config
+    // restoration for agents where undo() doesn't call it internally.
+    // For agents that do call it internally (cline, opencode), the second
+    // call is a no-op because the manifest entries are already removed.
+    agent.undo_burn_control()?;
+    if shim::uninstall_shim(agent_id)? {
+        println!("Removed PATH shim for {agent_id}");
+    }
     undo_env_agent(agent_id)?;
 
     let mut profile = load_agent_profile(agent_id)?

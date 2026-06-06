@@ -5,12 +5,15 @@ use std::path::{Path, PathBuf};
 
 #[must_use]
 pub fn log_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(format!("{home}/.kyris/fail-open.jsonl"))
+    crate::paths::fail_open_path()
 }
 
 pub fn record(action: &str, detail: &str, mcp_server: &str, working_dir: Option<&str>) {
-    record_to(&log_path(), action, detail, mcp_server, working_dir);
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    record_to(&path, action, detail, mcp_server, working_dir);
 }
 
 fn record_to(path: &Path, action: &str, detail: &str, mcp_server: &str, working_dir: Option<&str>) {

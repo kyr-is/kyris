@@ -34,16 +34,39 @@ pub struct AppState {
     pub stats_tx: mpsc::Sender<StatsEvent>,
     pub db: Arc<storage::DuckDbWriter>,
     pub provider_clients: ArcSwap<HashMap<String, reqwest::Client>>,
+    /// Shared upstream HTTP client used for the fresh-install passthrough case
+    /// (no `providers[]` configured, so `provider_clients` has no matching
+    /// entry) and as the fallback for any unconfigured provider name. Reusing
+    /// one tuned client keeps connections warm (keep-alive) and bounds connect
+    /// time; constructing a fresh `reqwest::Client` per request instead leaks a
+    /// new connection pool every call and, lacking a connect timeout, lets a
+    /// stalled connect hang to the full per-request timeout.
+    pub default_provider_client: reqwest::Client,
     pub pending: Arc<PendingStore>,
     pub agentpact_socket: Option<std::path::PathBuf>,
     pub mcp_annotation_cache: mcp_routing::AnnotationCache,
 }
 
 pub fn build_provider_client(_provider: &ProviderConfig) -> reqwest::Client {
+    build_default_provider_client()
+}
+
+/// The shared upstream HTTP client (see [`AppState::default_provider_client`]).
+///
+/// Tuned for a long-lived proxy talking to a small set of upstreams:
+/// - `connect_timeout` bounds a stalled TCP/TLS connect (a lost SYN or a slow
+///   handshake) so it fails fast instead of hanging to the per-request timeout
+///   — the failure signature behind the observed 30 s `/v1/responses` 502.
+/// - `tcp_keepalive` lets the OS probe idle keep-alive connections so a
+///   half-open one is reset and evicted rather than handed out and hung on.
+/// - `pool_idle_timeout` is kept below the typical upstream idle-close so we
+///   drop connections before the server does, avoiding the use-after-close race.
+pub fn build_default_provider_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_mins(1))
         .pool_max_idle_per_host(20)
         .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
         .expect("build reqwest client")
 }
@@ -61,6 +84,19 @@ pub async fn run(config: KyrisdConfig) {
         tracing::error!("{e}");
         std::process::exit(1);
     }
+
+    // Install signal streams BEFORE anything else (in particular,
+    // before the TCP listener binds). Creating any stream for a signal
+    // causes tokio to install its OS-level handler, which overrides
+    // Rust's default (SIGINT/SIGTERM → terminate with non-zero exit).
+    // Until this point, a signal that arrives while we're still doing
+    // startup work kills the process ungracefully — no drain, no
+    // socket cleanup, exit 130 (SIGINT) or 143 (SIGTERM).
+    //
+    // The streams themselves queue signals internally, so any signal
+    // delivered between this point and the select loop is captured
+    // and processed when we eventually call .recv().
+    let signals = ShutdownSignals::install();
 
     let listen_addr = config.server.listen.clone();
     let tls_enabled = config.tls.enabled;
@@ -83,9 +119,17 @@ pub async fn run(config: KyrisdConfig) {
     let agentpact_socket = probe_agentpact_socket();
 
     check_crash_recovery();
+    // Singleton enforcement: a canonical (launchd) start reaps stray kyrisd
+    // siblings. A dedicated/test instance sets `KYRIS_NO_STRAY_REAP` so it
+    // neither kills the installed daemon nor fights other dedicated instances
+    // (test isolation — multiple kyrisd on distinct ports coexist).
+    if std::env::var_os("KYRIS_NO_STRAY_REAP").is_none() {
+        reap_stray_daemons().await;
+    }
     write_pid_file();
 
     let stats_config = config.stats.clone();
+    let spend_config = config.spend.clone();
     let session_idle_minutes = config.circuit_breaker.session_idle_minutes;
     let tls_config = config.tls.clone();
 
@@ -96,6 +140,7 @@ pub async fn run(config: KyrisdConfig) {
         stats_tx: stats_tx.clone(),
         db: db.clone(),
         provider_clients: ArcSwap::from_pointee(clients),
+        default_provider_client: build_default_provider_client(),
         pending: Arc::new(PendingStore::new()),
         agentpact_socket,
         mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
@@ -106,8 +151,37 @@ pub async fn run(config: KyrisdConfig) {
         db.clone(),
         circuit_breaker,
         stats_config,
+        spend_config,
         session_idle_minutes,
     ));
+
+    // Single, visible statement of mode at startup, on two independent axes:
+    //   - relay.url (config)  -> live pricing (no enrollment needed)
+    //   - enrollment (creds)  -> event sync + included-vs-overage billing
+    // Each degraded axis is announced; neither is a hard failure.
+    let relay_url = state.config.load().relay.url.clone();
+    if relay_url.trim().is_empty() {
+        tracing::warn!(
+            "no `relay.url` configured: live pricing disabled, using last cached/bundled table"
+        );
+    } else {
+        tracing::info!(relay_url = %relay_url, "live pricing enabled from relay");
+    }
+    if let Some(creds) = kyris_core::credentials::load() {
+        tracing::info!(machine_id = %creds.machine_id, "enrolled: event sync enabled");
+        crate::tray::clear_issue("enrollment");
+    } else {
+        tracing::warn!(
+            "standalone (not enrolled): event sync disabled — run `kyris enroll` (pricing is unaffected)"
+        );
+        // Surface standalone as a tray indicator (warning overlay). It clears on
+        // the next startup after `kyris enroll` (which restarts kyrisd). `doctor`
+        // distinguishes this from real failures by the issue's reason string.
+        crate::tray::report_issue(
+            "enrollment",
+            "standalone (not enrolled) — run `kyris enroll` to enable event sync",
+        );
+    }
 
     tokio::spawn(crate::sync::daemon_sync::run_sync_loop(state.clone()));
     tokio::spawn(crate::pricing_fetch::run_pricing_fetch(state.clone()));
@@ -132,7 +206,27 @@ pub async fn run(config: KyrisdConfig) {
         .merge(routed_routes)
         .merge(operator_routes)
         .merge(health_routes(state.clone()))
-        .layer(RequestBodyLimitLayer::new(max_body));
+        .layer(RequestBodyLimitLayer::new(max_body))
+        // Per-request access log (boundary). Reads trace_id from the
+        // extension stamped by the outer trace_id_middleware below.
+        .layer(axum::middleware::from_fn(request_log_middleware))
+        // Response-side framing sanity check: catches known-bad
+        // body-framing header combinations BEFORE hyper rejects them
+        // and writes nothing. The most common silent failure mode is
+        // a hop-by-hop or content-encoding header copied verbatim from
+        // an upstream response onto our own (smaller, decompressed,
+        // re-collected) body. This layer surfaces the conflict at
+        // ERROR with the constructed-response context.
+        .layer(axum::middleware::from_fn(response_framing_check_middleware))
+        // Outermost layer: mint or accept the trace_id, attach to
+        // extensions + span, echo as x-kyris-trace-id. EVERY layer
+        // below (auth, body-limit, the framing check) runs inside
+        // the trace span, so even rejected requests carry the id in
+        // their log lines. "No log entry for this trace_id" must
+        // reliably mean "the request never reached the daemon."
+        .layer(axum::middleware::from_fn(
+            crate::trace_id::trace_id_middleware,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&listen_addr)
         .await
@@ -141,14 +235,23 @@ pub async fn run(config: KyrisdConfig) {
     let scheme = if tls_enabled { "https" } else { "http" };
     tracing::info!(listen = %listen_addr, %scheme, "kyrisd listening");
 
-    tokio::spawn(sighup_reload(state.clone()));
+    tokio::spawn(sighup_reload(state.clone(), signals.sighup));
+    tokio::spawn(sigusr1_diagnostics(signals.sigusr1));
+    tokio::spawn(sigusr2_toggle_log_filter(state.clone(), signals.sigusr2));
+    tokio::spawn(agentpactd_health_poller());
+    tokio::spawn(watch_policy_mode());
 
     if tls_enabled {
-        serve_tls_with_graceful_shutdown(listener, app, &tls_config, shutdown_signal())
-            .await
-            .expect("TLS server error");
+        serve_tls_with_graceful_shutdown(
+            listener,
+            app,
+            &tls_config,
+            shutdown_signal(signals.shutdown),
+        )
+        .await
+        .expect("TLS server error");
     } else {
-        serve_with_graceful_shutdown(listener, app, shutdown_signal())
+        serve_with_graceful_shutdown(listener, app, shutdown_signal(signals.shutdown))
             .await
             .expect("server error");
     }
@@ -165,6 +268,154 @@ pub async fn run(config: KyrisdConfig) {
     }
 
     remove_pid_file();
+}
+
+/// Per-request access log. Logs every request the daemon sees at
+/// `INFO` (4xx → WARN, 5xx → ERROR), with method / path / status /
+/// `latency_ms` / body sizes / `trace_id`. Runs inside the request span
+/// opened by [`crate::trace_id::trace_id_middleware`], so the same
+/// `trace_id` field appears on this line and every nested handler
+/// log — making `kyris logs trace <id>` a single coherent view.
+async fn request_log_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    // Cheap body-size telemetry: read Content-Length from the request
+    // and response headers without consuming the bodies. Streamed or
+    // chunked responses come through as `None`; that itself is
+    // diagnostic information (LLM streaming responses look that way).
+    let req_bytes = content_length(req.headers());
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16();
+    let resp_bytes = content_length(response.headers());
+    #[allow(clippy::cast_possible_truncation)]
+    let latency_ms = start.elapsed().as_millis() as u64;
+    if status >= 500 {
+        tracing::error!(
+            method = %method,
+            path = %path,
+            status,
+            latency_ms,
+            req_bytes = ?req_bytes,
+            resp_bytes = ?resp_bytes,
+            "request"
+        );
+    } else if status >= 400 {
+        tracing::warn!(
+            method = %method,
+            path = %path,
+            status,
+            latency_ms,
+            req_bytes = ?req_bytes,
+            resp_bytes = ?resp_bytes,
+            "request"
+        );
+    } else {
+        tracing::info!(
+            method = %method,
+            path = %path,
+            status,
+            latency_ms,
+            req_bytes = ?req_bytes,
+            resp_bytes = ?resp_bytes,
+            "request"
+        );
+    }
+    response
+}
+
+/// Sanity check on the response before it goes to hyper. Catches the
+/// "framing conflict" silent failure: when a handler builds a
+/// response carrying header combinations hyper rejects, hyper resets
+/// the TCP connection and writes nothing — the client sees
+/// `RemoteDisconnected`, our `request_log_middleware` logged status
+/// 401/200/whatever (because the response object was built), and
+/// nothing in the log says WHY the bytes never landed.
+///
+/// We surface the conflict at ERROR here so the log answers the
+/// question without anyone having to attach hyper at DEBUG. We do
+/// NOT auto-fix the response — adapter-level filtering is the right
+/// fix point, and we want the bug to remain visible until that
+/// filter lands.
+async fn response_framing_check_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(req).await;
+    if let Some(reason) = response_framing_violation(&response) {
+        let status = response.status().as_u16();
+        let header_names: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(axum::http::HeaderName::as_str)
+            .collect();
+        tracing::error!(
+            status,
+            reason = %reason,
+            header_names = ?header_names,
+            "response_framing_conflict: hyper will reset this connection \
+             and the client will see RemoteDisconnected / Empty reply; \
+             the response was built but the framing headers contradict \
+             the body the response will be serialized with"
+        );
+    }
+    response
+}
+
+/// Detect response header combinations hyper rejects at serialize
+/// time. Returns `Some(reason)` if a known conflict is present.
+///
+/// Known conflicts (RFC 7230 §3.3.3 + RFC 7230 §4):
+/// - `transfer-encoding` AND `content-length` together: hyper
+///   refuses to choose between them and resets the connection.
+/// - Hop-by-hop headers (`connection`, `keep-alive`, `te`,
+///   `trailer`, `upgrade`, `proxy-*`) survive past a proxy: hyper
+///   strips some and errors on others depending on version.
+fn response_framing_violation(response: &axum::response::Response) -> Option<String> {
+    // True hop-by-hop headers (RFC 7230 §6.1) must never survive past a
+    // proxy. `content-length`/`transfer-encoding` are legitimate on their
+    // own and are NOT flagged here; only the connection-scoped set is.
+    const HOP_BY_HOP: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "te",
+        "trailer",
+        "proxy-authenticate",
+        "proxy-authorization",
+    ];
+    let headers = response.headers();
+    let has_te = headers.contains_key("transfer-encoding");
+    let has_cl = headers.contains_key("content-length");
+    if has_te && has_cl {
+        return Some(
+            "both transfer-encoding and content-length headers are set \
+             on the response (hyper requires exactly one)"
+                .to_string(),
+        );
+    }
+    for name in HOP_BY_HOP {
+        if headers.contains_key(*name) {
+            return Some(format!(
+                "hop-by-hop header `{name}` is set on the response (RFC 7230 \
+                 §6.1 forbids relaying connection-scoped headers past a proxy)"
+            ));
+        }
+    }
+    None
+}
+
+/// Read `Content-Length` from a header map as `u64`. None when the
+/// header is absent or unparseable (streamed/chunked responses, or
+/// requests with no body).
+fn content_length(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 async fn serve_with_graceful_shutdown<F>(
@@ -291,8 +542,7 @@ fn probe_agentpact_socket() -> Option<std::path::PathBuf> {
 }
 
 fn check_crash_recovery() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pid_path = format!("{home}/.kyris/kyrisd.pid");
+    let pid_path = kyris_core::paths::pid_path();
     let Ok(contents) = std::fs::read_to_string(&pid_path) else {
         return;
     };
@@ -328,10 +578,103 @@ fn check_crash_recovery() {
     }
 }
 
+/// Kill any *other* kyrisd processes owned by this user before we claim
+/// the pidfile and port, so exactly one kyrisd survives any start —
+/// install or reboot.
+///
+/// Production kyrisd is launchd-managed and does not orphan, but dev/test
+/// runs of the debug binary (`target/debug/kyrisd`) or the cargo test
+/// binary (`target/debug/deps/kyrisd-<hex>`) can detach from their parent
+/// when the terminal/cargo/IDE that launched them goes away, surviving as
+/// strays reparented to launchd. This sweep cleans them up at the next
+/// canonical start instead of letting them linger.
+///
+/// Safety bounds, in order of importance:
+/// - never our own PID;
+/// - only processes owned by our own UID (never signal another user);
+/// - only executables whose file name is exactly `kyrisd` or a cargo
+///   test/bench binary (`kyrisd-<hex>`) — the CLI (`kyris`, `kyris-mcp`)
+///   and `agentpactd` are deliberately excluded.
+///
+/// Each stray gets SIGTERM, a short grace period, then SIGKILL if it is
+/// still alive.
+#[cfg(unix)]
+async fn reap_stray_daemons() {
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::{Pid, Uid};
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let own_pid = std::process::id();
+    let owner_uid = Uid::current().as_raw();
+
+    let mut sys = System::new();
+    let refresh = ProcessRefreshKind::nothing()
+        .with_exe(UpdateKind::Always)
+        .with_user(UpdateKind::Always);
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+
+    let strays: Vec<u32> = sys
+        .processes()
+        .values()
+        .filter_map(|proc| {
+            let pid = proc.pid().as_u32();
+            if pid == own_pid {
+                return None;
+            }
+            // Same user only — never signal another user's processes.
+            // sysinfo's `Uid` derefs to the raw `libc::uid_t`, which is
+            // exactly what `nix::Uid::as_raw()` returns.
+            if proc.user_id().map(|uid| **uid) != Some(owner_uid) {
+                return None;
+            }
+            let name = proc.exe()?.file_name()?.to_str()?;
+            is_kyrisd_executable(name).then_some(pid)
+        })
+        .collect();
+
+    if strays.is_empty() {
+        return;
+    }
+
+    tracing::warn!(?strays, "reaping stray kyrisd process(es) on startup");
+    for &pid in &strays {
+        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+    }
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for &pid in &strays {
+        let target = Pid::from_raw(pid as i32);
+        // `kill(.., None)` is signal 0: Ok means the process still exists
+        // and we may signal it. Anything else (exited, or now unowned) we
+        // leave alone.
+        if signal::kill(target, None).is_ok() {
+            tracing::warn!(pid, "stray kyrisd ignored SIGTERM — sending SIGKILL");
+            let _ = signal::kill(target, Signal::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn reap_stray_daemons() {}
+
+/// `true` for a kyrisd executable file name: the installed/dev binary
+/// (`kyrisd`) or a cargo test/bench binary (`kyrisd-<hex>`). Excludes
+/// `kyris`, `kyris-mcp`, `agentpactd`, and unrelated names.
+#[cfg(unix)]
+fn is_kyrisd_executable(file_name: &str) -> bool {
+    if file_name == "kyrisd" {
+        return true;
+    }
+    match file_name.strip_prefix("kyrisd-") {
+        Some(suffix) => !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 fn write_pid_file() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pid_path = format!("{home}/.kyris/kyrisd.pid");
-    if let Some(parent) = std::path::Path::new(&pid_path).parent() {
+    let pid_path = kyris_core::paths::pid_path();
+    if let Some(parent) = pid_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
@@ -340,9 +683,7 @@ fn write_pid_file() {
 }
 
 fn remove_pid_file() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pid_path = format!("{home}/.kyris/kyrisd.pid");
-    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(kyris_core::paths::pid_path());
 }
 
 /// Routes that require auth: circuit-breaker reset, pending requests, and
@@ -355,6 +696,11 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
             "/api/circuit-breaker/reset",
             post(circuit_breaker_reset).with_state(state.clone()),
         )
+        .route(
+            "/api/circuit-breaker/reset-all",
+            post(circuit_breaker_reset_all).with_state(state.clone()),
+        )
+        .route("/api/hook/log", post(hook_log).with_state(state.clone()))
         .route("/api/pending", get(list_pending).with_state(state.clone()))
         .route(
             "/api/pending/{id}/resolve",
@@ -377,18 +723,36 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
             get(operator_gateway_records).with_state(state.clone()),
         )
         .route(
+            "/operator/timeline",
+            get(operator_timeline).with_state(state.clone()),
+        )
+        .route(
+            "/operator/stats",
+            get(operator_stats).with_state(state.clone()),
+        )
+        .route(
+            "/operator/stream",
+            get(operator_stream).with_state(state.clone()),
+        )
+        .route(
             "/operator/session-tokens/{session_id}",
-            get(operator_session_token).with_state(state),
+            get(operator_session_token).with_state(state.clone()),
+        )
+        .route(
+            "/operator/diag/log-filter",
+            get(diag_log_filter_get)
+                .post(diag_log_filter_set)
+                .with_state(state),
         )
 }
 
-/// Health/readiness routes -- no auth required (load-balancer probes).
+/// Health/readiness route -- no auth required.
+/// Returns 200 only when kyrisd is fully initialised and ready to serve
+/// requests: at least one provider configured, DB writable, no dropped writes.
 fn health_routes(state: Arc<AppState>) -> Router {
     use axum::routing::get;
 
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz).with_state(state))
+    Router::new().route("/healthz", get(healthz).with_state(state))
 }
 
 #[derive(Deserialize)]
@@ -407,6 +771,20 @@ async fn circuit_breaker_reset(
         tracing::warn!(session_id = %body.session_id, "circuit breaker reset: unknown session");
         axum::http::StatusCode::NOT_FOUND
     }
+}
+
+/// Reset every session that's currently sitting at or above its token
+/// cap. Returns the list of session IDs that were cleared so the CLI
+/// can show the operator exactly which sessions resumed. Empty list
+/// is a valid success — no sessions were tripped.
+async fn circuit_breaker_reset_all(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let cleared = state.circuit_breaker.reset_all_tripped();
+    if cleared.is_empty() {
+        tracing::info!("circuit breaker reset-all: no sessions were tripped");
+    } else {
+        tracing::info!(count = cleared.len(), "circuit breaker reset-all");
+    }
+    Json(serde_json::json!({ "cleared": cleared }))
 }
 
 async fn list_pending(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -440,6 +818,25 @@ impl ResolveDecision {
     }
 }
 
+/// Map an approval-dialog outcome to a resolution.
+///
+/// `CouldNotShow` maps to `None`: the dialog never reached the user (occluded,
+/// off-space, or — on platforms without an approval UI — never attempted), so
+/// the request is left **pending** for `kyris pending` / the menu-bar path
+/// rather than resolved. Returning `Approved` here would defeat the permission
+/// gate; see `notify::ask_approval`'s non-macOS fallback, which returns
+/// `CouldNotShow` precisely so this leaves the request pending.
+fn decision_for_approval_outcome(
+    outcome: crate::notify::ApprovalOutcome,
+) -> Option<ResolveDecision> {
+    match outcome {
+        crate::notify::ApprovalOutcome::Yes => Some(ResolveDecision::Approved),
+        crate::notify::ApprovalOutcome::Always => Some(ResolveDecision::Always),
+        crate::notify::ApprovalOutcome::No => Some(ResolveDecision::Denied),
+        crate::notify::ApprovalOutcome::CouldNotShow => None,
+    }
+}
+
 fn parse_resolve_decision(value: &str) -> Option<ResolveDecision> {
     match value {
         "approved" => Some(ResolveDecision::Approved),
@@ -460,6 +857,9 @@ async fn send_permission_response(
 ) -> Result<(), String> {
     let token = approval_token.to_string();
     tokio::task::spawn_blocking(move || {
+        // Discard the optional advisory warning (e.g. an unpersisted "always"
+        // grant); agentpactd logs it, and the pending-resolution HTTP path has
+        // no channel to relay it back to the developer.
         agentpact::send_permission_response(
             &socket,
             "kyrisd-resolve",
@@ -467,6 +867,7 @@ async fn send_permission_response(
             decision.as_approval_response(),
             None,
         )
+        .map(|_warning| ())
         .map_err(|reason| reason.replace("approval response", "resolution"))
     })
     .await
@@ -519,6 +920,22 @@ struct HoldRequest {
     approval_token: String,
     server: String,
     tool: Option<String>,
+    /// Optional verbatim code/command/path to render in the popup's
+    /// accessoryView. Distinct from `tool` because `tool` is a short
+    /// label ("Bash", "Read"); `code` is what the user actually needs
+    /// to read to decide ("git push --force origin main"). Older
+    /// callers omit it — the popup falls back to plain body text.
+    #[serde(default)]
+    code: Option<String>,
+    /// Whether the popup may offer "Always". Defaults to `true` for older
+    /// callers; `false` greys out the button (e.g. privilege escalation,
+    /// which agentpactd never persists anyway).
+    #[serde(default = "default_allow_always")]
+    allow_always: bool,
+}
+
+fn default_allow_always() -> bool {
+    true
 }
 
 async fn hold_pending(
@@ -528,14 +945,105 @@ async fn hold_pending(
     let pending_timeout = state.config.load().mcp.pending_timeout_seconds;
     let pending = state.pending.clone();
     let timeout_id = body.id.clone();
-    let _rx = state
-        .pending
-        .hold(body.id.clone(), body.approval_token, body.server, body.tool);
+
+    // Clone for the dialog task before fields are moved into hold()
+    let dialog_id = body.id.clone();
+    let dialog_server = body.server.clone();
+    let dialog_tool = body.tool.clone();
+    let dialog_code = body.code.clone();
+    let dialog_allow_always = body.allow_always;
+
+    let _rx = state.pending.hold(
+        body.id.clone(),
+        body.approval_token,
+        body.server,
+        body.tool,
+        dialog_allow_always,
+    );
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(pending_timeout)).await;
         pending.timeout(&timeout_id);
     });
     state.pending.set_timeout_handle(&body.id, handle);
+
+    // Show the approval dialog immediately rather than waiting for `kyris pending`.
+    #[cfg(feature = "tray")]
+    {
+        let state = state.clone();
+        tracing::info!(
+            target: "kyrisd::approval",
+            pending_id = %body.id,
+            server = %dialog_server,
+            tool = ?dialog_tool,
+            "dispatching approval dialog"
+        );
+        tokio::spawn(async move {
+            let tool_label = dialog_tool.as_deref().unwrap_or("unknown tool");
+            // Title/body kept lean: the window titlebar already says
+            // "Kyris", and when a code block is present it speaks for
+            // itself — no need for a "Review and approve:" prompt. The
+            // no-code path keeps prose because there's nothing else to
+            // show the user.
+            let body_line = if dialog_code.is_some() {
+                String::new()
+            } else {
+                format!("Agent wants to run {tool_label}. Allow?")
+            };
+            let outcome = crate::notify::ask_approval(
+                &format!("Allow {dialog_server}"),
+                &body_line,
+                dialog_code.as_deref(),
+                dialog_allow_always,
+            )
+            .await;
+            // CouldNotShow means the panel never became visible to the user
+            // — treat as "no answer yet" and leave the request pending so
+            // the menu-bar attention path (or `kyris pending`) can pick it
+            // up. Treating CouldNotShow as Denied would silently reject
+            // every request whenever the user is in a fullscreen app or on
+            // a different Space — the exact failure mode this design fixes.
+            let Some(decision) = decision_for_approval_outcome(outcome) else {
+                tracing::warn!(
+                    pending_id = %dialog_id,
+                    "approval panel could not be shown — leaving request pending"
+                );
+                return;
+            };
+            // Best-effort log of the user's answer for `kyris approvals`
+            // recall and offline catalog mining. Records the verbatim command
+            // (multi-line preserved via JSON `\n` escaping); the agent's tool
+            // label is intentionally not recorded. Falls back to dialog_tool
+            // when no verbatim payload was carried in the hold request (older
+            // callers that only sent the short label).
+            let command = dialog_code.as_deref().or(dialog_tool.as_deref());
+            crate::approvals_log::record(&crate::approvals_log::ApprovalRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                pending_id: &dialog_id,
+                server: &dialog_server,
+                command,
+                agent: "unknown",
+                decision: match decision {
+                    ResolveDecision::Approved => "approved",
+                    ResolveDecision::Always => "always",
+                    ResolveDecision::Denied => "denied",
+                },
+            });
+            let Ok(claim) = state.pending.claim(&dialog_id) else {
+                return; // already timed out or resolved by another path
+            };
+            let socket = agentpact_socket_for(&state);
+            if let Err(e) = send_permission_response(socket, &claim.approval_token, decision).await
+            {
+                tracing::warn!(pending_id = %dialog_id, %e, "failed to send approval dialog response");
+                state.pending.abandon_claim(claim);
+                return;
+            }
+            state
+                .pending
+                .complete_claim(claim, decision.allows_execution());
+        });
+    }
+
     StatusCode::OK
 }
 
@@ -558,6 +1066,80 @@ async fn pending_status(
             Json(serde_json::json!({ "error": "not found" })),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// /api/hook/log — best-effort audit endpoint, called once per hook
+// invocation at exit. The CLI sends one payload carrying inputs, the
+// daemon's decision, and timing; this endpoint emits a single
+// `hook resolved` tracing line. Optional fields (segments, approval_id)
+// are omitted from the line when absent rather than serialized as null.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct HookLogBody {
+    /// Correlation id for one hook invocation. Lets operators group
+    /// related entries and spot duplicate asks (same
+    /// agent+action+detail, different `hook_id`).
+    hook_id: String,
+    /// Agent that triggered the hook (e.g. `claude-code`, `codex-cli`).
+    agent: String,
+    /// `AgentPact` action (`execute`, `read`, `write`, `call`).
+    action: String,
+    /// Verbatim payload from the agent — shell command, file path, MCP
+    /// tool args. Free-form; not parsed.
+    detail: String,
+    /// Compound segments the daemon split `detail` into, when more than
+    /// one. Only populated for `action=execute` compound commands.
+    segments: Option<Vec<String>>,
+    /// Final decision routed back to the agent (`allow`, `deny`).
+    decision: String,
+    /// Who/what decided. See `cli/src/hook_cmd.rs` for the canonical
+    /// set (`agentpact_auto`, `agentpact_deny`, `user_approved`,
+    /// `user_denied`, `user_timeout`, `kyrisd_unreachable`,
+    /// `agentpact_unreachable`, `passthrough`, `unmapped`,
+    /// `protocol_mismatch`).
+    source: String,
+    /// `AgentPact` approval id when the decision went through an ask
+    /// path; lets operators correlate hook records with approval-
+    /// dialog lifecycle in `kyris::approval`. Absent for auto-decide
+    /// paths.
+    approval_id: Option<String>,
+    /// Whether the agent will get another say after kyris's response.
+    /// `"none"` — kyris denied (exit 2) or returned a definitive
+    /// allow-shape that suppresses the agent's prompt. `"agent_decides"`
+    /// — kyris allowed silently (empty stdout) and the agent applies
+    /// its own permission rules, which may or may not prompt.
+    agent_prompt: String,
+    /// Wall-clock time from hook entry to outcome, in milliseconds.
+    elapsed_ms: u64,
+}
+
+async fn hook_log(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<HookLogBody>,
+) -> StatusCode {
+    // Single line per hook. `segments` and `approval_id` are tracing
+    // fields only when present; when absent the line simply omits them.
+    let segments_json = body
+        .segments
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+    tracing::info!(
+        target: "kyrisd::hook",
+        hook_id = %body.hook_id,
+        agent = %body.agent,
+        action = %body.action,
+        detail = %body.detail,
+        segments = segments_json.as_deref(),
+        decision = %body.decision,
+        source = %body.source,
+        approval_id = body.approval_id.as_deref(),
+        agent_prompt = %body.agent_prompt,
+        elapsed_ms = body.elapsed_ms,
+        "hook resolved"
+    );
+    StatusCode::NO_CONTENT
 }
 
 // ---------------------------------------------------------------------------
@@ -584,10 +1166,104 @@ struct GatewayRecordsResponse {
     records: Vec<kyris_core::record::GatewayRecord>,
 }
 
+#[derive(Deserialize, Default)]
+struct TimelineQuery {
+    agent: Option<String>,
+    action: Option<String>,
+    decision: Option<String>,
+    session: Option<String>,
+    trace_id: Option<String>,
+    /// `working_dir` prefix (a directory and everything beneath it).
+    dir: Option<String>,
+    /// RFC3339 inclusive lower / upper bounds.
+    since: Option<String>,
+    until: Option<String>,
+    /// Newest-first row cap. Default 50, hard cap `10_000` (in `query_timeline`).
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct StatsQuery {
+    /// RFC3339 inclusive lower bound for the aggregation window.
+    since: Option<String>,
+    dir: Option<String>,
+}
+
+/// Reject a non-RFC3339 `since`/`until` with `400`. Both timeline readers
+/// compare these bounds against stored timestamps, but they do so differently —
+/// the event-log reader over `read_json` and the typed gateway-record reader —
+/// so a malformed value would filter inconsistently (one path silently keeps
+/// everything, the other drops everything). Failing fast here keeps the window
+/// honest: a bad bound is a client error, not a misleading partial result.
+fn validate_rfc3339(
+    name: &str,
+    val: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(v) = val
+        && chrono::DateTime::parse_from_rfc3339(v).is_err()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("invalid `{name}`: expected an RFC3339 timestamp, got {v:?}")
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// GET /operator/timeline — the unified event↔record timeline, joined in kyrisd
+/// (no `DuckDB` lock: kyrisd owns the records and reads the event log itself).
+/// Returns finished `TimelineEntry` rows; the CLI renders them.
+async fn operator_timeline(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<TimelineQuery>,
+) -> Result<Json<kyris_core::timeline::TimelinePage>, (StatusCode, Json<serde_json::Value>)> {
+    validate_rfc3339("since", q.since.as_deref())?;
+    validate_rfc3339("until", q.until.as_deref())?;
+    let filter = crate::timeline::TimelineFilter {
+        agent: q.agent,
+        action: q.action,
+        decision: q.decision,
+        session: q.session,
+        trace_id: q.trace_id,
+        dir: q.dir,
+        since: q.since,
+        until: q.until,
+        limit: q.limit.unwrap_or(50),
+    };
+    let log_dir = crate::timeline::agentpact_log_dir();
+    let entries = crate::timeline::query_timeline(&state.db, &log_dir, &filter);
+    Ok(Json(kyris_core::timeline::TimelinePage {
+        entries,
+        cursor: None,
+    }))
+}
+
+/// GET /operator/stats — aggregate usage over a window, computed in kyrisd from
+/// the same unified timeline. The CLI renders the numbers.
+async fn operator_stats(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<StatsQuery>,
+) -> Result<Json<kyris_core::timeline::TimelineStats>, (StatusCode, Json<serde_json::Value>)> {
+    validate_rfc3339("since", q.since.as_deref())?;
+    let filter = crate::timeline::TimelineFilter {
+        since: q.since,
+        dir: q.dir,
+        // Aggregate over the whole window, not a newest-N slice.
+        limit: 10_000,
+        ..Default::default()
+    };
+    let log_dir = crate::timeline::agentpact_log_dir();
+    let entries = crate::timeline::query_timeline(&state.db, &log_dir, &filter);
+    Ok(Json(crate::timeline::compute_stats(&entries)))
+}
+
 async fn operator_gateway_records(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<GatewayRecordsQuery>,
 ) -> Result<Json<GatewayRecordsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    validate_rfc3339("since", q.since.as_deref())?;
     let filter = storage::GatewayRecordFilter {
         provider: q.provider.as_deref(),
         model: q.model.as_deref(),
@@ -611,6 +1287,37 @@ async fn operator_gateway_records(
     }
 }
 
+/// Live stream of gateway records as they are persisted (L4 of the monitoring
+/// strategy). Server-Sent Events; one JSON `GatewayRecord` per event. Subscribers
+/// that fall behind the broadcast buffer skip ahead (records are dropped for that
+/// reader, not buffered indefinitely) — the `DuckDB` store remains the full record.
+async fn operator_stream(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Sse<
+    impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let rx = state.db.subscribe_records();
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(record) => {
+                    let event = Event::default()
+                        .json_data(&record)
+                        .unwrap_or_else(|_| Event::default().comment("record serialize error"));
+                    return Some((Ok::<_, std::convert::Infallible>(event), rx));
+                }
+                // Slow consumer: skip the gap and keep streaming (loop re-polls).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // Sender dropped (daemon shutting down): end the stream.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 async fn operator_session_token(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -631,22 +1338,116 @@ async fn operator_session_token(
     }
 }
 
+/// Maximum auto-revert window the diag endpoint accepts (1 hour).
+/// Past this, edit `kyrisd.yaml`'s `log.filter` and restart — long-
+/// term verbose logging shouldn't ride on a Tokio timer that the
+/// next crash wipes.
+const DIAG_LOG_FILTER_MAX_DURATION_SECS: u64 = 3600;
+
+#[derive(Deserialize)]
+struct DiagLogFilterRequest {
+    /// `EnvFilter` directive string (e.g. `kyrisd::adapter=trace,kyrisd=debug`).
+    filter: String,
+    /// Auto-revert window in seconds. Absent / 0 = manual revert.
+    /// Capped at [`DIAG_LOG_FILTER_MAX_DURATION_SECS`].
+    #[serde(default)]
+    duration_secs: Option<u64>,
+}
+
 #[derive(Serialize)]
-struct ReadyzResponse {
+struct DiagLogFilterResponse {
+    previous_filter: String,
+    new_filter: String,
+    /// Absent when no auto-revert was requested or `duration_secs=0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reverts_at: Option<String>,
+}
+
+/// GET /operator/diag/log-filter — read the currently-active filter.
+/// Returns whatever `try_set_filter` last accepted (or the startup
+/// value when nothing has been mutated since boot).
+async fn diag_log_filter_get() -> Json<serde_json::Value> {
+    let current =
+        crate::logging::current_filter().unwrap_or_else(|| "(not initialized)".to_string());
+    Json(serde_json::json!({ "filter": current }))
+}
+
+/// POST /operator/diag/log-filter — swap the active filter,
+/// optionally scheduling an auto-revert. Validates the directive
+/// before applying so a typo never breaks logging mid-stream.
+async fn diag_log_filter_set(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<DiagLogFilterRequest>,
+) -> Result<Json<DiagLogFilterResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let previous =
+        crate::logging::current_filter().unwrap_or_else(|| state.config.load().log.filter.clone());
+
+    if let Err(error) = crate::logging::try_set_filter(&req.filter) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error })),
+        ));
+    }
+
+    let duration = req
+        .duration_secs
+        .filter(|d| *d > 0)
+        .map(|d| d.min(DIAG_LOG_FILTER_MAX_DURATION_SECS));
+
+    let reverts_at = duration.map(|secs| {
+        let when = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
+        when.to_rfc3339()
+    });
+
+    if let Some(secs) = duration {
+        let revert_to = previous.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            match crate::logging::try_set_filter(&revert_to) {
+                Ok(()) => tracing::info!(
+                    reverted_to = %revert_to,
+                    source = "diag_endpoint_auto_revert",
+                    "log_filter_reverted"
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "log_filter auto-revert failed; current filter unchanged"
+                ),
+            }
+        });
+    }
+
+    tracing::info!(
+        previous = %previous,
+        new = %req.filter,
+        duration_secs = ?duration,
+        source = "diag_endpoint",
+        "log_filter_changed"
+    );
+
+    Ok(Json(DiagLogFilterResponse {
+        previous_filter: previous,
+        new_filter: req.filter,
+        reverts_at,
+    }))
+}
+
+#[derive(Serialize)]
+struct HealthzResponse {
     ready: bool,
     providers: usize,
     dropped_events: u64,
     db_writable: bool,
 }
 
-async fn readyz(
+async fn healthz(
     State(state): State<Arc<AppState>>,
-) -> (axum::http::StatusCode, Json<ReadyzResponse>) {
+) -> (axum::http::StatusCode, Json<HealthzResponse>) {
     let config = state.config.load();
     let dropped = storage::dropped_count();
     let providers = config.providers.len();
     let db_writable = state.db.probe_writable();
-    let ready = providers > 0 && dropped == 0 && db_writable;
+    let ready = dropped == 0 && db_writable;
     let status = if ready {
         axum::http::StatusCode::OK
     } else {
@@ -654,7 +1455,7 @@ async fn readyz(
     };
     (
         status,
-        Json(ReadyzResponse {
+        Json(HealthzResponse {
             ready,
             providers,
             dropped_events: dropped,
@@ -663,19 +1464,9 @@ async fn readyz(
     )
 }
 
-#[derive(Serialize)]
-struct HealthzResponse {
-    status: &'static str,
-}
-
-async fn healthz() -> Json<HealthzResponse> {
-    Json(HealthzResponse { status: "ok" })
-}
-
 fn provider_configs_match(old: &ProviderConfig, new: &ProviderConfig) -> bool {
     old.name == new.name
         && old.format == new.format
-        && old.api_key == new.api_key
         && old.upstream == new.upstream
         && old.models == new.models
         && old.timeout_seconds == new.timeout_seconds
@@ -737,64 +1528,365 @@ async fn reload_loop<F, Fut>(
     }
 }
 
-async fn sighup_reload(state: Arc<AppState>) {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
-        let (reload_tx, reload_rx) = mpsc::channel(8);
-
-        tokio::spawn(async move {
-            loop {
-                hup.recv().await;
-                if reload_tx.send(()).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        reload_loop(state, reload_rx, || async { config::try_load_config() }).await;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = state;
-        // SIGHUP is not available on non-unix platforms.
-        std::future::pending::<()>().await;
-    }
+/// Owned bundle of signal streams installed BEFORE the listener binds.
+/// Creating the streams up front means tokio installs its OS-level
+/// signal handlers immediately; signals delivered during the rest of
+/// startup are queued internally rather than killing the process via
+/// Rust's default handler. See `run()` for why this matters.
+#[cfg(unix)]
+pub(crate) struct ShutdownSignals {
+    pub sighup: tokio::signal::unix::Signal,
+    pub sigusr1: tokio::signal::unix::Signal,
+    pub sigusr2: tokio::signal::unix::Signal,
+    pub shutdown: ShutdownStreams,
 }
 
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
+#[cfg(not(unix))]
+pub(crate) struct ShutdownSignals {
+    pub sighup: (),
+    pub sigusr1: (),
+    pub sigusr2: (),
+    pub shutdown: ShutdownStreams,
+}
 
-        let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let ctrl_c = tokio::signal::ctrl_c();
+#[cfg(unix)]
+pub(crate) struct ShutdownStreams {
+    pub sigterm: tokio::signal::unix::Signal,
+    pub sigint: tokio::signal::unix::Signal,
+}
 
-        tokio::select! {
-            _ = ctrl_c => {
-                tracing::info!("ctrl+c received, shutting down");
+#[cfg(not(unix))]
+pub(crate) struct ShutdownStreams;
+
+impl ShutdownSignals {
+    pub fn install() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Self {
+                sighup: signal(SignalKind::hangup()).expect("install SIGHUP handler"),
+                sigusr1: signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler"),
+                sigusr2: signal(SignalKind::user_defined2()).expect("install SIGUSR2 handler"),
+                shutdown: ShutdownStreams {
+                    sigterm: signal(SignalKind::terminate()).expect("install SIGTERM handler"),
+                    sigint: signal(SignalKind::interrupt()).expect("install SIGINT handler"),
+                },
             }
-            _ = sigterm.recv() => {
-                tracing::info!("SIGTERM received, shutting down");
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                sighup: (),
+                sigusr1: (),
+                sigusr2: (),
+                shutdown: ShutdownStreams,
             }
         }
     }
+}
 
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install ctrl+c handler");
-        tracing::info!("shutdown signal received");
+/// Probe agentpactd every second and reflect reachability into the
+/// tray's issue set. The tray icon goes amber when the policy daemon
+/// stops servicing requests (e.g. crashed, bootout'd, kyris-stopped, or
+/// wedged) so the user notices without having to run a check command.
+///
+/// Uses a real `daemon.health` round-trip rather than a bare
+/// `connect()`: a bare connect succeeds as long as the kernel queues the
+/// connection — it can't tell "alive" from "accept loop hung" — and,
+/// because it is dropped immediately, it races the server's `accept()`
+/// and shows up there as a transient `ENOTCONN` logged once per probe.
+/// The round-trip both means something and closes cleanly.
+async fn agentpactd_health_poller() {
+    let socket_path = std::env::var("AGENTPACT_SOCK").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.agentpact/agentpact.sock")
+    });
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        // The probe is blocking I/O (connect + write + read); run it off
+        // the async worker so a wedged daemon can't stall the runtime.
+        let socket = socket_path.clone();
+        let reachable = tokio::task::spawn_blocking(move || {
+            agentpact::probe_daemon_health(&socket, Duration::from_secs(2))
+        })
+        .await
+        .unwrap_or(false);
+        if reachable {
+            crate::tray::clear_issue("agentpactd");
+        } else {
+            crate::tray::report_issue(
+                "agentpactd",
+                format!("policy daemon socket not responding at {socket_path}"),
+            );
+        }
     }
+}
+
+/// Event-driven watcher on the user-level `pact.yaml`. Resolves the
+/// effective mode once at startup, then re-resolves only when the
+/// `user_policy_dir` actually changes — same pattern agentpactd's
+/// own policy watcher uses, just narrowed to "tell the tray icon
+/// when mode flips."
+///
+/// The tray is a system-wide indicator with no working-directory
+/// context, so we resolve against `home` (no cwd) — repo overrides
+/// are surfaced by `kyris status` / `doctor` instead. Uses
+/// `agentpact::policy::resolution` so this watcher and the CLI's
+/// headline can't drift.
+///
+/// If the filesystem watcher fails to register (vanishingly rare
+/// on supported platforms — would require missing inotify on Linux
+/// or `FSEvents` on macOS), we log a warning and continue with
+/// whatever mode was resolved at startup. No polling fallback —
+/// "either event-driven, or static-from-boot" is easier to reason
+/// about than a silent polling fallback that wastes CPU.
+async fn watch_policy_mode() {
+    // `agentpact` is locally aliased to `kyris_agentpact_client` (the
+    // wire-types crate, no `policy`/`config`/`protocol` modules);
+    // reach the agentpact server lib via the fully-qualified
+    // `::agentpact` path.
+    use ::agentpact::policy::resolution::{SYSTEM_POLICY_DIR, resolve_mode_for};
+    use ::agentpact::protocol::types::Mode;
+    use notify_debouncer_mini::new_debouncer;
+
+    let Some(home) = std::env::var("HOME").ok().map(std::path::PathBuf::from) else {
+        tracing::warn!("HOME unset; tray policy-mode indicator will stay at default");
+        return;
+    };
+    let user_dir = ::agentpact::config::default_user_policy_dir(&home);
+    let system_dir = std::path::Path::new(SYSTEM_POLICY_DIR);
+
+    // Capture the resolved mode and push to the tray.
+    let push_to_tray = || {
+        let log_mode = resolve_mode_for(&home, &home, &user_dir, system_dir).mode == Mode::Log;
+        crate::tray::set_log_mode(log_mode);
+    };
+    push_to_tray();
+
+    // notify thread → async task. Capacity 1 because any pending
+    // wakeup means "re-resolve"; coalescing extras is correct.
+    let (fs_tx, mut fs_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    // 100ms debounce matches agentpactd's policy watcher.
+    let debouncer = match new_debouncer(Duration::from_millis(100), move |_| {
+        let _ = fs_tx.try_send(());
+    }) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to create policy mode watcher; tray mode will be static"
+            );
+            return;
+        }
+    };
+    let mut debouncer = debouncer;
+
+    if let Err(e) = debouncer
+        .watcher()
+        .watch(&user_dir, notify::RecursiveMode::NonRecursive)
+    {
+        tracing::warn!(
+            dir = %user_dir.display(),
+            error = %e,
+            "could not watch user-policy directory; tray mode will be static"
+        );
+        return;
+    }
+    tracing::info!(dir = %user_dir.display(), "watching for policy mode changes");
+
+    // Hold `debouncer` on this task's stack so the underlying
+    // watcher thread lives as long as the task does. The task
+    // itself lives until process exit.
+    while fs_rx.recv().await.is_some() {
+        push_to_tray();
+    }
+    drop(debouncer);
+}
+
+/// Write a JSON diagnostics dump to
+/// `~/.local/state/kyris/diagnostics/` (see
+/// [`kyris_core::paths::diagnostics_dir`]). Called from the SIGUSR1
+/// handler. Doesn't dump deep daemon state yet — that would require
+/// hold-and-snapshot of various mutexes. For now we emit basic
+/// build/process metadata; richer dumps can be added as the daemon's
+/// internal state surfaces are stabilized.
+#[cfg(unix)]
+fn write_diagnostics_dump() -> std::io::Result<std::path::PathBuf> {
+    let dir = kyris_core::paths::diagnostics_dir();
+    std::fs::create_dir_all(&dir)?;
+    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let path = dir.join(format!("dump-{ts}.json"));
+
+    let dump = serde_json::json!({
+        "schema_version": 1,
+        "version": crate::build_info::VERSION,
+        "build_date": crate::build_info::BUILD_DATE,
+        "commit": crate::build_info::COMMIT,
+        "features": crate::build_info::FEATURES,
+        "pid": std::process::id(),
+        "tray_issues": crate::tray::list_issues()
+            .into_iter()
+            .map(|(k, v)| serde_json::json!({"key": k, "reason": v}))
+            .collect::<Vec<_>>(),
+    });
+    let body = serde_json::to_vec_pretty(&dump).expect("serialize diagnostics dump");
+    std::fs::write(&path, body)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+async fn sigusr1_diagnostics(mut sigusr1: tokio::signal::unix::Signal) {
+    loop {
+        sigusr1.recv().await;
+        match write_diagnostics_dump() {
+            Ok(path) => tracing::info!(dump = %path.display(), "SIGUSR1 diagnostics dump"),
+            Err(e) => tracing::warn!("SIGUSR1 diagnostics dump failed: {e}"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn sigusr1_diagnostics(_sigusr1: ()) {
+    std::future::pending::<()>().await;
+}
+
+/// SIGUSR2 — toggle the active log filter between the configured
+/// baseline (`log.filter`) and the verbose preset (`log.verbose_filter`).
+/// Lets an operator with shell access flip on adapter-level debug
+/// during a misbehaving request without restarting the daemon, and
+/// flip back when done. The transition itself is always logged at
+/// INFO so it appears in the log regardless of which filter is now
+/// active.
+///
+/// No auto-revert on this path — it sticks until another SIGUSR2 or
+/// a daemon restart. For bounded-window debugging, prefer the
+/// admin endpoint (`POST /operator/diag/log-filter`) which accepts
+/// `duration_secs` and auto-reverts via a Tokio timer.
+#[cfg(unix)]
+async fn sigusr2_toggle_log_filter(state: Arc<AppState>, mut sigusr2: tokio::signal::unix::Signal) {
+    loop {
+        sigusr2.recv().await;
+        let config = state.config.load();
+        let baseline = config.log.filter.clone();
+        let verbose = config.log.verbose_filter.clone();
+        match crate::logging::try_toggle_verbose(&baseline, &verbose) {
+            Ok(now_active) => {
+                tracing::info!(
+                    active_filter = %now_active,
+                    baseline = %baseline,
+                    verbose = %verbose,
+                    source = "sigusr2",
+                    "log_filter_toggled"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGUSR2 log-filter toggle failed");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn sigusr2_toggle_log_filter(_state: Arc<AppState>, _sigusr2: ()) {
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+async fn sighup_reload(state: Arc<AppState>, mut hup: tokio::signal::unix::Signal) {
+    let (reload_tx, reload_rx) = mpsc::channel(8);
+
+    tokio::spawn(async move {
+        loop {
+            hup.recv().await;
+            if reload_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    reload_loop(state, reload_rx, || async { config::try_load_config() }).await;
+}
+
+#[cfg(not(unix))]
+async fn sighup_reload(state: Arc<AppState>, _hup: ()) {
+    let _ = state;
+    // SIGHUP is not available on non-unix platforms.
+    std::future::pending::<()>().await;
+}
+
+#[cfg(unix)]
+async fn shutdown_signal(mut streams: ShutdownStreams) {
+    tokio::select! {
+        _ = streams.sigint.recv() => {
+            tracing::info!("SIGINT received, shutting down");
+        }
+        _ = streams.sigterm.recv() => {
+            tracing::info!("SIGTERM received, shutting down");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal(_streams: ShutdownStreams) {
+    tokio::signal::ctrl_c()
+        .await
+        .expect("install ctrl+c handler");
+    tracing::info!("shutdown signal received");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notify::ApprovalOutcome;
+
+    #[test]
+    fn testCouldNotShowLeavesRequestPending() {
+        // The permission-gate invariant: an outcome that never reached the
+        // user must NOT resolve the request (and must never auto-approve).
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::CouldNotShow),
+            None
+        );
+    }
+
+    #[test]
+    fn testExplicitOutcomesResolveAsChosen() {
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::Yes),
+            Some(ResolveDecision::Approved)
+        );
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::Always),
+            Some(ResolveDecision::Always)
+        );
+        assert_eq!(
+            decision_for_approval_outcome(ApprovalOutcome::No),
+            Some(ResolveDecision::Denied)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn testIsKyrisdExecutableMatchesInstalledAndTestBinaries() {
+        // Installed/dev binary.
+        assert!(is_kyrisd_executable("kyrisd"));
+        // cargo test/bench binaries: `kyrisd-<hex>`.
+        assert!(is_kyrisd_executable("kyrisd-63734a7a32da801b"));
+        assert!(is_kyrisd_executable("kyrisd-deadbeef"));
+        // Not kyrisd: the CLI, the MCP wrapper, the policy daemon.
+        assert!(!is_kyrisd_executable("kyris"));
+        assert!(!is_kyrisd_executable("kyris-mcp"));
+        assert!(!is_kyrisd_executable("agentpactd"));
+        // `kyrisd-` prefix with a non-hex suffix is not a cargo artifact
+        // and must not be swept (guards against e.g. `kyrisd-backup`).
+        assert!(!is_kyrisd_executable("kyrisd-backup"));
+        assert!(!is_kyrisd_executable("kyrisd-"));
+        // Substring / suffix matches must not trip it.
+        assert!(!is_kyrisd_executable("notkyrisd"));
+        assert!(!is_kyrisd_executable("kyrisdd"));
+    }
 
     use axum::routing::get;
     use kyris_core::config::ProviderFormat;
@@ -820,11 +1912,13 @@ mod tests {
             mcp_server: None,
             mcp_tool: None,
             metering: kyris_core::record::Metering::Available,
+            plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
+            agent: Some("claude-code".to_string()),
         }
     }
 
-    fn make_provider(name: &str, api_key: &str, upstream: &str) -> ProviderConfig {
+    fn make_provider(name: &str, upstream: &str) -> ProviderConfig {
         let format = match name {
             "anthropic" => ProviderFormat::Anthropic,
             "google" => ProviderFormat::Google,
@@ -833,7 +1927,6 @@ mod tests {
         ProviderConfig {
             name: name.to_string(),
             format,
-            api_key: api_key.to_string(),
             upstream: upstream.to_string(),
             models: vec![format!("{name}-model")],
             timeout_seconds: 30,
@@ -860,6 +1953,7 @@ mod tests {
                 &temp_root.join("kyrisd.duckdb"),
             )),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket,
             mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
@@ -935,6 +2029,7 @@ mod tests {
             Arc::new(storage::DuckDbWriter::open(&db_path)),
             circuit_breaker,
             kyris_core::config::StatsConfig::default(),
+            kyris_core::config::SpendConfig::default(),
             30,
         ));
 
@@ -962,7 +2057,7 @@ mod tests {
     async fn testReloadLoopKeepsOldConfigActiveUntilNewConfigLoads() {
         let dir = tempfile::tempdir().unwrap();
         let mut initial_config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        initial_config.providers = vec![make_provider("openai", "old-key", "https://old.example")];
+        initial_config.providers = vec![make_provider("openai", "https://old.example")];
         let initial_clients = build_provider_clients(&initial_config);
         let state = make_test_state(initial_config, dir.path());
         state.provider_clients.store(Arc::new(initial_clients));
@@ -973,8 +2068,8 @@ mod tests {
         let next_config = {
             let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
             config.providers = vec![
-                make_provider("openai", "new-key", "https://new.example"),
-                make_provider("anthropic", "anth-key", "https://anth.example"),
+                make_provider("openai", "https://new.example"),
+                make_provider("anthropic", "https://anth.example"),
             ];
             config
         };
@@ -1001,14 +2096,19 @@ mod tests {
 
         reload_tx.send(()).await.unwrap();
         started.notified().await;
-        assert_eq!(state.config.load().providers[0].api_key, "old-key");
+        assert_eq!(
+            state.config.load().providers[0].upstream,
+            "https://old.example"
+        );
 
         gate.notify_waiters();
         drop(reload_tx);
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let loaded = state.config.load();
-                if loaded.providers.len() == 2 && loaded.providers[0].api_key == "new-key" {
+                if loaded.providers.len() == 2
+                    && loaded.providers[0].upstream == "https://new.example"
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1020,7 +2120,7 @@ mod tests {
 
         let loaded = state.config.load();
         assert_eq!(loaded.providers.len(), 2);
-        assert_eq!(loaded.providers[0].api_key, "new-key");
+        assert_eq!(loaded.providers[0].upstream, "https://new.example");
         let clients = state.provider_clients.load();
         assert!(clients.contains_key("openai"));
         assert!(clients.contains_key("anthropic"));
@@ -1030,7 +2130,7 @@ mod tests {
     async fn testReloadLoopKeepsCurrentConfigOnLoadFailure() {
         let dir = tempfile::tempdir().unwrap();
         let mut initial_config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        initial_config.providers = vec![make_provider("google", "old-key", "https://old.example")];
+        initial_config.providers = vec![make_provider("google", "https://old.example")];
         let initial_clients = build_provider_clients(&initial_config);
         let state = make_test_state(initial_config, dir.path());
         state.provider_clients.store(Arc::new(initial_clients));
@@ -1050,15 +2150,20 @@ mod tests {
         let loaded = state.config.load();
         assert_eq!(loaded.providers.len(), 1);
         assert_eq!(loaded.providers[0].name, "google");
-        assert_eq!(loaded.providers[0].api_key, "old-key");
+        assert_eq!(loaded.providers[0].upstream, "https://old.example");
         let clients = state.provider_clients.load();
         assert_eq!(clients.len(), 1);
         assert!(clients.contains_key("google"));
     }
 
     #[tokio::test]
-    async fn testHealthzReturnsOk() {
-        let app = Router::new().route("/healthz", axum::routing::get(healthz));
+    async fn testHealthzReadyWithProviders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![make_provider("openai", "http://localhost")];
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route("/healthz", axum::routing::get(healthz).with_state(state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1078,39 +2183,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "ok");
-
-        let _ = shutdown_tx.send(());
-        handle.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn testReadyzWithProviders() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
-        config.providers = vec![make_provider("openai", "key", "http://localhost")];
-        let state = make_test_state(config, dir.path());
-
-        let app = Router::new().route("/readyz", axum::routing::get(readyz).with_state(state));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = format!("http://{}", listener.local_addr().unwrap());
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-                .unwrap();
-        });
-
-        let resp = reqwest::Client::new()
-            .get(format!("{addr}/readyz"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["ready"], true);
         assert_eq!(body["providers"], 1);
         assert_eq!(body["db_writable"], true);
@@ -1120,12 +2192,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testReadyzWithoutProvidersReturnsUnavailable() {
+    async fn testHealthzReadyWithoutProviders() {
         let dir = tempfile::tempdir().unwrap();
         let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         let state = make_test_state(config, dir.path());
 
-        let app = Router::new().route("/readyz", axum::routing::get(readyz).with_state(state));
+        let app = Router::new().route("/healthz", axum::routing::get(healthz).with_state(state));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1139,13 +2211,15 @@ mod tests {
         });
 
         let resp = reqwest::Client::new()
-            .get(format!("{addr}/readyz"))
+            .get(format!("{addr}/healthz"))
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["ready"], false);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["providers"], 0);
+        assert_eq!(body["db_writable"], true);
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
@@ -1234,6 +2308,7 @@ mod tests {
             "tok-1".into(),
             "github".into(),
             Some("read_file".into()),
+            true,
         );
 
         let app = Router::new().route(
@@ -1332,6 +2407,7 @@ mod tests {
             "tok-s-1".into(),
             "github".into(),
             Some("read_file".into()),
+            true,
         );
 
         let app = Router::new().route(
@@ -1397,6 +2473,14 @@ mod tests {
                 axum::routing::get(operator_gateway_records).with_state(state.clone()),
             )
             .route(
+                "/operator/timeline",
+                axum::routing::get(operator_timeline).with_state(state.clone()),
+            )
+            .route(
+                "/operator/stats",
+                axum::routing::get(operator_stats).with_state(state.clone()),
+            )
+            .route(
                 "/operator/session-tokens/{session_id}",
                 axum::routing::get(operator_session_token).with_state(state),
             );
@@ -1437,6 +2521,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn testOperatorTimelineRejectsMalformedSince() {
+        // A non-RFC3339 bound must 400 on every operator read path, rather than
+        // returning a misleading partial window (the event reader would keep
+        // everything, the record reader would drop everything). Regression for
+        // the silent since-divergence found during live verification.
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let client = reqwest::Client::new();
+
+        for path in [
+            "/operator/timeline?since=1d",
+            "/operator/timeline?until=garbage",
+            "/operator/stats?since=7d",
+            "/operator/gateway-records?since=not-a-time",
+        ] {
+            let resp = client.get(format!("{addr}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "expected 400 for {path}");
+        }
+
+        // A valid RFC3339 bound is accepted.
+        for path in [
+            "/operator/timeline?since=2026-01-01T00:00:00Z",
+            "/operator/stats?since=2026-01-01T00:00:00%2B00:00",
+        ] {
+            let resp = client.get(format!("{addr}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), 200, "expected 200 for {path}");
+        }
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn testOperatorGatewayRecordsFilterByProvider() {
         let dir = tempfile::tempdir().unwrap();
         let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
@@ -1460,6 +2579,78 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorStreamDeliversPersistedRecord() {
+        use futures_util::StreamExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route(
+            "/operator/stream",
+            axum::routing::get(operator_stream).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        // `.send()` returns once response headers arrive, which is after the
+        // handler has already subscribed — so inserting now cannot race the
+        // subscription.
+        let resp = reqwest::Client::new()
+            .get(format!("{addr}/operator/stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        state
+            .db
+            .insert_batch(&[sample_event("trace-stream", Some("sess-stream"))])
+            .expect("insert");
+
+        // Read SSE chunks until the first `data:` line, then parse it.
+        let mut body = resp.bytes_stream();
+        let mut buf = String::new();
+        let record = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let chunk = body.next().await.expect("stream ended").expect("chunk");
+                buf.push_str(&String::from_utf8_lossy(&chunk));
+                if let Some(line) = buf.lines().find(|l| l.starts_with("data:")) {
+                    let json = line.trim_start_matches("data:").trim();
+                    return serde_json::from_str::<serde_json::Value>(json).expect("parse record");
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for streamed record");
+
+        assert_eq!(record["trace_id"], "trace-stream");
+        assert_eq!(record["provider"], "openai");
+        assert_eq!(record["status"], "success");
+
+        // The SSE response is a long-lived connection; graceful shutdown would
+        // block on it. Drop the client side and abort the server task instead.
+        drop(body);
+        let _ = shutdown_tx.send(());
+        handle.abort();
     }
 
     #[tokio::test]
@@ -1531,6 +2722,50 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
+    }
+
+    #[test]
+    fn testHookLogBodyDeserializesFullShape() {
+        let raw = serde_json::json!({
+            "hook_id": "76ce3727",
+            "agent": "claude-code",
+            "action": "execute",
+            "detail": "ls && echo hi",
+            "segments": ["ls", "echo hi"],
+            "decision": "allow",
+            "source": "agentpact_auto",
+            "approval_id": "apr_42",
+            "agent_prompt": "none",
+            "elapsed_ms": 12
+        });
+        let body: HookLogBody = serde_json::from_value(raw).unwrap();
+        assert_eq!(body.hook_id, "76ce3727");
+        assert_eq!(
+            body.segments.as_deref(),
+            Some(&["ls".to_string(), "echo hi".to_string()][..])
+        );
+        assert_eq!(body.approval_id.as_deref(), Some("apr_42"));
+        assert_eq!(body.agent_prompt, "none");
+    }
+
+    #[test]
+    fn testHookLogBodyDeserializesWithoutOptionals() {
+        // segments and approval_id are absent on auto-decide non-compound
+        // calls; the body must still parse.
+        let raw = serde_json::json!({
+            "hook_id": "abcd",
+            "agent": "codex-cli",
+            "action": "execute",
+            "detail": "ls",
+            "decision": "allow",
+            "source": "agentpact_auto",
+            "agent_prompt": "agent_decides",
+            "elapsed_ms": 3
+        });
+        let body: HookLogBody = serde_json::from_value(raw).unwrap();
+        assert!(body.segments.is_none());
+        assert!(body.approval_id.is_none());
+        assert_eq!(body.agent_prompt, "agent_decides");
     }
 
     #[tokio::test]
@@ -1665,10 +2900,14 @@ mod tests {
             kyris_core::pending::hold_poll_resolve(
                 &client,
                 &task_conn,
-                "e2e-approve-1",
-                "test-token",
-                "github",
-                "read_file",
+                kyris_core::pending::PendingApproval {
+                    approval_id: "e2e-approve-1",
+                    approval_token: "test-token",
+                    server: "github",
+                    tool: "read_file",
+                    code: None,
+                    allow_always: true,
+                },
             )
             .await
         });
@@ -1722,10 +2961,14 @@ mod tests {
             kyris_core::pending::hold_poll_resolve(
                 &client,
                 &task_conn,
-                "e2e-deny-1",
-                "test-token",
-                "github",
-                "write_file",
+                kyris_core::pending::PendingApproval {
+                    approval_id: "e2e-deny-1",
+                    approval_token: "test-token",
+                    server: "github",
+                    tool: "write_file",
+                    code: None,
+                    allow_always: true,
+                },
             )
             .await
         });

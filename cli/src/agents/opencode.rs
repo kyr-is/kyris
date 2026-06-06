@@ -7,7 +7,8 @@ use crate::integration::{read_json_value, set_json_value_path, write_json_value}
 use crate::state::restore_manifest_entry;
 
 use super::probe::{
-    ProbeResult, fingerprint, json_has_mcp_wrap, not_detected, probe_config_rewrite_burn_control,
+    ProbeResult, fingerprint, json_has_any_mcp_servers, json_has_mcp_wrap, not_detected,
+    probe_config_rewrite_burn_control,
 };
 use super::registry::{AgentDescriptor, McpConfigFormat, McpConfigLocation, which_exists};
 
@@ -66,8 +67,13 @@ impl AgentDescriptor for OpenCode {
         let has_mcp_wrap = config_path
             .as_deref()
             .is_some_and(|p| json_has_mcp_wrap(p, "mcp"));
+        let has_any_mcp_servers = config_path
+            .as_deref()
+            .is_some_and(|p| json_has_any_mcp_servers(p, "mcp"));
         let tool = if has_mcp_wrap {
             SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+        } else if !has_any_mcp_servers {
+            SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
@@ -111,6 +117,17 @@ impl AgentDescriptor for OpenCode {
     }
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
+    }
+    fn surface_design_ceilings(
+        &self,
+    ) -> (
+        Option<super::profile::CoverageCeiling>,
+        Option<super::profile::CoverageCeiling>,
+        Option<super::profile::CoverageCeiling>,
+    ) {
+        // opencode has no live-hook path — compiled policy is the maximum
+        // achievable command-control coverage.
+        (Some(super::profile::CoverageCeiling::Compiled), None, None)
     }
     fn mcp_config(&self) -> Option<McpConfigLocation> {
         opencode_config_path().ok().map(|path| McpConfigLocation {
@@ -199,6 +216,10 @@ impl AgentDescriptor for OpenCode {
         Ok(())
     }
     fn undo_burn_control(&self) -> Result<(), String> {
+        // Remove MCP upstreams before restoring the config file.
+        let mcp_names = super::configure::mcp_server_names_from_agent(self);
+        super::configure::remove_mcp_upstreams(&mcp_names)?;
+
         for path in self.burn_control_config_paths() {
             if restore_manifest_entry(&path)? {
                 println!("Reverted {}", path.display());

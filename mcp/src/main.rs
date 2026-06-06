@@ -65,11 +65,59 @@ fn main() -> ExitCode {
         match relay::run_wrapper(&server_name, cmd, cmd_args, has_tty, socket_timeout).await {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
-                eprintln!("[kyris-mcp] error: {e}");
+                let msg = format!("server={server_name} {e}");
+                eprintln!("[kyris-mcp] error: {msg}");
+                log_error(&msg);
                 ExitCode::from(1)
             }
         }
     })
+}
+
+fn log_error(msg: &str) {
+    let path = kyris_core::paths::log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ts = epoch_to_utc(secs);
+        let _ = writeln!(file, "{ts} [kyris-mcp] [ERROR] {msg}");
+    }
+}
+
+/// Minimal UTC timestamp formatter — avoids a chrono/time dependency in the
+/// mcp crate which is intentionally kept lean.
+fn epoch_to_utc(epoch_secs: u64) -> String {
+    let secs_per_day: u64 = 86_400;
+    let day_secs = epoch_secs % secs_per_day;
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let days = epoch_secs / secs_per_day;
+    let (year, month, day) = days_to_ymd(days + 719_468);
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+fn days_to_ymd(z: u64) -> (u64, u64, u64) {
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
 }
 
 fn check_tty() -> bool {

@@ -1,15 +1,109 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+//! User-facing toast notifications.
+//!
+//! On macOS, every UN center call runs in-process via the
+//! `notify_macos` module (objc2 bindings, carved out from the
+//! crate-wide `deny(unsafe_code)`). We tried a sibling Swift helper
+//! binary and a subprocess approach; both failed because macOS's
+//! notification daemon only honors requests from a process
+//! `LaunchServices` identifies as a foreground-eligible app, and
+//! kyrisd's children don't inherit that identity. See
+//! `notify_macos` for the detailed rationale and Apple Forums thread
+//! 679326.
+//!
+//! On non-macOS, delivery falls back to `notify-rust` (freedesktop
+//! dbus on Linux); the dep is feature-gated on `tray` because
+//! headless server builds don't need toasts.
+//!
+//! Every call also emits a `tracing::info!` line at
+//! `target = "kyris::toast"`, so operators tailing
+//! `kyrisd.log` see the content even when GUI delivery is
+//! disabled, denied, or silently dropping.
+
+/// Daemon-startup permission request. Idempotent. Has to run on the
+/// daemon side (not in install.sh or a cask postflight) because
+/// macOS only honors UN center calls from a `LaunchServices`-
+/// registered process — see `notify_macos::request_authorization_if_needed`
+/// and Apple Forums thread 679326.
+pub fn request_authorization_if_needed() {
+    #[cfg(target_os = "macos")]
+    crate::notify_macos::request_authorization_if_needed();
+}
+
+/// User-facing approval outcomes. `Yes`/`No`/`Always` come from the user
+/// clicking a button. `CouldNotShow` is the structural signal that the
+/// dialog never became visible to the user (occluded, off-active-space,
+/// off-screen, or otherwise undeliverable) and the caller should fall
+/// back to another channel (menu-bar attention, TTY prompt, web UI)
+/// rather than treating the absence of an answer as a denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Yes,
+    No,
+    Always,
+    CouldNotShow,
+}
+
+/// Show a modal Yes / No / Always dialog and return the user's choice.
+/// On macOS with the tray feature this dispatches to the main thread via
+/// the tao event loop. On other platforms there is no approval UI yet, so it
+/// returns [`ApprovalOutcome::CouldNotShow`] — the request stays pending for
+/// `kyris pending` / the menu-bar path. It must NOT return `Yes`: a permission
+/// gate that auto-approves when it cannot ask is not a gate.
+///
+/// `code`, when `Some`, is rendered in the popup's accessoryView as
+/// monospaced text — the right surface for shell commands and file paths
+/// (whose readability suffers in the standard `informativeText` font).
+/// When `None`, the popup uses `body` alone.
+/// `allow_always` controls whether the "Always" button is offered; `false`
+/// greys it out (e.g. privilege escalation, which agentpactd never persists).
+#[cfg(feature = "tray")]
+pub async fn ask_approval(
+    title: &str,
+    body: &str,
+    code: Option<&str>,
+    allow_always: bool,
+) -> ApprovalOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        crate::tray::ask_approval(title, body, code, allow_always).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (title, body, code, allow_always);
+        // No desktop approval UI on non-macOS yet. Fail safe: leave the
+        // request pending (resolvable via `kyris pending`) rather than
+        // silently approving it.
+        ApprovalOutcome::CouldNotShow
+    }
+}
+
+#[cfg(all(test, feature = "tray", not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn testNonMacosAskApprovalNeverAutoApproves() {
+        // Regression: the non-macOS fallback used to return `Yes`, silently
+        // approving every held request. It must return CouldNotShow so the
+        // request stays pending instead of being auto-approved.
+        let outcome = ask_approval("t", "b", Some("rm -rf /"), true).await;
+        assert_eq!(outcome, ApprovalOutcome::CouldNotShow);
+        assert_ne!(outcome, ApprovalOutcome::Yes);
+    }
+}
 
 pub fn send_toast(title: &str, body: &str) {
-    if let Err(e) = notify_rust::Notification::new()
-        .summary(title)
-        .body(body)
-        .appname("Kyris")
-        .show()
-    {
-        tracing::warn!(error = %e, "failed to send toast notification");
-    }
+    tracing::info!(target: "kyrisd::toast", %title, %body, "toast");
+
+    #[cfg(target_os = "macos")]
+    crate::notify_macos::post(title, body);
+
+    // TODO: Desktop toasts for Windows/Linux — not yet implemented.
+    // The tracing::info! line above is the authoritative record.
+    #[cfg(all(not(target_os = "macos"), feature = "tray"))]
+    {}
 }
 
 pub fn circuit_breaker_toast(token_count: i64) {
@@ -36,13 +130,32 @@ pub fn daemon_recovery_toast(duration: &str) {
 }
 
 pub fn agentpactd_unreachable_toast() {
-    send_toast("AgentPact Governance Was Offline", "Daemon unreachable.");
+    send_toast(
+        "AgentPact Governance Was Offline",
+        "agentpactd was unreachable. Run `kyris daemon status` to investigate.",
+    );
 }
 
-pub fn relay_sync_error_toast(reason: &str) {
+/// Fired ONCE when sync transitions into the enrollment-error state (the relay
+/// rejected this machine's credential, or sync failed persistently). Transient
+/// relay-unavailable (5xx / network) is deliberately silent — it only updates
+/// status (see `sync::daemon_sync`) so a relay blip or overnight idle doesn't
+/// spam toasts.
+pub fn enrollment_error_toast() {
     send_toast(
-        "Kyris: Relay Sync Failed",
-        &format!("Relay sync failed: {reason}. Events queued locally."),
+        "Kyris: Enrollment Error",
+        "kyris can't sync — this machine isn't enrolled with the relay. \
+         Run `kyris enroll` to resume. Events are queued locally meanwhile.",
+    );
+}
+
+pub fn spend_warning_toast(total_usd: f64, threshold_usd: f64, window_hours: u64) {
+    send_toast(
+        "Kyris: Spend Warning",
+        &format!(
+            "${total_usd:.2} spent in the last {window_hours}h \
+             (threshold: ${threshold_usd:.2}). Run `kyris stats` for details."
+        ),
     );
 }
 
