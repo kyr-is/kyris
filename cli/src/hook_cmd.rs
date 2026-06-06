@@ -131,6 +131,15 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
 
     let segs = segments.unwrap_or_else(|| vec![args.cmd.clone()]);
 
+    // A genuinely compound command (>=2 segments) is driven per-segment but
+    // audited as ONE event: mint a command-group id and tag every segment's
+    // request with it + the original line. Single commands carry no group and
+    // audit one event as before.
+    let command_group_id = (segs.len() >= 2).then(pact_client::new_command_group);
+    let command_group = command_group_id
+        .as_deref()
+        .map(|group| (group, args.cmd.as_str()));
+
     let allow_response = AllowResponse::EmptyStdout;
     let ctx = PermissionCtx {
         audit_conn: None,
@@ -154,7 +163,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     let result = run_segments(
         &segs,
         pact_client::allow_on_daemon_unavailable(),
-        |seg| classify_segment(&ctx, None, seg),
+        |seg| classify_segment(&ctx, None, seg, command_group),
         |approval_id, approval_token, seg, allow_always| match tty.as_ref() {
             Some(tty) => tty_prompt_segment(
                 tty,
@@ -175,6 +184,13 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
             ),
         },
     );
+
+    // Every segment of the line has been driven (allowed or denied): finalize
+    // the buffered aggregate into one event. Best-effort — the daemon's expiry
+    // sweep flushes the buffer if this commit is dropped.
+    if let Some(group) = &command_group_id {
+        pact_client::send_command_commit(&sock_path, group, socket_timeout);
+    }
 
     match result {
         Ok(_) => std::process::exit(0),
@@ -808,10 +824,14 @@ fn drive_per_segment(
 ) -> ! {
     let segs = segments.unwrap_or_else(|| vec![ctx.detail.to_string()]);
 
+    // Compound line (>=2 segments) → drive per-segment but audit as one event.
+    let command_group_id = (segs.len() >= 2).then(pact_client::new_command_group);
+    let command_group = command_group_id.as_deref().map(|group| (group, ctx.detail));
+
     let result = run_segments(
         &segs,
         pact_client::allow_on_daemon_unavailable(),
-        |seg| classify_segment(ctx, seed_pid, seg),
+        |seg| classify_segment(ctx, seed_pid, seg, command_group),
         |approval_id, approval_token, seg, allow_always| {
             poll_segment(
                 ctx.action,
@@ -824,6 +844,12 @@ fn drive_per_segment(
             )
         },
     );
+
+    // Finalize the buffered aggregate into one event (best-effort; expiry sweep
+    // backstops a dropped commit).
+    if let Some(group) = &command_group_id {
+        pact_client::send_command_commit(ctx.sock_path, group, ctx.socket_timeout);
+    }
 
     match result {
         Ok(source) => {
@@ -924,7 +950,12 @@ fn block_defers_to_agent(source: &str, allow_on_unavailable: bool) -> bool {
 /// instead of re-asking. This is the kyris-side half of the
 /// `AGENTPACT_EXEC_TOKEN` chain-anchoring contract (the other half is
 /// `consume_by_chain` in `agentpact::permission::request`).
-fn classify_segment(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>, seg: &str) -> SegClass {
+fn classify_segment(
+    ctx: &PermissionCtx<'_>,
+    seed_pid: Option<u32>,
+    seg: &str,
+    command_group: Option<(&str, &str)>,
+) -> SegClass {
     // The agent process is our parent (this CLI runs as a hook child of
     // Claude Code / Codex / Gemini). `std::os::unix::process::parent_id`
     // is stable since 1.69 and returns `u32`; kyris targets only Unix.
@@ -941,6 +972,7 @@ fn classify_segment(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>, seg: &str) -
         seed_pid,
         anchor_pid,
         None,
+        command_group,
         ctx.socket_timeout,
     ) {
         Ok((McpPermissionDecision::Allow { .. }, _)) => SegClass::Auto,

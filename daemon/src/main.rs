@@ -64,6 +64,20 @@ fn main() {
 
 #[cfg(feature = "tray")]
 fn run(config: kyris_core::config::KyrisdConfig) {
+    // A dedicated/test instance sets KYRIS_NO_TRAY to run HEADLESS on this same
+    // (tray-built) binary — no menu-bar icon, no AppKit run loop. Without it,
+    // every short-lived test kyrisd would pop a tray icon and clutter the bar.
+    if std::env::var_os("KYRIS_NO_TRAY").is_some() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        rt.block_on(async {
+            server::run(config).await;
+        });
+        return;
+    }
+
     // Tokio runs on a background thread so the main thread is free to host
     // the macOS AppKit run loop required by `tray-icon`.
     let tokio_handle = std::thread::Builder::new()

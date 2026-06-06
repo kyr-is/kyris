@@ -81,6 +81,7 @@ fn gateway_row_to_record(
             plan_status_str.as_deref().unwrap_or("unknown"),
         )
         .unwrap_or_default(),
+        agent: row.get(19)?,
     })
 }
 
@@ -137,8 +138,8 @@ impl DuckDbWriter {
                 id, trace_id, timestamp, provider, model,
                 tokens_in, tokens_out, tokens_cache_create, tokens_cache_read,
                 cost_usd, latency_ms, status, session_id, synced, mcp_server, mcp_tool,
-                working_dir, metering, plan_status
-            ) VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?, ?, ?, ?)",
+                working_dir, metering, plan_status, agent
+            ) VALUES (?, ?, now(), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?, ?, ?, ?, ?)",
         )?;
         for event in events {
             let id = uuid::Uuid::now_v7().to_string();
@@ -186,6 +187,7 @@ impl DuckDbWriter {
                 event.working_dir,
                 metering_str,
                 plan_status_str,
+                event.agent,
             ])?;
 
             // Best-effort fan-out to live monitor subscribers. The DB row is the
@@ -211,6 +213,7 @@ impl DuckDbWriter {
                 metering: event.metering,
                 plan_status: event.plan_status,
                 working_dir: event.working_dir.clone(),
+                agent: event.agent.clone(),
             });
         }
         Ok(())
@@ -329,7 +332,7 @@ impl DuckDbWriter {
                     provider, model, \
                     tokens_in, tokens_out, tokens_cache_create, tokens_cache_read, \
                     cost_usd, latency_ms, status, session_id, synced, \
-                    mcp_server, mcp_tool, working_dir, metering, plan_status \
+                    mcp_server, mcp_tool, working_dir, metering, plan_status, agent \
              FROM gateway_records \
              WHERE synced = false AND working_dir IS NOT NULL \
              ORDER BY timestamp LIMIT 500",
@@ -354,7 +357,7 @@ impl DuckDbWriter {
                     provider, model, \
                     tokens_in, tokens_out, tokens_cache_create, tokens_cache_read, \
                     cost_usd, latency_ms, status, session_id, synced, \
-                    mcp_server, mcp_tool, working_dir, metering, plan_status \
+                    mcp_server, mcp_tool, working_dir, metering, plan_status, agent \
              FROM gateway_records WHERE 1 = 1",
         );
         let mut params: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
@@ -613,6 +616,7 @@ mod tests {
             metering: kyris_core::record::Metering::Available,
             plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
+            agent: None,
         }
     }
 
@@ -845,6 +849,7 @@ mod tests {
             metering: kyris_core::record::Metering::Available,
             plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: Some("/tmp/project".to_string()),
+            agent: None,
         };
 
         writer
@@ -932,6 +937,7 @@ mod tests {
             metering: kyris_core::record::Metering::Unavailable,
             plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
+            agent: None,
         };
         writer.insert_batch(&[event]).expect("insert");
 
@@ -1023,6 +1029,7 @@ mod tests {
             metering: kyris_core::record::Metering::Available,
             plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
+            agent: None,
         }
     }
 

@@ -34,6 +34,11 @@ pub struct GatewayRecord {
     pub plan_status: PlanStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
+    /// The agent that made the model call (e.g. `claude-code`). `None` when the
+    /// agent didn't identify itself via `x-kyris-agent-id`. Lets the timeline
+    /// attribute burn (tokens/cost) to *who* spent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +87,15 @@ pub enum Metering {
     #[default]
     #[serde(other)]
     Available,
+}
+
+impl std::fmt::Display for Metering {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Available => f.write_str("available"),
+            Self::Unavailable => f.write_str("unavailable"),
+        }
+    }
 }
 
 /// Cost-coverage class for a gateway record. Orthogonal to [`Metering`] (which
@@ -144,7 +158,8 @@ CREATE TABLE IF NOT EXISTS gateway_records (
     mcp_tool    VARCHAR,
     working_dir VARCHAR,
     metering    VARCHAR NOT NULL DEFAULT 'available',
-    plan_status VARCHAR NOT NULL DEFAULT 'unknown'
+    plan_status VARCHAR NOT NULL DEFAULT 'unknown',
+    agent       VARCHAR
 )";
 
 pub const CREATE_SESSION_TOKENS: &str = "\
@@ -240,6 +255,7 @@ mod tests {
             metering: Metering::Available,
             plan_status: PlanStatus::Included,
             working_dir: Some("/tmp/project".to_string()),
+            agent: Some("claude-code".to_string()),
         };
         let json = serde_json::to_string(&record).unwrap();
         let parsed: GatewayRecord = serde_json::from_str(&json).unwrap();
@@ -271,6 +287,7 @@ mod tests {
             metering: Metering::Unavailable,
             plan_status: PlanStatus::Unknown,
             working_dir: None,
+            agent: None,
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(!json.contains("mcp_server"));

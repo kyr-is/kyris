@@ -20,7 +20,7 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub routing_trace_id: Option<String>,
+    pub trace_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_remote_origin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,6 +55,27 @@ pub struct Event {
     pub mode: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub event_kind: String,
+    /// Per-segment breakdown for a compound `execute` command the agent issued
+    /// as one line (e.g. `cmd1 && cmd2`). The event represents the whole line
+    /// (`detail`), with each split segment's own decision/coverage here. Empty
+    /// (and omitted) for non-compound commands — there is nothing to break down.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<Segment>,
+}
+
+/// One segment of a compound `execute` command, with the decision agentpactd
+/// reached for that segment specifically. The parent [`Event`] is the whole
+/// command the agent requested; this is how a piece of it was governed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct Segment {
+    pub command: String,
+    pub decision: Decision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
 }
 
 // Action lives in `agentpact-types` (the canonical home for wire
@@ -66,6 +87,7 @@ pub struct Event {
 pub use agentpact_types::Action;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
@@ -114,6 +136,7 @@ impl std::fmt::Display for SyncState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageState {
@@ -241,7 +264,7 @@ mod tests {
         }"#;
         let event: Event = serde_json::from_str(json).unwrap();
         assert!(event.working_dir.is_none());
-        assert!(event.routing_trace_id.is_none());
+        assert!(event.trace_id.is_none());
         assert_eq!(event.attribution_method, AttributionMethod::Unknown);
     }
 
@@ -300,7 +323,7 @@ mod tests {
             rule_id: None,
             reason: None,
             working_dir: None,
-            routing_trace_id: None,
+            trace_id: None,
             git_remote_origin: None,
             mcp_server: None,
             mcp_operation: None,
@@ -318,6 +341,7 @@ mod tests {
             coverage_state: CoverageState::default(),
             mode: String::new(),
             event_kind: String::new(),
+            segments: Vec::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(!json.contains("rule_kind"));

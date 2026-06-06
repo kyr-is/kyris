@@ -136,10 +136,16 @@ pub fn agentpactd_unreachable_toast() {
     );
 }
 
-pub fn relay_sync_error_toast(reason: &str) {
+/// Fired ONCE when sync transitions into the enrollment-error state (the relay
+/// rejected this machine's credential, or sync failed persistently). Transient
+/// relay-unavailable (5xx / network) is deliberately silent — it only updates
+/// status (see `sync::daemon_sync`) so a relay blip or overnight idle doesn't
+/// spam toasts.
+pub fn enrollment_error_toast() {
     send_toast(
-        "Kyris: Relay Sync Failed",
-        &format!("Relay sync failed: {reason}. Events queued locally."),
+        "Kyris: Enrollment Error",
+        "kyris can't sync — this machine isn't enrolled with the relay. \
+         Run `kyris enroll` to resume. Events are queued locally meanwhile.",
     );
 }
 

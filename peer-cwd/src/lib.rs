@@ -23,9 +23,19 @@ const PID_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1
 /// connection. Returns `None` if the platform is unsupported, the peer PID
 /// cannot be determined, or the CWD cannot be read.
 pub fn resolve(peer_addr: SocketAddr) -> Option<String> {
-    let peer_port = peer_addr.port();
-    let pid = find_pid_for_local_port(peer_port)?;
-    read_cwd(pid)
+    resolve_with_pid(peer_addr).map(|(_, cwd)| cwd)?
+}
+
+/// Resolve the PID owning the peer side of a localhost TCP connection together
+/// with its CWD, in a single PID scan (the scan is the expensive part — see
+/// [`PID_SCAN_TIMEOUT`]). The PID lets `kyrisd` then ask `agentpactd` to
+/// attribute the owning agent (`attribution.resolve`) when the agent can't
+/// self-identify via a header. The CWD may be `None` even when the PID resolves
+/// (e.g. unreadable). Returns `None` only when the peer PID cannot be determined
+/// or the platform is unsupported.
+pub fn resolve_with_pid(peer_addr: SocketAddr) -> Option<(i32, Option<String>)> {
+    let pid = find_pid_for_local_port(peer_addr.port())?;
+    Some((pid, read_cwd(pid)))
 }
 
 // ---------------------------------------------------------------------------

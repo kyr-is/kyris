@@ -15,6 +15,7 @@ pub use kyris_types::pricing;
 pub use kyris_types::record;
 pub use kyris_types::schema;
 pub use kyris_types::sync;
+pub use kyris_types::timeline;
 
 pub mod agentpact;
 pub mod config;

@@ -2,16 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 
+use crate::timeline::TimelineEntry;
+
+/// One sync push from kyrisd to the relay. kyrisd is the single join owner, so
+/// it ships **already-joined** [`TimelineEntry`] rows — the relay stores them
+/// and only coordinates across machines. (This replaces the old
+/// `EventBatch { events[], kyrisd_records[] }` two-raw-stream contract: the
+/// relay no longer joins.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventBatch {
+pub struct TimelineBatch {
     pub machine_id: String,
     pub batch_id: String,
-    pub events: Vec<Box<serde_json::value::RawValue>>,
-    #[serde(default)]
-    pub kyrisd_records: Vec<Box<serde_json::value::RawValue>>,
+    pub entries: Vec<TimelineEntry>,
     pub cursor: SyncCursor,
 }
 
+/// kyrisd's progress marker through the agentpact event log. kyrisd drives the
+/// join from this position (plus its own unsynced records), so the cursor stays
+/// an event-log offset even though the payload is now joined entries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncCursor {
     pub filename: String,
@@ -73,21 +81,20 @@ mod tests {
     }
 
     #[test]
-    fn testEventBatchEmptyEvents() {
-        let batch = EventBatch {
+    fn testTimelineBatchEmptyEntries() {
+        let batch = TimelineBatch {
             machine_id: "m-1".to_string(),
             batch_id: "b-1".to_string(),
-            events: vec![],
-            kyrisd_records: vec![],
+            entries: vec![],
             cursor: SyncCursor {
                 filename: "events.jsonl".to_string(),
                 byte_offset: 0,
             },
         };
         let json = serde_json::to_string(&batch).unwrap();
-        let parsed: EventBatch = serde_json::from_str(&json).unwrap();
-        assert!(parsed.events.is_empty());
-        assert!(parsed.kyrisd_records.is_empty());
+        let parsed: TimelineBatch = serde_json::from_str(&json).unwrap();
+        assert!(parsed.entries.is_empty());
+        assert_eq!(parsed.cursor.byte_offset, 0);
     }
 
     #[test]

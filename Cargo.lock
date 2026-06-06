@@ -1947,7 +1947,6 @@ dependencies = [
  "clap",
  "console",
  "dialoguer",
- "duckdb",
  "jsonschema",
  "kyris-agentpact-client",
  "kyris-core",

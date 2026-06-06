@@ -18,7 +18,6 @@ kyris-core = { workspace = true, features = ["pending"] }
 kyris-agentpact-client = { workspace = true }
 agentpact = { workspace = true }
 clap = { workspace = true }
-duckdb = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "macros", "time"] }

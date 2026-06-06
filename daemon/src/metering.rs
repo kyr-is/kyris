@@ -28,6 +28,11 @@ pub struct StatsEvent {
     /// key -> Overage.
     pub plan_status: PlanStatus,
     pub working_dir: Option<String>,
+    /// The agent that made the model call (e.g. `claude-code`), from the
+    /// `x-kyris-agent-id` header. `None` when the agent didn't identify itself —
+    /// burn is then attributed by provider/model only. Persisted on the gateway
+    /// record so the timeline can show *who* burned the tokens.
+    pub agent: Option<String>,
 }
 
 #[cfg(test)]

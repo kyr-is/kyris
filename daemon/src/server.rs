@@ -34,16 +34,39 @@ pub struct AppState {
     pub stats_tx: mpsc::Sender<StatsEvent>,
     pub db: Arc<storage::DuckDbWriter>,
     pub provider_clients: ArcSwap<HashMap<String, reqwest::Client>>,
+    /// Shared upstream HTTP client used for the fresh-install passthrough case
+    /// (no `providers[]` configured, so `provider_clients` has no matching
+    /// entry) and as the fallback for any unconfigured provider name. Reusing
+    /// one tuned client keeps connections warm (keep-alive) and bounds connect
+    /// time; constructing a fresh `reqwest::Client` per request instead leaks a
+    /// new connection pool every call and, lacking a connect timeout, lets a
+    /// stalled connect hang to the full per-request timeout.
+    pub default_provider_client: reqwest::Client,
     pub pending: Arc<PendingStore>,
     pub agentpact_socket: Option<std::path::PathBuf>,
     pub mcp_annotation_cache: mcp_routing::AnnotationCache,
 }
 
 pub fn build_provider_client(_provider: &ProviderConfig) -> reqwest::Client {
+    build_default_provider_client()
+}
+
+/// The shared upstream HTTP client (see [`AppState::default_provider_client`]).
+///
+/// Tuned for a long-lived proxy talking to a small set of upstreams:
+/// - `connect_timeout` bounds a stalled TCP/TLS connect (a lost SYN or a slow
+///   handshake) so it fails fast instead of hanging to the per-request timeout
+///   — the failure signature behind the observed 30 s `/v1/responses` 502.
+/// - `tcp_keepalive` lets the OS probe idle keep-alive connections so a
+///   half-open one is reset and evicted rather than handed out and hung on.
+/// - `pool_idle_timeout` is kept below the typical upstream idle-close so we
+///   drop connections before the server does, avoiding the use-after-close race.
+pub fn build_default_provider_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_mins(1))
         .pool_max_idle_per_host(20)
         .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
         .expect("build reqwest client")
 }
@@ -96,7 +119,13 @@ pub async fn run(config: KyrisdConfig) {
     let agentpact_socket = probe_agentpact_socket();
 
     check_crash_recovery();
-    reap_stray_daemons().await;
+    // Singleton enforcement: a canonical (launchd) start reaps stray kyrisd
+    // siblings. A dedicated/test instance sets `KYRIS_NO_STRAY_REAP` so it
+    // neither kills the installed daemon nor fights other dedicated instances
+    // (test isolation — multiple kyrisd on distinct ports coexist).
+    if std::env::var_os("KYRIS_NO_STRAY_REAP").is_none() {
+        reap_stray_daemons().await;
+    }
     write_pid_file();
 
     let stats_config = config.stats.clone();
@@ -111,6 +140,7 @@ pub async fn run(config: KyrisdConfig) {
         stats_tx: stats_tx.clone(),
         db: db.clone(),
         provider_clients: ArcSwap::from_pointee(clients),
+        default_provider_client: build_default_provider_client(),
         pending: Arc::new(PendingStore::new()),
         agentpact_socket,
         mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
@@ -693,6 +723,14 @@ fn authed_operational_routes(state: Arc<AppState>) -> Router {
             get(operator_gateway_records).with_state(state.clone()),
         )
         .route(
+            "/operator/timeline",
+            get(operator_timeline).with_state(state.clone()),
+        )
+        .route(
+            "/operator/stats",
+            get(operator_stats).with_state(state.clone()),
+        )
+        .route(
             "/operator/stream",
             get(operator_stream).with_state(state.clone()),
         )
@@ -1128,10 +1166,104 @@ struct GatewayRecordsResponse {
     records: Vec<kyris_core::record::GatewayRecord>,
 }
 
+#[derive(Deserialize, Default)]
+struct TimelineQuery {
+    agent: Option<String>,
+    action: Option<String>,
+    decision: Option<String>,
+    session: Option<String>,
+    trace_id: Option<String>,
+    /// `working_dir` prefix (a directory and everything beneath it).
+    dir: Option<String>,
+    /// RFC3339 inclusive lower / upper bounds.
+    since: Option<String>,
+    until: Option<String>,
+    /// Newest-first row cap. Default 50, hard cap `10_000` (in `query_timeline`).
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct StatsQuery {
+    /// RFC3339 inclusive lower bound for the aggregation window.
+    since: Option<String>,
+    dir: Option<String>,
+}
+
+/// Reject a non-RFC3339 `since`/`until` with `400`. Both timeline readers
+/// compare these bounds against stored timestamps, but they do so differently —
+/// the event-log reader over `read_json` and the typed gateway-record reader —
+/// so a malformed value would filter inconsistently (one path silently keeps
+/// everything, the other drops everything). Failing fast here keeps the window
+/// honest: a bad bound is a client error, not a misleading partial result.
+fn validate_rfc3339(
+    name: &str,
+    val: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(v) = val
+        && chrono::DateTime::parse_from_rfc3339(v).is_err()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("invalid `{name}`: expected an RFC3339 timestamp, got {v:?}")
+            })),
+        ));
+    }
+    Ok(())
+}
+
+/// GET /operator/timeline — the unified event↔record timeline, joined in kyrisd
+/// (no `DuckDB` lock: kyrisd owns the records and reads the event log itself).
+/// Returns finished `TimelineEntry` rows; the CLI renders them.
+async fn operator_timeline(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<TimelineQuery>,
+) -> Result<Json<kyris_core::timeline::TimelinePage>, (StatusCode, Json<serde_json::Value>)> {
+    validate_rfc3339("since", q.since.as_deref())?;
+    validate_rfc3339("until", q.until.as_deref())?;
+    let filter = crate::timeline::TimelineFilter {
+        agent: q.agent,
+        action: q.action,
+        decision: q.decision,
+        session: q.session,
+        trace_id: q.trace_id,
+        dir: q.dir,
+        since: q.since,
+        until: q.until,
+        limit: q.limit.unwrap_or(50),
+    };
+    let log_dir = crate::timeline::agentpact_log_dir();
+    let entries = crate::timeline::query_timeline(&state.db, &log_dir, &filter);
+    Ok(Json(kyris_core::timeline::TimelinePage {
+        entries,
+        cursor: None,
+    }))
+}
+
+/// GET /operator/stats — aggregate usage over a window, computed in kyrisd from
+/// the same unified timeline. The CLI renders the numbers.
+async fn operator_stats(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<StatsQuery>,
+) -> Result<Json<kyris_core::timeline::TimelineStats>, (StatusCode, Json<serde_json::Value>)> {
+    validate_rfc3339("since", q.since.as_deref())?;
+    let filter = crate::timeline::TimelineFilter {
+        since: q.since,
+        dir: q.dir,
+        // Aggregate over the whole window, not a newest-N slice.
+        limit: 10_000,
+        ..Default::default()
+    };
+    let log_dir = crate::timeline::agentpact_log_dir();
+    let entries = crate::timeline::query_timeline(&state.db, &log_dir, &filter);
+    Ok(Json(crate::timeline::compute_stats(&entries)))
+}
+
 async fn operator_gateway_records(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(q): axum::extract::Query<GatewayRecordsQuery>,
 ) -> Result<Json<GatewayRecordsResponse>, (StatusCode, Json<serde_json::Value>)> {
+    validate_rfc3339("since", q.since.as_deref())?;
     let filter = storage::GatewayRecordFilter {
         provider: q.provider.as_deref(),
         model: q.model.as_deref(),
@@ -1782,6 +1914,7 @@ mod tests {
             metering: kyris_core::record::Metering::Available,
             plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir: None,
+            agent: Some("claude-code".to_string()),
         }
     }
 
@@ -1820,6 +1953,7 @@ mod tests {
                 &temp_root.join("kyrisd.duckdb"),
             )),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket,
             mcp_annotation_cache: mcp_routing::AnnotationCache::default(),
@@ -2339,6 +2473,14 @@ mod tests {
                 axum::routing::get(operator_gateway_records).with_state(state.clone()),
             )
             .route(
+                "/operator/timeline",
+                axum::routing::get(operator_timeline).with_state(state.clone()),
+            )
+            .route(
+                "/operator/stats",
+                axum::routing::get(operator_stats).with_state(state.clone()),
+            )
+            .route(
                 "/operator/session-tokens/{session_id}",
                 axum::routing::get(operator_session_token).with_state(state),
             );
@@ -2373,6 +2515,41 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         let records = body["records"].as_array().unwrap();
         assert_eq!(records.len(), 3);
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testOperatorTimelineRejectsMalformedSince() {
+        // A non-RFC3339 bound must 400 on every operator read path, rather than
+        // returning a misleading partial window (the event reader would keep
+        // everything, the record reader would drop everything). Regression for
+        // the silent since-divergence found during live verification.
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+        let (addr, shutdown_tx, handle) = spawn_operator_app(state).await;
+        let client = reqwest::Client::new();
+
+        for path in [
+            "/operator/timeline?since=1d",
+            "/operator/timeline?until=garbage",
+            "/operator/stats?since=7d",
+            "/operator/gateway-records?since=not-a-time",
+        ] {
+            let resp = client.get(format!("{addr}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), 400, "expected 400 for {path}");
+        }
+
+        // A valid RFC3339 bound is accepted.
+        for path in [
+            "/operator/timeline?since=2026-01-01T00:00:00Z",
+            "/operator/stats?since=2026-01-01T00:00:00%2B00:00",
+        ] {
+            let resp = client.get(format!("{addr}{path}")).send().await.unwrap();
+            assert_eq!(resp.status(), 200, "expected 200 for {path}");
+        }
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();

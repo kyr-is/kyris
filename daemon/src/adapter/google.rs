@@ -151,7 +151,7 @@ async fn handle_generate_content(
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!(
         "{}/v1beta/models/{}:generateContent?key={}",
         provider.upstream, model, caller_key
@@ -200,10 +200,16 @@ async fn handle_generate_content(
         }
     };
 
-    let working_dir = match trace_token.as_deref() {
-        Some(token) => super::relay_trace_attach(&state, token, &trace_id).await,
-        None => super::resolve_peer_working_dir(peer_addr).await,
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
     };
+    let agent = agent_id.clone().or(peer_agent);
 
     if state
         .stats_tx
@@ -229,6 +235,7 @@ async fn handle_generate_content(
             metering,
             plan_status: kyris_core::record::PlanStatus::Overage,
             working_dir,
+            agent,
         })
         .is_err()
     {
@@ -298,7 +305,7 @@ async fn handle_stream_generate_content(
     let client = clients
         .get(&provider_name)
         .cloned()
-        .unwrap_or_else(reqwest::Client::new);
+        .unwrap_or_else(|| state.default_provider_client.clone());
     let upstream_url = format!(
         "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
         provider.upstream, model, caller_key
@@ -331,6 +338,7 @@ async fn handle_stream_generate_content(
         provider_name,
         session_id,
         trace_token,
+        agent_id,
         peer_addr,
         start,
     )
@@ -347,6 +355,7 @@ fn relay_ndjson_stream(
     provider_name: String,
     session_id: String,
     trace_token: Option<String>,
+    agent_id: Option<String>,
     peer_addr: SocketAddr,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
@@ -488,10 +497,17 @@ fn relay_ndjson_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let working_dir = match trace_token.as_deref() {
-                Some(token) => super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                None => super::resolve_peer_working_dir_sync(peer_addr),
+            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+                (
+                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
+                    None,
+                )
+            } else {
+                let attr =
+                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
+                (attr.working_dir, attr.agent)
             };
+            let agent = agent_id.clone().or(peer_agent);
 
             if state
                 .stats_tx
@@ -511,6 +527,7 @@ fn relay_ndjson_stream(
                     metering: stream_metering,
                     plan_status: kyris_core::record::PlanStatus::Overage,
                     working_dir,
+                    agent,
                 })
                 .is_err()
             {
@@ -1204,6 +1221,7 @@ mod tests {
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: crate::server::build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
             mcp_annotation_cache: crate::mcp_routing::AnnotationCache::default(),

@@ -156,15 +156,71 @@ pub fn write_native_seen_breadcrumb(agent_id: &str) {
     let _ = std::fs::write(&path, chrono::Utc::now().to_rfc3339());
 }
 
-pub async fn resolve_peer_working_dir(peer_addr: SocketAddr) -> Option<String> {
-    tokio::task::spawn_blocking(move || kyris_peer_cwd::resolve(peer_addr))
-        .await
-        .ok()
-        .flatten()
+/// CWD and agent attribution for the process owning a peer connection, resolved
+/// from a single OS PID scan. Used on the non-conformant path (no
+/// `x-kyris-trace-token`): the CWD seeds `working_dir`, and — only when the
+/// agent did not send an `x-kyris-agent-id` header (`need_agent`) — `kyrisd`
+/// asks `agentpactd` to attribute the owning agent from the PID. The header is
+/// authoritative when present (Claude Code), so we skip the daemon round-trip
+/// for it. Both fields are best-effort and independently `None`.
+pub struct PeerAttribution {
+    pub working_dir: Option<String>,
+    pub agent: Option<String>,
 }
 
-pub fn resolve_peer_working_dir_sync(peer_addr: SocketAddr) -> Option<String> {
-    kyris_peer_cwd::resolve(peer_addr)
+fn resolve_peer_attribution_blocking(
+    socket: Option<String>,
+    peer_addr: SocketAddr,
+    need_agent: bool,
+) -> PeerAttribution {
+    let Some((pid, working_dir)) = kyris_peer_cwd::resolve_with_pid(peer_addr) else {
+        return PeerAttribution {
+            working_dir: None,
+            agent: None,
+        };
+    };
+    let agent = if need_agent {
+        socket.and_then(|socket| {
+            let pid = u32::try_from(pid).ok()?;
+            kyris_agentpact_client::resolve_agent(
+                &socket,
+                pid,
+                Some(std::time::Duration::from_secs(2)),
+            )
+        })
+    } else {
+        None
+    };
+    PeerAttribution { working_dir, agent }
+}
+
+pub async fn resolve_peer_attribution(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    need_agent: bool,
+) -> PeerAttribution {
+    let socket = state
+        .resolve_agentpact_socket()
+        .map(|p| p.display().to_string());
+    tokio::task::spawn_blocking(move || {
+        resolve_peer_attribution_blocking(socket, peer_addr, need_agent)
+    })
+    .await
+    .unwrap_or(PeerAttribution {
+        working_dir: None,
+        agent: None,
+    })
+}
+
+pub fn resolve_peer_attribution_sync(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    need_agent: bool,
+) -> PeerAttribution {
+    let socket = state
+        .resolve_agentpact_socket()
+        .map(|p| p.display().to_string());
+    resolve_peer_attribution_blocking(socket, peer_addr, need_agent)
 }
 
 pub fn routes(state: Arc<AppState>) -> Router {

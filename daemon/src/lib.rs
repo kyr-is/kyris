@@ -48,5 +48,6 @@ pub mod server;
 pub mod storage;
 pub mod streaming;
 pub mod sync;
+pub mod timeline;
 pub mod trace_id;
 pub mod tray;

@@ -33,6 +33,16 @@ struct AccessTokenResponse {
     error: Option<String>,
 }
 
+/// GitHub's device-flow error body — e.g. `device_flow_disabled` →
+/// "Device Flow must be explicitly enabled for this App". Returned with a
+/// non-2xx status on the device-code request. `error` is required, so a
+/// successful device-code body (which has no `error`) won't match this.
+#[derive(Deserialize)]
+struct DeviceFlowError {
+    error: String,
+    error_description: Option<String>,
+}
+
 #[derive(Serialize)]
 struct EnrollmentRequest {
     hostname: String,
@@ -54,8 +64,7 @@ fn enroll(args: EnrollArgs) -> Result<(), String> {
     let existing_credentials = kyris_core::credentials::load();
     let relay_url = resolve_relay_url(&args, &config.relay.url)?;
 
-    let github_client_id = std::env::var("GITHUB_CLIENT_ID")
-        .map_err(|_| "GITHUB_CLIENT_ID is not set.".to_string())?;
+    let github_client_id = resolve_github_client_id(&config.github.client_id)?;
 
     if args.force {
         println!("Re-enrolling via GitHub device flow...");
@@ -116,18 +125,42 @@ fn enroll(args: EnrollArgs) -> Result<(), String> {
 
 async fn request_device_code(client_id: &str) -> Result<DeviceCodeResponse, String> {
     let client = reqwest::Client::new();
-    client
+    // Kyris authenticates via a GitHub App. GitHub Apps ignore the OAuth `scope`
+    // param on the device flow — user access is governed by the app's configured
+    // permissions (notably "Email addresses: read") — so we don't send `scope`.
+    let response = client
         .post(github_device_code_url())
         .header("accept", "application/json")
         .header("user-agent", user_agent())
-        .form(&[("client_id", client_id), ("scope", "read:user user:email")])
+        .form(&[("client_id", client_id)])
         .send()
         .await
-        .map_err(|e| format!("Failed to request GitHub device code: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("GitHub device code request failed: {e}"))?
-        .json::<DeviceCodeResponse>()
+        .map_err(|e| format!("Failed to request GitHub device code: {e}"))?;
+
+    let status = response.status();
+    let body = response
+        .text()
         .await
+        .map_err(|e| format!("Failed to read GitHub device code response: {e}"))?;
+
+    // GitHub reports failures here with a JSON error body (typically a non-2xx
+    // status), e.g. device_flow_disabled -> "Device Flow must be explicitly
+    // enabled for this App". Surface that description instead of a bare HTTP
+    // status (which is all `.error_for_status()` would give us).
+    if let Ok(err) = serde_json::from_str::<DeviceFlowError>(&body) {
+        let detail = err.error_description.unwrap_or_else(|| err.error.clone());
+        return Err(format!(
+            "GitHub device code request failed: {detail} ({})",
+            err.error
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "GitHub device code request failed: HTTP {status}: {body}"
+        ));
+    }
+
+    serde_json::from_str::<DeviceCodeResponse>(&body)
         .map_err(|e| format!("Failed to parse GitHub device code response: {e}"))
 }
 
@@ -354,6 +387,27 @@ fn resolve_relay_url(args: &EnrollArgs, config_relay_url: &str) -> Result<String
     Ok(relay_url)
 }
 
+/// Resolve the GitHub App client id for the device flow. Precedence:
+/// `GITHUB_CLIENT_ID` env > config `github.client_id`. The client id is PUBLIC,
+/// so the committed config carries the prod app and the `kyris-dev` patch the dev
+/// app; the env var overrides per run (e.g. CI). Fails-fast (naming both sources)
+/// when neither yields a value — never guesses an app.
+fn resolve_github_client_id(config_client_id: &str) -> Result<String, String> {
+    let non_empty = |s: String| {
+        let trimmed = s.trim().to_string();
+        (!trimmed.is_empty()).then_some(trimmed)
+    };
+    std::env::var("GITHUB_CLIENT_ID")
+        .ok()
+        .and_then(non_empty)
+        .or_else(|| non_empty(config_client_id.to_string()))
+        .ok_or_else(|| {
+            "Cannot enroll without a GitHub client id. Set `github.client_id` in kyrisd.yaml or the \
+             GITHUB_CLIENT_ID env var."
+                .to_string()
+        })
+}
+
 fn verify_force_rotation(
     existing: Option<&Credentials>,
     enrollment: &EnrollmentResponse,
@@ -448,6 +502,26 @@ mod tests {
         if std::env::var("KYRIS_RELAY_URL").is_err() {
             let error = resolve_relay_url(&args, "  ").expect_err("should fail");
             assert!(error.contains("relay.url"));
+        }
+    }
+
+    #[test]
+    fn test_resolve_github_client_id_uses_config_when_no_env() {
+        // Config `github.client_id` is the source when no env is set; env must be
+        // unset for config to decide (test env does not set it).
+        if std::env::var("GITHUB_CLIENT_ID").is_err() {
+            assert_eq!(
+                resolve_github_client_id("prod-client-id").expect("client id"),
+                "prod-client-id"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_github_client_id_errors_when_no_source() {
+        if std::env::var("GITHUB_CLIENT_ID").is_err() {
+            let error = resolve_github_client_id("  ").expect_err("should fail");
+            assert!(error.contains("github.client_id"));
         }
     }
 

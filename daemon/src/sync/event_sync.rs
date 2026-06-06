@@ -4,7 +4,8 @@ use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use kyris_core::event::Event;
-use kyris_core::sync::{EventBatch, SyncCursor};
+use kyris_core::sync::{SyncCursor, TimelineBatch};
+use kyris_core::timeline::TimelineEntry;
 
 use super::scope::SyncScope;
 
@@ -205,32 +206,16 @@ impl EventSyncer {
         false
     }
 
-    pub fn build_batch(
-        &self,
-        events: Vec<Box<serde_json::value::RawValue>>,
-        machine_id: &str,
-        kyrisd_records: Vec<Box<serde_json::value::RawValue>>,
-    ) -> EventBatch {
-        EventBatch {
+    /// Wrap already-joined timeline entries into a sync batch. kyrisd is the
+    /// join owner, so the wire carries finished [`TimelineEntry`] rows — the
+    /// relay stores them and only coordinates across machines.
+    pub fn build_batch(&self, entries: Vec<TimelineEntry>, machine_id: &str) -> TimelineBatch {
+        TimelineBatch {
             machine_id: machine_id.to_string(),
             batch_id: uuid::Uuid::now_v7().to_string(),
-            events,
-            kyrisd_records,
+            entries,
             cursor: self.cursor.clone(),
         }
-    }
-
-    pub fn serialize_records(
-        records: Vec<kyris_core::record::GatewayRecord>,
-    ) -> Vec<Box<serde_json::value::RawValue>> {
-        records
-            .iter()
-            .filter_map(|r| {
-                serde_json::to_string(r)
-                    .ok()
-                    .and_then(|s| serde_json::value::RawValue::from_string(s).ok())
-            })
-            .collect()
     }
 }
 
@@ -342,14 +327,38 @@ pub fn compute_hmac_signature(key: &[u8], body: &[u8]) -> String {
     const_hex::encode(tag.as_ref())
 }
 
+/// Why a sync batch POST failed. The sync loop classifies on this so it can tell
+/// an **auth rejection** (credential invalid → enrollment error, pause sync)
+/// from a **transient** relay/network problem (relay unavailable → keep
+/// accumulating + retry). See [`super::daemon_sync`].
+#[derive(Debug)]
+pub enum SendError {
+    /// Couldn't reach the relay or serialize the batch (network, DNS, timeout,
+    /// TLS, serialization). Always transient.
+    Transport(String),
+    /// The relay responded with a non-2xx status. The code lets the loop
+    /// distinguish 401 (enrollment) from 5xx (relay unavailable) from other.
+    Status(u16),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(e) => write!(f, "relay request failed: {e}"),
+            Self::Status(code) => write!(f, "relay returned HTTP {code}"),
+        }
+    }
+}
+
 pub async fn send_batch(
     client: &reqwest::Client,
     relay_url: &str,
     machine_id: &str,
     machine_token: &str,
-    batch: &EventBatch,
-) -> Result<(), String> {
-    let body = serde_json::to_vec(batch).map_err(|e| format!("serialize batch: {e}"))?;
+    batch: &TimelineBatch,
+) -> Result<(), SendError> {
+    let body = serde_json::to_vec(batch)
+        .map_err(|e| SendError::Transport(format!("serialize batch: {e}")))?;
     let signature = compute_hmac_signature(machine_token.as_bytes(), &body);
 
     let response = client
@@ -360,12 +369,13 @@ pub async fn send_batch(
         .body(body)
         .send()
         .await
-        .map_err(|e| format!("relay POST failed: {e}"))?;
+        .map_err(|e| SendError::Transport(format!("relay POST failed: {e}")))?;
 
-    if response.status().is_success() {
+    let status = response.status();
+    if status.is_success() {
         Ok(())
     } else {
-        Err(format!("relay returned {}", response.status()))
+        Err(SendError::Status(status.as_u16()))
     }
 }
 
@@ -440,10 +450,11 @@ mod tests {
     }
 
     #[test]
-    fn testIsInScopeEmptyScope() {
+    fn testEmptyScopeSyncsGovernedDir() {
         let dir = tempfile::tempdir().unwrap();
         let syncer = make_syncer(vec![], dir.path());
-        assert!(!syncer.is_in_scope(Some("/work/project")));
+        // Default-on: a governed, non-private dir syncs with no explicit scope.
+        assert!(syncer.is_in_scope(Some("/work/project")));
     }
 
     #[test]
@@ -826,14 +837,50 @@ mod tests {
 
     // ── Existing helper tests ─────────────────────────────────────────────
 
+    fn sample_entry(id: &str) -> TimelineEntry {
+        TimelineEntry {
+            id: id.to_string(),
+            timestamp: "2026-04-12T00:00:00Z".to_string(),
+            trace_id: None,
+            agent: Some("test".to_string()),
+            action: "execute".to_string(),
+            detail: Some("git status".to_string()),
+            decision: Some("auto".to_string()),
+            coverage_state: "observed".to_string(),
+            source: "agent".to_string(),
+            working_dir: Some("/work/project".to_string()),
+            git_remote_origin: None,
+            session: None,
+            mode: Some("enforce".to_string()),
+            rule_kind: None,
+            rule_id: None,
+            sync_state: None,
+            hostname: None,
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cache_create: None,
+            tokens_cache_read: None,
+            cost_usd: None,
+            latency_ms: None,
+            status: None,
+            metering: None,
+            plan_status: None,
+            mcp_server: None,
+            mcp_tool: None,
+            segments: Vec::new(),
+        }
+    }
+
     #[test]
     fn testBuildBatch() {
         let dir = tempfile::tempdir().unwrap();
         let syncer = make_syncer(vec![], dir.path());
-        let batch = syncer.build_batch(vec![], "machine-1", vec![]);
+        let batch = syncer.build_batch(vec![], "machine-1");
         assert_eq!(batch.machine_id, "machine-1");
         assert!(!batch.batch_id.is_empty());
-        assert!(batch.events.is_empty());
+        assert!(batch.entries.is_empty());
     }
 
     #[test]
@@ -942,7 +989,8 @@ mod tests {
         let (events, offset) = syncer.read_new_events();
         syncer.commit_read(offset);
         assert_eq!(events.len(), 1);
-        let batch = syncer.build_batch(events, "machine-1", vec![]);
+        // kyrisd ships joined entries, not raw events; build one from the read.
+        let batch = syncer.build_batch(vec![sample_entry("evt-1")], "machine-1");
 
         let (relay_url, recorded, handle) = spawn_mock_relay(200);
         let client = reqwest::Client::new();
@@ -968,10 +1016,10 @@ mod tests {
             request.headers.get("x-kyris-signature").map(String::as_str),
             Some(expected_signature.as_str())
         );
-        let parsed: EventBatch = serde_json::from_slice(&request.body).unwrap();
+        let parsed: TimelineBatch = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(parsed.machine_id, "machine-1");
-        assert_eq!(parsed.events.len(), 1);
-        assert_eq!(parse_event(&parsed.events[0]).id, "evt-1");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].id, "evt-1");
         assert_eq!(parsed.cursor.filename, "events.jsonl");
         assert!(parsed.cursor.byte_offset > 0);
     }
@@ -980,7 +1028,7 @@ mod tests {
     async fn testSendBatchReturnsRelayStatusError() {
         let dir = tempfile::tempdir().unwrap();
         let syncer = make_syncer(vec![], dir.path());
-        let batch = syncer.build_batch(vec![], "machine-1", vec![]);
+        let batch = syncer.build_batch(vec![], "machine-1");
 
         let (relay_url, _recorded, handle) = spawn_mock_relay(503);
         let client = reqwest::Client::new();
@@ -995,7 +1043,10 @@ mod tests {
         .expect_err("relay should fail");
         handle.join().unwrap();
 
-        assert!(error.contains("503"), "{error}");
+        assert!(
+            matches!(error, SendError::Status(503)),
+            "expected Status(503), got {error}"
+        );
     }
 
     #[derive(Clone, Debug)]

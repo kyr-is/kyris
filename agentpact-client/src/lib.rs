@@ -333,12 +333,13 @@ pub fn request_hook_permission(
     seed_boundary_pid: Option<u32>,
     anchor_pid: Option<u32>,
     ppid_chain: Option<&[u32]>,
+    command_group: Option<(&str, &str)>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     if let Some(deny) = oversized_execute_deny(action, detail) {
         return Ok((deny, None));
     }
-    let request = build_hook_permission_request(
+    let mut request = build_hook_permission_request(
         request_id_prefix,
         action,
         detail,
@@ -347,11 +348,38 @@ pub fn request_hook_permission(
         anchor_pid,
         ppid_chain,
     );
+    // Compound-command grouping: tag this segment with its group + the original
+    // command line so agentpactd buffers it and writes one aggregated event on
+    // `command.commit`. Absent for single commands.
+    if let Some((group, original)) = command_group {
+        request["command_group"] = serde_json::json!(group);
+        request["original_command"] = serde_json::json!(original);
+    }
     send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
         let decision = parse_mcp_permission_response(&response);
         let segments = parse_response_segments(&response);
         (decision, segments)
     })
+}
+
+/// Mint a fresh command-group id for a compound command (one per original
+/// command line). Lives here because this crate already owns the `uuid` dep.
+#[must_use]
+pub fn new_command_group() -> String {
+    format!("cg-{}", uuid::Uuid::now_v7())
+}
+
+/// Finalize a compound command after driving every segment: tells agentpactd
+/// to write the one aggregated event from the buffered per-segment decisions.
+/// Best-effort — on failure the daemon's expiry sweep flushes the buffer, so a
+/// dropped commit never loses the aggregate.
+pub fn send_command_commit(socket_path: &str, command_group: &str, socket_timeout: Duration) {
+    let request = serde_json::json!({
+        "id": format!("commit-{}", uuid::Uuid::now_v7()),
+        "method": "command.commit",
+        "command_group": command_group,
+    });
+    let _ = send_daemon_request_with_retry(socket_path, &request, socket_timeout);
 }
 
 /// Classify a hook command **without side effects** — a preview request.
@@ -467,6 +495,38 @@ pub fn send_trace_attach(
         }
         None => Err("trace.attach returned malformed response".to_string()),
     }
+}
+
+/// Ask `agentpactd` which agent owns `pid` (the process `kyrisd` observed owning
+/// an LLM connection). Used to attribute gateway records for agents that can't
+/// send an `x-kyris-agent-id` header — every agent except Claude Code, which
+/// alone has a custom-header mechanism; the rest authenticate via the provider's
+/// API-key field. `agentpactd` is the single owner of attribution (boundary +
+/// process-lineage signatures), so `kyrisd` asks rather than reimplementing it.
+///
+/// Best-effort and fail-soft: returns `None` on any transport/parse failure, a
+/// non-`PACT_OK` code, or an `"unknown"` result. Attribution is enrichment, not
+/// correctness — an unattributed record is acceptable, a wrong guess is not.
+#[must_use]
+pub fn resolve_agent(
+    socket_path: &str,
+    pid: u32,
+    socket_timeout: Option<Duration>,
+) -> Option<String> {
+    let request = serde_json::json!({
+        "id": format!("kyrisd-attr-{}", uuid::Uuid::now_v7()),
+        "method": "attribution.resolve",
+        "pid": pid,
+    });
+    let response = send_daemon_request_to_socket(socket_path, &request, socket_timeout).ok()?;
+    if response.get("code").and_then(|c| c.as_str()) != Some("PACT_OK") {
+        return None;
+    }
+    response
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "unknown")
+        .map(String::from)
 }
 
 /// Sends a user approval decision back to `agentpactd`.
@@ -885,6 +945,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Duration::from_millis(50),
         );
         match result {
@@ -911,6 +972,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Duration::from_millis(50),
         );
         assert!(
@@ -929,6 +991,7 @@ mod tests {
             "test",
             "read",
             &big,
+            None,
             None,
             None,
             None,

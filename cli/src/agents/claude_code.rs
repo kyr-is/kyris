@@ -35,7 +35,11 @@ pub fn claude_hooks_dir() -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("hooks"))
 }
 
-fn claude_code_env_exports(base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
+fn claude_code_env_exports(
+    base_url: &str,
+    inbound_key: &str,
+    agent_id: &str,
+) -> Vec<(String, String)> {
     vec![
         ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
         // Deliver the kyrisd gate secret in a dedicated header (parsed by Claude
@@ -47,7 +51,10 @@ fn claude_code_env_exports(base_url: &str, inbound_key: &str) -> Vec<(String, St
         // the subscription OAuth.
         (
             "ANTHROPIC_CUSTOM_HEADERS".to_string(),
-            format!("x-kyris-inbound: {inbound_key}"),
+            // Two newline-separated headers (Claude Code's documented format for
+            // multiple): the kyrisd gate secret, and the agent id so kyrisd can
+            // attribute the model-call burn to this agent on the gateway record.
+            format!("x-kyris-inbound: {inbound_key}\nx-kyris-agent-id: {agent_id}"),
         ),
         (
             "ANTHROPIC_BEDROCK_BASE_URL".to_string(),
@@ -155,7 +162,7 @@ impl AgentDescriptor for ClaudeCode {
         &["agentpact_pretooluse", "kyris-mcp"]
     }
     fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
-        claude_code_env_exports(base_url, inbound_key)
+        claude_code_env_exports(base_url, inbound_key, self.canonical_id())
     }
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         (true, true, true)
@@ -413,7 +420,8 @@ mod tests {
 
     #[test]
     fn testClaudeCodeExportsMultiBackend() {
-        let exports = claude_code_env_exports("http://127.0.0.1:4710", "sk-test");
+        let exports =
+            claude_code_env_exports("http://127.0.0.1:4710", "sk-test", "anthropic/claude-code");
         let keys: Vec<&str> = exports.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"ANTHROPIC_BASE_URL"));
         assert!(keys.contains(&"ANTHROPIC_BEDROCK_BASE_URL"));
@@ -432,6 +440,9 @@ mod tests {
             .find(|(k, _)| k == "ANTHROPIC_CUSTOM_HEADERS")
             .map(|(_, v)| v.as_str())
             .unwrap_or_default();
-        assert_eq!(custom, "x-kyris-inbound: sk-test");
+        assert_eq!(
+            custom,
+            "x-kyris-inbound: sk-test\nx-kyris-agent-id: anthropic/claude-code"
+        );
     }
 }

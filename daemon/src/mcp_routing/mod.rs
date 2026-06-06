@@ -163,7 +163,7 @@ fn get_mcp_client(state: &AppState, server_name: &str) -> reqwest::Client {
         .load()
         .get(&format!("mcp_{server_name}"))
         .cloned()
-        .unwrap_or_else(reqwest::Client::new)
+        .unwrap_or_else(|| state.default_provider_client.clone())
 }
 
 pub fn routes(state: Arc<AppState>) -> Router {
@@ -768,6 +768,7 @@ mod tests {
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),
             provider_clients: ArcSwap::from_pointee(HashMap::new()),
+            default_provider_client: crate::server::build_default_provider_client(),
             pending: Arc::new(PendingStore::new()),
             agentpact_socket: None,
             mcp_annotation_cache: AnnotationCache::default(),

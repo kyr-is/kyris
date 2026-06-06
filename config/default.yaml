@@ -50,8 +50,20 @@ circuit_breaker:
 relay:
   url: "https://relay.kyr.is"
 
+# GitHub App for `kyris enroll`'s device flow. `client_id` is PUBLIC (it appears
+# in the authorize URL), so it lives here; the dev patch overrides it to the dev
+# app. `GITHUB_CLIENT_ID` env overrides per run. The client SECRET is never here
+# — only the relay (server-side) needs it.
+github:
+  client_id: "Iv23liLeYbum0sNojXLs"
+
 # Enrollment lives in credentials.json (run `kyris enroll`), not here.
-# `scope` only narrows which directories' events sync (empty = all).
+# Sync is default-on for governed directories. Conventionally-private locations
+# are always excluded: hidden/dot-prefixed dirs (~/.ssh, ~/.config, ~/.local…),
+# owner-only (0700) dirs, and the macOS personal folders (~/Documents,
+# ~/Downloads, ~/Pictures, ~/Music, ~/Movies, ~/Desktop, ~/Library, …).
+# An empty `scope` syncs every other governed dir; set it to NARROW further,
+# e.g. `["~/work", "~/src/myrepo"]`. See forest/design/kyris.md §5.8.
 sync:
   scope: []
 

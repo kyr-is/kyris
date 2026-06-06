@@ -42,6 +42,7 @@ mod json_patch_ops;
 mod lifecycle;
 mod logs_cmd;
 mod mcp_cmd;
+mod operator;
 mod pending;
 mod query;
 mod scan;

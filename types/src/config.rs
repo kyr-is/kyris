@@ -17,6 +17,8 @@ pub struct KyrisdConfig {
     #[serde(default)]
     pub relay: RelayConfig,
     #[serde(default)]
+    pub github: GithubConfig,
+    #[serde(default)]
     pub sync: SyncConfig,
     #[serde(default)]
     pub pricing: PricingConfig,
@@ -249,9 +251,23 @@ pub struct RelayConfig {
     pub url: String,
 }
 
+/// GitHub App used for `kyris enroll`'s device flow. `client_id` is PUBLIC (it
+/// appears in the authorize URL), so it lives in committed config: the committed
+/// value is the prod app, and the `kyris-dev` patch overrides it to the dev app.
+/// The `GITHUB_CLIENT_ID` env var overrides config per run. The client SECRET is
+/// never here — only the relay (server-side) needs it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GithubConfig {
+    #[serde(default)]
+    pub client_id: String,
+}
+
 /// Sync directory scope. Whether sync runs at all is determined by
-/// enrollment (`credentials.json`), not config; this only narrows which
-/// directories' events are synced (empty = all).
+/// enrollment (`credentials.json`), not config. Sync is default-on for
+/// governed directories that are not conventionally private (hidden/dot-prefixed
+/// dirs, owner-only `0700` dirs, and the macOS personal folders are always
+/// excluded — see `daemon::sync::scope`). An empty `scope` syncs every such
+/// directory; a non-empty `scope` additionally *narrows* to the listed paths.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncConfig {
     #[serde(default)]
