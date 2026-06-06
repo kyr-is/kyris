@@ -1996,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-hook"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "libc",
  "serde",
