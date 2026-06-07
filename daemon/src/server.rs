@@ -492,19 +492,25 @@ where
     Ok(())
 }
 
+/// Flush the stats pipeline on shutdown.
+///
+/// In-flight HTTP requests are ALREADY drained by the server's graceful
+/// shutdown (`serve_with_graceful_shutdown`) before this runs, so there is
+/// nothing here to wait on for request draining — dropping the stats sender
+/// lets the writer task finish the channel, bounded by `drain_timeout` so a
+/// stuck writer can't hang exit. (A previous version slept the full
+/// `drain_timeout` unconditionally here, which made EVERY shutdown take the
+/// whole budget — ~30s by default — even when idle. That delayed clean exit
+/// past the test harness's force-kill window, leaving a stale PID file that the
+/// next start reported as "previous daemon crashed".)
 async fn drain_and_flush_stats(
     stats_tx: mpsc::Sender<StatsEvent>,
     stats_writer_handle: tokio::task::JoinHandle<()>,
     drain_timeout: Duration,
 ) -> Result<(), String> {
-    tracing::info!(
-        drain_timeout_seconds = drain_timeout.as_secs(),
-        "draining in-flight requests"
-    );
-    tokio::time::sleep(drain_timeout).await;
-
+    tracing::info!("flushing stats pipeline on shutdown");
     drop(stats_tx);
-    tokio::time::timeout(Duration::from_secs(5), stats_writer_handle)
+    tokio::time::timeout(drain_timeout, stats_writer_handle)
         .await
         .map_err(|_| "timed out waiting for stats writer flush".to_string())?
         .map_err(|error| format!("stats writer task failed: {error}"))?;
@@ -556,8 +562,25 @@ fn check_crash_recovery() {
 
         let alive = signal::kill(Pid::from_raw(old_pid), None).is_ok();
         if !alive {
-            tracing::warn!(old_pid, "detected stale PID file — previous daemon crashed");
             let modified = std::fs::metadata(&pid_path).and_then(|m| m.modified()).ok();
+            // Distinguish a panic (the previous daemon wrote a crash report, so
+            // the cause is recorded) from an uncatchable external kill (SIGKILL /
+            // OOM / power loss — the panic hook never ran, so there is NO report).
+            // A report modified after the dead daemon wrote its PID file is that
+            // daemon's own panic; absence of one means it was killed from outside.
+            if let Some(report) = modified.and_then(crate::crash::most_recent_report_since) {
+                tracing::warn!(
+                    old_pid,
+                    crash_report = %report.display(),
+                    "previous daemon panicked — see crash report"
+                );
+            } else {
+                tracing::warn!(
+                    old_pid,
+                    "previous daemon exited without a panic report — killed externally \
+                     (SIGKILL / OOM / power loss / forced restart), not a Rust panic"
+                );
+            }
             let duration = modified.and_then(|m| m.elapsed().ok()).map_or_else(
                 || "unknown".to_string(),
                 |d| {
@@ -2037,7 +2060,10 @@ mod tests {
             .send(sample_event("trace-drain", Some("sess-drain")))
             .await
             .unwrap();
-        drain_and_flush_stats(stats_tx, writer_handle, Duration::from_millis(0))
+        // `drain_timeout` now bounds the stats-writer flush (it no longer gates a
+        // blind pre-sleep), so give the writer a real budget to persist the
+        // queued event before the handle is awaited.
+        drain_and_flush_stats(stats_tx, writer_handle, Duration::from_secs(5))
             .await
             .unwrap();
 

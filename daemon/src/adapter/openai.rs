@@ -1210,6 +1210,10 @@ mod tests {
         assert_eq!(event.tokens.output, 100);
         assert_eq!(event.session_id.as_deref(), Some("sess-123"));
         assert_eq!(state.circuit_breaker.get_token_count("sess-123"), 300);
+        // G-K2: OpenAI has no subscription-OAuth path — every call is API-key
+        // billed, so the metering event the route emits always classifies
+        // `overage` (asserted at the route level, not just the helper).
+        assert_eq!(event.plan_status, kyris_core::record::PlanStatus::Overage);
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(

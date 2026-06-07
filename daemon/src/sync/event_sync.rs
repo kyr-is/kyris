@@ -522,6 +522,65 @@ mod tests {
         assert_eq!(parse_event(&events[0]).id, "evt-1");
     }
 
+    /// G-K4: privacy filtering (hidden / owner-only-0700 dirs) is enforced through
+    /// the syncer's REAL read path (`read_new_events` → `is_in_scope` →
+    /// `is_private`), not just via `is_in_scope` called directly. With default-on
+    /// scope (empty patterns), a conventionally-private dir's event must be dropped
+    /// while a public dir's event syncs.
+    #[cfg(unix)]
+    #[test]
+    fn testReadNewEventsDropsPrivateDirsUnderDefaultOnScope() {
+        use std::os::unix::fs::PermissionsExt;
+        // NB: a NON-dot prefix — `tempfile`'s default temp root is `.tmpXXXX`,
+        // whose leading dot would make EVERY child "hidden" (rule #1) and mask
+        // the per-dir privacy signals this test is exercising.
+        let dir = tempfile::Builder::new()
+            .prefix("kyrisgk4")
+            .tempdir()
+            .unwrap();
+
+        // Real on-disk dirs: a world-traversable public one (0755) and an
+        // owner-only one (0700 → conventionally private). The hidden case is
+        // lexical (a dot-prefixed component), so it needs no real dir.
+        let public = dir.path().join("project");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let owner_only = dir.path().join("secret0700");
+        std::fs::create_dir(&owner_only).unwrap();
+        std::fs::set_permissions(&owner_only, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let hidden = dir.path().join(".hidden"); // dot-prefixed → private (lexical)
+
+        let event = |id: &str, wd: &str| {
+            serde_json::json!({
+                "id": id, "timestamp": "2026-04-12T00:00:00Z", "agent": "test",
+                "action": "execute", "detail": "cmd", "decision": "auto", "working_dir": wd,
+            })
+            .to_string()
+        };
+        let log_path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &log_path,
+            format!(
+                "{}\n{}\n{}\n",
+                event("pub", public.to_str().unwrap()),
+                event("own", owner_only.to_str().unwrap()),
+                event("hid", hidden.to_str().unwrap()),
+            ),
+        )
+        .unwrap();
+
+        // Empty scope = default-on: everything governed syncs EXCEPT the
+        // conventionally-private dirs, which are filtered inside read_new_events.
+        let mut syncer = make_syncer(vec![], dir.path());
+        let (events, _) = syncer.read_new_events();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the public-dir event should survive privacy filtering"
+        );
+        assert_eq!(parse_event(&events[0]).id, "pub");
+    }
+
     #[test]
     fn testReadNewEventsResumesFromCursor() {
         use std::io::Write;

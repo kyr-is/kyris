@@ -31,8 +31,8 @@ pub enum Resolution {
     Denied,
     /// The hold could not be established — kyrisd was unreachable or rejected
     /// the hold request. The approval dialog was **never rendered**, so the
-    /// human was never asked. Callers may safely fall open / defer to the
-    /// agent's own prompt under `on_daemon_unavailable: allow`.
+    /// human was never asked. A down ask-renderer must never block the
+    /// developer, so callers fall open / defer to the agent's own prompt.
     Unreachable,
     /// The hold *was* established (the dialog rendered) but resolution failed —
     /// it timed out or the pending entered an unexpected state. The human may

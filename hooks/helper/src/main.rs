@@ -116,11 +116,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
 
     let Ok(response) = send_request(&socket_path, &request) else {
-        if daemon_state_allows(&socket_path) {
-            write_fail_open_event("execute", &command, &cwd);
-            return ExitCode::from(11);
-        }
-        return ExitCode::from(10);
+        // agentpactd (the decider) is unreachable — never block the developer.
+        // Fail open and spool for the audit trail. (No operator flag gates this:
+        // a down daemon must not freeze the dev's machine.)
+        write_fail_open_event("execute", &command, &cwd);
+        return ExitCode::from(11);
     };
 
     // Step 2 error-tracing: recover the agentpactd request id from the echoed
@@ -505,14 +505,6 @@ fn read_daemon_state(socket_path: &str) -> Option<serde_json::Value> {
     serde_json::from_str(&contents).ok()
 }
 
-fn daemon_state_allows(socket_path: &str) -> bool {
-    read_daemon_state(socket_path)
-        .as_ref()
-        .and_then(|v| v.get("on_daemon_unavailable"))
-        .and_then(|val| val.as_str())
-        == Some("allow")
-}
-
 fn check_protocol_version(socket_path: &str) -> Result<(), String> {
     let Some(state) = read_daemon_state(socket_path) else {
         return Ok(());
@@ -706,52 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn testDaemonStateAllowsReturnsTrue() {
-        let dir = tempfile::tempdir().unwrap();
-        let state_path = dir.path().join("daemon.state");
-        std::fs::write(
-            &state_path,
-            r#"{"protocol_version":1,"on_daemon_unavailable":"allow","on_log_broken":"continue"}"#,
-        )
-        .unwrap();
-        let socket_path = dir.path().join("agentpact.sock");
-        assert!(daemon_state_allows(socket_path.to_str().unwrap()));
-    }
-
-    #[test]
-    fn testDaemonStateBlockReturnsFalse() {
-        let dir = tempfile::tempdir().unwrap();
-        let state_path = dir.path().join("daemon.state");
-        std::fs::write(
-            &state_path,
-            r#"{"protocol_version":1,"on_daemon_unavailable":"block","on_log_broken":"continue"}"#,
-        )
-        .unwrap();
-        let socket_path = dir.path().join("agentpact.sock");
-        assert!(!daemon_state_allows(socket_path.to_str().unwrap()));
-    }
-
-    #[test]
-    fn testDaemonStateMissingFileReturnsFalse() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("agentpact.sock");
-        assert!(!daemon_state_allows(socket_path.to_str().unwrap()));
-    }
-
-    #[test]
-    fn testDaemonStateAllowsWithSpaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let state_path = dir.path().join("daemon.state");
-        std::fs::write(
-            &state_path,
-            r#"{"protocol_version": 1, "on_daemon_unavailable": "allow", "on_log_broken": "continue"}"#,
-        )
-        .unwrap();
-        let socket_path = dir.path().join("agentpact.sock");
-        assert!(daemon_state_allows(socket_path.to_str().unwrap()));
-    }
-
-    #[test]
     fn testWriteFailOpenEvent() {
         let dir = tempfile::tempdir().unwrap();
         // fail-open log lives under $XDG_STATE_HOME/kyris/ after the XDG
@@ -806,7 +752,7 @@ mod tests {
         let state_path = dir.path().join("daemon.state");
         std::fs::write(
             &state_path,
-            r#"{"protocol_version":1,"on_daemon_unavailable":"block"}"#,
+            r#"{"protocol_version":1,"on_log_broken":"block"}"#,
         )
         .unwrap();
         let socket_path = dir.path().join("agentpact.sock");
@@ -819,7 +765,7 @@ mod tests {
         let state_path = dir.path().join("daemon.state");
         std::fs::write(
             &state_path,
-            r#"{"protocol_version":99,"on_daemon_unavailable":"block"}"#,
+            r#"{"protocol_version":99,"on_log_broken":"block"}"#,
         )
         .unwrap();
         let socket_path = dir.path().join("agentpact.sock");
@@ -834,7 +780,7 @@ mod tests {
         let state_path = dir.path().join("daemon.state");
         std::fs::write(
             &state_path,
-            r#"{"protocol_version":0,"on_daemon_unavailable":"block"}"#,
+            r#"{"protocol_version":0,"on_log_broken":"block"}"#,
         )
         .unwrap();
         let socket_path = dir.path().join("agentpact.sock");
@@ -854,7 +800,7 @@ mod tests {
     fn testCheckProtocolVersionMissingField() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("daemon.state");
-        std::fs::write(&state_path, r#"{"on_daemon_unavailable":"block"}"#).unwrap();
+        std::fs::write(&state_path, r#"{"on_log_broken":"block"}"#).unwrap();
         let socket_path = dir.path().join("agentpact.sock");
         assert!(check_protocol_version(socket_path.to_str().unwrap()).is_ok());
     }

@@ -89,6 +89,31 @@ fn caller_api_key(headers: &HeaderMap, raw_query: Option<&str>) -> Option<String
     None
 }
 
+/// Which side of the request the forwarded key came from, for diagnostic tracing
+/// on an upstream rejection. Mirrors [`caller_api_key`]'s precedence (header
+/// first), so it names the source that was actually used.
+fn caller_key_source(headers: &HeaderMap) -> &'static str {
+    if headers.contains_key("x-goog-api-key") {
+        "header:x-goog-api-key"
+    } else {
+        "query:key"
+    }
+}
+
+/// A non-reversible fingerprint of a credential for diagnostic logs: its length
+/// plus the first/last 4 characters. NEVER logs the full secret — enough to tell
+/// "the right key, intact" from "empty / truncated / a different key" when an
+/// upstream rejects it, without leaking the credential into the log.
+fn credential_fingerprint(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 8 {
+        return format!("len={n} <too-short-to-fingerprint>");
+    }
+    let head: String = s.chars().take(4).collect();
+    let tail: String = s.chars().skip(n - 4).collect();
+    format!("len={n} {head}…{tail}")
+}
+
 fn parse_model_action(model_action: &str) -> Option<(String, GoogleAction)> {
     if let Some(model) = model_action.strip_suffix(":generateContent") {
         return Some((model.to_string(), GoogleAction::GenerateContent));
@@ -174,6 +199,24 @@ async fn handle_generate_content(
         tracing::error!(error = %e, "failed to read Google generateContent upstream response body");
         StatusCode::BAD_GATEWAY
     })?;
+    // Diagnostic: on an upstream rejection, record HOW the credential was
+    // presented (source + redacted fingerprint) alongside the upstream status
+    // and error body. This is the evidence that distinguishes a kyrisd
+    // forwarding defect (empty/truncated/wrong key) from a genuine upstream 4xx
+    // (the right key, intact, rejected by Google). Never logs the full key.
+    if !status.is_success() {
+        tracing::warn!(
+            trace_id = %trace_id,
+            provider = "google",
+            method = "generateContent",
+            model = %model,
+            upstream_status = status.as_u16(),
+            key_source = caller_key_source(&headers),
+            key_fp = %credential_fingerprint(&caller_key),
+            upstream_body = %String::from_utf8_lossy(&resp_body).chars().take(300).collect::<String>(),
+            "google upstream returned non-2xx — forwarded credential shown by source + redacted fingerprint"
+        );
+    }
     let parsed_tokens = extract_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
         kyris_core::record::Metering::Available
@@ -327,6 +370,22 @@ async fn handle_stream_generate_content(
 
     let status = response.status();
     let resp_headers = response.headers().clone();
+    // Same upstream-rejection diagnostic as the non-streaming path. The error
+    // body is consumed downstream by the stream relay, so we log source + status
+    // + redacted key fingerprint here (enough to tell a forwarding defect from a
+    // genuine upstream 4xx); never logs the full key.
+    if !status.is_success() {
+        tracing::warn!(
+            trace_id = %trace_id,
+            provider = "google",
+            method = "streamGenerateContent",
+            model = %model,
+            upstream_status = status.as_u16(),
+            key_source = caller_key_source(&headers),
+            key_fp = %credential_fingerprint(&caller_key),
+            "google streaming upstream returned non-2xx — forwarded credential shown by source + redacted fingerprint"
+        );
+    }
 
     relay_ndjson_stream(
         state,
@@ -848,6 +907,10 @@ mod tests {
         assert_eq!(event.tokens.output, 150);
         assert_eq!(event.session_id.as_deref(), Some("sess-google"));
         assert_eq!(state.circuit_breaker.get_token_count("sess-google"), 450);
+        // G-K2: Google has no subscription-OAuth path — every call is API-key
+        // billed, so the metering event the route emits always classifies
+        // `overage` (asserted at the route level, not just the helper).
+        assert_eq!(event.plan_status, kyris_core::record::PlanStatus::Overage);
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(request.model, "gemini-2.0-flash");

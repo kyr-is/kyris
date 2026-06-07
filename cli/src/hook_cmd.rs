@@ -119,13 +119,12 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
         socket_timeout,
     ) {
         Ok(pair) => pair,
-        Err(reason) => {
-            if pact_client::allow_on_daemon_unavailable() {
-                kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
-                std::process::exit(0);
-            }
-            emit_deny(&reason);
-            std::process::exit(2);
+        Err(_reason) => {
+            // agentpactd (the decider) is unreachable — never freeze the
+            // developer's shell. Fail open (spool for the audit trail) and let
+            // the command run; the human at the terminal is the operator.
+            kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
+            std::process::exit(0);
         }
     };
 
@@ -149,7 +148,6 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
         detail: &args.cmd,
         cwd,
         native_allow_response: &allow_response,
-        log_mode_fallback: false,
         sock_path: &sock_path,
         socket_timeout,
         started_at: std::time::Instant::now(),
@@ -162,7 +160,6 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
 
     let result = run_segments(
         &segs,
-        pact_client::allow_on_daemon_unavailable(),
         |seg| classify_segment(&ctx, None, seg, command_group),
         |approval_id, approval_token, seg, allow_always| match tty.as_ref() {
             Some(tty) => tty_prompt_segment(
@@ -194,15 +191,13 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
 
     match result {
         Ok(_) => std::process::exit(0),
-        // Gate 2 of the two-gate flow: an ask that couldn't be rendered because
-        // kyrisd is unreachable, under a fail-open policy → allow + spool. This
-        // is what lets a command the agent-hook already deferred-and-approved
-        // actually run (the agent hook only defers under the same `allow`).
-        // Under `deny` this arm is skipped and we hard-deny below.
-        Err(block)
-            if block.source == "kyrisd_unreachable"
-                && pact_client::allow_on_daemon_unavailable() =>
-        {
+        // A daemon was unavailable — agentpactd (the decider) is down, or an ask
+        // couldn't be rendered because kyrisd is down. Never freeze the
+        // developer's shell: fail open and spool for the audit trail. This also
+        // keeps the two gates consistent — a command the agent hook deferred and
+        // the human approved actually runs here. A real deny / denial / timeout
+        // still blocks below.
+        Err(block) if block_from_daemon_unavailable(block.source) => {
             kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
             std::process::exit(0);
         }
@@ -545,7 +540,6 @@ fn run_check(args: HookCheckArgs) {
         detail: &detail,
         cwd: cwd.as_deref(),
         native_allow_response: &native_allow_response,
-        log_mode_fallback: log_mode,
         sock_path: &sock_path,
         socket_timeout,
         started_at,
@@ -611,12 +605,10 @@ fn handle_non_governed(
 ///
 /// The allow-shape decision is made INSIDE the dispatcher per outcome
 /// rather than baked in here: a successful daemon response carries the
-/// effective mode in [`McpPermissionDecision::Allow`] and the
-/// dispatcher branches on it; only the fail-open arm (no daemon
-/// response to consult) falls back to `log_mode_fallback`, which the
-/// caller computes once via `agentpact::policy::resolution` against
-/// the current working directory so a repo override still wins on
-/// the fail-open path.
+/// effective mode in [`McpPermissionDecision::Allow`] and the dispatcher
+/// branches on it. The daemon-unavailable arm has no decision to scout, so
+/// it defers to the agent's own prompt (`EmptyStdout`) regardless of mode —
+/// never suppressing a prompt for a command the daemon never actually cleared.
 struct PermissionCtx<'a> {
     audit_conn: Option<&'a kyris_core::config::KyrisdConnection>,
     hook_id: &'a str,
@@ -625,7 +617,6 @@ struct PermissionCtx<'a> {
     detail: &'a str,
     cwd: Option<&'a str>,
     native_allow_response: &'a AllowResponse,
-    log_mode_fallback: bool,
     sock_path: &'a str,
     socket_timeout: std::time::Duration,
     started_at: std::time::Instant,
@@ -678,9 +669,12 @@ fn dispatch_preview_outcome(
                 matches!(&decision, McpPermissionDecision::Allow { mode } if mode.is_log());
             drive_per_segment(ctx, seed_pid, segments, log_mode);
         }
-        Err(_) if pact_client::allow_on_daemon_unavailable() => {
-            let response =
-                effective_allow_response(ctx.native_allow_response, ctx.log_mode_fallback);
+        Err(_reason) => {
+            // agentpactd (the decider) is unreachable. Never block the
+            // developer: defer to the AGENT's own permission UX by emitting the
+            // EmptyStdout shape (NOT the native allow shape, which would suppress
+            // the agent's own prompt for a command the daemon never actually
+            // cleared). Spool it for the audit trail.
             kyris_core::fail_open_log::record(ctx.action, ctx.detail, ctx.agent, ctx.cwd);
             audit_log_hook(
                 ctx.audit_conn,
@@ -689,17 +683,14 @@ fn dispatch_preview_outcome(
                 ctx.action,
                 ctx.detail,
                 None,
-                "allow",
+                "defer",
                 "agentpact_unreachable",
                 None,
-                agent_prompt_for(&response),
+                agent_prompt_for(&AllowResponse::EmptyStdout),
                 ctx.started_at.elapsed(),
             );
-            emit_allow(&response);
+            emit_allow(&AllowResponse::EmptyStdout);
             std::process::exit(0);
-        }
-        Err(reason) => {
-            audit_and_exit_deny(ctx, None, "agentpact_unreachable", &reason);
         }
     }
 }
@@ -742,17 +733,21 @@ struct SegBlock {
     reason: String,
 }
 
-/// Pure aggregation over a command's segments. Auto segments pass; the
-/// first `Deny`, a fail-closed `Unavailable`, or a blocked popup stops
-/// the walk and blocks the whole command (the agent runs it as a unit,
-/// so a partial approval is useless). Returns the audit `source` for the
-/// allow path, or a [`SegBlock`] for the deny path.
+/// Pure aggregation over a command's segments. Auto segments pass; the first
+/// `Deny`, an `Unavailable` (the decider is down), or a blocked popup stops the
+/// walk and returns a [`SegBlock`] for the whole command (the agent runs it as a
+/// unit, so a partial approval is useless). Returns the audit `source` for the
+/// allow path, or a [`SegBlock`] otherwise.
+///
+/// `Unavailable` returns a block tagged `agentpact_unreachable`; it is the
+/// *caller* that decides what unavailability means — the agent hook defers to
+/// the agent's own prompt, the shell gate fails open — so this function does not
+/// itself fail open or closed.
 ///
 /// I/O lives entirely in the injected closures, so this is unit-tested
 /// directly with canned classifications and popup results.
 fn run_segments<C, P>(
     segments: &[String],
-    allow_on_unavailable: bool,
     mut classify: C,
     mut prompt: P,
 ) -> Result<&'static str, SegBlock>
@@ -772,15 +767,11 @@ where
                 });
             }
             SegClass::Unavailable { reason } => {
-                if allow_on_unavailable {
-                    source = "agentpact_unreachable";
-                } else {
-                    return Err(SegBlock {
-                        exit_code: 2,
-                        source: "agentpact_unreachable",
-                        reason,
-                    });
-                }
+                return Err(SegBlock {
+                    exit_code: 2,
+                    source: "agentpact_unreachable",
+                    reason,
+                });
             }
             SegClass::Ask {
                 approval_id,
@@ -830,7 +821,6 @@ fn drive_per_segment(
 
     let result = run_segments(
         &segs,
-        pact_client::allow_on_daemon_unavailable(),
         |seg| classify_segment(ctx, seed_pid, seg, command_group),
         |approval_id, approval_token, seg, allow_always| {
             poll_segment(
@@ -870,19 +860,14 @@ fn drive_per_segment(
             emit_allow(&response);
             std::process::exit(0);
         }
-        Err(block)
-            if block_defers_to_agent(block.source, pact_client::allow_on_daemon_unavailable()) =>
-        {
-            // agentpactd returned a real "ask", but the no-TTY resolution
-            // channel (kyrisd) couldn't render the dialog, AND the policy is
-            // fail-open (`on_daemon_unavailable: allow`). Defer to the AGENT's
-            // own permission UX by emitting the EmptyStdout shape, so the human
-            // still decides via the agent's prompt; the shell-preexec gate also
-            // fails-open under `allow`, so an approved command actually runs.
-            // Spool it so the audit trail shows kyris punted this command.
-            // (Under `deny`, this arm is skipped and we hard-deny below — no
-            // false-hope "approve then shell-deny". A real deny / user denial /
-            // timeout always blocks.)
+        Err(block) if block_from_daemon_unavailable(block.source) => {
+            // A daemon was unavailable: either agentpactd (the decider) is down,
+            // or it returned a real "ask" but kyrisd (the no-TTY ask renderer)
+            // couldn't show the dialog. Never block the developer — defer to the
+            // AGENT's own permission UX by emitting the EmptyStdout shape, so the
+            // human still decides via the agent's prompt. Spool it so the audit
+            // trail shows kyris punted this command. A real deny / user denial /
+            // rendered-then-timed-out ask always blocks below.
             kyris_core::fail_open_log::record(ctx.action, ctx.detail, ctx.agent, ctx.cwd);
             audit_log_hook(
                 ctx.audit_conn,
@@ -920,24 +905,20 @@ fn drive_per_segment(
     }
 }
 
-/// On the agent-hook path, decide whether a blocked segment should *defer to
-/// the agent's own permission UX* instead of hard-denying.
+/// Whether a [`SegBlock`] was caused by a daemon being *unavailable* rather than
+/// by a genuine decision. Unavailability must never block the developer's
+/// machine — the agent hook responds by deferring to the agent's own permission
+/// prompt, the shell gate by failing open — so both callers branch on this.
+/// - `agentpact_unreachable` — the decider (agentpactd) is down, so there is no
+///   verdict to enforce.
+/// - `kyrisd_unreachable` — agentpactd returned a real "ask" but the no-TTY ask
+///   renderer (kyrisd) couldn't show the dialog.
 ///
-/// Deferring is correct ONLY when (a) the block is `kyrisd_unreachable` —
-/// agentpactd returned a real "ask" but the no-TTY resolution channel (kyrisd)
-/// couldn't render the dialog — AND (b) the operator's `on_daemon_unavailable`
-/// is `allow`. The `allow` gate matters because the agent's command is governed
-/// a SECOND time by the shell preexec hook: there, `on_daemon_unavailable:allow`
-/// makes that gate fail-open, so a command the agent prompts-and-approves
-/// actually runs. Under `deny`, the shell gate would re-deny it — so deferring
-/// there only yields a confusing "agent prompts → you approve → shell denies."
-/// Hence under `deny` we hard-deny here too, cleanly and consistently.
-///
-/// Every other source always blocks: a policy deny (`agentpact_deny`), the
-/// developer's own denial (`user_denied`), an unreachable decider
-/// (`agentpact_unreachable`), or a timeout (`user_timeout`).
-fn block_defers_to_agent(source: &str, allow_on_unavailable: bool) -> bool {
-    source == "kyrisd_unreachable" && allow_on_unavailable
+/// Every other source is a genuine decision and always blocks: a policy deny
+/// (`agentpact_deny`), the developer's own denial (`user_denied`), or a rendered
+/// ask that the human never resolved (`user_timeout` / `resolution_failed`).
+fn block_from_daemon_unavailable(source: &str) -> bool {
+    matches!(source, "kyrisd_unreachable" | "agentpact_unreachable")
 }
 
 /// Classify one segment with a real (token-bearing) request to agentpactd.
@@ -1019,17 +1000,15 @@ fn poll_segment(
     };
     let seg = seg_display.as_str();
     let Some(conn) = kyris_core::config::load_kyrisd_connection() else {
-        if pact_client::allow_on_daemon_unavailable() {
-            kyris_core::fail_open_log::record(server, seg, "kyris-hook", None);
-            return PopupResult::Approved {
-                source: "kyrisd_unreachable",
-            };
-        }
-        deny_ask_immediately(approval_token, sock_path, socket_timeout);
+        // No kyrisd to render the ask. Report it as a daemon-unavailability
+        // block; the caller (agent hook → defer, shell → fail open) decides what
+        // that means. We do NOT deny the agentpactd ask here — the command may
+        // still run via the deferred/fail-open path, and recording a deny for a
+        // command that runs would be an audit lie. Let the pending ask expire.
         return PopupResult::Blocked {
             exit_code: 2,
             source: "kyrisd_unreachable",
-            reason: "kyrisd unreachable — cannot delegate approval".to_string(),
+            reason: "kyrisd unreachable — could not render approval dialog".to_string(),
         };
     };
 
@@ -1073,15 +1052,11 @@ fn poll_segment(
             reason: "denied by developer via kyris pending".to_string(),
         },
         kyris_core::pending::Resolution::Unreachable => {
-            // The dialog never rendered. If the policy is `allow`,
-            // drive_per_segment will DEFER this to the agent's own prompt
-            // (source "kyrisd_unreachable") and the command may then run — so do
-            // NOT deny the agentpactd ask here: recording a deny for a command
-            // that subsequently runs would be an audit lie. Let the pending
-            // expire. Under `deny` we hard-deny, where the deny IS accurate.
-            if !pact_client::allow_on_daemon_unavailable() {
-                deny_ask_immediately(approval_token, sock_path, socket_timeout);
-            }
+            // The dialog never rendered (kyrisd is down). Report it as a
+            // daemon-unavailability block; the caller defers (agent hook) or
+            // fails open (shell), so the command may still run. Do NOT deny the
+            // agentpactd ask here — recording a deny for a command that
+            // subsequently runs would be an audit lie. Let the pending expire.
             PopupResult::Blocked {
                 exit_code: 2,
                 source: "kyrisd_unreachable",
@@ -1105,32 +1080,6 @@ fn poll_segment(
             }
         }
     }
-}
-
-/// Audit a deny outcome and exit with code 2. Always reports
-/// `agent_prompt=none` because exit-2 blocks the tool regardless of the
-/// agent's own permission logic.
-fn audit_and_exit_deny(
-    ctx: &PermissionCtx<'_>,
-    segments: Option<&[String]>,
-    source: &str,
-    reason: &str,
-) -> ! {
-    audit_log_hook(
-        ctx.audit_conn,
-        ctx.hook_id,
-        ctx.agent,
-        ctx.action,
-        ctx.detail,
-        segments,
-        "deny",
-        source,
-        None,
-        "none",
-        ctx.started_at.elapsed(),
-    );
-    emit_deny(reason);
-    std::process::exit(2);
 }
 
 fn deny_ask_immediately(
@@ -1539,7 +1488,6 @@ mod tests {
         let mut prompted = 0;
         let result = run_segments(
             &segs,
-            false,
             |_seg| SegClass::Auto,
             |_id, _tok, _seg, _allow| {
                 prompted += 1;
@@ -1561,7 +1509,6 @@ mod tests {
         let mut prompted_allow_always = None;
         let result = run_segments(
             &segs,
-            false,
             |seg| {
                 if seg == "mystery-bin" {
                     SegClass::Ask {
@@ -1594,7 +1541,6 @@ mod tests {
         let mut classified = Vec::new();
         let result = run_segments(
             &segs,
-            false,
             |seg| {
                 classified.push(seg.to_string());
                 SegClass::Ask {
@@ -1624,7 +1570,6 @@ mod tests {
         let segs = seg_vec(&["rm -rf /"]);
         let result = run_segments(
             &segs,
-            false,
             |_seg| SegClass::Deny {
                 reason: "blocked by policy".to_string(),
             },
@@ -1636,31 +1581,22 @@ mod tests {
     }
 
     #[test]
-    fn testRunSegmentsUnavailableFailsClosedByDefault() {
+    fn testRunSegmentsUnavailableBlocksAsDaemonUnreachable() {
+        // The decider being down is reported as an `agentpact_unreachable`
+        // block; run_segments itself never fails open or closed — the caller
+        // (agent hook → defer, shell → fail open) decides what unavailability
+        // means. `block_from_daemon_unavailable` recognizes this source.
         let segs = seg_vec(&["cmd"]);
         let result = run_segments(
             &segs,
-            false, // fail closed
             |_seg| SegClass::Unavailable {
                 reason: "daemon down".to_string(),
             },
             |_id, _tok, _seg, _allow| unreachable!(),
         );
-        assert_eq!(result.unwrap_err().source, "agentpact_unreachable");
-    }
-
-    #[test]
-    fn testRunSegmentsUnavailableFailsOpenWhenAllowed() {
-        let segs = seg_vec(&["cmd"]);
-        let result = run_segments(
-            &segs,
-            true, // fail open
-            |_seg| SegClass::Unavailable {
-                reason: "daemon down".to_string(),
-            },
-            |_id, _tok, _seg, _allow| unreachable!(),
-        );
-        assert_eq!(result.unwrap(), "agentpact_unreachable");
+        let block = result.unwrap_err();
+        assert_eq!(block.source, "agentpact_unreachable");
+        assert!(block_from_daemon_unavailable(block.source));
     }
 
     #[test]
@@ -2127,35 +2063,29 @@ mod tests {
     }
 
     #[test]
-    fn testDeferGatedOnKyrisdUnreachableAndFailOpenPolicy() {
-        // The agent-hook defers ONLY when (a) the dialog couldn't be rendered
-        // (kyrisd down → `kyrisd_unreachable`) AND (b) the policy is fail-open.
-        // Under `allow`, the shell-preexec gate also fails-open so an approved
-        // command runs; under `deny`, deferring would only yield a confusing
-        // "approve → shell denies", so we hard-deny here too.
+    fn testDaemonUnavailableSourcesNeverBlockTheDeveloper() {
+        // A daemon being unavailable — the decider (agentpactd) down, or kyrisd
+        // unable to render an ask — never blocks: the agent hook defers, the
+        // shell gate fails open. No operator flag gates this anymore.
         assert!(
-            block_defers_to_agent("kyrisd_unreachable", true),
-            "kyrisd_unreachable under fail-open → defer"
+            block_from_daemon_unavailable("kyrisd_unreachable"),
+            "kyrisd down (can't render ask) must hand back to the agent"
         );
         assert!(
-            !block_defers_to_agent("kyrisd_unreachable", false),
-            "kyrisd_unreachable under fail-closed → hard-deny, not defer"
+            block_from_daemon_unavailable("agentpact_unreachable"),
+            "agentpactd down (no decider) must hand back to the agent"
         );
-        // No other source ever defers, regardless of policy.
+        // Genuine decisions always block — they are not unavailability.
         for source in [
             "agentpact_deny",
             "user_denied",
             "user_timeout",
-            "agentpact_unreachable",
+            "resolution_failed",
             "agentpact_auto",
         ] {
             assert!(
-                !block_defers_to_agent(source, true),
-                "`{source}` must NOT defer"
-            );
-            assert!(
-                !block_defers_to_agent(source, false),
-                "`{source}` must NOT defer"
+                !block_from_daemon_unavailable(source),
+                "`{source}` is a real decision and must NOT be treated as daemon-unavailable"
             );
         }
     }

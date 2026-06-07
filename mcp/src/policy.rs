@@ -199,10 +199,10 @@ pub async fn check_permission_with_socket(
     .await;
 
     let Ok(outcome) = outcome else {
-        if allow_on_daemon_unavailable() {
-            return fail_open_allow(server_name, tool_name);
-        }
-        return daemon_unavailable_deny();
+        // agentpactd (the decider) is unreachable — never block the agent's tool
+        // call. Fail open (spool for the audit trail); the agent already chose to
+        // call this tool, so this hands the decision back to it.
+        return fail_open_allow(server_name, tool_name);
     };
 
     // `request_id` is the agentpactd request id (echoed in its response) —
@@ -248,12 +248,9 @@ pub async fn check_permission_with_socket(
                 .await
             }
         }
-        Err(_) if allow_on_daemon_unavailable() => fail_open_allow(server_name, tool_name),
-        Err(reason) => PactDecision::Deny {
-            code: DenyCode::DaemonUnreachable,
-            reason,
-            hint: None,
-        },
+        // agentpactd request failed (decider unreachable) — fail open rather
+        // than block the agent's tool call.
+        Err(_reason) => fail_open_allow(server_name, tool_name),
     }
 }
 
@@ -318,7 +315,9 @@ async fn resolve_ask_via_kyrisd(
 ) -> PactDecision {
     let conn = kyris_core::config::load_kyrisd_connection();
     let Some(conn) = conn else {
-        return deny_ask_immediately(approval_token, sock_path, socket_timeout).await;
+        // kyrisd (the no-TTY ask renderer) is unavailable — fail open rather than
+        // block the agent's tool call. Let the agentpactd ask expire.
+        return fail_open_allow(server_name, tool_name);
     };
 
     let client = reqwest::Client::new();
@@ -349,10 +348,14 @@ async fn resolve_ask_via_kyrisd(
     match resolution {
         kyris_core::pending::Resolution::Approved => PactDecision::Allow,
         kyris_core::pending::Resolution::Denied => no_tty_deny(),
-        // No-TTY MCP has no agent prompt to defer to, so a couldn't-render
-        // (`Unreachable`) and a rendered-then-lost (`Failed`) both deny.
-        kyris_core::pending::Resolution::Unreachable
-        | kyris_core::pending::Resolution::Failed(_) => {
+        // kyrisd couldn't render the dialog (it's down) — fail open rather than
+        // block the agent's tool call; let the agentpactd ask expire. This
+        // matches the agent-hook/shell behavior: daemon-down never blocks.
+        kyris_core::pending::Resolution::Unreachable => fail_open_allow(server_name, tool_name),
+        // The dialog WAS rendered but resolution failed (timed out / lost). The
+        // human may have been mid-decision, so this denies — it is a real ask,
+        // not a daemon-unavailable case.
+        kyris_core::pending::Resolution::Failed(_) => {
             deny_ask_immediately(approval_token, sock_path, socket_timeout).await
         }
     }
@@ -376,10 +379,6 @@ async fn deny_ask_immediately(
         Ok(Ok(())) => {}
     }
     no_tty_deny()
-}
-
-fn allow_on_daemon_unavailable() -> bool {
-    pact_client::allow_on_daemon_unavailable()
 }
 
 #[cfg(test)]
@@ -494,45 +493,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testCheckPermissionAskWithoutTtyDeniesAndResponds() {
-        let socket_path = unique_socket_path("ask-deny");
+    async fn testCheckPermissionAskWithoutTtyFailsOpenWhenKyrisdUnavailable() {
+        // agentpactd returns a real ask, but there is no TTY and no reachable
+        // kyrisd to render the dialog. A down ask-renderer must NOT block the
+        // agent's tool call — it fails open (allows). So agentpactd is hit
+        // exactly ONCE (the permission.request); no deny-response is sent, and
+        // the ask is left to expire. As in this module's other socket tests,
+        // `load_kyrisd_connection()` resolves to None in the cargo-test
+        // environment, so the no-TTY ask has no renderer to reach.
+        let socket_path = unique_socket_path("ask-failopen");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
 
         let server = std::thread::spawn(move || {
-            for step in 0..2 {
-                let (mut stream, _) = listener.accept().expect("accept socket");
-                let mut request_body = Vec::new();
-                stream.read_to_end(&mut request_body).expect("read request");
-                let request: serde_json::Value =
-                    serde_json::from_slice(&request_body).expect("parse request");
-
-                let response = match step {
-                    0 => {
-                        assert_eq!(request["method"], "permission.request");
-                        assert_eq!(request["detail"], "read_file");
-                        assert_eq!(request["context"]["mcp_server"], "test-server");
-                        serde_json::json!({
-                            "code": "PACT_ASK",
-                            "approval_id": "req-42",
-                            "approval_token": "apt_123"
-                        })
-                    }
-                    1 => {
-                        assert_eq!(request["method"], "permission.respond");
-                        assert_eq!(request["approval_token"], "apt_123");
-                        assert_eq!(request["response"], "denied");
-                        serde_json::json!({
-                            "code": "PACT_DENIED",
-                            "reason": "denied"
-                        })
-                    }
-                    _ => unreachable!(),
-                };
-
-                stream
-                    .write_all(response.to_string().as_bytes())
-                    .expect("write response");
-            }
+            let (mut stream, _) = listener.accept().expect("accept socket");
+            let mut request_body = Vec::new();
+            stream.read_to_end(&mut request_body).expect("read request");
+            let request: serde_json::Value =
+                serde_json::from_slice(&request_body).expect("parse request");
+            assert_eq!(request["method"], "permission.request");
+            assert_eq!(request["detail"], "read_file");
+            assert_eq!(request["context"]["mcp_server"], "test-server");
+            let response = serde_json::json!({
+                "code": "PACT_ASK",
+                "approval_id": "req-42",
+                "approval_token": "apt_123"
+            });
+            stream
+                .write_all(response.to_string().as_bytes())
+                .expect("write response");
         });
 
         let decision = check_permission_with_socket(
@@ -545,13 +533,11 @@ mod tests {
             std::time::Duration::from_millis(500),
         )
         .await;
-        assert!(matches!(
+        assert_eq!(
             decision,
-            PactDecision::Deny {
-                code: DenyCode::PolicyDenied,
-                ..
-            }
-        ));
+            PactDecision::Allow,
+            "no-TTY ask with no reachable kyrisd must fail open, not block the agent"
+        );
 
         server.join().expect("join server");
         let _ = std::fs::remove_file(&socket_path);
@@ -574,49 +560,11 @@ mod tests {
         assert!(path.ends_with(".agentpact/agentpact.sock"));
     }
 
-    #[test]
-    fn testAllowOnDaemonUnavailableWithStateFile() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let state_file = dir.path().join("daemon.state");
-        std::fs::write(
-            &state_file,
-            r#"{"on_daemon_unavailable":"allow","on_log_broken":"continue"}"#,
-        )
-        .unwrap();
-        let sock = dir.path().join("agentpact.sock");
-        unsafe { std::env::set_var("AGENTPACT_SOCK", sock.to_str().unwrap()) };
-        assert!(allow_on_daemon_unavailable());
-        unsafe { std::env::remove_var("AGENTPACT_SOCK") };
-    }
-
-    #[test]
-    fn testAllowOnDaemonUnavailableDenyByDefault() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        unsafe { std::env::remove_var("AGENTPACT_SOCK") };
-        let dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("HOME", dir.path().to_str().unwrap()) };
-        assert!(!allow_on_daemon_unavailable());
-    }
-
-    #[test]
-    fn testAllowOnDaemonUnavailableBlockFromStateFile() {
-        let _lock = ENV_MUTEX.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let state_file = dir.path().join("daemon.state");
-        std::fs::write(
-            &state_file,
-            r#"{"on_daemon_unavailable":"block","on_log_broken":"continue"}"#,
-        )
-        .unwrap();
-        let sock = dir.path().join("agentpact.sock");
-        unsafe { std::env::set_var("AGENTPACT_SOCK", sock.to_str().unwrap()) };
-        assert!(!allow_on_daemon_unavailable());
-        unsafe { std::env::remove_var("AGENTPACT_SOCK") };
-    }
-
     #[tokio::test]
-    async fn testCheckPermissionDaemonUnreachableDenies() {
+    async fn testCheckPermissionDaemonUnreachableFailsOpen() {
+        // agentpactd unreachable must NEVER block the agent's tool call — it
+        // fails open (defers to the agent), so the dev's machine isn't blocked
+        // by a down daemon. (No operator flag gates this anymore.)
         {
             let _lock = ENV_MUTEX.lock().unwrap();
             unsafe { std::env::remove_var("AGENTPACT_POLICY_FILE") };
@@ -631,7 +579,11 @@ mod tests {
             std::time::Duration::from_millis(100),
         )
         .await;
-        assert!(matches!(decision, PactDecision::Deny { .. }));
+        assert_eq!(
+            decision,
+            PactDecision::Allow,
+            "a down agentpactd must fail open, not block the agent"
+        );
     }
 
     #[tokio::test]

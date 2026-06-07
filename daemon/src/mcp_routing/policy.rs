@@ -79,14 +79,12 @@ pub async fn check_permission(
     {
         Ok(decision) => decision,
         Err(e) => {
-            if agentpact::allow_on_daemon_unavailable() {
-                tracing::warn!(error = %e, "agentpactd unavailable, allowing due to policy");
-                fail_open_log::record("call", &tool, server_name, working_dir);
-                PolicyDecision::Allow
-            } else {
-                tracing::warn!(error = %e, "agentpactd permission.request failed, blocking");
-                PolicyDecision::Deny("agentpact_unavailable".to_string())
-            }
+            // agentpactd (the decider) is unreachable — fail open rather than
+            // block the agent's routed MCP tool call. A down daemon must never
+            // block; the call is spooled to the fail-open log for the audit trail.
+            tracing::warn!(error = %e, "agentpactd unavailable, allowing (fail-open)");
+            fail_open_log::record("call", &tool, server_name, working_dir);
+            PolicyDecision::Allow
         }
     }
 }

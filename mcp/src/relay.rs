@@ -131,10 +131,9 @@ fn build_denied_response(
             "PACT_POLICY_ERROR",
             "Fix policy files: run agentpactd schema to validate",
         ),
-        DenyCode::DaemonUnreachable => (
-            "DAEMON_UNREACHABLE",
-            "Run agentpactd or set on_daemon_unavailable: allow",
-        ),
+        DenyCode::DaemonUnreachable => {
+            ("DAEMON_UNREACHABLE", "Run agentpactd to restore governance")
+        }
     };
     let hint = daemon_hint.unwrap_or(static_hint);
     // Strip trailing period so the ". {hint}" separator is never doubled.
@@ -734,7 +733,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(
             v["error"]["message"],
-            "[AgentPact DAEMON_UNREACHABLE] AgentPact daemon is unreachable. Run agentpactd or set on_daemon_unavailable: allow"
+            "[AgentPact DAEMON_UNREACHABLE] AgentPact daemon is unreachable. Run agentpactd to restore governance"
         );
     }
 

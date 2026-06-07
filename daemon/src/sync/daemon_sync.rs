@@ -126,7 +126,17 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
         },
     );
 
-    let scope = config.sync.scope.clone();
+    // Canonicalize the user-configured scope once, here at the config-load edge:
+    // a scope entry typed through a symlinked root (`/tmp/...`, or `~/work`
+    // → `/mnt/...`) is resolved to the same canonical spelling the upstream
+    // `working_dir` already has (agentpactd canonicalizes at ingest; peer-cwd
+    // comes from getcwd). Downstream `SyncScope` then compares literally.
+    let scope: Vec<String> = config
+        .sync
+        .scope
+        .iter()
+        .map(|s| super::scope::canonicalize_scope_path(s))
+        .collect();
     let log_dir = agentpact_log_dir();
 
     let mut syncer = EventSyncer::new(cursor, scope.clone(), log_dir.clone());

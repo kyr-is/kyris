@@ -238,7 +238,7 @@ const RETRY_BACKOFFS: &[u64] = &[50, 100, 250];
 /// it could never be received intact, and it is auto-denied regardless.
 /// Guarding here makes that deny deterministic: it avoids transmitting a
 /// payload the daemon would reject mid-read, which could otherwise surface as
-/// a transport error and fail *open* under `on_daemon_unavailable: allow`.
+/// a transport error and fail *open* (a down daemon defers to the agent).
 fn oversized_execute_deny(action: &str, detail: &str) -> Option<McpPermissionDecision> {
     (action == "execute" && detail.len() > agentpact_types::MAX_COMMAND_LENGTH_CEILING).then(|| {
         McpPermissionDecision::Deny {
@@ -600,16 +600,6 @@ pub fn probe_daemon_health(socket_path: &str, timeout: Duration) -> bool {
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
-#[must_use]
-pub fn allow_on_daemon_unavailable() -> bool {
-    let state = read_daemon_state();
-    state
-        .as_ref()
-        .and_then(|v| v.get("on_daemon_unavailable"))
-        .and_then(|val| val.as_str())
-        == Some("allow")
-}
-
 /// Reads `daemon.state` and checks that `protocol_version` matches
 /// `PROTOCOL_VERSION`. Missing state file or missing field = Ok (pass-through).
 ///
@@ -662,10 +652,6 @@ pub fn check_daemon_protocol_version(state: &serde_json::Value) -> Result<(), St
              Upgrade agentpact: brew upgrade agentpact"
         ))
     }
-}
-
-fn read_daemon_state() -> Option<serde_json::Value> {
-    read_daemon_state_at(&daemon_state_path()?)
 }
 
 fn read_daemon_state_at(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -1096,7 +1082,7 @@ mod tests {
 
     #[test]
     fn testProtocolVersionMissingFieldIsOk() {
-        let state = serde_json::json!({"on_daemon_unavailable": "block"});
+        let state = serde_json::json!({"on_log_broken": "block"});
         assert!(check_daemon_protocol_version(&state).is_ok());
     }
 
