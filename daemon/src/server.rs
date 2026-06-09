@@ -916,6 +916,7 @@ async fn resolve_pending(
         return StatusCode::BAD_REQUEST;
     };
 
+    let pending_info = state.pending.list().into_iter().find(|p| p.id == id);
     let claim = match state.pending.claim(&id) {
         Ok(claim) => claim,
         Err(ResolveError::NotFound | ResolveError::NoLongerResolvable(_)) => {
@@ -934,6 +935,33 @@ async fn resolve_pending(
     state
         .pending
         .complete_claim(claim, decision.allows_execution());
+    if let Some(info) = pending_info {
+        let command = info.code.as_deref().or(info.tool.as_deref());
+        let decision_label = match decision {
+            ResolveDecision::Approved => "approved",
+            ResolveDecision::Always => "always",
+            ResolveDecision::Denied => "denied",
+        };
+        kyris_core::prompt_log::record_now(
+            &id,
+            "api",
+            "resolved",
+            &info.server,
+            info.tool.as_deref(),
+            command,
+            "unknown",
+            info.allow_always,
+            Some(decision_label),
+        );
+        crate::approvals_log::record(&crate::approvals_log::ApprovalRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            pending_id: &id,
+            server: &info.server,
+            command,
+            agent: "unknown",
+            decision: decision_label,
+        });
+    }
     StatusCode::OK
 }
 
@@ -981,7 +1009,19 @@ async fn hold_pending(
         body.approval_token,
         body.server,
         body.tool,
+        dialog_code.clone(),
         dialog_allow_always,
+    );
+    kyris_core::prompt_log::record_now(
+        &body.id,
+        "api",
+        "held",
+        &dialog_server,
+        dialog_tool.as_deref(),
+        dialog_code.as_deref().or(dialog_tool.as_deref()),
+        "unknown",
+        dialog_allow_always,
+        None,
     );
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(pending_timeout)).await;
@@ -999,6 +1039,17 @@ async fn hold_pending(
             server = %dialog_server,
             tool = ?dialog_tool,
             "dispatching approval dialog"
+        );
+        kyris_core::prompt_log::record_now(
+            &body.id,
+            "tray",
+            "dispatch",
+            &dialog_server,
+            dialog_tool.as_deref(),
+            dialog_code.as_deref().or(dialog_tool.as_deref()),
+            "unknown",
+            dialog_allow_always,
+            None,
         );
         tokio::spawn(async move {
             let tool_label = dialog_tool.as_deref().unwrap_or("unknown tool");
@@ -1019,6 +1070,12 @@ async fn hold_pending(
                 dialog_allow_always,
             )
             .await;
+            let prompt_outcome = match outcome {
+                crate::notify::ApprovalOutcome::Yes => "approved",
+                crate::notify::ApprovalOutcome::No => "denied",
+                crate::notify::ApprovalOutcome::Always => "always",
+                crate::notify::ApprovalOutcome::CouldNotShow => "could_not_show",
+            };
             // CouldNotShow means the panel never became visible to the user
             // — treat as "no answer yet" and leave the request pending so
             // the menu-bar attention path (or `kyris pending`) can pick it
@@ -1026,12 +1083,34 @@ async fn hold_pending(
             // every request whenever the user is in a fullscreen app or on
             // a different Space — the exact failure mode this design fixes.
             let Some(decision) = decision_for_approval_outcome(outcome) else {
+                kyris_core::prompt_log::record_now(
+                    &dialog_id,
+                    "tray",
+                    "not_shown",
+                    &dialog_server,
+                    dialog_tool.as_deref(),
+                    dialog_code.as_deref().or(dialog_tool.as_deref()),
+                    "unknown",
+                    dialog_allow_always,
+                    Some(prompt_outcome),
+                );
                 tracing::warn!(
                     pending_id = %dialog_id,
                     "approval panel could not be shown — leaving request pending"
                 );
                 return;
             };
+            kyris_core::prompt_log::record_now(
+                &dialog_id,
+                "tray",
+                "resolved",
+                &dialog_server,
+                dialog_tool.as_deref(),
+                dialog_code.as_deref().or(dialog_tool.as_deref()),
+                "unknown",
+                dialog_allow_always,
+                Some(prompt_outcome),
+            );
             // Best-effort log of the user's answer for `kyris approvals`
             // recall and offline catalog mining. Records the verbatim command
             // (multi-line preserved via JSON `\n` escaping); the agent's tool
@@ -2334,6 +2413,7 @@ mod tests {
             "tok-1".into(),
             "github".into(),
             Some("read_file".into()),
+            None,
             true,
         );
 
@@ -2433,6 +2513,7 @@ mod tests {
             "tok-s-1".into(),
             "github".into(),
             Some("read_file".into()),
+            None,
             true,
         );
 

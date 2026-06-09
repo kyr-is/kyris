@@ -19,6 +19,7 @@ struct PendingRequest {
     id: String,
     server: String,
     tool: Option<String>,
+    code: Option<String>,
     state: String,
     held_since_ms: u64,
     /// Daemon's authoritative signal: whether answering "always" would persist
@@ -28,6 +29,7 @@ struct PendingRequest {
     allow_always: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn run(_args: PendingArgs) {
     let config = load_or_init_config().unwrap_or_else(|error| {
         eprintln!("{error}");
@@ -89,9 +91,31 @@ pub fn run(_args: PendingArgs) {
                     let stdin = std::io::stdin();
                     let mut reader = BufReader::new(stdin.lock());
                     let mut writer = std::io::stdout().lock();
+                    kyris_core::prompt_log::record_now(
+                        &request.id,
+                        "cli",
+                        "displayed",
+                        &request.server,
+                        request.tool.as_deref(),
+                        request.code.as_deref().or(request.tool.as_deref()),
+                        "unknown",
+                        request.allow_always,
+                        None,
+                    );
                     let Some(decision) = prompt_decision(&request, &mut reader, &mut writer) else {
                         continue;
                     };
+                    kyris_core::prompt_log::record_now(
+                        &request.id,
+                        "cli",
+                        "decision_submitted",
+                        &request.server,
+                        request.tool.as_deref(),
+                        request.code.as_deref().or(request.tool.as_deref()),
+                        "unknown",
+                        request.allow_always,
+                        Some(decision),
+                    );
 
                     let resolve = client
                         .post(format!("{base_url}/api/pending/{}/resolve", request.id))
@@ -227,6 +251,7 @@ mod tests {
             id: "req-1".to_string(),
             server: server.to_string(),
             tool: tool.map(str::to_string),
+            code: tool.map(str::to_string),
             state: "held".to_string(),
             held_since_ms: 0,
             allow_always,

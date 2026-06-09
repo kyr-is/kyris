@@ -2,15 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::PathBuf;
 
-use crate::config_writer::WellFormedJsonValidator;
-use crate::integration::{read_json_value, write_json_value};
-
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
-    json_has_mcp_wrap, not_detected,
+    ProbeResult, env_reaches_agent, fingerprint, json_has_any_mcp_servers, json_has_mcp_wrap,
+    not_detected,
 };
 use super::registry::{
-    AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation, ToolMapping,
+    AgentDescriptor, AgentIntegrationPlan, AllowResponse, AttributionMechanism,
+    BurnControlMechanism, ExecutionMechanism, HookProtocol, McpConfigFormat, McpConfigLocation,
+    SurfaceIntegration, ToolMapping, ToolMechanism,
 };
 
 pub struct ClaudeCode;
@@ -33,6 +32,15 @@ pub fn claude_settings_path() -> Result<PathBuf, String> {
 pub fn claude_hooks_dir() -> Result<PathBuf, String> {
     let home = crate::integration::home_dir()?;
     Ok(home.join(".claude").join("hooks"))
+}
+
+/// Detected when the `claude` binary is on PATH (installed but maybe never run)
+/// OR `~/.claude/` exists (run at least once) — parity with the other agents,
+/// which also treat binary-on-PATH as installed. Configuring claude creates
+/// `~/.claude/` if absent, so the binary-only case is handled.
+fn claude_code_detected() -> bool {
+    super::registry::which_exists("claude")
+        || crate::integration::home_dir().is_ok_and(|h| h.join(".claude").is_dir())
 }
 
 fn claude_code_env_exports(
@@ -85,11 +93,11 @@ impl AgentDescriptor for ClaudeCode {
         "Claude Code"
     }
     fn is_installed(&self) -> bool {
-        crate::integration::home_dir().is_ok_and(|h| h.join(".claude").is_dir())
+        claude_code_detected()
     }
     fn probe(&self) -> ProbeResult {
-        use super::profile::{AdaptedMechanism, SurfaceState};
-        let detected = crate::integration::home_dir().is_ok_and(|h| h.join(".claude").is_dir());
+        use super::profile::SurfaceState;
+        let detected = claude_code_detected();
         if !detected {
             return not_detected();
         }
@@ -122,12 +130,12 @@ impl AgentDescriptor for ClaudeCode {
             .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
 
         let execution = if has_hook {
-            SurfaceState::adapted(AdaptedMechanism::LiveHook)
+            SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter)
         } else {
             SurfaceState::none()
         };
         let tool = if has_mcp_wrap {
-            SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+            SurfaceState::adapted(ToolMechanism::McpWrapping)
         } else if !has_any_mcp_servers {
             // Nothing in settings.json to wrap — wrap surface is structurally
             // inert until the user adds an MCP server. Treat as N/A so the
@@ -136,9 +144,8 @@ impl AgentDescriptor for ClaudeCode {
         } else {
             SurfaceState::none()
         };
-        let has_env_file = env_file_has_var("claude-code", "ANTHROPIC_BASE_URL");
-        let burn_control = if has_env_file && env_loader_sourced() {
-            SurfaceState::adapted(AdaptedMechanism::EnvVarProxy)
+        let burn_control = if env_reaches_agent("claude-code", "ANTHROPIC_BASE_URL") {
+            SurfaceState::adapted(BurnControlMechanism::EnvVarProxy)
         } else {
             SurfaceState::none()
         };
@@ -164,8 +171,21 @@ impl AgentDescriptor for ClaudeCode {
     fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
         claude_code_env_exports(base_url, inbound_key, self.canonical_id())
     }
-    fn expected_surfaces(&self) -> (bool, bool, bool) {
-        (true, true, true)
+    fn integration_plan(&self) -> AgentIntegrationPlan {
+        super::capabilities::apply_declared_capabilities(
+            self.canonical_id(),
+            AgentIntegrationPlan {
+                execution: SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+                tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
+                burn_control: SurfaceIntegration::adapted(&[BurnControlMechanism::EnvVarProxy]),
+                attribution: &[
+                    AttributionMechanism::KyrisPathShim,
+                    AttributionMechanism::NativeHookPayload,
+                    AttributionMechanism::ProcessLineage,
+                ],
+                agentpact_native_attribution: false,
+            },
+        )
     }
     fn launch_dir_env(&self) -> Option<&'static str> {
         // Claude Code's PreToolUse payload `cwd` is the LIVE working directory
@@ -173,7 +193,7 @@ impl AgentDescriptor for ClaudeCode {
         // is the correct permitted-domain anchor.
         Some("CLAUDE_PROJECT_DIR")
     }
-    fn configure_execution(
+    fn configure_execution_surface(
         &self,
         _base_url: &str,
         _inbound_key: &str,
@@ -184,7 +204,7 @@ impl AgentDescriptor for ClaudeCode {
         let settings_path = claude_settings_path()?;
         super::configure::install_live_hook_adapter(
             "claude-code",
-            "claude-code",
+            "claude-code:execution",
             "PreToolUse",
             &script_path,
             &settings_path,
@@ -194,60 +214,38 @@ impl AgentDescriptor for ClaudeCode {
             None,
         )
     }
-    fn configure_burn_control(
+    fn configure_tool_surface(
         &self,
         base_url: &str,
         inbound_key: &str,
         _agent_specific: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
-        let settings_path = claude_settings_path()?;
-        let mut changes = Vec::new();
-        if settings_path.exists() {
-            let mut settings = read_json_value(&settings_path)?;
-            let mcp_result = super::configure::rewrite_json_mcp_servers(
-                &mut settings,
-                &["mcpServers"],
-                base_url,
-                inbound_key,
-            );
-            if mcp_result.changed {
-                write_json_value(
-                    &settings_path,
-                    &settings,
-                    "claude-code",
-                    &WellFormedJsonValidator,
-                )?;
-                changes.push(format!(
-                    "rewrote MCP servers in {}",
-                    settings_path.display()
-                ));
-            }
-            if !mcp_result.http_rewrites.is_empty() {
-                super::configure::upsert_mcp_upstreams(&mcp_result.http_rewrites)?;
-                changes.push("registered MCP upstream(s) in kyrisd.yaml".to_string());
-            }
-        }
-        Ok(changes)
+        super::configure::configure_json_mcp_tool_surface(self, base_url, inbound_key)
     }
-    fn undo(&self) -> Result<(), String> {
-        // Remove MCP upstreams before restoring settings.json to its
-        // pre-kyris state (server names become unreadable after restore).
-        let mcp_names = super::configure::mcp_server_names_from_agent(self);
-        super::configure::remove_mcp_upstreams(&mcp_names)?;
-
+    fn apply_extra_tool_filters(&self, settings: &mut serde_json::Value) -> bool {
+        // Claude has no per-server denylist field, so deny policy-blocked MCP
+        // tools via `permissions.deny` (mcp__server__tool). Supplementary to the
+        // runtime wrap/routing — see configure.rs.
+        super::configure::apply_claude_mcp_tool_denies(settings)
+    }
+    fn undo_tool_surface(&self) -> Result<(), String> {
+        super::configure::undo_json_mcp_tool_surface(self)
+    }
+    fn undo_execution_surface(&self) -> Result<(), String> {
         let settings_path = claude_settings_path()?;
-        if crate::state::restore_manifest_entry(&settings_path)? {
+        if crate::state::restore_manifest_entry_component(&settings_path, "claude-code:execution")?
+        {
             println!("Reverted {}", settings_path.display());
         }
         let script = claude_hooks_dir()?.join("agentpact_pretooluse.sh");
-        super::undo::remove_file_if_exists(&script)?;
+        if !crate::state::restore_manifest_entry_component(&script, "claude-code:execution")? {
+            super::undo::remove_file_if_exists(&script)?;
+        }
         Ok(())
     }
-    fn undo_burn_control(&self) -> Result<(), String> {
-        // MCP cleanup is handled in undo(); undo_burn_control handles
-        // the remaining burn-control artifacts.
+    fn undo_burn_control_surface(&self) -> Result<(), String> {
         for path in self.burn_control_config_paths() {
-            if crate::state::restore_manifest_entry(&path)? {
+            if crate::state::restore_manifest_entry_component(&path, "claude-code:burn-control")? {
                 println!("Reverted {}", path.display());
             }
         }
@@ -340,6 +338,7 @@ impl AgentDescriptor for ClaudeCode {
                 "WebSearch".to_string(),
                 "ShareOnboardingGuide".to_string(),
             ],
+            detail_pass_throughs: Vec::new(),
             default_action: "call".to_string(),
             // Claude Code's PreToolUse hook treats exit-0 with empty stdout as
             // "no decision" and falls back to its own permission prompt — which

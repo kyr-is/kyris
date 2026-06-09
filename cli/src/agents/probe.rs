@@ -3,13 +3,14 @@
 use crate::integration::read_json_value;
 use crate::state::env_dir;
 
-use super::profile::{AdaptedMechanism, ManagedFileFingerprint, SurfaceState};
+use super::profile::{ManagedFileFingerprint, SurfaceState};
+use super::registry::{BurnControlMechanism, ExecutionMechanism, ToolMechanism};
 
 pub struct ProbeResult {
     pub detected: bool,
-    pub execution: SurfaceState,
-    pub tool: SurfaceState,
-    pub burn_control: SurfaceState,
+    pub execution: SurfaceState<ExecutionMechanism>,
+    pub tool: SurfaceState<ToolMechanism>,
+    pub burn_control: SurfaceState<BurnControlMechanism>,
     pub managed_files: Vec<ManagedFileFingerprint>,
 }
 
@@ -49,12 +50,12 @@ pub(super) fn probe_config_rewrite_burn_control(
     base_url_check: impl FnOnce(&serde_json::Value) -> bool,
     agent_id: &str,
     env_var: &str,
-) -> SurfaceState {
+) -> SurfaceState<BurnControlMechanism> {
     let has_base_url =
         config_path.is_some_and(|p| read_json_value(p).is_ok_and(|v| base_url_check(&v)));
-    let has_env_proxy = env_file_has_var(agent_id, env_var) && env_loader_sourced();
+    let has_env_proxy = env_reaches_agent(agent_id, env_var);
     if has_base_url || has_env_proxy {
-        SurfaceState::adapted(AdaptedMechanism::ConfigRewrite)
+        SurfaceState::adapted(BurnControlMechanism::ConfigRewrite)
     } else {
         SurfaceState::none()
     }
@@ -127,8 +128,23 @@ pub(super) fn env_file_has_var(agent_id: &str, var_name: &str) -> bool {
     })
 }
 
-/// Returns true if the user's shell RC files source `~/.kyris/env/load.sh`,
-/// meaning env-based agent configuration will actually be loaded at runtime.
+/// True iff the agent's Kyris env file carries `var_name` AND that file will
+/// actually be loaded when the agent runs — either because the agent's PATH
+/// shim sources it (the robust, shell-independent path) or because the user's
+/// shell RC sources the env loader. Replaces bare
+/// `env_file_has_var && env_loader_sourced` checks, which under-reported
+/// burn-control as off whenever the shim — not the shell RC — delivers the env
+/// (e.g. under fish or a GUI launch, where the loader is never sourced).
+pub(super) fn env_reaches_agent(agent_id: &str, var_name: &str) -> bool {
+    env_file_has_var(agent_id, var_name)
+        && (super::shim::shim_delivers_env(agent_id) || env_loader_sourced())
+}
+
+/// Legacy/back-compat detector: returns true if the user's shell RC files
+/// source `~/.kyris/env/load.sh`. Current installs deliver env via the PATH
+/// shim and no longer write this loader, but installs predating that change
+/// still have it — recognize it so their burn-control isn't under-reported
+/// until a reinstall refreshes the shim.
 pub(super) fn env_loader_sourced() -> bool {
     let home = std::env::var("HOME").unwrap_or_default();
     let zshrc = std::fs::read_to_string(format!("{home}/.zshrc")).unwrap_or_default();

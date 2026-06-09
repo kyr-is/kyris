@@ -49,6 +49,17 @@ fn shim_source(agent_id: &str, binary: &str) -> String {
 # they are inside a governed agent and arm the preexec trap.
 export KYRIS_GOVERNED_SUBPROCESS="{agent_id}"
 
+# Source this agent's Kyris env file(s) — base-URL redirect + inbound-key
+# header — so burn-control / gateway routing reaches the agent on EVERY launch.
+# This is the sole env-delivery path (there is no shell-RC env loader): the shim
+# is the one wrapper that always runs when the agent binary is invoked. Guarded
+# with -f so agents that ship no env file are unaffected. The "-"*.sh glob also
+# picks up split files (e.g. cline's cline-policy.sh).
+for __kyris_env in "$HOME/.kyris/env/{agent_id}.sh" "$HOME/.kyris/env/{agent_id}"-*.sh; do
+    [ -f "$__kyris_env" ] && . "$__kyris_env"
+done
+unset __kyris_env
+
 # Strip our own directory from PATH so `command -v {binary}` resolves to
 # the real binary (the next match on PATH). Without this we would loop
 # onto ourselves.
@@ -94,6 +105,28 @@ pub fn install_shim(agent_id: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// True iff the on-disk shim for `agent_id` sources that agent's Kyris env
+/// file. The burn-control / execution probes use this to recognize
+/// shim-delivered env vars as a live delivery path independent of shell-RC
+/// sourcing. A pre-env shim (older kyris) lacks the line → returns false, so
+/// the surface is reported honestly until a reinstall refreshes the shim.
+pub(super) fn shim_delivers_env(agent_id: &str) -> bool {
+    let Some(binary) = binary_name(agent_id) else {
+        return false;
+    };
+    let Ok(dir) = bin_dir() else {
+        return false;
+    };
+    std::fs::read_to_string(dir.join(binary))
+        .is_ok_and(|contents| shim_content_delivers_env(&contents, agent_id))
+}
+
+/// Pure predicate: does shim `contents` source `agent_id`'s Kyris env file?
+/// Split out so it can be tested without a filesystem or HOME dependency.
+fn shim_content_delivers_env(contents: &str, agent_id: &str) -> bool {
+    contents.contains(&format!(".kyris/env/{agent_id}.sh"))
+}
+
 /// Remove an agent's PATH shim. Manifest-tracked, so the normal uninstall
 /// path (`restore_manifest_entry`) will also clean it up; this helper is for
 /// `kyris agents uninstall <agent>`, which removes just one agent's surfaces.
@@ -130,6 +163,30 @@ mod tests {
         assert!(s.contains(r#"__kyris_shim_dir="$HOME/.kyris/bin""#));
         assert!(s.contains("real=$(command -v claude"));
         assert!(s.contains("exec \"$real\" \"$@\""));
+    }
+
+    #[test]
+    fn testShimSourcesAgentEnvFile() {
+        // The shim must deliver the agent's env file on every launch so
+        // burn-control reaches it independent of shell-RC sourcing (fish, GUI).
+        let s = shim_source("claude-code", "claude");
+        assert!(s.contains(r#""$HOME/.kyris/env/claude-code.sh""#));
+        // Split env files (e.g. cline-policy.sh) are picked up via the glob.
+        assert!(s.contains(r#""$HOME/.kyris/env/claude-code"-*.sh"#));
+        assert!(shim_content_delivers_env(&s, "claude-code"));
+    }
+
+    #[test]
+    fn testShimContentDeliversEnvDetectsAbsence() {
+        // A pre-env shim (no env-source line) must be reported as NOT delivering,
+        // so the probe stays honest until a reinstall refreshes the shim.
+        let pre_env =
+            "#!/bin/sh\nexport KYRIS_GOVERNED_SUBPROCESS=\"claude-code\"\nexec claude \"$@\"\n";
+        assert!(!shim_content_delivers_env(pre_env, "claude-code"));
+        assert!(shim_content_delivers_env(
+            &shim_source("cline", "cline"),
+            "cline"
+        ));
     }
 
     /// The shim must be runnable by /bin/sh — no bashisms. macOS' /bin/sh is

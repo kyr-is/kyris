@@ -308,6 +308,7 @@ async fn forward_mcp_post(
                 approval_token,
                 server_name.clone(),
                 tool_name,
+                None,
                 allow_always,
             );
 

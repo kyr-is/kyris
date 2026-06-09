@@ -1,20 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-use std::path::PathBuf;
-
 use crate::config_writer::NoopValidator;
 use crate::lifecycle::log::InstallLog;
-use crate::state::{ensure_line, env_dir, load_or_init_config, write_managed_file};
+use crate::state::{env_dir, load_or_init_config, write_managed_file};
 
 use super::registry::{self, AgentDescriptor};
-
-const ENV_LOADER_SOURCE: &str = r#"# SPDX-License-Identifier: Apache-2.0
-for file in "$HOME/.kyris/env/"*.sh; do
-    [ -f "$file" ] || continue
-    [ "$file" = "$HOME/.kyris/env/load.sh" ] && continue
-    . "$file"
-done
-"#;
 
 pub fn prestage_all(log: Option<&InstallLog>) -> Result<(), String> {
     let config = load_or_init_config()?;
@@ -100,7 +90,10 @@ fn prestage_env(
         return Ok(Vec::new());
     }
 
-    let mut changes = ensure_env_loader()?;
+    // The per-agent PATH shim sources this env file on every launch (see
+    // shim.rs), so there is no shell-RC env loader to install — the agent gets
+    // its base-URL/key redirect from the one wrapper that always runs.
+    let mut changes = Vec::new();
 
     let env_file = env_dir()?.join(format!("{}.sh", agent.id()));
     // Shell env file (export VAR=...) — opaque text.
@@ -112,38 +105,6 @@ fn prestage_env(
         &NoopValidator,
     )? {
         changes.push(format!("wrote {}", env_file.display()));
-    }
-
-    Ok(changes)
-}
-
-/// Ensure `load.sh` exists and shell RC files source it.
-/// Called by `prestage_env` for agents with env exports, and by
-/// `configure_execution` for agents that write env files directly
-/// (e.g. Cline's compiled policy).
-pub fn ensure_env_loader() -> Result<Vec<String>, String> {
-    let loader_path = env_dir()?.join("load.sh");
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
-    let mut changes = Vec::new();
-
-    // Shell loader script — opaque text.
-    if write_managed_file(
-        &loader_path,
-        ENV_LOADER_SOURCE,
-        "agents",
-        Some(0o600),
-        &NoopValidator,
-    )? {
-        changes.push(format!("wrote {}", loader_path.display()));
-    }
-
-    for (path, label) in [
-        (PathBuf::from(&home).join(".zshrc"), "~/.zshrc"),
-        (PathBuf::from(&home).join(".bashrc"), "~/.bashrc"),
-    ] {
-        if ensure_line(&path, "source \"$HOME/.kyris/env/load.sh\"", "agents")? {
-            changes.push(format!("updated {label}"));
-        }
     }
 
     Ok(changes)

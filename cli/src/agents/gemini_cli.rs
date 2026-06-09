@@ -6,12 +6,14 @@ use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{read_json_value, write_json_value};
 
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
-    json_has_mcp_wrap, not_detected,
+    ProbeResult, env_reaches_agent, fingerprint, json_has_any_mcp_servers, json_has_mcp_wrap,
+    not_detected,
 };
 use super::registry::{
-    AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation,
-    PrimaryProvider, ToolMapping, provider_env_exports, which_exists,
+    AgentDescriptor, AgentIntegrationPlan, AllowResponse, AttributionMechanism,
+    BurnControlMechanism, ExecutionMechanism, HookProtocol, McpConfigFormat, McpConfigLocation,
+    PrimaryProvider, SurfaceIntegration, ToolMapping, ToolMechanism, provider_env_exports,
+    which_exists,
 };
 
 pub struct GeminiCli;
@@ -46,7 +48,7 @@ impl AgentDescriptor for GeminiCli {
         which_exists("gemini") || gemini_settings_exists()
     }
     fn probe(&self) -> ProbeResult {
-        use super::profile::{AdaptedMechanism, CoverageCeiling, SurfaceState};
+        use super::profile::{CoverageCeiling, SurfaceState};
         let detected = gemini_settings_exists() || which_exists("gemini");
         if !detected {
             return not_detected();
@@ -72,23 +74,22 @@ impl AgentDescriptor for GeminiCli {
             .is_some_and(|p| p.exists());
 
         let execution = if has_hook {
-            SurfaceState::adapted(AdaptedMechanism::LiveHook)
+            SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter)
         } else if has_compiled_policy {
-            SurfaceState::adapted(AdaptedMechanism::CompiledPolicy)
+            SurfaceState::adapted(ExecutionMechanism::CompiledPolicy)
                 .with_ceiling(CoverageCeiling::Compiled)
         } else {
             SurfaceState::none()
         };
         let tool = if has_mcp_wrap {
-            SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+            SurfaceState::adapted(ToolMechanism::McpWrapping)
         } else if !has_any_mcp_servers {
             SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
-        let has_env_file = env_file_has_var("gemini-cli", "GOOGLE_GEMINI_BASE_URL");
-        let burn_control = if has_env_file && env_loader_sourced() {
-            SurfaceState::adapted(AdaptedMechanism::EnvVarProxy)
+        let burn_control = if env_reaches_agent("gemini-cli", "GOOGLE_GEMINI_BASE_URL") {
+            SurfaceState::adapted(BurnControlMechanism::EnvVarProxy)
         } else {
             SurfaceState::none()
         };
@@ -123,8 +124,30 @@ impl AgentDescriptor for GeminiCli {
         exports.push(("GOOGLE_VERTEX_BASE_URL".to_string(), base_url.to_string()));
         exports
     }
-    fn expected_surfaces(&self) -> (bool, bool, bool) {
-        (true, true, true)
+    fn integration_plan(&self) -> AgentIntegrationPlan {
+        super::capabilities::apply_declared_capabilities(
+            self.canonical_id(),
+            AgentIntegrationPlan {
+                execution: SurfaceIntegration::adapted(&[
+                    ExecutionMechanism::LiveHookAdapter,
+                    ExecutionMechanism::CompiledPolicy,
+                ]),
+                tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
+                burn_control: SurfaceIntegration::adapted(&[BurnControlMechanism::EnvVarProxy]),
+                attribution: &[
+                    AttributionMechanism::KyrisPathShim,
+                    AttributionMechanism::NativeHookPayload,
+                    AttributionMechanism::ProcessLineage,
+                ],
+                agentpact_native_attribution: false,
+            },
+        )
+    }
+    fn supported_settings(&self) -> &'static [(&'static str, &'static str)] {
+        &[(
+            "maxSessionTurns",
+            "Max agent turns per session (writes maxSessionTurns to settings.json)",
+        )]
     }
     fn launch_dir_env(&self) -> Option<&'static str> {
         // Gemini CLI's hook payload `cwd` is already the fixed launch dir, but
@@ -132,7 +155,7 @@ impl AgentDescriptor for GeminiCli {
         // permitted-domain anchor.
         Some("GEMINI_PROJECT_DIR")
     }
-    fn configure_execution(
+    fn configure_execution_surface(
         &self,
         _base_url: &str,
         _inbound_key: &str,
@@ -147,11 +170,15 @@ impl AgentDescriptor for GeminiCli {
 
         let mut changes = super::configure::install_live_hook_adapter(
             "gemini-cli",
-            "gemini-cli",
+            "gemini-cli:execution",
             "BeforeTool",
             &script_path,
             &settings_path,
-            false,
+            // Gemini 0.41 requires the NESTED hook shape — `BeforeTool: [{ hooks:
+            // [{ type, command }] }]` — and silently DISCARDS the flat
+            // `{ type, command }` form ("Discarding invalid hook definition for
+            // BeforeTool"), so governance never fires. Must be nested (like codex).
+            true,
             // Gemini's default hook timeout is 60s — below kyris's ~590s no-TTY
             // poll window — so it would kill the hook mid-wait. Pin it to 600s
             // (Gemini's `timeout` is in milliseconds).
@@ -170,7 +197,7 @@ impl AgentDescriptor for GeminiCli {
                     if crate::state::write_managed_file(
                         &policy_path,
                         &toml_content,
-                        "gemini-cli",
+                        "gemini-cli:execution",
                         None,
                         &NoopValidator,
                     )? {
@@ -185,10 +212,22 @@ impl AgentDescriptor for GeminiCli {
 
         Ok(changes)
     }
-    fn configure_burn_control(
+    fn configure_tool_surface(
         &self,
         base_url: &str,
         inbound_key: &str,
+        _agent_specific: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        super::configure::configure_json_mcp_tool_surface(self, base_url, inbound_key)
+    }
+    fn apply_extra_tool_filters(&self, settings: &mut serde_json::Value) -> bool {
+        // Gemini natively supports a per-server tool denylist via `excludeTools`.
+        super::configure::apply_json_tool_filters(settings, &["mcpServers"])
+    }
+    fn configure_burn_control_surface(
+        &self,
+        _base_url: &str,
+        _inbound_key: &str,
         agent_specific: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
         let settings_path = gemini_settings_path()?;
@@ -196,20 +235,12 @@ impl AgentDescriptor for GeminiCli {
 
         if settings_path.exists() {
             let mut settings = read_json_value(&settings_path)?;
-            let mut settings_changed =
-                super::configure::apply_json_tool_filters(&mut settings, &["mcpServers"]);
-            let mcp_result = super::configure::rewrite_json_mcp_servers(
-                &mut settings,
-                &["mcpServers"],
-                base_url,
-                inbound_key,
-            );
-            if mcp_result.changed {
-                settings_changed = true;
-            }
-            if let Some(val) = agent_specific.get("maxSessionTurns")
-                && let Ok(n) = val.parse::<u64>()
-            {
+            let mut settings_changed = false;
+            if let Some(val) = agent_specific.get("maxSessionTurns") {
+                // Loud on a bad value rather than silently skipping it.
+                let n: u64 = val.parse().map_err(|_| {
+                    format!("maxSessionTurns must be a non-negative integer, got '{val}'")
+                })?;
                 settings["maxSessionTurns"] = serde_json::json!(n);
                 settings_changed = true;
             }
@@ -217,26 +248,21 @@ impl AgentDescriptor for GeminiCli {
                 write_json_value(
                     &settings_path,
                     &settings,
-                    "gemini-cli",
+                    "gemini-cli:burn-control",
                     &WellFormedJsonValidator,
                 )?;
                 changes.push(format!("updated {}", settings_path.display()));
-            }
-            if !mcp_result.http_rewrites.is_empty() {
-                super::configure::upsert_mcp_upstreams(&mcp_result.http_rewrites)?;
-                changes.push("registered MCP upstream(s) in kyrisd.yaml".to_string());
             }
         }
 
         Ok(changes)
     }
-    fn undo(&self) -> Result<(), String> {
-        // Remove MCP upstreams before restoring settings.json.
-        let mcp_names = super::configure::mcp_server_names_from_agent(self);
-        super::configure::remove_mcp_upstreams(&mcp_names)?;
-
+    fn undo_tool_surface(&self) -> Result<(), String> {
+        super::configure::undo_json_mcp_tool_surface(self)
+    }
+    fn undo_execution_surface(&self) -> Result<(), String> {
         let settings_path = gemini_settings_path()?;
-        if crate::state::restore_manifest_entry(&settings_path)? {
+        if crate::state::restore_manifest_entry_component(&settings_path, "gemini-cli:execution")? {
             println!("Reverted {}", settings_path.display());
         }
         let script = settings_path
@@ -244,14 +270,18 @@ impl AgentDescriptor for GeminiCli {
             .unwrap_or(std::path::Path::new("."))
             .join("hooks")
             .join("agentpact_beforetool.sh");
-        super::undo::remove_file_if_exists(&script)?;
+        if !crate::state::restore_manifest_entry_component(&script, "gemini-cli:execution")? {
+            super::undo::remove_file_if_exists(&script)?;
+        }
         let policy = gemini_policies_dir()?.join("agentpact.toml");
-        super::undo::remove_file_if_exists(&policy)?;
+        if !crate::state::restore_manifest_entry_component(&policy, "gemini-cli:execution")? {
+            super::undo::remove_file_if_exists(&policy)?;
+        }
         Ok(())
     }
-    fn undo_burn_control(&self) -> Result<(), String> {
+    fn undo_burn_control_surface(&self) -> Result<(), String> {
         for path in self.burn_control_config_paths() {
-            if crate::state::restore_manifest_entry(&path)? {
+            if crate::state::restore_manifest_entry_component(&path, "gemini-cli:burn-control")? {
                 println!("Reverted {}", path.display());
             }
         }
@@ -306,6 +336,7 @@ impl AgentDescriptor for GeminiCli {
                 "search_file_content".to_string(),
                 "web_fetch".to_string(),
             ],
+            detail_pass_throughs: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::Json {
                 body: serde_json::json!({"decision": "allow"}),

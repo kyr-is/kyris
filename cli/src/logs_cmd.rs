@@ -14,9 +14,9 @@ use std::time::SystemTime;
 /// Print the list of kyris log files with size and last-modified time.
 ///
 /// Covers kyrisd's in-process log, the launchd-captured stdout/stderr
-/// log, the agentpactd log, and the shell-hook fail-open log. Missing
-/// files are listed too with `-` for size/mtime, since "we expected one
-/// here" is just as useful for diagnosis as the existing files.
+/// log, the agentpactd log, approval prompt/decision logs, and the shell-hook
+/// fail-open log. Missing files are listed too with `-` for size/mtime, since
+/// "we expected one here" is just as useful for diagnosis as the existing files.
 #[derive(Args)]
 pub struct LogsArgs {
     #[command(subcommand)]
@@ -60,6 +60,14 @@ fn collect_log_entries() -> Vec<LogEntry> {
         path: agentpactd_log_path(),
     });
     let fail_open = kyris_core::paths::state_dir().join("fail-open.jsonl");
+    entries.push(LogEntry {
+        label: "approval prompts",
+        path: kyris_core::paths::prompts_log_path(),
+    });
+    entries.push(LogEntry {
+        label: "approval decisions",
+        path: kyris_core::paths::approvals_log_path(),
+    });
     entries.push(LogEntry {
         label: "shell fail-open",
         path: fail_open,
@@ -175,12 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn testCollectLogEntriesIncludesCoreFour() {
+    fn testCollectLogEntriesIncludesCoreLogs() {
         let entries = collect_log_entries();
         let labels: Vec<&'static str> = entries.iter().map(|e| e.label).collect();
         assert!(labels.contains(&"kyris"));
         assert!(labels.contains(&"kyrisd (launchd)"));
         assert!(labels.contains(&"agentpactd"));
+        assert!(labels.contains(&"approval prompts"));
+        assert!(labels.contains(&"approval decisions"));
         assert!(labels.contains(&"shell fail-open"));
     }
 }

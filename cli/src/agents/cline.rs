@@ -4,13 +4,16 @@ use std::path::PathBuf;
 
 use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{read_json_value, set_json_string_path, write_json_value};
-use crate::state::restore_manifest_entry;
+use crate::state::restore_manifest_entry_component;
 
 use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
-    json_has_mcp_wrap, not_detected,
+    ProbeResult, env_reaches_agent, fingerprint, json_has_any_mcp_servers, json_has_mcp_wrap,
+    not_detected,
 };
-use super::registry::{AgentDescriptor, McpConfigFormat, McpConfigLocation};
+use super::registry::{
+    AgentDescriptor, AgentIntegrationPlan, AttributionMechanism, BurnControlMechanism,
+    ExecutionMechanism, McpConfigFormat, McpConfigLocation, SurfaceIntegration, ToolMechanism,
+};
 
 pub struct Cline;
 
@@ -74,7 +77,7 @@ fn install_cline_policy_launchd(json: &str, changes: &mut Vec<String>) -> Result
     if crate::state::write_managed_file(
         &value_path,
         json,
-        "cline",
+        "cline:execution",
         Some(0o600),
         &WellFormedJsonValidator,
     )? {
@@ -111,7 +114,7 @@ fn install_cline_policy_launchd(json: &str, changes: &mut Vec<String>) -> Result
     if crate::state::write_managed_file(
         &plist_path,
         &plist_contents,
-        "cline",
+        "cline:execution",
         Some(0o644),
         &NoopValidator,
     )? {
@@ -148,7 +151,9 @@ fn uninstall_cline_policy_launchd() {
         let _ = std::process::Command::new("launchctl")
             .args(["bootout", &domain, &plist_path.to_string_lossy()])
             .status();
-        let _ = std::fs::remove_file(&plist_path);
+        if !restore_manifest_entry_component(&plist_path, "cline:execution").unwrap_or(false) {
+            let _ = std::fs::remove_file(&plist_path);
+        }
     }
 
     let _ = std::process::Command::new("launchctl")
@@ -159,7 +164,9 @@ fn uninstall_cline_policy_launchd() {
         .join(".kyris")
         .join("env")
         .join("cline-policy.json");
-    let _ = std::fs::remove_file(&value_path);
+    if !restore_manifest_entry_component(&value_path, "cline:execution").unwrap_or(false) {
+        let _ = std::fs::remove_file(&value_path);
+    }
 }
 
 impl AgentDescriptor for Cline {
@@ -173,14 +180,13 @@ impl AgentDescriptor for Cline {
         cline_extension_installed()
     }
     fn probe(&self) -> ProbeResult {
-        use super::profile::{AdaptedMechanism, CoverageCeiling, SurfaceState};
+        use super::profile::{CoverageCeiling, SurfaceState};
         let detected = cline_extension_installed();
         if !detected {
             return not_detected();
         }
         let vscode_only = cline_is_vscode_only();
 
-        let has_env_file = env_file_has_var("cline", "CLINE_COMMAND_PERMISSIONS");
         let has_launchd_plist = crate::integration::home_dir()
             .ok()
             .map(|h| {
@@ -189,9 +195,14 @@ impl AgentDescriptor for Cline {
                     .join("is.kyr.cline-policy.plist")
             })
             .is_some_and(|p| p.exists());
-        let env_reachable = (has_env_file && env_loader_sourced()) || has_launchd_plist;
+        // `cline-policy.sh` is matched by env_reaches_agent's `<id>-*.sh` glob
+        // and is sourced by cline's PATH shim, so the CLI gets the policy env
+        // without depending on shell-RC sourcing; the launchd plist remains the
+        // delivery path for the VS Code extension host.
+        let env_reachable =
+            env_reaches_agent("cline", "CLINE_COMMAND_PERMISSIONS") || has_launchd_plist;
         let execution = if env_reachable {
-            let state = SurfaceState::adapted(AdaptedMechanism::CompiledPolicy);
+            let state = SurfaceState::adapted(ExecutionMechanism::CompiledPolicy);
             if vscode_only {
                 state.with_ceiling(CoverageCeiling::Observed)
             } else {
@@ -209,7 +220,7 @@ impl AgentDescriptor for Cline {
             .as_deref()
             .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
         let tool = if has_mcp_wrap {
-            SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+            SurfaceState::adapted(ToolMechanism::McpWrapping)
         } else if !has_any_mcp_servers {
             SurfaceState::not_applicable()
         } else {
@@ -224,7 +235,7 @@ impl AgentDescriptor for Cline {
             })
         });
         let burn_control = if has_base_url_rewrite {
-            SurfaceState::adapted(AdaptedMechanism::ConfigRewrite)
+            SurfaceState::adapted(BurnControlMechanism::ConfigRewrite)
         } else {
             SurfaceState::none()
         };
@@ -249,21 +260,27 @@ impl AgentDescriptor for Cline {
     fn env_exports(&self, _base_url: &str, _inbound_key: &str) -> Vec<(String, String)> {
         Vec::new()
     }
-    fn expected_surfaces(&self) -> (bool, bool, bool) {
-        (true, true, true)
+    fn integration_plan(&self) -> AgentIntegrationPlan {
+        super::capabilities::apply_declared_capabilities(
+            self.canonical_id(),
+            AgentIntegrationPlan {
+                // cline has no live-hook path — compiled policy is the maximum
+                // achievable command-control coverage.
+                execution: SurfaceIntegration::adapted_with_ceiling(
+                    &[ExecutionMechanism::CompiledPolicy],
+                    super::profile::CoverageCeiling::Compiled,
+                ),
+                tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
+                burn_control: SurfaceIntegration::adapted(&[BurnControlMechanism::ConfigRewrite]),
+                attribution: &[
+                    AttributionMechanism::KyrisPathShim,
+                    AttributionMechanism::ProcessLineage,
+                ],
+                agentpact_native_attribution: false,
+            },
+        )
     }
-    fn surface_design_ceilings(
-        &self,
-    ) -> (
-        Option<super::profile::CoverageCeiling>,
-        Option<super::profile::CoverageCeiling>,
-        Option<super::profile::CoverageCeiling>,
-    ) {
-        // cline has no live-hook path — compiled policy is the maximum
-        // achievable command-control coverage.
-        (Some(super::profile::CoverageCeiling::Compiled), None, None)
-    }
-    fn configure_execution(
+    fn configure_execution_surface(
         &self,
         _base_url: &str,
         _inbound_key: &str,
@@ -283,14 +300,15 @@ impl AgentDescriptor for Cline {
             "# SPDX-License-Identifier: Apache-2.0\nexport CLINE_COMMAND_PERMISSIONS={}\n",
             super::prestage::shell_single_quote(&json)
         );
-        let loader_changes = super::prestage::ensure_env_loader()?;
-        changes.extend(loader_changes);
+        // The cline PATH shim sources cline-policy.sh on every CLI launch (its
+        // `<id>-*.sh` glob), so no shell-RC env loader is needed; the VS Code
+        // extension host is still covered by the launchd plist below.
         let env_file = crate::state::env_dir()?.join("cline-policy.sh");
         // Shell env file (export VAR='...') — opaque text, no schema.
         if crate::state::write_managed_file(
             &env_file,
             &contents,
-            "cline",
+            "cline:execution",
             Some(0o600),
             &NoopValidator,
         )? {
@@ -341,33 +359,23 @@ impl AgentDescriptor for Cline {
         }
         paths
     }
-    fn configure_burn_control(
+    fn configure_tool_surface(
         &self,
         base_url: &str,
         inbound_key: &str,
         _agent_specific: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
-        let mcp_path = cline_mcp_settings_path()?;
-        let mut changes = Vec::new();
-
-        if mcp_path.exists() {
-            let mut settings = read_json_value(&mcp_path)?;
-            let mcp_result = super::configure::rewrite_json_mcp_servers(
-                &mut settings,
-                &["mcpServers"],
-                base_url,
-                inbound_key,
-            );
-            if mcp_result.changed {
-                write_json_value(&mcp_path, &settings, "cline", &WellFormedJsonValidator)?;
-                changes.push(format!("rewrote MCP servers in {}", mcp_path.display()));
-            }
-            if !mcp_result.http_rewrites.is_empty() {
-                super::configure::upsert_mcp_upstreams(&mcp_result.http_rewrites)?;
-                changes.push("registered MCP upstream(s) in kyrisd.yaml".to_string());
-            }
-        }
-
+        // cline has no per-server MCP tool-denylist field (only whole-server
+        // `disabled`/`autoApprove`), so it uses the default (no) extra filter and
+        // relies on the runtime wrap/routing backstop — see configure.rs.
+        super::configure::configure_json_mcp_tool_surface(self, base_url, inbound_key)
+    }
+    fn configure_burn_control_surface(
+        &self,
+        base_url: &str,
+        _inbound_key: &str,
+        _agent_specific: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
         let global_state_path = cline_global_state_path()?;
         let base_url_v1 = format!("{base_url}/v1");
         let mut state = read_json_value(&global_state_path)?;
@@ -380,11 +388,12 @@ impl AgentDescriptor for Cline {
                 state_changed = true;
             }
         }
+        let mut changes = Vec::new();
         if state_changed {
             write_json_value(
                 &global_state_path,
                 &state,
-                "cline",
+                "cline:burn-control",
                 &WellFormedJsonValidator,
             )?;
             changes.push(format!(
@@ -395,45 +404,23 @@ impl AgentDescriptor for Cline {
 
         Ok(changes)
     }
-    fn undo(&self) -> Result<(), String> {
+    fn undo_execution_surface(&self) -> Result<(), String> {
         let policy_file = crate::state::env_dir()?.join("cline-policy.sh");
-        super::undo::remove_file_if_exists(&policy_file)?;
+        if restore_manifest_entry_component(&policy_file, "cline:execution")? {
+            println!("Reverted {}", policy_file.display());
+        } else {
+            super::undo::remove_file_if_exists(&policy_file)?;
+        }
         uninstall_cline_policy_launchd();
-        self.undo_burn_control()?;
         Ok(())
     }
-    fn undo_burn_control(&self) -> Result<(), String> {
-        // Remove MCP upstreams before restoring the MCP settings file.
-        let mcp_names = super::configure::mcp_server_names_from_agent(self);
-        super::configure::remove_mcp_upstreams(&mcp_names)?;
-
-        let mcp_path = cline_mcp_settings_path()?;
-        if restore_manifest_entry(&mcp_path)? {
-            println!("Reverted {}", mcp_path.display());
-        }
+    fn undo_tool_surface(&self) -> Result<(), String> {
+        super::configure::undo_json_mcp_tool_surface(self)
+    }
+    fn undo_burn_control_surface(&self) -> Result<(), String> {
         let global_state_path = cline_global_state_path()?;
-        if global_state_path.exists() {
-            let mut state = read_json_value(&global_state_path)?;
-            if let Some(obj) = state.as_object_mut() {
-                let mut changed = false;
-                for key in ["anthropicBaseUrl", "openAiBaseUrl"] {
-                    if obj.remove(key).is_some() {
-                        changed = true;
-                    }
-                }
-                if changed {
-                    write_json_value(
-                        &global_state_path,
-                        &state,
-                        "cline",
-                        &WellFormedJsonValidator,
-                    )?;
-                    println!(
-                        "Removed base URL overrides from {}",
-                        global_state_path.display()
-                    );
-                }
-            }
+        if restore_manifest_entry_component(&global_state_path, "cline:burn-control")? {
+            println!("Reverted {}", global_state_path.display());
         }
         Ok(())
     }

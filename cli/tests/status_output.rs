@@ -92,8 +92,98 @@ fn test_status_claude_code_burn_control_none_without_loader_sourced() {
         .find(|l| l.contains("claude-code") && l.contains("burn:"))
         .expect("claude-code line in status output");
     assert!(
-        line.contains("burn:none"),
-        "expected burn:none, got: {line}"
+        line.contains("burn:none/proxy"),
+        "expected burn:none/proxy, got: {line}"
+    );
+}
+
+#[test]
+fn test_status_claude_code_burn_control_active_via_shim_without_loader() {
+    // Regression for the fish/GUI gap: the PATH shim sources the agent's env
+    // file on every launch, so burn-control is live even though NO shell RC
+    // sources ~/.kyris/env/load.sh. This is the scenario the loader-only probe
+    // wrongly reported as off (fish never sources the loader).
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    fs::write(home.join(".claude").join("settings.json"), "{}").expect("write settings");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("claude-code.sh"),
+        "export ANTHROPIC_BASE_URL=http://127.0.0.1:4710\n",
+    )
+    .expect("write claude env");
+
+    // Install a PATH shim that sources the env file — and deliberately NO
+    // ~/.zshrc loader, mirroring a fish/GUI launch.
+    let bin_dir = home.join(".kyris").join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    fs::write(
+        bin_dir.join("claude"),
+        "#!/bin/sh\nfor __kyris_env in \"$HOME/.kyris/env/claude-code.sh\" \"$HOME/.kyris/env/claude-code\"-*.sh; do\n  [ -f \"$__kyris_env\" ] && . \"$__kyris_env\"\ndone\nexec claude \"$@\"\n",
+    )
+    .expect("write claude shim");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("claude-code") && l.contains("burn:"))
+        .expect("claude-code line in status output");
+    assert!(
+        line.contains("burn:proxy"),
+        "expected burn:proxy (active via shim, no loader), got: {line}"
+    );
+}
+
+#[test]
+fn test_status_cline_execution_active_via_shim_without_loader() {
+    // Cline's CLI gets its CLINE_COMMAND_PERMISSIONS policy from the shim
+    // sourcing cline-policy.sh — no shell-RC loader and no launchd plist needed
+    // (the plist only covers the VS Code extension host).
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    let ext_dir = home
+        .join(".vscode")
+        .join("extensions")
+        .join("saoudrizwan.claude-dev-3.0.0");
+    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
+
+    let env_dir = home.join(".kyris").join("env");
+    fs::create_dir_all(&env_dir).expect("create env dir");
+    fs::write(
+        env_dir.join("cline-policy.sh"),
+        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
+    )
+    .expect("write cline policy env");
+
+    let bin_dir = home.join(".kyris").join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    fs::write(
+        bin_dir.join("cline"),
+        "#!/bin/sh\nfor __kyris_env in \"$HOME/.kyris/env/cline.sh\" \"$HOME/.kyris/env/cline\"-*.sh; do\n  [ -f \"$__kyris_env\" ] && . \"$__kyris_env\"\ndone\nexec cline \"$@\"\n",
+    )
+    .expect("write cline shim");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("cline") && l.contains("cmd:"))
+        .expect("cline line in status output");
+    assert!(
+        line.contains("cmd:policy"),
+        "expected cmd:policy (active via shim, no loader), got: {line}"
     );
 }
 
@@ -155,7 +245,10 @@ fn test_status_cline_execution_none_without_loader_sourced() {
         .lines()
         .find(|l| l.contains("cline") && l.contains("cmd:"))
         .expect("cline line in status output");
-    assert!(line.contains("cmd:none"), "expected cmd:none, got: {line}");
+    assert!(
+        line.contains("cmd:none/policy"),
+        "expected cmd:none/policy, got: {line}"
+    );
 }
 
 #[test]
@@ -225,6 +318,83 @@ fn test_status_cline_execution_active_via_launchd_plist() {
         .find(|l| l.contains("cline") && l.contains("cmd:"))
         .expect("cline line in status output");
     assert!(line.contains("policy"), "expected cmd:policy, got: {line}");
+}
+
+#[test]
+fn test_status_codex_burn_control_shows_provider_not_config_skew() {
+    // Regression for the observed-vs-plan vocabulary skew: codex burn-control is
+    // delivered by rewriting config.toml to route through the kyris model
+    // provider. The probe must report that as "provider" (matching the plan
+    // label BurnControlMechanism::KyrisdModelProvider), not "config", so a
+    // correctly-routed codex shows `burn:provider/provider` rather than the
+    // `burn:config/provider` skew that reads as drift.
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    let codex_dir = home.join(".codex");
+    fs::create_dir_all(&codex_dir).expect("create .codex");
+    fs::write(
+        codex_dir.join("config.toml"),
+        "model_provider = \"kyris\"\n\n[model_providers.kyris]\nbase_url = \"http://127.0.0.1:4710/v1\"\n",
+    )
+    .expect("write codex config");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("codex-cli") && l.contains("burn:"))
+        .expect("codex-cli line in status output");
+    assert!(
+        line.contains("burn:provider/provider"),
+        "expected burn:provider/provider (no skew), got: {line}"
+    );
+}
+
+#[test]
+fn test_status_detects_claude_via_binary_without_dot_claude_dir() {
+    // Parity fix: claude must be detected when the `claude` binary is on PATH
+    // even if ~/.claude doesn't exist yet (the other agents already do this).
+    let temp_home = TempDir::new().expect("temp home");
+    let fake_bin = TempDir::new().expect("fake bin");
+    write_kyrisd_config(temp_home.path(), "127.0.0.1:1");
+    write_fake_binary(fake_bin.path(), "claude", "1.0.0");
+    // Deliberately do NOT create ~/.claude — detection must come from the binary.
+
+    let output = run_status(temp_home.path(), Some(fake_bin.path()));
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("claude-code"),
+        "claude should be detected via the `claude` binary on PATH, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_status_warns_about_unwrapped_mcp_servers() {
+    // A wrapped tool surface plus an MCP server added after setup (not routed
+    // through kyris) must surface a drift warning prompting a reconcile.
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    write_kyrisd_config(home, "127.0.0.1:1");
+
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    fs::write(
+        home.join(".claude").join("settings.json"),
+        r#"{"mcpServers":{"wrapped":{"command":"kyris-mcp","args":["wrap"]},"added-later":{"command":"npx","args":["-y","srv"]}}}"#,
+    )
+    .expect("write settings");
+
+    let output = run_status(home, None);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("added-later") && stdout.contains("not routed through kyris"),
+        "expected unwrapped-server drift warning, got: {stdout}"
+    );
 }
 
 #[test]

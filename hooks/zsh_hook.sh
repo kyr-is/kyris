@@ -58,6 +58,21 @@ __kyris_running_under_governed_agent() {
     return 1
 }
 
+__kyris_codex_shell_snapshot_active() {
+    local cmd="$1"
+    if [[ -n "${__KYRIS_CODEX_SNAPSHOT_ACTIVE:-}" ]]; then
+        if [[ "$ZSH_EVAL_CONTEXT" == *file* ]]; then
+            return 0
+        fi
+        unset __KYRIS_CODEX_SNAPSHOT_ACTIVE
+    fi
+    if [[ "$cmd" == *".codex/shell_snapshots/"* || "$cmd" == *"__CODEX_SNAPSHOT_"* ]]; then
+        __KYRIS_CODEX_SNAPSHOT_ACTIVE=1
+        return 0
+    fi
+    return 1
+}
+
 if [[ "${KYRIS_HOOK_FORCE:-0}" != "1" ]] && ! __kyris_running_under_governed_agent; then
     return 0 2>/dev/null || exit 0
 fi
@@ -72,6 +87,10 @@ __kyris_preexec() {
     local cmd="$1"
     local sock="${AGENTPACT_SOCK:-$HOME/.agentpact/agentpact.sock}"
     local sentinel="$HOME/.kyris/.daemon-unreachable"
+
+    if __kyris_codex_shell_snapshot_active "$cmd"; then
+        return 0
+    fi
 
     if __kyris_sentinel_active "$sentinel"; then
         return 1
@@ -299,6 +318,10 @@ if [[ -o interactive ]]; then
 else
     TRAPDEBUG() {
         local cmd="$ZSH_DEBUG_CMD"
+
+        if __kyris_codex_shell_snapshot_active "$cmd"; then
+            return 0
+        fi
 
         # Govern the AGENT's commands, not the shell's own startup-file sourcing
         # (/etc/zprofile's path_helper, ~/.zshrc, …). TRAPDEBUG fires on those

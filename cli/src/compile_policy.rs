@@ -344,7 +344,14 @@ pub fn serialize_codex_rules_file(rules: &serde_json::Value) -> String {
         let tokens: Vec<&str> = prefix.split_whitespace().collect();
         let pattern = tokens
             .iter()
-            .map(|t| format!("\"{t}\""))
+            .map(|t| {
+                // Escape for a Starlark double-quoted string literal: backslash
+                // first, then the quote. A raw `"` token (e.g. from `tr -d '"'`)
+                // otherwise produces `"""` — an unfinished string literal that
+                // makes codex fail to load the whole rules file.
+                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let decision = permission.to_ascii_lowercase();
@@ -482,6 +489,19 @@ pub struct CodexPermissionsTable {
 ///
 /// Empty tables are omitted; callers should skip writing `[permissions.kyris]`
 /// when both maps are empty.
+///
+/// Resolve a policy filesystem glob into a Codex-accepted path. Absolute, `~/`,
+/// `~`, and `:special` paths pass through unchanged; a relative glob (`./x` or
+/// `x`) is resolved against `workspace_root` (Codex rejects relative paths). The
+/// trailing glob (`*`) survives as a literal path component.
+fn to_codex_fs_path(glob: &str, workspace_root: &Path) -> String {
+    if glob == "~" || glob.starts_with('/') || glob.starts_with("~/") || glob.starts_with(':') {
+        return glob.to_string();
+    }
+    let rel = glob.strip_prefix("./").unwrap_or(glob);
+    workspace_root.join(rel).to_string_lossy().into_owned()
+}
+
 pub fn compile_codex_permissions_table(
     policy_path: Option<&Path>,
 ) -> Result<CodexPermissionsTable, String> {
@@ -492,12 +512,20 @@ pub fn compile_codex_permissions_table(
     let mut url_paths_dropped: Vec<String> = Vec::new();
     let mut ask_collapsed: Vec<String> = Vec::new();
 
+    // Codex requires absolute / `~/` / `:special` filesystem paths and REJECTS
+    // the whole config on a relative one. Policy globs may be project-relative
+    // (`./src/*`), so resolve them against the workspace (the cwd at setup time)
+    // into absolute paths Codex accepts. The glob tail (`*`) is preserved.
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     for (path_glob, perm) in &level.paths {
         if *perm == Permission::Ask {
             ask_collapsed.push(path_glob.clone());
         }
         let mode = permission_to_file_mode(*perm);
-        filesystem.insert(path_glob.clone(), mode.as_codex_token().to_string());
+        filesystem.insert(
+            to_codex_fs_path(path_glob, &workspace_root),
+            mode.as_codex_token().to_string(),
+        );
     }
 
     for (domain_key, perm) in &level.urls {
@@ -599,6 +627,43 @@ fn dirs_home() -> Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn testToCodexFsPathResolvesRelativeAndKeepsValid() {
+        let base = std::path::Path::new("/work/proj");
+        // Relative globs resolve against the workspace root (Codex rejects relative
+        // paths); the glob tail survives.
+        assert_eq!(
+            to_codex_fs_path("./secrets/*", base),
+            "/work/proj/secrets/*"
+        );
+        assert_eq!(to_codex_fs_path("src/*", base), "/work/proj/src/*");
+        // Already-Codex-valid forms pass through unchanged.
+        assert_eq!(to_codex_fs_path("/etc/passwd", base), "/etc/passwd");
+        assert_eq!(to_codex_fs_path("~/.ssh/*", base), "~/.ssh/*");
+        assert_eq!(to_codex_fs_path("~", base), "~");
+        assert_eq!(
+            to_codex_fs_path(":workspace_roots", base),
+            ":workspace_roots"
+        );
+    }
+
+    #[test]
+    fn testSerializeCodexRulesEscapesQuoteTokens() {
+        // A command token that is a raw quote (e.g. from `tr -d "`) must be
+        // escaped, or codex fails to load the whole rules file with
+        // "unfinished string literal".
+        let rules = serde_json::json!([{"prefix": "tr -d \"", "permission": "Auto"}]);
+        let out = serialize_codex_rules_file(&rules);
+        assert!(
+            !out.contains("\"\"\""),
+            "unescaped quote token produced invalid `\"\"\"`: {out}"
+        );
+        assert!(
+            out.contains("\\\""),
+            "quote token should be backslash-escaped: {out}"
+        );
+    }
     use std::io::Write as _;
 
     fn writeTempYaml(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {

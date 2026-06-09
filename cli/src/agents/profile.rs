@@ -5,22 +5,14 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::registry::{BurnControlMechanism, ExecutionMechanism, ToolMechanism};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CapLevel {
     None = 0,
     Adapted = 1,
     Native = 2,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AdaptedMechanism {
-    LiveHook,
-    CompiledPolicy,
-    EnvVarProxy,
-    ConfigRewrite,
-    McpWrapping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,11 +22,16 @@ pub enum CoverageCeiling {
     Observed,
 }
 
+/// Observed state of one governance surface. Generic over `M`, the surface's
+/// own mechanism enum (`ExecutionMechanism` / `ToolMechanism` /
+/// `BurnControlMechanism`) — the SAME enum the plan declares — so the realized
+/// mechanism and the planned mechanism are drawn from one vocabulary and cannot
+/// render a skew. There is intentionally no flat cross-surface "observed" enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SurfaceState {
+pub struct SurfaceState<M> {
     pub level: CapLevel,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mechanism: Option<AdaptedMechanism>,
+    pub mechanism: Option<M>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ceiling: Option<CoverageCeiling>,
     // True when the surface has nothing to do for this agent in the current
@@ -64,9 +61,9 @@ pub struct NativeEvidence {
 pub struct AgentProfile {
     pub agent_id: String,
     pub detected: bool,
-    pub execution: SurfaceState,
-    pub tool: SurfaceState,
-    pub burn_control: SurfaceState,
+    pub execution: SurfaceState<ExecutionMechanism>,
+    pub tool: SurfaceState<ToolMechanism>,
+    pub burn_control: SurfaceState<BurnControlMechanism>,
     pub managed_files: Vec<ManagedFileFingerprint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_reconciled: Option<DateTime<Utc>>,
@@ -88,7 +85,7 @@ fn is_native_evidence_empty(ev: &NativeEvidence) -> bool {
     ev.execution.is_none() && ev.tool.is_none() && ev.burn_control.is_none()
 }
 
-impl SurfaceState {
+impl<M> SurfaceState<M> {
     pub fn none() -> Self {
         Self {
             level: CapLevel::None,
@@ -107,7 +104,7 @@ impl SurfaceState {
         }
     }
 
-    pub fn adapted(mechanism: AdaptedMechanism) -> Self {
+    pub fn adapted(mechanism: M) -> Self {
         Self {
             level: CapLevel::Adapted,
             mechanism: Some(mechanism),
@@ -165,24 +162,31 @@ impl AgentProfile {
     }
 }
 
+impl NativeEvidence {
+    pub fn merge_missing_from(&mut self, other: Self) -> bool {
+        let mut changed = false;
+        if self.execution.is_none() && other.execution.is_some() {
+            self.execution = other.execution;
+            changed = true;
+        }
+        if self.tool.is_none() && other.tool.is_some() {
+            self.tool = other.tool;
+            changed = true;
+        }
+        if self.burn_control.is_none() && other.burn_control.is_some() {
+            self.burn_control = other.burn_control;
+            changed = true;
+        }
+        changed
+    }
+}
+
 impl std::fmt::Display for CapLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::None => write!(f, "none"),
             Self::Adapted => write!(f, "adapted"),
             Self::Native => write!(f, "native"),
-        }
-    }
-}
-
-impl std::fmt::Display for AdaptedMechanism {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::LiveHook => write!(f, "hook"),
-            Self::CompiledPolicy => write!(f, "policy"),
-            Self::EnvVarProxy => write!(f, "proxy"),
-            Self::ConfigRewrite => write!(f, "config"),
-            Self::McpWrapping => write!(f, "mcp"),
         }
     }
 }
@@ -197,9 +201,9 @@ mod tests {
         let profile = AgentProfile {
             agent_id: "claude-code".to_string(),
             detected: true,
-            execution: SurfaceState::adapted(AdaptedMechanism::LiveHook),
-            tool: SurfaceState::adapted(AdaptedMechanism::LiveHook),
-            burn_control: SurfaceState::adapted(AdaptedMechanism::EnvVarProxy),
+            execution: SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter),
+            tool: SurfaceState::adapted(ToolMechanism::LiveHookAdapter),
+            burn_control: SurfaceState::adapted(BurnControlMechanism::EnvVarProxy),
             managed_files: vec![ManagedFileFingerprint {
                 path: "~/.claude/settings.json".to_string(),
                 content_hash: "abc123".to_string(),
@@ -223,8 +227,10 @@ mod tests {
         assert_eq!(restored.execution.level, CapLevel::Adapted);
         assert_eq!(
             restored.execution.mechanism,
-            Some(AdaptedMechanism::LiveHook)
+            Some(ExecutionMechanism::LiveHookAdapter)
         );
+        // Back-compat: the on-disk string stayed "live_hook" across the rename.
+        assert!(json.contains("\"live_hook\""));
         assert_eq!(restored.burn_control.level, CapLevel::Adapted);
         assert!(restored.last_native_seen.is_none());
         assert!(restored.native_evidence.burn_control.is_some());
@@ -263,5 +269,27 @@ mod tests {
         assert!(!profile.detected);
         assert_eq!(profile.execution.level, CapLevel::None);
         assert_eq!(profile.version, 1);
+    }
+
+    #[test]
+    fn testNativeEvidenceMergePreservesExistingSurfaceTimestamp() {
+        let existing = Utc::now();
+        let incoming = existing + chrono::Duration::seconds(10);
+        let mut evidence = NativeEvidence {
+            execution: Some(existing),
+            tool: None,
+            burn_control: None,
+        };
+
+        let changed = evidence.merge_missing_from(NativeEvidence {
+            execution: Some(incoming),
+            tool: Some(incoming),
+            burn_control: None,
+        });
+
+        assert!(changed);
+        assert_eq!(evidence.execution, Some(existing));
+        assert_eq!(evidence.tool, Some(incoming));
+        assert_eq!(evidence.burn_control, None);
     }
 }

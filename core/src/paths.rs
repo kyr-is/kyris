@@ -213,6 +213,15 @@ pub fn approvals_log_path() -> PathBuf {
     state_dir().join("approvals.jsonl")
 }
 
+/// `~/.local/state/kyris/prompts.jsonl` — append-only operational evidence for
+/// every approval prompt attempt: held, rendered, not shown, displayed via CLI,
+/// and resolved. This complements `approvals.jsonl`, which records user
+/// decisions for recall/catalog mining.
+#[must_use]
+pub fn prompts_log_path() -> PathBuf {
+    state_dir().join("prompts.jsonl")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -290,48 +290,6 @@ pub fn merge_toml_string_entries(
     changed
 }
 
-/// Remove all entries whose keys are in `keys` from the TOML table at
-/// `table_path`. Removes the table itself (and any now-empty parent tables
-/// in `table_path`) when it becomes empty. Returns `true` if anything changed.
-pub fn remove_toml_table_entries(
-    root: &mut toml::Value,
-    table_path: &[&str],
-    keys: Option<&[&str]>,
-) -> bool {
-    if table_path.is_empty() {
-        return false;
-    }
-    // Navigate to the parent of the target table so we can prune upward.
-    let mut cursor = root;
-    for key in &table_path[..table_path.len() - 1] {
-        let Some(next) = as_toml_table(cursor).get_mut(*key) else {
-            return false;
-        };
-        cursor = next;
-    }
-    let leaf = table_path[table_path.len() - 1];
-    let table = as_toml_table(cursor);
-    let Some(target) = table.get_mut(leaf) else {
-        return false;
-    };
-    match keys {
-        Some(remove_keys) => {
-            let t = as_toml_table(target);
-            let mut changed = false;
-            for k in remove_keys {
-                if t.remove(*k).is_some() {
-                    changed = true;
-                }
-            }
-            if t.is_empty() {
-                table.remove(leaf);
-            }
-            changed
-        }
-        None => table.remove(leaf).is_some(),
-    }
-}
-
 pub fn find_upwards(relative_path: &str) -> Option<PathBuf> {
     let mut current = std::env::current_dir().ok()?;
     loop {

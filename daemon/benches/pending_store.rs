@@ -16,6 +16,7 @@ fn bench_hold(c: &mut Criterion) {
                 format!("tok-{i}"),
                 "github".into(),
                 Some("read_file".into()),
+                None,
                 true,
             );
             i += 1;
@@ -29,7 +30,14 @@ fn bench_claim_complete(c: &mut Criterion) {
         let mut i = 0u64;
         b.iter(|| {
             let id = format!("req-{i}");
-            let _rx = store.hold(id.clone(), format!("tok-{i}"), "github".into(), None, true);
+            let _rx = store.hold(
+                id.clone(),
+                format!("tok-{i}"),
+                "github".into(),
+                None,
+                None,
+                true,
+            );
             let claim = store.claim(black_box(&id)).unwrap();
             store.complete_claim(claim, true);
             i += 1;
@@ -45,8 +53,14 @@ fn bench_prune(c: &mut Criterion) {
                 let store = PendingStore::new();
                 for j in 0..100u64 {
                     let id = format!("req-{j}");
-                    let _rx =
-                        store.hold(id.clone(), format!("tok-{j}"), "github".into(), None, true);
+                    let _rx = store.hold(
+                        id.clone(),
+                        format!("tok-{j}"),
+                        "github".into(),
+                        None,
+                        None,
+                        true,
+                    );
                     let claim = store.claim(&id).unwrap();
                     store.complete_claim(claim, true);
                 }
@@ -68,13 +82,21 @@ fn bench_list_held(c: &mut Criterion) {
             format!("tok-{i}"),
             "github".into(),
             Some("read_file".into()),
+            None,
             true,
         );
         receivers.push(rx);
     }
     for i in 50..100u64 {
         let id = format!("req-{i}");
-        let _rx = store.hold(id.clone(), format!("tok-{i}"), "github".into(), None, true);
+        let _rx = store.hold(
+            id.clone(),
+            format!("tok-{i}"),
+            "github".into(),
+            None,
+            None,
+            true,
+        );
         let claim = store.claim(&id).unwrap();
         store.complete_claim(claim, true);
     }

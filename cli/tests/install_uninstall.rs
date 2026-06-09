@@ -78,8 +78,10 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
             .exists()
     );
 
-    // Prestage wrote env files for detected agents
-    assert!(home.join(".kyris").join("env").join("load.sh").exists());
+    // Prestage wrote the per-agent env file, but NOT a shell-RC env loader: the
+    // PATH shim sources the agent env file directly, so load.sh and its
+    // ~/.zshrc / ~/.bashrc source line are gone.
+    assert!(!home.join(".kyris").join("env").join("load.sh").exists());
     assert!(
         home.join(".kyris")
             .join("env")
@@ -87,10 +89,10 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
             .exists()
     );
 
-    // Shell rc files updated
+    // Shell rc files updated for hooks — but no env loader line.
     let zshrc_after = fs::read_to_string(home.join(".zshrc")).expect("read .zshrc");
     assert!(zshrc_after.contains("source \"$HOME/.kyris/hooks/zsh_hook.sh\""));
-    assert!(zshrc_after.contains("source \"$HOME/.kyris/env/load.sh\""));
+    assert!(!zshrc_after.contains("env/load.sh"));
 
     let zshenv_after = fs::read_to_string(home.join(".zshenv")).expect("read .zshenv");
     assert!(zshenv_after.contains("source \"$HOME/.kyris/hooks/zshenv_hook.sh\""));
@@ -98,7 +100,7 @@ fn test_install_then_uninstall_restores_hooks_and_native_integrations() {
     let bashrc_after = fs::read_to_string(home.join(".bashrc")).expect("read .bashrc");
     assert!(bashrc_after.contains("source \"$HOME/.kyris/hooks/bash_hook.sh\""));
     assert!(bashrc_after.contains("export BASH_ENV=\"$HOME/.kyris/hooks/bash_env.sh\""));
-    assert!(bashrc_after.contains("source \"$HOME/.kyris/env/load.sh\""));
+    assert!(!bashrc_after.contains("env/load.sh"));
 
     let bash_profile_after =
         fs::read_to_string(home.join(".bash_profile")).expect("read .bash_profile");

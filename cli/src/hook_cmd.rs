@@ -15,7 +15,7 @@ use std::io::Read as _;
 use kyris_agentpact_client::{self as pact_client, ApprovalResponse, McpPermissionDecision};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
-use crate::agents::registry::{self, AllowResponse, HookProtocol, ToolMapping};
+use crate::agents::registry::{self, AllowResponse, DetailPassThrough, HookProtocol, ToolMapping};
 
 #[derive(Args)]
 pub struct HookArgs {
@@ -166,6 +166,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
                 tty,
                 &sock_path,
                 socket_timeout,
+                approval_id,
                 approval_token,
                 seg,
                 allow_always,
@@ -269,6 +270,7 @@ fn tty_prompt_segment(
     tty: &std::fs::File,
     sock_path: &str,
     socket_timeout: std::time::Duration,
+    approval_id: &str,
     approval_token: &str,
     seg: &str,
     allow_always: bool,
@@ -281,10 +283,32 @@ fn tty_prompt_segment(
     } else {
         "[y/n]"
     };
+    kyris_core::prompt_log::record_now(
+        approval_id,
+        "tty",
+        "displayed",
+        "shell",
+        Some(seg),
+        Some(seg),
+        "unknown",
+        allow_always,
+        None,
+    );
     eprint!("\x1b[33m[kyris] allow?\x1b[0m {seg} {choices} ");
     let _ = std::io::stderr().flush();
 
     let Some(answer) = read_tty_line(tty) else {
+        kyris_core::prompt_log::record_now(
+            approval_id,
+            "tty",
+            "read_failed",
+            "shell",
+            Some(seg),
+            Some(seg),
+            "unknown",
+            allow_always,
+            Some("tty_error"),
+        );
         deny_ask_immediately(approval_token, sock_path, socket_timeout);
         return PopupResult::Blocked {
             exit_code: 2,
@@ -306,6 +330,22 @@ fn tty_prompt_segment(
         }
         _ => (ApprovalResponse::Denied, "user_denied"),
     };
+    let outcome = match response {
+        ApprovalResponse::Approved => "approved",
+        ApprovalResponse::Always => "always",
+        ApprovalResponse::Denied => "denied",
+    };
+    kyris_core::prompt_log::record_now(
+        approval_id,
+        "tty",
+        "decision_submitted",
+        "shell",
+        Some(seg),
+        Some(seg),
+        "unknown",
+        allow_always,
+        Some(outcome),
+    );
 
     match pact_client::send_permission_response(
         sock_path,
@@ -417,6 +457,7 @@ fn discover_agent_pid() -> Option<u32> {
     None
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_check(args: HookCheckArgs) {
     let agent = &args.agent;
     let hook_id = generate_hook_id();
@@ -479,6 +520,31 @@ fn run_check(args: HookCheckArgs) {
         .map(str::to_string);
 
     let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
+
+    // Fast-path: agent-internal commands that are expressed through otherwise
+    // governable tools. They are not the user's requested side effect, so
+    // sending them to agentpactd would both produce noisy audit events and, for
+    // Codex shell snapshots, deny ordinary commands before their real command
+    // is evaluated.
+    if let Some(proto) = protocol.as_ref()
+        && let Some(pass) = matching_detail_pass_through(proto, &action, &detail)
+    {
+        audit_log_hook(
+            audit_conn.as_ref(),
+            &hook_id,
+            agent,
+            &action,
+            &detail,
+            None,
+            "allow",
+            &pass.reason,
+            None,
+            agent_prompt_for(&proto.allow_response),
+            started_at.elapsed(),
+        );
+        emit_allow(&proto.allow_response);
+        std::process::exit(0);
+    }
 
     // Fast-path: tools that do not reach agentpactd. Returns here only when the
     // tool IS governable; otherwise it audits, emits, and exits the process.
@@ -1333,6 +1399,20 @@ fn map_payload(protocol: Option<&HookProtocol>, input: &serde_json::Value) -> (S
     (action.to_string(), detail)
 }
 
+fn matching_detail_pass_through<'a>(
+    protocol: &'a HookProtocol,
+    action: &str,
+    detail: &str,
+) -> Option<&'a DetailPassThrough> {
+    protocol.detail_pass_throughs.iter().find(|pass| {
+        pass.action == action
+            && pass
+                .detail_contains
+                .iter()
+                .all(|needle| detail.contains(needle))
+    })
+}
+
 fn extract_detail(
     protocol: &HookProtocol,
     mapping: Option<&ToolMapping>,
@@ -1755,6 +1835,7 @@ mod tests {
                 detail_key: Some("command".to_string()),
             }],
             pass_through_tools: Vec::new(),
+            detail_pass_throughs: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -1775,6 +1856,7 @@ mod tests {
                 detail_key: Some("command".to_string()),
             }],
             pass_through_tools: Vec::new(),
+            detail_pass_throughs: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -1796,6 +1878,7 @@ mod tests {
                 detail_key: None,
             }],
             pass_through_tools: Vec::new(),
+            detail_pass_throughs: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -1812,6 +1895,7 @@ mod tests {
             detail_fields: vec!["tool_input".to_string()],
             tool_mappings: vec![],
             pass_through_tools: Vec::new(),
+            detail_pass_throughs: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         };
@@ -1922,6 +2006,22 @@ mod tests {
         let (action, detail) = map_payload(Some(&proto), &input);
         assert_eq!(action, "execute");
         assert_eq!(detail, "cargo build --release");
+        assert!(matching_detail_pass_through(&proto, &action, &detail).is_none());
+    }
+
+    #[test]
+    fn testCodexCliShellSnapshotPayloadPassesThrough() {
+        let proto = agent_protocol("codex-cli");
+        let input = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "if . '/Users/me/.codex/shell_snapshots/abc.sh' > /dev/null 2>&1\nthen\n\t:\nfi"}
+        });
+        let (action, detail) = map_payload(Some(&proto), &input);
+        assert_eq!(action, "execute");
+        assert!(matching_detail_pass_through(&proto, &action, &detail).is_some());
+
+        let direct = ". '/Users/me/.codex/shell_snapshots/abc.sh' > /dev/null 2>&1";
+        assert!(matching_detail_pass_through(&proto, "execute", direct).is_some());
     }
 
     #[test]

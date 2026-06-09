@@ -64,6 +64,29 @@ __kyris_running_under_governed_agent() {
     return 1
 }
 
+__kyris_codex_shell_snapshot_active() {
+    local cmd="$1"
+    local src
+    if [ -n "${__KYRIS_CODEX_SNAPSHOT_ACTIVE:-}" ]; then
+        if [ -n "${BASH_SOURCE[1]:-}" ]; then
+            return 0
+        fi
+        unset __KYRIS_CODEX_SNAPSHOT_ACTIVE
+    fi
+    case "$cmd" in
+        *".codex/shell_snapshots/"*|*"__CODEX_SNAPSHOT_"*)
+            __KYRIS_CODEX_SNAPSHOT_ACTIVE=1
+            return 0
+            ;;
+    esac
+    for src in "${BASH_SOURCE[@]}"; do
+        case "$src" in
+            *".codex/shell_snapshots/"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 if ! __kyris_running_under_governed_agent; then
     return 0 2>/dev/null || exit 0
 fi
@@ -78,6 +101,10 @@ trap '__kyris_preexec "$BASH_COMMAND"' DEBUG
 
 __kyris_preexec() {
     local cmd="$1"
+
+    if __kyris_codex_shell_snapshot_active "$cmd"; then
+        return 0
+    fi
 
     # Govern the AGENT's commands, not the shell's own startup-file sourcing
     # (/etc/profile, ~/.bashrc, …). The DEBUG trap (extdebug) fires on those too,

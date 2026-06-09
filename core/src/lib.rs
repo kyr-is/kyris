@@ -32,4 +32,5 @@ pub mod paths;
 #[cfg(feature = "pending")]
 pub mod pending;
 pub mod pricing_cache;
+pub mod prompt_log;
 pub mod secret;

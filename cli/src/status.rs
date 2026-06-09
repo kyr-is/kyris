@@ -5,6 +5,8 @@ use regex::Regex;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use crate::agents::profile::{CapLevel, SurfaceState};
+use crate::agents::registry::{MechanismLabel, plan_label};
 use crate::service::{ServiceKind, service_state};
 use crate::state::{bin_dir, load_config};
 
@@ -64,31 +66,44 @@ fn check_kyrisd() {
     );
 }
 
-fn check_native_integrations() {
-    use crate::agents::profile::{AdaptedMechanism, CapLevel};
+/// Compact `none`/`native`/`n/a`/<mechanism> cell for one surface.
+fn surface_cell<M: MechanismLabel>(s: &SurfaceState<M>) -> String {
+    if s.not_applicable {
+        return "n/a".into();
+    }
+    match s.level {
+        CapLevel::None => "none".into(),
+        CapLevel::Native => "native".into(),
+        CapLevel::Adapted => match &s.mechanism {
+            Some(m) => m.short().to_string(),
+            None => "adapted".into(),
+        },
+    }
+}
 
+/// A surface is "fully live" (in-band mediation, marker `+`) when it is
+/// inert (None/Native) or realized via an in-band mechanism — as opposed to a
+/// degraded compiled-policy / config-rewrite realization (marker `~`).
+fn surface_fully_live<M: MechanismLabel>(s: &SurfaceState<M>) -> bool {
+    s.level == CapLevel::None
+        || s.level == CapLevel::Native
+        || s.mechanism.as_ref().is_some_and(MechanismLabel::is_in_band)
+}
+
+fn check_native_integrations() {
     for agent in crate::agents::registry::all_agents() {
         let probe = agent.probe();
         if !probe.detected {
             continue;
         }
-        let exec_ok = probe.execution.level != CapLevel::None;
-        let tool_ok = probe.tool.level != CapLevel::None;
-        let burn_ok = probe.burn_control.level != CapLevel::None;
-        let all_live = [&probe.execution, &probe.tool, &probe.burn_control]
-            .iter()
-            .all(|s| {
-                s.level == CapLevel::None
-                    || s.level == CapLevel::Native
-                    || matches!(
-                        s.mechanism,
-                        Some(
-                            AdaptedMechanism::LiveHook
-                                | AdaptedMechanism::EnvVarProxy
-                                | AdaptedMechanism::McpWrapping
-                        )
-                    )
-            });
+        let plan = agent.integration_plan();
+        let exec_ok = probe.execution.level != CapLevel::None || probe.execution.not_applicable;
+        let tool_ok = probe.tool.level != CapLevel::None || probe.tool.not_applicable;
+        let burn_ok =
+            probe.burn_control.level != CapLevel::None || probe.burn_control.not_applicable;
+        let all_live = surface_fully_live(&probe.execution)
+            && surface_fully_live(&probe.tool)
+            && surface_fully_live(&probe.burn_control);
         let marker = if !exec_ok || !tool_ok || !burn_ok {
             "-"
         } else if all_live {
@@ -96,23 +111,39 @@ fn check_native_integrations() {
         } else {
             "~"
         };
-        let fmt = |s: &crate::agents::profile::SurfaceState| -> String {
-            match s.level {
-                CapLevel::None => "none".into(),
-                CapLevel::Native => "native".into(),
-                CapLevel::Adapted => match &s.mechanism {
-                    Some(m) => format!("{m}"),
-                    None => "adapted".into(),
-                },
-            }
-        };
-        println!(
-            "  [{marker}] {:<14} cmd:{:<7} mcp:{:<7} burn:{}",
-            agent.id(),
-            fmt(&probe.execution),
-            fmt(&probe.tool),
-            fmt(&probe.burn_control),
+        let exec = format!(
+            "{}/{}",
+            surface_cell(&probe.execution),
+            plan_label(plan.execution)
         );
+        let tool = format!("{}/{}", surface_cell(&probe.tool), plan_label(plan.tool));
+        let burn = format!(
+            "{}/{}",
+            surface_cell(&probe.burn_control),
+            plan_label(plan.burn_control)
+        );
+        println!(
+            "  [{marker}] {:<14} cmd:{:<13} mcp:{:<13} burn:{}",
+            agent.id(),
+            exec,
+            tool,
+            burn,
+        );
+
+        // Drift: the tool surface is wrapped, but extra MCP server(s) were added
+        // after setup and aren't routed through kyris yet. The configure-time
+        // rewrite never saw them; a reconcile will pick them up.
+        if probe.tool.level == CapLevel::Adapted {
+            let unwrapped = crate::agents::configure::unwrapped_mcp_server_names(agent.as_ref());
+            if !unwrapped.is_empty() {
+                println!(
+                    "  [!] {}: MCP server(s) not routed through kyris: {} — run `kyris agents reconcile {}`",
+                    agent.id(),
+                    unwrapped.join(", "),
+                    agent.id()
+                );
+            }
+        }
     }
 
     check_compiled_policy_degradation();

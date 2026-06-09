@@ -22,13 +22,15 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct CodexConfigShape {
-    /// Kyris sets this to its local routing endpoint (e.g. <http://127.0.0.1:4710/v1>).
+    /// Deprecated Kyris routing key. Still accepted so cleanup/migration can
+    /// validate configs left behind by older installs.
     pub openai_base_url: Option<String>,
     /// Kyris adds a `kyris` entry under this map; codex may have other entries.
     pub model_providers: Option<HashMap<String, ModelProvider>>,
     /// Kyris rewrites entries here to proxy through `kyris-mcp`.
     pub mcp_servers: Option<HashMap<String, McpServer>>,
-    /// Kyris flips `codex_hooks` to enable hook integration.
+    /// Kyris flips `hooks` to enable hook integration. `codex_hooks` is accepted
+    /// as a deprecated alias for older configs.
     pub features: Option<Features>,
     /// Everything else codex defines — preserved without validation.
     #[serde(flatten)]
@@ -43,6 +45,9 @@ pub struct ModelProvider {
     /// Renamed in some codex versions; treat as optional so kyris doesn't fail
     /// to validate if codex moved this elsewhere.
     pub experimental_bearer_token: Option<String>,
+    pub http_headers: Option<HashMap<String, String>>,
+    pub requires_openai_auth: Option<bool>,
+    pub supports_websockets: Option<bool>,
     #[serde(flatten)]
     pub _rest: HashMap<String, toml::Value>,
 }
@@ -59,6 +64,7 @@ pub struct McpServer {
 
 #[derive(Debug, Deserialize)]
 pub struct Features {
+    pub hooks: Option<bool>,
     pub codex_hooks: Option<bool>,
     #[serde(flatten)]
     pub _rest: HashMap<String, toml::Value>,
@@ -76,20 +82,24 @@ mod tests {
     #[test]
     fn testAcceptsTypicalKyrisModifiedConfig() {
         let toml = r#"
-            openai_base_url = "http://127.0.0.1:4710/v1"
+            model_provider = "kyris"
 
             [model_providers.kyris]
             name = "Kyris"
             base_url = "http://127.0.0.1:4710/v1"
             wire_api = "responses"
-            experimental_bearer_token = "sk-kyris-abc"
+            requires_openai_auth = true
+            supports_websockets = false
+
+            [model_providers.kyris.http_headers]
+            x-kyris-inbound = "sk-kyris-abc"
 
             [mcp_servers.foo]
             command = "kyris-mcp"
             args = ["--upstream", "foo"]
 
             [features]
-            codex_hooks = true
+            hooks = true
         "#;
         validator()
             .validate(toml)
@@ -120,7 +130,7 @@ mod tests {
             future_provider_field = true
 
             [features]
-            codex_hooks = true
+            hooks = true
             future_feature = "ok"
         "#;
         validator()
@@ -130,10 +140,10 @@ mod tests {
 
     #[test]
     fn testRejectsWrongTypeForOwnedField() {
-        // codex_hooks must be bool — string fails
+        // hooks must be bool — string fails
         let toml = r#"
             [features]
-            codex_hooks = "yes"
+            hooks = "yes"
         "#;
         validator()
             .validate(toml)

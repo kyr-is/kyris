@@ -42,6 +42,78 @@ fn run_setup(home: &Path, cwd: &Path, agent: &str) -> std::process::Output {
         .expect("run kyris agents setup")
 }
 
+/// An unknown `--set` key is rejected fail-fast, before any side effects, so it
+/// can't be silently stored and ignored (false confidence).
+#[test]
+fn test_setup_rejects_unknown_set_key() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    write_kyrisd_config(home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris"))
+        .current_dir(home)
+        .env("HOME", home)
+        .args([
+            "agents",
+            "setup",
+            "claude-code",
+            "--set",
+            "max-budget-usd=50",
+        ])
+        .output()
+        .expect("run kyris agents setup");
+
+    assert!(
+        !output.status.success(),
+        "unknown --set key should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Unknown --set key 'max-budget-usd'"),
+        "expected unknown-key error, got: {stderr}"
+    );
+    // Validation runs before any config write — settings.json must not exist.
+    assert!(
+        !home.join(".claude").join("settings.json").exists(),
+        "setup must reject before writing settings.json"
+    );
+}
+
+/// agentpactd down → setup reports an error (not success) naming agentpactd:
+/// command/MCP governance can't enforce without it, so "setup succeeded" would
+/// be false confidence.
+#[test]
+fn test_setup_errors_when_agentpactd_unreachable() {
+    let temp_home = TempDir::new().expect("temp home");
+    let home = temp_home.path();
+    fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    write_kyrisd_config(home);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_kyris"))
+        .current_dir(home)
+        .env("HOME", home)
+        // Force agentpactd unreachable deterministically, independent of host env.
+        .env("AGENTPACT_SOCK", home.join("nonexistent-agentpact.sock"))
+        .args(["agents", "setup", "claude-code"])
+        .output()
+        .expect("run kyris agents setup");
+
+    assert!(
+        !output.status.success(),
+        "setup must exit non-zero when agentpactd is unreachable"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agentpactd unreachable"),
+        "expected agentpactd to be surfaced, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("UNGOVERNED"),
+        "expected the ungoverned warning, got: {stderr}"
+    );
+}
+
 /// When the agent is not installed (no ~/.claude/settings.json), setup exits
 /// with an error as soon as the health check fails. No files are modified.
 #[test]
@@ -111,14 +183,27 @@ args = ["-y", "server"]
 
     // Execution surface was configured and stays configured.
     assert!(
-        config_content.contains("codex_hooks = true"),
+        config_content.contains("hooks = true"),
         "execution-surface change should be kept, got: {config_content}"
     );
 
     // Burn-control and MCP changes are also kept (no rollback).
     assert!(
-        config_content.contains("kyris-mcp") || config_content.contains("openai_base_url"),
+        config_content.contains("kyris-mcp")
+            || config_content.contains("model_provider = \"kyris\"")
+            || config_content.contains("[model_providers.kyris]"),
         "burn-control changes should be kept, got: {config_content}"
+    );
+
+    // Codex does not use a PATH shim; kyris marks governed subprocesses
+    // through Codex's shell environment policy instead.
+    assert!(
+        config_content.contains("KYRIS_GOVERNED_SUBPROCESS"),
+        "Codex shell-environment marker should be kept, got: {config_content}"
+    );
+    assert!(
+        !home.join(".kyris").join("bin").join("codex").exists(),
+        "Codex setup should not install a PATH shim"
     );
 
     // Original MCP server is still present (kyris wraps it, not replaces it).

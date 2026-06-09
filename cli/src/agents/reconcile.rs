@@ -4,9 +4,9 @@ use chrono::Utc;
 use std::path::Path;
 
 use crate::lifecycle::log::InstallLog;
-use crate::state::{kyris_home, load_agent_profile, save_agent_profile};
+use crate::state::{agents_dir, load_agent_profile, save_agent_profile};
 
-use super::profile::{AgentProfile, CapLevel};
+use super::profile::{AgentProfile, CapLevel, NativeEvidence, SurfaceState};
 use super::registry::{self, AgentDescriptor};
 
 fn was_configured(agent_id: &str) -> bool {
@@ -24,10 +24,6 @@ const DEBOUNCE_SECONDS: i64 = 300;
 
 fn last_reconcile_path() -> Result<std::path::PathBuf, String> {
     Ok(agents_dir()?.join(".last-reconcile"))
-}
-
-fn agents_dir() -> Result<std::path::PathBuf, String> {
-    Ok(kyris_home()?.join("agents"))
 }
 
 fn native_seen_path(agent_id: &str) -> Result<std::path::PathBuf, String> {
@@ -58,6 +54,29 @@ fn check_native_breadcrumb(agent_id: &str) -> Option<chrono::DateTime<Utc>> {
     let path = native_seen_path(agent_id).ok()?;
     let contents = std::fs::read_to_string(path).ok()?;
     contents.trim().parse().ok()
+}
+
+fn collect_native_evidence(agent: &dyn AgentDescriptor) -> NativeEvidence {
+    let mut evidence = agent.native_evidence();
+    if evidence.burn_control.is_none() {
+        evidence.burn_control = check_native_breadcrumb(agent.id());
+    }
+    evidence
+}
+
+fn promote_surface<M>(
+    surface: &mut SurfaceState<M>,
+    should_promote: bool,
+    undo: impl FnOnce() -> Result<(), String>,
+) -> Result<bool, String> {
+    if !should_promote || surface.level == CapLevel::Native {
+        return Ok(false);
+    }
+    if surface.level == CapLevel::Adapted {
+        undo()?;
+    }
+    *surface = SurfaceState::native();
+    Ok(true)
 }
 
 fn file_contains_marker(path: &Path, markers: &[&str]) -> bool {
@@ -104,6 +123,53 @@ pub fn reconcile_one(agent_id: &str) -> Result<AgentProfile, String> {
     Ok(profile)
 }
 
+/// Read-only status snapshot for every agent: load the persisted profile and
+/// merge it with a fresh probe of the current on-disk state, WITHOUT
+/// configuring, repairing, promoting, or persisting anything.
+///
+/// `kyris agents status` uses this so an inspection command never mutates the
+/// user's agent configs, never installs a shim, never runs `load_or_init_config`
+/// (which would create `kyrisd.yaml`), and never resets `last_reconciled` —
+/// which would mask a stopped reconcile daemon. Ongoing reconcile is the job of
+/// the daemon's reconcile watcher (`daemon/src/reconcile_watcher.rs`) plus the
+/// explicit `kyris agents setup` / `kyris agents reconcile` / `kyris install`.
+pub fn status_snapshot_all() -> ReconcileResult {
+    let mut results = Vec::new();
+    for agent in registry::all_agents() {
+        let profile = status_snapshot_agent(agent.as_ref())?;
+        results.push((agent, profile));
+    }
+    Ok(results)
+}
+
+fn status_snapshot_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, String> {
+    let mut profile =
+        load_agent_profile(agent.id())?.unwrap_or_else(|| AgentProfile::new_empty(agent.id()));
+    let probe = agent.probe();
+
+    if !probe.detected {
+        // Reflect not-detected in the returned snapshot without persisting it.
+        profile.detected = false;
+        profile.managed_files.clear();
+        return Ok(profile);
+    }
+
+    profile.detected = true;
+    // Take surface states from the probe, preserving Native levels the probe
+    // cannot observe (it only sees filesystem artifacts, not live protocol).
+    if profile.execution.level != CapLevel::Native {
+        profile.execution = probe.execution;
+    }
+    if profile.tool.level != CapLevel::Native {
+        profile.tool = probe.tool;
+    }
+    if profile.burn_control.level != CapLevel::Native {
+        profile.burn_control = probe.burn_control;
+    }
+    profile.managed_files = probe.managed_files;
+    Ok(profile)
+}
+
 #[allow(clippy::too_many_lines)]
 fn reconcile_agent(
     agent: &dyn AgentDescriptor,
@@ -126,14 +192,29 @@ fn reconcile_agent(
 
     profile.detected = true;
 
-    let burn_control_native = profile.burn_control.level == CapLevel::Native;
+    // Migrate legacy single-field native evidence to per-surface, then collect
+    // current runtime evidence before any auto-configure/repair step so proven
+    // native surfaces are not reinstalled as adapted.
+    profile.migrate_native_evidence();
+    profile
+        .native_evidence
+        .merge_missing_from(collect_native_evidence(agent));
+
+    let execution_native =
+        profile.execution.level == CapLevel::Native || profile.native_evidence.execution.is_some();
+    let tool_native =
+        profile.tool.level == CapLevel::Native || profile.native_evidence.tool.is_some();
+    let burn_control_native = profile.burn_control.level == CapLevel::Native
+        || profile.native_evidence.burn_control.is_some();
 
     // Auto-configure: agent is present but has never been configured.
     // Skip if the user explicitly disabled this agent via `kyris agents undo`.
     if !was_configured(agent.id()) && !profile.disabled {
-        match super::configure::configure_agent(
+        match super::configure::configure_agent_surfaces(
             agent.id(),
             &profile.agent_specific,
+            execution_native,
+            tool_native,
             burn_control_native,
             log,
         ) {
@@ -175,9 +256,11 @@ fn reconcile_agent(
     }
 
     if needs_repair {
-        match super::configure::configure_agent(
+        match super::configure::configure_agent_surfaces(
             agent.id(),
             &profile.agent_specific,
+            execution_native,
+            tool_native,
             burn_control_native,
             log,
         ) {
@@ -201,59 +284,66 @@ fn reconcile_agent(
         probe.managed_files = updated.managed_files;
     }
 
-    // Migrate legacy single-field native evidence to per-surface.
-    profile.migrate_native_evidence();
-
-    // Check for native protocol promotion via kyrisd breadcrumb.
-    // The breadcrumb (x-kyris-trace-token on LLM path) only proves
-    // burn-control nativeness. Execution and tool surfaces need their own
-    // evidence sources when agents add native AgentPact support.
-    if let Some(ts) = check_native_breadcrumb(agent.id())
-        && profile.native_evidence.burn_control.is_none()
-    {
-        profile.native_evidence.burn_control = Some(ts);
-    }
-
     // Update surface states from probe, preserving native levels that the
     // probe cannot detect (probe only sees filesystem artifacts, not protocol).
-    profile.execution = probe.execution;
-    profile.tool = probe.tool;
+    if profile.execution.level != CapLevel::Native {
+        profile.execution = probe.execution;
+    }
+    if profile.tool.level != CapLevel::Native {
+        profile.tool = probe.tool;
+    }
     if profile.burn_control.level != CapLevel::Native {
         profile.burn_control = probe.burn_control;
     }
 
     // Per-surface native promotion: only promote surfaces with evidence.
-    if profile.native_evidence.burn_control.is_some() {
-        let (_, _, need_burn) = agent.expected_surfaces();
-        if need_burn && profile.burn_control.level == CapLevel::Adapted {
-            if let Err(e) = agent.undo_burn_control() {
-                eprintln!("Burn-control cleanup for {} failed: {e}", agent.id());
+    let (need_execution, need_tool, need_burn) = agent.expected_surfaces();
+    let promote_execution = need_execution && profile.native_evidence.execution.is_some();
+    let promote_tool = need_tool && profile.native_evidence.tool.is_some();
+    let promote_burn = need_burn && profile.native_evidence.burn_control.is_some();
+
+    let mut execution_changed = false;
+    let mut tool_changed = false;
+    let mut burn_changed = false;
+
+    match promote_surface(&mut profile.execution, promote_execution, || {
+        agent.undo_execution_surface()
+    }) {
+        Ok(promoted) => execution_changed = promoted,
+        Err(e) => eprintln!("Execution cleanup for {} failed: {e}", agent.id()),
+    }
+    match promote_surface(&mut profile.tool, promote_tool, || {
+        agent.undo_tool_surface()
+    }) {
+        Ok(promoted) => tool_changed = promoted,
+        Err(e) => eprintln!("Tool cleanup for {} failed: {e}", agent.id()),
+    }
+    match promote_surface(&mut profile.burn_control, promote_burn, || {
+        agent.undo_burn_control_surface()
+    }) {
+        Ok(promoted) => burn_changed = promoted,
+        Err(e) => eprintln!("Burn-control cleanup for {} failed: {e}", agent.id()),
+    }
+
+    if execution_changed || tool_changed || burn_changed {
+        if let Err(e) = super::configure::configure_agent_surfaces(
+            agent.id(),
+            &profile.agent_specific,
+            promote_execution,
+            promote_tool,
+            promote_burn,
+            log,
+        ) {
+            eprintln!("Re-configure {} after promotion failed: {e}", agent.id());
+            if let Some(l) = log {
+                l.error(&format!(
+                    "re-configure {} after promotion failed: {e}",
+                    agent.id()
+                ));
             }
-            if let Err(e) =
-                super::configure::configure_agent(agent.id(), &profile.agent_specific, true, log)
-            {
-                eprintln!("Re-configure {} after promotion failed: {e}", agent.id());
-                if let Some(l) = log {
-                    l.error(&format!(
-                        "re-configure {} after promotion failed: {e}",
-                        agent.id()
-                    ));
-                }
-            }
-            profile.burn_control = super::profile::SurfaceState::native();
-            let updated = agent.probe();
-            probe.managed_files = updated.managed_files;
         }
-    }
-    // Execution and tool promotion placeholders. No evidence source exists
-    // today — when native hook/MCP protocols arrive, AgentDescriptor will need
-    // dedicated `undo_execution()` / `undo_tool()` methods to remove adapted
-    // artifacts without tearing down other surfaces.
-    if profile.native_evidence.execution.is_some() && profile.execution.level == CapLevel::Adapted {
-        profile.execution = super::profile::SurfaceState::native();
-    }
-    if profile.native_evidence.tool.is_some() && profile.tool.level == CapLevel::Adapted {
-        profile.tool = super::profile::SurfaceState::native();
+        let updated = agent.probe();
+        probe.managed_files = updated.managed_files;
     }
 
     profile.managed_files = probe.managed_files;
@@ -296,5 +386,38 @@ mod tests {
         let path = temp.path().join("test.json");
         std::fs::write(&path, "anything").expect("write");
         assert!(!file_contains_marker(&path, &[]));
+    }
+
+    #[test]
+    fn testPromoteSurfaceRunsCleanupForAdaptedSurface() {
+        let mut surface =
+            SurfaceState::adapted(crate::agents::registry::ToolMechanism::McpWrapping);
+        let mut cleaned = false;
+
+        let promoted = promote_surface(&mut surface, true, || {
+            cleaned = true;
+            Ok(())
+        })
+        .expect("promotion");
+
+        assert!(promoted);
+        assert!(cleaned);
+        assert_eq!(surface.level, CapLevel::Native);
+    }
+
+    #[test]
+    fn testPromoteSurfaceDoesNotCleanupNoneSurface() {
+        let mut surface = SurfaceState::<crate::agents::registry::ToolMechanism>::none();
+        let mut cleaned = false;
+
+        let promoted = promote_surface(&mut surface, true, || {
+            cleaned = true;
+            Ok(())
+        })
+        .expect("promotion");
+
+        assert!(promoted);
+        assert!(!cleaned);
+        assert_eq!(surface.level, CapLevel::Native);
     }
 }

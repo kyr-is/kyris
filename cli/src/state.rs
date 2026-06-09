@@ -38,6 +38,8 @@ pub struct ManifestEntry {
     pub path: String,
     pub action: ManifestAction,
     pub component: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_created: bool,
     pub timestamp: String,
 }
 
@@ -223,7 +225,7 @@ pub fn write_managed_file(
         let existing = std::fs::read_to_string(path)
             .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         if existing == contents {
-            record_manifest_if_absent(path, ManifestAction::Created, component)?;
+            record_manifest_if_absent(path, ManifestAction::Created, component, true)?;
             return Ok(false);
         }
     }
@@ -234,7 +236,7 @@ pub fn write_managed_file(
 
     ensure_parent(path)?;
     atomic_write(path, contents.as_bytes(), mode)?;
-    record_manifest_if_absent(path, ManifestAction::Created, component)?;
+    record_manifest_if_absent(path, ManifestAction::Created, component, true)?;
     Ok(true)
 }
 
@@ -250,7 +252,7 @@ pub fn write_managed_bytes(
         let existing =
             std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         if existing == contents {
-            record_manifest_if_absent(path, ManifestAction::Created, component)?;
+            record_manifest_if_absent(path, ManifestAction::Created, component, true)?;
             return Ok(false);
         }
     }
@@ -264,7 +266,7 @@ pub fn write_managed_bytes(
 
     ensure_parent(path)?;
     atomic_write(path, contents, mode)?;
-    record_manifest_if_absent(path, ManifestAction::Created, component)?;
+    record_manifest_if_absent(path, ManifestAction::Created, component, true)?;
     Ok(true)
 }
 
@@ -294,27 +296,18 @@ pub fn write_managed_json(
             .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         if existing == contents {
             // Content already matches; ensure manifest entry is present.
-            let action = make_json_action(old, new, file_existed);
-            record_manifest_if_absent(path, action, component)?;
+            record_managed_json_edit(path, old, new, file_existed, component)?;
             return Ok(false);
         }
     }
 
     ensure_parent(path)?;
     atomic_write(path, contents.as_bytes(), mode)?;
-    let action = make_json_action(old, new, file_existed);
-    record_manifest_if_absent(path, action, component)?;
+    record_managed_json_edit(path, old, new, file_existed, component)?;
     Ok(true)
 }
 
-fn make_json_action(
-    old: &serde_json::Value,
-    new: &serde_json::Value,
-    file_existed: bool,
-) -> ManifestAction {
-    if !file_existed {
-        return ManifestAction::Created;
-    }
+fn make_json_action(old: &serde_json::Value, new: &serde_json::Value) -> ManifestAction {
     let ops = crate::json_patch_ops::diff(old, new);
     if ops.is_empty() {
         ManifestAction::Created
@@ -343,23 +336,18 @@ pub fn write_managed_toml(
         let existing = std::fs::read_to_string(path)
             .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
         if existing == contents {
-            let action = make_toml_action(old, new, file_existed);
-            record_manifest_if_absent(path, action, component)?;
+            record_managed_toml_edit(path, old, new, file_existed, component)?;
             return Ok(false);
         }
     }
 
     ensure_parent(path)?;
     atomic_write(path, contents.as_bytes(), mode)?;
-    let action = make_toml_action(old, new, file_existed);
-    record_manifest_if_absent(path, action, component)?;
+    record_managed_toml_edit(path, old, new, file_existed, component)?;
     Ok(true)
 }
 
-fn make_toml_action(old: &toml::Value, new: &toml::Value, file_existed: bool) -> ManifestAction {
-    if !file_existed {
-        return ManifestAction::Created;
-    }
+fn make_toml_action(old: &toml::Value, new: &toml::Value) -> ManifestAction {
     let ops = crate::toml_patch::diff(old, new);
     if ops.is_empty() {
         ManifestAction::Created
@@ -424,6 +412,7 @@ fn record_line_in_manifest(path: &Path, line: &str, component: &str) -> Result<(
             lines: vec![line.to_string()],
         },
         component: component.to_string(),
+        file_created: false,
         timestamp: Utc::now().to_rfc3339(),
     });
     save_manifest(&entries)
@@ -434,18 +423,128 @@ fn record_manifest_if_absent(
     path: &Path,
     action: ManifestAction,
     component: &str,
+    file_created: bool,
 ) -> Result<(), String> {
     let mut entries = load_manifest()?;
-    if entries.iter().any(|e| e.path == path_string(path)) {
+    if entries
+        .iter()
+        .any(|e| e.path == path_string(path) && e.component == component)
+    {
         return Ok(());
     }
     entries.push(ManifestEntry {
         path: path_string(path),
         action,
         component: component.to_string(),
+        file_created,
         timestamp: Utc::now().to_rfc3339(),
     });
     save_manifest(&entries)
+}
+
+/// Record (or extend) the manifest entry for a TOML config that kyris is
+/// editing, so uninstall can structurally unapply ALL of kyris's edits — even
+/// when kyris writes the same file multiple times during one setup.
+///
+/// `old_on_disk` is the file's current parsed content (what the caller read just
+/// before this edit); `new` is the value about to be written. On the first edit
+/// the on-disk content IS the pre-kyris original; on a later edit we reconstruct
+/// the true original by unapplying the ops already recorded, then re-diff
+/// original→new — so the entry always holds the complete original→final patch.
+/// No file backup is kept; only the structural diff (which `restore_manifest_entry`
+/// reverses). Used by [`write_managed_toml`] so EVERY agent that writes config
+/// via `write_toml_value` gets correct multi-write reversal for free.
+fn record_managed_toml_edit(
+    path: &Path,
+    old_on_disk: &toml::Value,
+    new: &toml::Value,
+    file_existed_before_kyris: bool,
+    component: &str,
+) -> Result<(), String> {
+    let mut entries = load_manifest()?;
+    let target = path_string(path);
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|e| e.path == target && e.component == component)
+    {
+        // Recompute this component's action against the TRUE original for this
+        // component, preserving unrelated component edits already in the file.
+        let new_action = match &entry.action {
+            ManifestAction::Created => None,
+            ManifestAction::TomlPatch { ops } => {
+                let mut original = old_on_disk.clone();
+                crate::toml_patch::unapply(&mut original, ops);
+                Some(make_toml_action(&original, new))
+            }
+            other => {
+                return Err(format!(
+                    "manifest entry for {} has unexpected action for a TOML edit: {other:?}",
+                    path.display()
+                ));
+            }
+        };
+        if let Some(action) = new_action {
+            entry.action = action;
+        }
+        save_manifest(&entries)
+    } else {
+        entries.push(ManifestEntry {
+            path: target,
+            action: make_toml_action(old_on_disk, new),
+            component: component.to_string(),
+            file_created: !file_existed_before_kyris,
+            timestamp: Utc::now().to_rfc3339(),
+        });
+        save_manifest(&entries)
+    }
+}
+
+/// JSON twin of [`record_managed_toml_edit`]: cumulatively records the
+/// `original→final` `JsonPatch` for a config kyris edits (possibly multiple
+/// times), reconstructing the true original from any ops already recorded. Used
+/// by [`write_managed_json`] so every agent writing config via `write_json_value`
+/// gets correct multi-write reversal. No file backup — only the structural diff.
+fn record_managed_json_edit(
+    path: &Path,
+    old_on_disk: &serde_json::Value,
+    new: &serde_json::Value,
+    file_existed_before_kyris: bool,
+    component: &str,
+) -> Result<(), String> {
+    let mut entries = load_manifest()?;
+    let target = path_string(path);
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|e| e.path == target && e.component == component)
+    {
+        let new_action = match &entry.action {
+            ManifestAction::Created => None,
+            ManifestAction::JsonPatch { ops } => {
+                let mut original = old_on_disk.clone();
+                crate::json_patch_ops::unapply(&mut original, ops);
+                Some(make_json_action(&original, new))
+            }
+            other => {
+                return Err(format!(
+                    "manifest entry for {} has unexpected action for a JSON edit: {other:?}",
+                    path.display()
+                ));
+            }
+        };
+        if let Some(action) = new_action {
+            entry.action = action;
+        }
+        save_manifest(&entries)
+    } else {
+        entries.push(ManifestEntry {
+            path: target,
+            action: make_json_action(old_on_disk, new),
+            component: component.to_string(),
+            file_created: !file_existed_before_kyris,
+            timestamp: Utc::now().to_rfc3339(),
+        });
+        save_manifest(&entries)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,7 +556,36 @@ fn record_manifest_if_absent(
 pub fn restore_manifest_entry(path: &Path) -> Result<bool, String> {
     let target = path_string(path);
     let mut entries = load_manifest()?;
-    let Some(index) = entries.iter().position(|e| e.path == target) else {
+    let matching: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, e)| (e.path == target).then_some(idx))
+        .collect();
+    if matching.is_empty() {
+        return Ok(false);
+    }
+    for index in matching.into_iter().rev() {
+        let entry = entries.remove(index);
+        unapply_entry(&entry)?;
+    }
+    if entries.is_empty() {
+        remove_if_exists(&manifest_path()?)?;
+    } else {
+        save_manifest(&entries)?;
+    }
+    cleanup_kyris_dirs()?;
+    Ok(true)
+}
+
+/// Unapply and remove the manifest entry for one component on `path`.
+/// Returns `Ok(true)` if a matching entry was found.
+pub fn restore_manifest_entry_component(path: &Path, component: &str) -> Result<bool, String> {
+    let target = path_string(path);
+    let mut entries = load_manifest()?;
+    let Some(index) = entries
+        .iter()
+        .position(|e| e.path == target && e.component == component)
+    else {
         return Ok(false);
     };
     let entry = entries.remove(index);
@@ -522,6 +650,7 @@ fn unapply_entry(entry: &ManifestEntry) -> Result<String, String> {
                 return Ok(format!("skipped {} (already absent)", entry.path));
             }
             unapply_json_file(&path, ops)?;
+            remove_empty_created_json_file(entry, &path)?;
             Ok(format!("unapplied JSON patch on {}", entry.path))
         }
         ManifestAction::TomlPatch { ops } => {
@@ -529,9 +658,38 @@ fn unapply_entry(entry: &ManifestEntry) -> Result<String, String> {
                 return Ok(format!("skipped {} (already absent)", entry.path));
             }
             unapply_toml_file(&path, ops)?;
+            remove_empty_created_toml_file(entry, &path)?;
             Ok(format!("unapplied TOML patch on {}", entry.path))
         }
     }
+}
+
+fn remove_empty_created_json_file(entry: &ManifestEntry, path: &Path) -> Result<(), String> {
+    if !entry.file_created || !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| format!("Cannot parse {}: {e}", path.display()))?;
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        remove_if_exists(path)?;
+    }
+    Ok(())
+}
+
+fn remove_empty_created_toml_file(entry: &ManifestEntry, path: &Path) -> Result<(), String> {
+    if !entry.file_created || !path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+    let value: toml::Value =
+        toml::from_str(&contents).map_err(|e| format!("Cannot parse {}: {e}", path.display()))?;
+    if value.as_table().is_some_and(toml::Table::is_empty) {
+        remove_if_exists(path)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -757,5 +915,51 @@ mod tests {
         let f = dir.path().join("out.txt");
         atomic_write(&f, b"hello", Some(0o644)).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "hello");
+    }
+
+    #[test]
+    fn testJsonPatchComponentUnapplyLeavesOtherComponentKeys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("settings.json");
+        std::fs::write(&f, r#"{"execution":true,"tool":true}"#).unwrap();
+
+        let entry = ManifestEntry {
+            path: f.to_string_lossy().to_string(),
+            action: make_json_action(
+                &serde_json::json!({"tool": true}),
+                &serde_json::json!({"execution": true, "tool": true}),
+            ),
+            component: "agent:execution".to_string(),
+            file_created: false,
+            timestamp: Utc::now().to_rfc3339(),
+        };
+
+        unapply_entry(&entry).unwrap();
+
+        let restored: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        assert_eq!(restored, serde_json::json!({"tool": true}));
+    }
+
+    #[test]
+    fn testCreatedJsonPatchDeletesFileWhenEmptyAfterUnapply() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("settings.json");
+        std::fs::write(&f, r#"{"execution":true}"#).unwrap();
+
+        let entry = ManifestEntry {
+            path: f.to_string_lossy().to_string(),
+            action: make_json_action(
+                &serde_json::json!({}),
+                &serde_json::json!({"execution": true}),
+            ),
+            component: "agent:execution".to_string(),
+            file_created: true,
+            timestamp: Utc::now().to_rfc3339(),
+        };
+
+        unapply_entry(&entry).unwrap();
+
+        assert!(!f.exists());
     }
 }

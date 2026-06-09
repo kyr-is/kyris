@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+pub mod capabilities;
 pub mod claude_code;
 pub mod cline;
 pub mod codex_cli;
@@ -76,7 +77,10 @@ pub fn run(args: AgentsArgs) {
 }
 
 fn run_status(agent: Option<String>) -> Result<(), String> {
-    let results = reconcile::reconcile_all(true, None)?;
+    // Status is read-only: snapshot persisted profile + live probe, never
+    // configure/repair/persist. Mutating reconcile is the daemon's job (plus
+    // explicit `kyris agents setup` / `reconcile`). See `status_snapshot_all`.
+    let results = reconcile::status_snapshot_all()?;
 
     if let Some(agent_id) = agent {
         let (descriptor, profile) = results

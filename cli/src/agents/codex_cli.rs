@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::{Path, PathBuf};
 
-use crate::config_writer::{NoopValidator, TomlShapeValidator, WellFormedJsonValidator};
+use crate::config_writer::{
+    ConfigValidator, NoopValidator, TomlShapeValidator, WellFormedJsonValidator,
+};
 use crate::integration::{
     ensure_toml_bool_path, ensure_toml_string_path, merge_toml_string_entries, read_json_value,
-    read_toml_value, remove_json_command_hook, remove_toml_table_entries, write_json_value,
-    write_toml_value,
+    read_toml_value, remove_json_command_hook, write_toml_value,
 };
-use crate::state::restore_manifest_entry;
+use crate::state::restore_manifest_entry_component;
 
 use super::codex_cli_schema::CodexConfigShape;
 
@@ -18,7 +19,9 @@ fn codex_config_validator() -> TomlShapeValidator<CodexConfigShape> {
 
 use super::probe::{ProbeResult, fingerprint, not_detected, toml_has_any_mcp_servers};
 use super::registry::{
-    AgentDescriptor, AllowResponse, HookProtocol, McpConfigFormat, McpConfigLocation, ToolMapping,
+    AgentDescriptor, AgentIntegrationPlan, AllowResponse, AttributionMechanism,
+    BurnControlMechanism, DetailPassThrough, ExecutionMechanism, HookProtocol, McpConfigFormat,
+    McpConfigLocation, SurfaceIntegration, ToolMapping, ToolMechanism,
 };
 
 pub struct CodexCli;
@@ -46,26 +49,90 @@ fn ensure_codex_kyris_model_provider(
     ) {
         changed = true;
     }
+    // The inbound key authenticates codex TO kyrisd via a custom header — NOT the
+    // bearer. Putting it in `experimental_bearer_token` made codex send it as the
+    // `Authorization: Bearer`, which kyrisd forwards UPSTREAM (→ OpenAI rejects
+    // `sk-kyris-…` as an invalid API key, 401). The bearer must stay codex's OWN
+    // credential (login/api-key), which kyrisd forwards and classifies
+    // included-vs-overage — exactly like claude's `x-kyris-inbound` custom header.
     if ensure_toml_string_path(
         config,
-        &["model_providers", "kyris", "experimental_bearer_token"],
+        &[
+            "model_providers",
+            "kyris",
+            "http_headers",
+            "x-kyris-inbound",
+        ],
         inbound_key,
     ) {
+        changed = true;
+    }
+    // codex must use ITS OWN auth (auth.json — ChatGPT login OR api key) as the
+    // upstream bearer, which kyrisd forwards and classifies included-vs-overage.
+    // `requires_openai_auth = true` makes this custom provider draw from auth.json
+    // like the built-in openai provider (model-provider/src/auth.rs hands a
+    // command-less provider the global auth_manager). The built-in openai provider
+    // can't be used instead — its ID is reserved and can't carry the
+    // x-kyris-inbound header.
+    if ensure_toml_bool_path(
+        config,
+        &["model_providers", "kyris", "requires_openai_auth"],
+        true,
+    ) {
+        changed = true;
+    }
+    // kyrisd serves `/v1/responses` over HTTP only — a WS upgrade there returns
+    // 405, so codex would waste ~6s retrying the WS transport before falling back.
+    // Disable it so codex goes straight to HTTP (wire_api = "responses" still
+    // streams fine over HTTP/SSE).
+    if ensure_toml_bool_path(
+        config,
+        &["model_providers", "kyris", "supports_websockets"],
+        false,
+    ) {
+        changed = true;
+    }
+    // Migration: older kyris installs wrote the inbound key into
+    // `experimental_bearer_token`, which codex sends as the `Authorization: Bearer`
+    // — kyrisd forwards it upstream and OpenAI rejects `sk-kyris-…` (401). Our
+    // helpers only add/update keys, so explicitly delete the stale one; codex then
+    // falls back to its auth.json credential (the bearer now comes from there).
+    if let Some(provider) = config
+        .get_mut("model_providers")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|m| m.get_mut("kyris"))
+        .and_then(toml::Value::as_table_mut)
+        && provider.remove("experimental_bearer_token").is_some()
+    {
         changed = true;
     }
     changed
 }
 
 pub fn codex_config_path() -> Result<PathBuf, String> {
-    if let Some(path) = crate::integration::find_upwards(".codex/config.toml") {
-        return Ok(path);
-    }
+    Ok(codex_config_path_from(
+        std::env::var_os("CODEX_HOME").map(PathBuf::from),
+        crate::integration::home_dir()?,
+    ))
+}
+
+fn codex_config_path_from(codex_home: Option<PathBuf>, home: PathBuf) -> PathBuf {
+    codex_home
+        .unwrap_or_else(|| home.join(".codex"))
+        .join("config.toml")
+}
+
+fn codex_config_candidate_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     if let Ok(path) = std::env::var("CODEX_HOME") {
-        return Ok(PathBuf::from(path).join("config.toml"));
+        paths.push(PathBuf::from(path).join("config.toml"));
     }
-    Ok(crate::integration::home_dir()?
-        .join(".codex")
-        .join("config.toml"))
+    if let Ok(home) = crate::integration::home_dir() {
+        paths.push(home.join(".codex").join("config.toml"));
+    }
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 pub fn codex_config_exists() -> bool {
@@ -95,6 +162,18 @@ fn read_or_empty_codex_config(config_path: &Path) -> Result<toml::Value, String>
     }
 }
 
+fn ensure_codex_shell_env_marker(config: &mut toml::Value) -> bool {
+    ensure_toml_string_path(
+        config,
+        &[
+            "shell_environment_policy",
+            "set",
+            "KYRIS_GOVERNED_SUBPROCESS",
+        ],
+        "codex-cli",
+    )
+}
+
 pub fn codex_dir() -> Result<PathBuf, String> {
     let path = codex_config_path()?;
     path.parent()
@@ -104,6 +183,160 @@ pub fn codex_dir() -> Result<PathBuf, String> {
 
 pub fn codex_hooks_path() -> Result<PathBuf, String> {
     Ok(codex_dir()?.join("hooks.json"))
+}
+
+/// Write codex's `config.toml` with a surface component + schema validator.
+/// The reversible patch is recorded inside `write_toml_value` — shared across
+/// every agent — so `kyris agents undo` reverses every edit, including across
+/// the several writes setup performs, with no per-agent recording code.
+fn write_codex_config(
+    config_path: &Path,
+    new: &toml::Value,
+    component: &str,
+) -> Result<(), String> {
+    write_toml_value(config_path, new, component, &codex_config_validator())?;
+    Ok(())
+}
+
+fn write_codex_config_unmanaged(config_path: &Path, new: &toml::Value) -> Result<(), String> {
+    let mut serialized = toml::to_string_pretty(new)
+        .map_err(|e| format!("Cannot serialize {}: {e}", config_path.display()))?;
+    serialized.push('\n');
+    codex_config_validator()
+        .validate(&serialized)
+        .map_err(|e| format!("validation failed for {}: {e}", config_path.display()))?;
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(config_path, serialized)
+        .map_err(|e| format!("Cannot write {}: {e}", config_path.display()))
+}
+
+fn write_json_unmanaged(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let mut serialized = serde_json::to_string_pretty(value)
+        .map_err(|e| format!("Cannot serialize {}: {e}", path.display()))?;
+    serialized.push('\n');
+    WellFormedJsonValidator
+        .validate(&serialized)
+        .map_err(|e| format!("validation failed for {}: {e}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, serialized).map_err(|e| format!("Cannot write {}: {e}", path.display()))
+}
+
+fn table_is_empty(root: &toml::Value, path: &[&str]) -> bool {
+    let mut cursor = root;
+    for segment in path {
+        let Some(next) = cursor.get(*segment) else {
+            return false;
+        };
+        cursor = next;
+    }
+    cursor.as_table().is_some_and(toml::Table::is_empty)
+}
+
+fn remove_toml_path(root: &mut toml::Value, path: &[&str]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cursor = root;
+    for segment in &path[..path.len() - 1] {
+        let Some(next) = cursor.get_mut(*segment) else {
+            return false;
+        };
+        cursor = next;
+    }
+    let Some(table) = cursor.as_table_mut() else {
+        return false;
+    };
+    table.remove(path[path.len() - 1]).is_some()
+}
+
+fn is_kyris_local_url(url: &str) -> bool {
+    url.contains("127.0.0.1") || url.contains("localhost") || url.contains(":4710")
+}
+
+fn scrub_codex_config_value(config: &mut toml::Value) -> bool {
+    let mut changed = false;
+
+    if config.get("model_provider").and_then(toml::Value::as_str) == Some("kyris") {
+        changed |= remove_toml_path(config, &["model_provider"]);
+    }
+    if config
+        .get("openai_base_url")
+        .and_then(toml::Value::as_str)
+        .is_some_and(is_kyris_local_url)
+    {
+        changed |= remove_toml_path(config, &["openai_base_url"]);
+    }
+    changed |= remove_toml_path(config, &["model_providers", "kyris"]);
+    if table_is_empty(config, &["model_providers"]) {
+        changed |= remove_toml_path(config, &["model_providers"]);
+    }
+    changed |= remove_toml_path(config, &["permissions", "kyris"]);
+    if table_is_empty(config, &["permissions"]) {
+        changed |= remove_toml_path(config, &["permissions"]);
+    }
+    if config
+        .get("default_permissions")
+        .and_then(toml::Value::as_str)
+        == Some("kyris")
+    {
+        changed |= remove_toml_path(config, &["default_permissions"]);
+    }
+    changed |= remove_toml_path(
+        config,
+        &[
+            "shell_environment_policy",
+            "set",
+            "KYRIS_GOVERNED_SUBPROCESS",
+        ],
+    );
+    if table_is_empty(config, &["shell_environment_policy", "set"]) {
+        changed |= remove_toml_path(config, &["shell_environment_policy", "set"]);
+    }
+    if table_is_empty(config, &["shell_environment_policy"]) {
+        changed |= remove_toml_path(config, &["shell_environment_policy"]);
+    }
+
+    changed
+}
+
+pub fn scrub_codex_residue() -> Result<Vec<String>, String> {
+    let mut changes = Vec::new();
+    for path in codex_config_candidate_paths() {
+        if !path.exists() {
+            continue;
+        }
+        let mut config = read_toml_value(&path)?;
+        if scrub_codex_config_value(&mut config) {
+            write_codex_config_unmanaged(&path, &config)?;
+            changes.push(format!("scrubbed {}", path.display()));
+        }
+    }
+
+    let hooks_path = codex_hooks_path()?;
+    if hooks_path.exists() {
+        let mut hooks = read_json_value(&hooks_path)?;
+        if remove_json_command_hook(&mut hooks, "PreToolUse", "kyris_pretooluse") {
+            write_json_unmanaged(&hooks_path, &hooks)?;
+            changes.push(format!("removed hook from {}", hooks_path.display()));
+        }
+    }
+
+    let script = codex_dir()?.join("kyris_pretooluse.sh");
+    if super::undo::remove_file_if_exists(&script)? {
+        changes.push(format!("removed {}", script.display()));
+    }
+    let rules = codex_dir()?.join("rules").join("agentpact.rules");
+    if super::undo::remove_file_if_exists(&rules)? {
+        changes.push(format!("removed {}", rules.display()));
+    }
+
+    Ok(changes)
 }
 
 impl AgentDescriptor for CodexCli {
@@ -119,7 +352,7 @@ impl AgentDescriptor for CodexCli {
         codex_config_exists() || codex_binary_installed()
     }
     fn probe(&self) -> ProbeResult {
-        use super::profile::{AdaptedMechanism, CoverageCeiling, SurfaceState};
+        use super::profile::{CoverageCeiling, SurfaceState};
         let detected = codex_config_exists() || codex_binary_installed();
         if !detected {
             return not_detected();
@@ -147,29 +380,34 @@ impl AgentDescriptor for CodexCli {
             .is_some_and(|p| p.exists());
 
         let execution = if has_hook {
-            SurfaceState::adapted(AdaptedMechanism::LiveHook)
+            SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter)
         } else if has_compiled_policy {
-            SurfaceState::adapted(AdaptedMechanism::CompiledPolicy)
+            SurfaceState::adapted(ExecutionMechanism::CompiledPolicy)
                 .with_ceiling(CoverageCeiling::Compiled)
         } else {
             SurfaceState::none()
         };
         let tool = if has_mcp_wrap {
-            SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+            SurfaceState::adapted(ToolMechanism::McpWrapping)
         } else if !has_any_mcp_servers {
             SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
-        let has_base_url_config = config_path.as_deref().is_some_and(|p| {
+        let has_kyris_provider_config = config_path.as_deref().is_some_and(|p| {
             read_toml_value(p).is_ok_and(|v| {
-                v.get("openai_base_url")
-                    .and_then(toml::Value::as_str)
-                    .is_some_and(|u| !u.is_empty())
+                v.get("model_provider").and_then(toml::Value::as_str) == Some("kyris")
+                    && v.get("model_providers")
+                        .and_then(toml::Value::as_table)
+                        .and_then(|providers| providers.get("kyris"))
+                        .and_then(toml::Value::as_table)
+                        .and_then(|provider| provider.get("base_url"))
+                        .and_then(toml::Value::as_str)
+                        .is_some_and(|u| !u.is_empty())
             })
         });
-        let burn_control = if has_base_url_config {
-            SurfaceState::adapted(AdaptedMechanism::ConfigRewrite)
+        let burn_control = if has_kyris_provider_config {
+            SurfaceState::adapted(BurnControlMechanism::KyrisdModelProvider)
         } else {
             SurfaceState::none()
         };
@@ -195,13 +433,37 @@ impl AgentDescriptor for CodexCli {
         }
     }
     fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &["kyris-mcp", "kyris_pretooluse"]
+        &[
+            "kyris-mcp",
+            "kyris_pretooluse",
+            "KYRIS_GOVERNED_SUBPROCESS",
+            "model_provider = \"kyris\"",
+            "[model_providers.kyris]",
+        ]
     }
     fn env_exports(&self, _base_url: &str, _inbound_key: &str) -> Vec<(String, String)> {
         Vec::new()
     }
-    fn expected_surfaces(&self) -> (bool, bool, bool) {
-        (true, true, true)
+    fn integration_plan(&self) -> AgentIntegrationPlan {
+        super::capabilities::apply_declared_capabilities(
+            self.canonical_id(),
+            AgentIntegrationPlan {
+                execution: SurfaceIntegration::adapted(&[
+                    ExecutionMechanism::LiveHookAdapter,
+                    ExecutionMechanism::CompiledPolicy,
+                ]),
+                tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
+                burn_control: SurfaceIntegration::adapted(&[
+                    BurnControlMechanism::KyrisdModelProvider,
+                ]),
+                attribution: &[
+                    AttributionMechanism::ShellEnvironmentPolicy,
+                    AttributionMechanism::NativeHookPayload,
+                    AttributionMechanism::PeerProcessObserved,
+                ],
+                agentpact_native_attribution: false,
+            },
+        )
     }
     // Configuration for Codex CLI is a linear sequence of TOML edits (live
     // hook adapter + rules dir + permissions table + default_permissions +
@@ -209,7 +471,7 @@ impl AgentDescriptor for CodexCli {
     // it into helpers would require threading the change Vec through every
     // call and would make the install transcript harder to read.
     #[allow(clippy::too_many_lines)]
-    fn configure_execution(
+    fn configure_execution_surface(
         &self,
         _base_url: &str,
         _inbound_key: &str,
@@ -236,13 +498,15 @@ impl AgentDescriptor for CodexCli {
         )?;
 
         let mut config = read_or_empty_codex_config(&config_path)?;
-        if ensure_toml_bool_path(&mut config, &["features", "codex_hooks"], true) {
-            write_toml_value(
-                &config_path,
-                &config,
-                "codex-cli",
-                &codex_config_validator(),
-            )?;
+        // `hooks` is codex's canonical feature key (codex 0.133 `features list`);
+        // `codex_hooks` is a deprecated alias that warns in `codex doctor`.
+        if ensure_toml_bool_path(&mut config, &["features", "hooks"], true) {
+            write_codex_config(&config_path, &config, "codex-cli:execution")?;
+            changes.push(format!("updated {}", config_path.display()));
+        }
+        let mut config = read_or_empty_codex_config(&config_path)?;
+        if ensure_codex_shell_env_marker(&mut config) {
+            write_codex_config(&config_path, &config, "codex-cli:execution")?;
             changes.push(format!("updated {}", config_path.display()));
         }
 
@@ -255,7 +519,7 @@ impl AgentDescriptor for CodexCli {
                     if crate::state::write_managed_file(
                         &rules_path,
                         &rules_content,
-                        "codex-cli",
+                        "codex-cli:execution",
                         None,
                         &NoopValidator,
                     )? {
@@ -339,12 +603,7 @@ impl AgentDescriptor for CodexCli {
                     }
 
                     if config_changed {
-                        write_toml_value(
-                            &config_path,
-                            &config,
-                            "codex-cli",
-                            &codex_config_validator(),
-                        )?;
+                        write_codex_config(&config_path, &config, "codex-cli:execution")?;
                     }
                 }
 
@@ -367,7 +626,7 @@ impl AgentDescriptor for CodexCli {
 
         Ok(changes)
     }
-    fn configure_burn_control(
+    fn configure_burn_control_surface(
         &self,
         base_url: &str,
         inbound_key: &str,
@@ -381,12 +640,35 @@ impl AgentDescriptor for CodexCli {
         let mut config = read_or_empty_codex_config(&config_path)?;
 
         let base_url_v1 = format!("{base_url}/v1");
-        let mut config_changed =
-            ensure_toml_string_path(&mut config, &["openai_base_url"], &base_url_v1);
+        let mut config_changed = false;
+        // Route codex through the kyris custom provider by default — the built-in
+        // openai provider can't carry the x-kyris-inbound header (reserved ID).
+        if ensure_toml_string_path(&mut config, &["model_provider"], "kyris") {
+            config_changed = true;
+        }
         if ensure_codex_kyris_model_provider(&mut config, &base_url_v1, inbound_key) {
             config_changed = true;
         }
 
+        if config_changed {
+            write_codex_config(&config_path, &config, "codex-cli:burn-control")?;
+            changes.push(format!("updated {}", config_path.display()));
+        }
+
+        Ok(changes)
+    }
+    fn configure_tool_surface(
+        &self,
+        base_url: &str,
+        inbound_key: &str,
+        _agent_specific: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        let config_path = codex_config_path()?;
+        ensure_codex_dir()?;
+        let mut changes = Vec::new();
+        let mut config = read_or_empty_codex_config(&config_path)?;
+
+        let mut config_changed = false;
         let mcp_result =
             super::configure::rewrite_codex_mcp_servers(&mut config, base_url, inbound_key);
         if mcp_result.changed {
@@ -396,12 +678,7 @@ impl AgentDescriptor for CodexCli {
             config_changed = true;
         }
         if config_changed {
-            write_toml_value(
-                &config_path,
-                &config,
-                "codex-cli",
-                &codex_config_validator(),
-            )?;
+            write_codex_config(&config_path, &config, "codex-cli:tool")?;
             changes.push(format!("updated {}", config_path.display()));
         }
         if !mcp_result.http_rewrites.is_empty() {
@@ -411,67 +688,49 @@ impl AgentDescriptor for CodexCli {
 
         Ok(changes)
     }
-    fn undo(&self) -> Result<(), String> {
+    fn undo_tool_surface(&self) -> Result<(), String> {
         // Remove MCP upstreams from kyrisd.yaml before the config file is
         // restored to its pre-kyris state (after which the server names
         // would no longer be readable from the agent config).
         let mcp_names = super::configure::mcp_server_names_from_agent(self);
         super::configure::remove_mcp_upstreams(&mcp_names)?;
 
-        let hooks_path = codex_hooks_path()?;
-        if hooks_path.exists() {
-            let mut hooks = read_json_value(&hooks_path)?;
-            if remove_json_command_hook(&mut hooks, "PreToolUse", "kyris_pretooluse") {
-                write_json_value(&hooks_path, &hooks, "codex-cli", &WellFormedJsonValidator)?;
-                println!("Removed hook from {}", hooks_path.display());
-            }
-        }
-
+        // Structurally unapply every config.toml edit kyris recorded at setup
+        // (the complete original→configured TOML patch): routing keys,
+        // [model_providers.kyris], [permissions.kyris], default_permissions,
+        // hooks feature, … all reverse together, restoring the user's pre-kyris
+        // config exactly — no backup, no leftover routing or credential.
         let config_path = codex_config_path()?;
-        if config_path.exists() {
-            let mut config = read_toml_value(&config_path)?;
-            let mut changed = false;
-            if ensure_toml_bool_path(&mut config, &["features", "codex_hooks"], false) {
-                changed = true;
-                println!("Reset codex_hooks in {}", config_path.display());
-            }
-            // Remove [permissions.kyris] and prune [permissions] only if it
-            // becomes empty — preserves any other profiles the user may have.
-            if remove_toml_table_entries(&mut config, &["permissions"], Some(&["kyris"])) {
-                changed = true;
-            }
-            if let Some(dp) = config
-                .as_table()
-                .and_then(|t| t.get("default_permissions"))
-                .and_then(toml::Value::as_str)
-                && dp == "kyris"
-                && let Some(t) = config.as_table_mut()
-            {
-                t.remove("default_permissions");
-                changed = true;
-            }
-            if changed {
-                write_toml_value(
-                    &config_path,
-                    &config,
-                    "codex-cli",
-                    &codex_config_validator(),
-                )?;
-            }
-        }
-        restore_manifest_entry(&config_path)?;
+        restore_manifest_entry_component(&config_path, "codex-cli:tool")?;
 
-        let script = codex_dir()?.join("kyris_pretooluse.sh");
-        super::undo::remove_file_if_exists(&script)?;
-        let rules = codex_dir()?.join("rules").join("agentpact.rules");
-        super::undo::remove_file_if_exists(&rules)?;
+        for change in scrub_codex_residue()? {
+            println!("{change}");
+        }
         Ok(())
     }
-    fn undo_burn_control(&self) -> Result<(), String> {
+    fn undo_execution_surface(&self) -> Result<(), String> {
+        let config_path = codex_config_path()?;
+        restore_manifest_entry_component(&config_path, "codex-cli:execution")?;
+        let hooks_path = codex_hooks_path()?;
+        restore_manifest_entry_component(&hooks_path, "codex-cli:execution")?;
+        let script = codex_dir()?.join("kyris_pretooluse.sh");
+        restore_manifest_entry_component(&script, "codex-cli:execution")?;
+        let rules = codex_dir()?.join("rules").join("agentpact.rules");
+        restore_manifest_entry_component(&rules, "codex-cli:execution")?;
+
+        for change in scrub_codex_residue()? {
+            println!("{change}");
+        }
+        Ok(())
+    }
+    fn undo_burn_control_surface(&self) -> Result<(), String> {
         for path in self.burn_control_config_paths() {
-            if restore_manifest_entry(&path)? {
+            if restore_manifest_entry_component(&path, "codex-cli:burn-control")? {
                 println!("Reverted {}", path.display());
             }
+        }
+        for change in scrub_codex_residue()? {
+            println!("{change}");
         }
         Ok(())
     }
@@ -505,6 +764,11 @@ impl AgentDescriptor for CodexCli {
             // Codex CLI internal coordination tools: skip the daemon. See
             // claude_code.rs and hook_cmd.rs for the design rationale.
             pass_through_tools: vec!["update_plan".to_string(), "view_image".to_string()],
+            detail_pass_throughs: vec![DetailPassThrough {
+                action: "execute".to_string(),
+                detail_contains: vec![".codex/shell_snapshots/".to_string()],
+                reason: "codex-shell-snapshot".to_string(),
+            }],
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
         })
@@ -568,19 +832,15 @@ mod tests {
 
     #[test]
     fn testEmptyConfigCanBePopulatedByBurnControlLogic() {
-        // Simulates the configure_burn_control flow for a first-time user:
+        // Simulates the burn-control surface setup for a first-time user:
         // start with empty TOML and verify the expected keys are written.
         let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
 
-        let changed = ensure_toml_string_path(
-            &mut config,
-            &["openai_base_url"],
-            "http://127.0.0.1:4710/v1",
-        );
-        assert!(changed, "openai_base_url should be written to empty config");
+        let changed = ensure_toml_string_path(&mut config, &["model_provider"], "kyris");
+        assert!(changed, "model_provider should be written to empty config");
         assert_eq!(
-            config.get("openai_base_url").and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:4710/v1")
+            config.get("model_provider").and_then(toml::Value::as_str),
+            Some("kyris")
         );
 
         let changed2 = ensure_codex_kyris_model_provider(
@@ -597,20 +857,107 @@ mod tests {
 
     #[test]
     fn testEmptyConfigCanBePopulatedByExecutionLogic() {
-        // Simulates the configure_execution codex_hooks path for first-time user.
+        // Simulates the configure_execution hooks-feature path for first-time user.
         let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
-        let changed = ensure_toml_bool_path(&mut config, &["features", "codex_hooks"], true);
-        assert!(changed, "codex_hooks should be set in empty config");
-        assert_eq!(config["features"]["codex_hooks"].as_bool(), Some(true));
+        let changed = ensure_toml_bool_path(&mut config, &["features", "hooks"], true);
+        assert!(changed, "features.hooks should be set in empty config");
+        assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn testCodexConfigPathUsesUserScopeNotProjectDiscovery() {
+        let home = PathBuf::from("/tmp/home");
+        assert_eq!(
+            codex_config_path_from(None, home.clone()),
+            home.join(".codex").join("config.toml")
+        );
+        assert_eq!(
+            codex_config_path_from(Some(PathBuf::from("/tmp/codex-home")), home),
+            PathBuf::from("/tmp/codex-home").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn testEnsureCodexShellEnvMarkerPreservesExistingSetEntries() {
+        let mut config: toml::Value = toml::from_str(
+            r#"
+[shell_environment_policy.set]
+EXISTING = "keep"
+"#,
+        )
+        .expect("parse config");
+
+        assert!(ensure_codex_shell_env_marker(&mut config));
+        assert_eq!(
+            config["shell_environment_policy"]["set"]["EXISTING"].as_str(),
+            Some("keep")
+        );
+        assert_eq!(
+            config["shell_environment_policy"]["set"]["KYRIS_GOVERNED_SUBPROCESS"].as_str(),
+            Some("codex-cli")
+        );
+    }
+
+    #[test]
+    fn testScrubCodexConfigValueRemovesOnlyKyrisOwnedState() {
+        let mut config: toml::Value = toml::from_str(
+            r#"
+model_provider = "kyris"
+openai_base_url = "http://127.0.0.1:4710/v1"
+default_permissions = "kyris"
+
+[model_providers.openai]
+base_url = "https://api.openai.com/v1"
+
+[model_providers.kyris]
+base_url = "http://127.0.0.1:4710/v1"
+
+[permissions.kyris.filesystem]
+":workspace_roots" = "write"
+
+[shell_environment_policy.set]
+EXISTING = "keep"
+KYRIS_GOVERNED_SUBPROCESS = "codex-cli"
+"#,
+        )
+        .expect("parse config");
+
+        assert!(scrub_codex_config_value(&mut config));
+        assert!(config.get("model_provider").is_none());
+        assert!(config.get("openai_base_url").is_none());
+        assert!(config.get("default_permissions").is_none());
+        assert!(
+            config["model_providers"]
+                .as_table()
+                .is_some_and(|providers| providers.contains_key("openai"))
+        );
+        assert!(
+            !config["model_providers"]
+                .as_table()
+                .is_some_and(|providers| providers.contains_key("kyris"))
+        );
+        assert!(config.get("permissions").is_none());
+        assert_eq!(
+            config["shell_environment_policy"]["set"]["EXISTING"].as_str(),
+            Some("keep")
+        );
+        assert!(
+            config["shell_environment_policy"]["set"]
+                .as_table()
+                .is_some_and(|set| !set.contains_key("KYRIS_GOVERNED_SUBPROCESS"))
+        );
     }
 
     // --- existing test ---
 
     #[test]
     fn testCodexKyrisModelProviderIsValidForCodex0130() {
-        let mut config: toml::Value =
-            toml::from_str("[model_providers.kyris]\nbase_url = \"http://old.example/v1\"\n")
-                .expect("parse config");
+        // Seed a config carrying the stale experimental_bearer_token an older
+        // kyris install would have written — setup must migrate it away.
+        let mut config: toml::Value = toml::from_str(
+            "[model_providers.kyris]\nbase_url = \"http://old.example/v1\"\nexperimental_bearer_token = \"sk-kyris-stale\"\n",
+        )
+        .expect("parse config");
 
         assert!(ensure_codex_kyris_model_provider(
             &mut config,
@@ -627,9 +974,20 @@ mod tests {
             Some("http://127.0.0.1:4710/v1")
         );
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+        // The inbound key is a custom header, NOT the bearer (the bearer would be
+        // forwarded upstream to OpenAI and rejected). codex uses its own auth.json
+        // credential for the bearer via requires_openai_auth.
         assert_eq!(
-            provider["experimental_bearer_token"].as_str(),
+            provider["http_headers"]["x-kyris-inbound"].as_str(),
             Some("sk-kyris-test")
         );
+        assert!(
+            provider.get("experimental_bearer_token").is_none(),
+            "stale experimental_bearer_token must be migrated away (it hijacks the \
+             Authorization bearer; codex must use its own auth.json credential)"
+        );
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+        // kyrisd serves /v1/responses over HTTP only — WS returns 405.
+        assert_eq!(provider["supports_websockets"].as_bool(), Some(false));
     }
 }

@@ -20,6 +20,52 @@ use crate::metering::{StatsEvent, TokenCounts};
 use crate::server::AppState;
 use crate::streaming;
 
+/// `ChatGPT` subscription (login) tokens are only valid at `OpenAI`'s `ChatGPT` codex
+/// backend — NOT api.openai.com, which rejects them ("missing scopes:
+/// api.responses.write"). codex signals subscription auth by attaching a
+/// `ChatGPT-Account-ID` header (api-key auth omits it) and natively sends such
+/// requests to this base URL; kyrisd mirrors that choice. (api.openai.com is the
+/// default for api-key auth — see `ProviderConfig::default_for`.)
+const CHATGPT_CODEX_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Pick the Responses upstream from the caller's credential type. A `ChatGPT`
+/// subscription login (signalled by `ChatGPT-Account-ID`) routes to the `ChatGPT`
+/// codex backend at `/responses`; an API key routes to `{upstream}/v1/responses`.
+fn responses_upstream_url(
+    provider: &kyris_core::config::ProviderConfig,
+    headers: &HeaderMap,
+) -> String {
+    if headers.contains_key("chatgpt-account-id") {
+        format!("{CHATGPT_CODEX_UPSTREAM}/responses")
+    } else {
+        format!("{}/v1/responses", provider.upstream)
+    }
+}
+
+/// Whether a caller request header should be forwarded upstream. kyrisd must NOT
+/// leak its own routing headers (`x-kyris-*`, the inbound key above all) and must
+/// let the HTTP client recompute framing/length headers. Everything else the
+/// caller sent — authorization, content-type, `ChatGPT-Account-ID`, `OpenAI-Beta`,
+/// the `x-codex-*` session/turn headers — is forwarded so the upstream sees a
+/// faithful request (the `ChatGPT` backend in particular requires these).
+fn is_forwardable_request_header(name: &str) -> bool {
+    !name.starts_with("x-kyris-")
+        && !matches!(
+            name,
+            "host"
+                | "content-length"
+                | "accept-encoding"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "proxy-authorization"
+                | "proxy-authenticate"
+        )
+}
+
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route(
@@ -344,18 +390,21 @@ async fn handle_responses(
         });
     let provider_name = provider.name.clone();
 
-    // Pure passthrough: forward the caller's `authorization` header or fail
-    // fast. kyrisd holds no provider credential of its own.
-    let Some(authorization) = headers.get("authorization").cloned() else {
+    // Pure passthrough: the caller's `authorization` (their own credential) is
+    // forwarded with the rest of their headers below. Fail fast if absent —
+    // kyrisd holds no provider credential of its own.
+    if !headers.contains_key("authorization") {
         return Ok(no_credential_error(&trace_id));
-    };
+    }
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
         .unwrap_or_else(|| state.default_provider_client.clone());
-    let upstream_url = format!("{}/v1/responses", provider.upstream);
+    // Route by credential type: a ChatGPT subscription login goes to the ChatGPT
+    // codex backend, an API key to api.openai.com (see `responses_upstream_url`).
+    let upstream_url = responses_upstream_url(&provider, &headers);
 
     let outbound_body = serde_json::to_vec(&body_value).map_err(|e| {
         tracing::warn!(error = %e, "failed to serialize OpenAI responses outbound body");
@@ -368,18 +417,22 @@ async fn handle_responses(
         provider.timeout_seconds
     };
 
-    let response = client
+    let mut request = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("authorization", &authorization)
-        .header("content-type", "application/json")
-        .body(outbound_body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "OpenAI responses upstream request failed");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .body(outbound_body);
+    // Forward the caller's headers faithfully (codex's ChatGPT-Account-ID,
+    // OpenAI-Beta, x-codex-* session/turn headers, content-type, authorization),
+    // minus kyrisd's own x-kyris-* routing headers and framing/length headers.
+    for (name, value) in &headers {
+        if is_forwardable_request_header(name.as_str()) {
+            request = request.header(name, value);
+        }
+    }
+    let response = request.send().await.map_err(|e| {
+        tracing::error!(error = %e, "OpenAI responses upstream request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
@@ -1051,6 +1104,60 @@ mod tests {
     use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post};
     use kyris_core::config::{KyrisdConfig, ProviderConfig, ProviderFormat};
     use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn testResponsesUpstreamRoutesByCredentialType() {
+        let provider = ProviderConfig::default_for(ProviderFormat::OpenAI);
+
+        // API-key auth (no ChatGPT-Account-ID) -> the standard OpenAI API.
+        let mut api = HeaderMap::new();
+        api.insert("authorization", "Bearer sk-abc".parse().unwrap());
+        assert_eq!(
+            responses_upstream_url(&provider, &api),
+            "https://api.openai.com/v1/responses"
+        );
+
+        // ChatGPT subscription login (ChatGPT-Account-ID present, normalized
+        // lowercase by the http crate) -> the ChatGPT codex backend at /responses.
+        let mut sub = HeaderMap::new();
+        sub.insert("authorization", "Bearer eyJhbGc".parse().unwrap());
+        sub.insert("chatgpt-account-id", "acct-123".parse().unwrap());
+        assert_eq!(
+            responses_upstream_url(&provider, &sub),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn testForwardableRequestHeaderFiltersKyrisAndFraming() {
+        // kyrisd's own routing headers must never leak upstream (the inbound key
+        // especially), and the client recomputes framing/length headers.
+        for blocked in [
+            "x-kyris-inbound",
+            "x-kyris-agent-id",
+            "x-kyris-session-id",
+            "host",
+            "content-length",
+            "accept-encoding",
+            "connection",
+        ] {
+            assert!(
+                !is_forwardable_request_header(blocked),
+                "{blocked} must not be forwarded"
+            );
+        }
+        // The caller's auth + codex routing headers must pass through.
+        for ok in [
+            "authorization",
+            "content-type",
+            "chatgpt-account-id",
+            "openai-beta",
+            "x-codex-turn-state",
+            "x-codex-installation-id",
+        ] {
+            assert!(is_forwardable_request_header(ok), "{ok} must be forwarded");
+        }
+    }
 
     use crate::{
         circuit_breaker::CircuitBreaker, cost::CostCalculator, pending::PendingStore,

@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 use chrono::Utc;
 
-use super::profile::{AgentProfile, CapLevel, SurfaceState};
-use super::registry::AgentDescriptor;
+use super::profile::{AgentProfile, CapLevel, CoverageCeiling, SurfaceState};
+use super::registry::{AgentDescriptor, MechanismLabel, SurfaceIntegration, plan_label};
 
 const STALE_THRESHOLD_MINUTES: i64 = 30;
 
-fn format_surface_short(state: &SurfaceState) -> String {
+fn format_surface_short<M: MechanismLabel>(state: &SurfaceState<M>) -> String {
     if state.not_applicable {
         return "n/a".to_string();
     }
@@ -15,10 +15,21 @@ fn format_surface_short(state: &SurfaceState) -> String {
         CapLevel::None => "-".to_string(),
         CapLevel::Native => "native".to_string(),
         CapLevel::Adapted => match &state.mechanism {
-            Some(mech) => format!("{mech}"),
+            Some(mech) => mech.short().to_string(),
             None => "adapted".to_string(),
         },
     }
+}
+
+fn format_surface_with_plan<M: MechanismLabel>(
+    state: &SurfaceState<M>,
+    plan: SurfaceIntegration<M>,
+) -> String {
+    format!("{}/{}", format_surface_short(state), plan_label(plan))
+}
+
+fn is_compiled_degradation<M>(state: &SurfaceState<M>, design: Option<CoverageCeiling>) -> bool {
+    state.is_compiled_only() && design != Some(CoverageCeiling::Compiled)
 }
 
 fn format_agent_specific(profile: &AgentProfile) -> String {
@@ -36,14 +47,15 @@ fn format_agent_specific(profile: &AgentProfile) -> String {
 
 pub fn print_summary(agents: &[(Box<dyn AgentDescriptor>, AgentProfile)]) {
     println!(
-        " {:<14} {:<12} {:<12} {:<12} {:<30} Status",
-        "Agent", "Command", "MCP", "Burn", "Agent-Specific"
+        " {:<14} {:<16} {:<16} {:<16} {:<30} Status",
+        "Agent", "Command obs/plan", "MCP obs/plan", "Burn obs/plan", "Agent-Specific"
     );
     for (descriptor, profile) in agents {
         if !profile.detected {
             println!(" {:<14} not found", descriptor.id());
             continue;
         }
+        let plan = descriptor.integration_plan();
         let (need_exec, need_tool, need_burn) = descriptor.expected_surfaces();
         let exec_met = !need_exec
             || profile.execution.level != CapLevel::None
@@ -55,9 +67,6 @@ pub fn print_summary(agents: &[(Box<dyn AgentDescriptor>, AgentProfile)]) {
             || profile.burn_control.not_applicable;
         let (design_exec_ceiling, design_tool_ceiling, design_burn_ceiling) =
             descriptor.surface_design_ceilings();
-        let is_compiled_degradation = |state: &SurfaceState, design: Option<_>| {
-            state.is_compiled_only() && design != Some(super::profile::CoverageCeiling::Compiled)
-        };
         let has_compiled_only = is_compiled_degradation(&profile.execution, design_exec_ceiling)
             || is_compiled_degradation(&profile.tool, design_tool_ceiling)
             || is_compiled_degradation(&profile.burn_control, design_burn_ceiling);
@@ -85,11 +94,11 @@ pub fn print_summary(agents: &[(Box<dyn AgentDescriptor>, AgentProfile)]) {
             "incomplete".to_string()
         };
         println!(
-            " {:<14} {:<12} {:<12} {:<12} {:<30} {}",
+            " {:<14} {:<16} {:<16} {:<16} {:<30} {}",
             descriptor.id(),
-            format_surface_short(&profile.execution),
-            format_surface_short(&profile.tool),
-            format_surface_short(&profile.burn_control),
+            format_surface_with_plan(&profile.execution, plan.execution),
+            format_surface_with_plan(&profile.tool, plan.tool),
+            format_surface_with_plan(&profile.burn_control, plan.burn_control),
             format_agent_specific(profile),
             status,
         );
@@ -102,25 +111,31 @@ pub fn print_detail(descriptor: &dyn AgentDescriptor, profile: &AgentProfile) {
         println!("  Status: not found");
         return;
     }
+    let plan = descriptor.integration_plan();
+    let expects_native = plan.execution == SurfaceIntegration::AgentPactNative
+        || plan.tool == SurfaceIntegration::AgentPactNative
+        || plan.burn_control == SurfaceIntegration::AgentPactNative;
     let has_native = profile.execution.level == CapLevel::Native
         || profile.tool.level == CapLevel::Native
         || profile.burn_control.level == CapLevel::Native;
     if has_native {
         println!("  native support:    active");
+    } else if expects_native {
+        println!("  native support:    expected, not observed");
     } else {
-        println!("  native support:    - (no agent support)");
+        println!("  native support:    - (adapted integration)");
     }
     println!(
         "  command control:   {}",
-        format_control_line(&profile.execution)
+        format_control_line(&profile.execution, plan.execution)
     );
     println!(
         "  mcp control:       {}",
-        format_control_line(&profile.tool)
+        format_control_line(&profile.tool, plan.tool)
     );
     println!(
         "  burn control:      {}",
-        format_control_line(&profile.burn_control)
+        format_control_line(&profile.burn_control, plan.burn_control)
     );
     if !profile.agent_specific.is_empty() {
         let mut pairs: Vec<_> = profile.agent_specific.iter().collect();
@@ -151,16 +166,20 @@ pub fn print_detail(descriptor: &dyn AgentDescriptor, profile: &AgentProfile) {
     }
 }
 
-fn format_control_line(state: &SurfaceState) -> String {
+fn format_control_line<M: MechanismLabel>(
+    state: &SurfaceState<M>,
+    plan: SurfaceIntegration<M>,
+) -> String {
+    let planned = plan_label(plan);
     if state.not_applicable {
-        return "n/a (nothing to mediate)".to_string();
+        return format!("n/a (nothing to mediate; plan: {planned})");
     }
-    match state.level {
+    let observed = match state.level {
         CapLevel::None => "-".to_string(),
         CapLevel::Native => "active (native)".to_string(),
         CapLevel::Adapted => {
             let via = match &state.mechanism {
-                Some(mech) => format!("active via {}", mechanism_description(mech)),
+                Some(mech) => format!("active via {}", mech.detail()),
                 None => "active".to_string(),
             };
             if state.is_compiled_only() {
@@ -169,16 +188,52 @@ fn format_control_line(state: &SurfaceState) -> String {
                 via
             }
         }
-    }
+    };
+    format!("{observed} (plan: {planned})")
 }
 
-fn mechanism_description(mech: &super::profile::AdaptedMechanism) -> &'static str {
-    use super::profile::AdaptedMechanism;
-    match mech {
-        AdaptedMechanism::LiveHook => "hook",
-        AdaptedMechanism::CompiledPolicy => "compiled policy",
-        AdaptedMechanism::EnvVarProxy => "env shim",
-        AdaptedMechanism::ConfigRewrite => "config rewrite",
-        AdaptedMechanism::McpWrapping => "mcp wrapper",
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::registry::ExecutionMechanism;
+
+    #[test]
+    fn testFormatControlLineShowsNativeExpectedButNotObserved() {
+        let line = format_control_line(
+            &SurfaceState::<ExecutionMechanism>::none(),
+            SurfaceIntegration::AgentPactNative,
+        );
+
+        assert_eq!(line, "- (plan: native)");
+    }
+
+    #[test]
+    fn testFormatControlLineShowsObservedAndAdaptedPlan() {
+        let line = format_control_line(
+            &SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter),
+            SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+        );
+
+        assert_eq!(line, "active via hook (plan: hook)");
+    }
+
+    #[test]
+    fn testFormatSurfaceWithPlanShowsObservedAndPlanWhenTheyDiffer() {
+        // A real obs≠plan case: codex/gemini execution falls back to compiled
+        // policy when the live hook isn't active. The observed mechanism
+        // (policy) legitimately differs from the multi-mechanism plan
+        // (hook+policy), and the formatter surfaces both. Both labels now come
+        // from the SAME per-surface vocabulary, so a `config/provider`-style skew
+        // for a correctly-configured surface is impossible by construction —
+        // which is why the old label-alignment test is gone.
+        let line = format_surface_with_plan(
+            &SurfaceState::adapted(ExecutionMechanism::CompiledPolicy),
+            SurfaceIntegration::adapted(&[
+                ExecutionMechanism::LiveHookAdapter,
+                ExecutionMechanism::CompiledPolicy,
+            ]),
+        );
+
+        assert_eq!(line, "policy/hook+policy");
     }
 }

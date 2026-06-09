@@ -132,7 +132,7 @@ pub fn run() {
 
     // Wait for kyrisd to be fully ready before reconciling agents. The
     // component installer started kyrisd moments ago; without a wait,
-    // the health check inside configure_burn_control races the daemon's
+    // the health check inside burn-control surface setup races the daemon's
     // startup and may fail even though the daemon is healthy.
     if let Ok(config) = load_or_init_config() {
         let base_url = config.base_url();
