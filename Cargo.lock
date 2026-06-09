@@ -1985,6 +1985,7 @@ dependencies = [
  "aws-lc-rs",
  "chrono",
  "kyris-types",
+ "libc",
  "reqwest 0.13.4",
  "serde",
  "serde-saphyr",

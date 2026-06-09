@@ -949,7 +949,7 @@ async fn resolve_pending(
             &info.server,
             info.tool.as_deref(),
             command,
-            "unknown",
+            &info.agent,
             info.allow_always,
             Some(decision_label),
         );
@@ -958,7 +958,7 @@ async fn resolve_pending(
             pending_id: &id,
             server: &info.server,
             command,
-            agent: "unknown",
+            agent: &info.agent,
             decision: decision_label,
         });
     }
@@ -974,19 +974,14 @@ struct HoldRequest {
     /// Optional verbatim code/command/path to render in the popup's
     /// accessoryView. Distinct from `tool` because `tool` is a short
     /// label ("Bash", "Read"); `code` is what the user actually needs
-    /// to read to decide ("git push --force origin main"). Older
-    /// callers omit it — the popup falls back to plain body text.
+    /// to read to decide ("git push --force origin main").
     #[serde(default)]
     code: Option<String>,
-    /// Whether the popup may offer "Always". Defaults to `true` for older
-    /// callers; `false` greys out the button (e.g. privilege escalation,
-    /// which agentpactd never persists anyway).
-    #[serde(default = "default_allow_always")]
+    /// Source agent or integration surface (`codex-cli`, `claude-code`,
+    /// `kyris-mcp`, ...).
+    agent: String,
+    /// Whether the popup may offer "Always".
     allow_always: bool,
-}
-
-fn default_allow_always() -> bool {
-    true
 }
 
 async fn hold_pending(
@@ -1002,6 +997,7 @@ async fn hold_pending(
     let dialog_server = body.server.clone();
     let dialog_tool = body.tool.clone();
     let dialog_code = body.code.clone();
+    let dialog_agent = body.agent.clone();
     let dialog_allow_always = body.allow_always;
 
     let _rx = state.pending.hold(
@@ -1010,6 +1006,7 @@ async fn hold_pending(
         body.server,
         body.tool,
         dialog_code.clone(),
+        body.agent,
         dialog_allow_always,
     );
     kyris_core::prompt_log::record_now(
@@ -1019,7 +1016,7 @@ async fn hold_pending(
         &dialog_server,
         dialog_tool.as_deref(),
         dialog_code.as_deref().or(dialog_tool.as_deref()),
-        "unknown",
+        &dialog_agent,
         dialog_allow_always,
         None,
     );
@@ -1047,7 +1044,7 @@ async fn hold_pending(
             &dialog_server,
             dialog_tool.as_deref(),
             dialog_code.as_deref().or(dialog_tool.as_deref()),
-            "unknown",
+            &dialog_agent,
             dialog_allow_always,
             None,
         );
@@ -1090,7 +1087,7 @@ async fn hold_pending(
                     &dialog_server,
                     dialog_tool.as_deref(),
                     dialog_code.as_deref().or(dialog_tool.as_deref()),
-                    "unknown",
+                    &dialog_agent,
                     dialog_allow_always,
                     Some(prompt_outcome),
                 );
@@ -1107,7 +1104,7 @@ async fn hold_pending(
                 &dialog_server,
                 dialog_tool.as_deref(),
                 dialog_code.as_deref().or(dialog_tool.as_deref()),
-                "unknown",
+                &dialog_agent,
                 dialog_allow_always,
                 Some(prompt_outcome),
             );
@@ -1123,7 +1120,7 @@ async fn hold_pending(
                 pending_id: &dialog_id,
                 server: &dialog_server,
                 command,
-                agent: "unknown",
+                agent: &dialog_agent,
                 decision: match decision {
                     ResolveDecision::Approved => "approved",
                     ResolveDecision::Always => "always",
@@ -2414,6 +2411,7 @@ mod tests {
             "github".into(),
             Some("read_file".into()),
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -2490,14 +2488,74 @@ mod tests {
                 "id": "req-ext-1",
                 "approval_token": "apt-ext-1",
                 "server": "github",
-                "tool": "read_file"
+                "tool": "read_file",
+                "agent": "test-agent",
+                "allow_always": true
             }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(state.pending.list_held().len(), 1);
-        assert_eq!(state.pending.list_held()[0].id, "req-ext-1");
+        let held = state.pending.list_held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, "req-ext-1");
+        assert_eq!(held[0].agent, "test-agent");
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testHoldPendingEndpointRequiresAgentAndAllowAlways() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route(
+            "/api/pending/hold",
+            axum::routing::post(hold_pending).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let missing_agent = client
+            .post(format!("{addr}/api/pending/hold"))
+            .json(&serde_json::json!({
+                "id": "req-missing-agent",
+                "approval_token": "apt-missing-agent",
+                "server": "github",
+                "tool": "read_file",
+                "allow_always": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_agent.status(), 422);
+
+        let missing_allow_always = client
+            .post(format!("{addr}/api/pending/hold"))
+            .json(&serde_json::json!({
+                "id": "req-missing-aa",
+                "approval_token": "apt-missing-aa",
+                "server": "github",
+                "tool": "read_file",
+                "agent": "test-agent"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_allow_always.status(), 422);
+        assert!(state.pending.list_held().is_empty());
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
@@ -2514,6 +2572,7 @@ mod tests {
             "github".into(),
             Some("read_file".into()),
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -3013,6 +3072,7 @@ mod tests {
                     server: "github",
                     tool: "read_file",
                     code: None,
+                    agent: "test-agent",
                     allow_always: true,
                 },
             )
@@ -3074,6 +3134,7 @@ mod tests {
                     server: "github",
                     tool: "write_file",
                     code: None,
+                    agent: "test-agent",
                     allow_always: true,
                 },
             )
@@ -3149,6 +3210,8 @@ mod tests {
                 "approval_token": "test-token",
                 "server": "anthropic",
                 "tool": "agent",
+                "agent": "test-agent",
+                "allow_always": true
             }))
             .send()
             .await
@@ -3169,6 +3232,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["id"], "e2e-list-1");
         assert_eq!(requests[0]["server"], "anthropic");
+        assert_eq!(requests[0]["agent"], "test-agent");
         assert_eq!(requests[0]["state"], "held");
 
         let _ = shutdown_tx.send(());

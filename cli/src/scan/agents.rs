@@ -301,9 +301,9 @@ fn check_compilation_gaps(agent_id: &str) -> Vec<String> {
 
 fn check_ask_dropped(agent_id: &str) -> u32 {
     type Compiler = fn(Option<&std::path::Path>) -> Result<(serde_json::Value, u32), String>;
+    // cline + opencode are live-hook now (no compiled COMMAND policy → the hook
+    // handles `ask`); only codex + gemini emit a compiled policy that can drop ask.
     let compiler: Option<Compiler> = match agent_id {
-        "cline" => Some(crate::compile_policy::compile_cline_permissions_summary),
-        "opencode" => Some(crate::compile_policy::compile_opencode_permissions),
         "codex-cli" => Some(crate::compile_policy::compile_codex_permissions),
         "gemini-cli" => Some(crate::compile_policy::compile_gemini_permissions),
         _ => None,

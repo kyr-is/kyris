@@ -20,12 +20,11 @@ struct PendingRequest {
     server: String,
     tool: Option<String>,
     code: Option<String>,
+    agent: String,
     state: String,
     held_since_ms: u64,
     /// Daemon's authoritative signal: whether answering "always" would persist
-    /// a standing override. Defaults to false when absent so we never advertise
-    /// a grant that would not stick.
-    #[serde(default)]
+    /// a standing override.
     allow_always: bool,
 }
 
@@ -98,7 +97,7 @@ pub fn run(_args: PendingArgs) {
                         &request.server,
                         request.tool.as_deref(),
                         request.code.as_deref().or(request.tool.as_deref()),
-                        "unknown",
+                        &request.agent,
                         request.allow_always,
                         None,
                     );
@@ -112,7 +111,7 @@ pub fn run(_args: PendingArgs) {
                         &request.server,
                         request.tool.as_deref(),
                         request.code.as_deref().or(request.tool.as_deref()),
-                        "unknown",
+                        &request.agent,
                         request.allow_always,
                         Some(decision),
                     );
@@ -227,16 +226,27 @@ mod tests {
 
     #[test]
     fn testPendingRequestDeserialization() {
-        let json = r#"{"id":"req-1","server":"github","tool":"read_file","state":"held","held_since_ms":5000}"#;
+        let json = r#"{"id":"req-1","server":"github","tool":"read_file","code":null,"agent":"test-agent","state":"held","held_since_ms":5000,"allow_always":true}"#;
         let req: PendingRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.id, "req-1");
         assert_eq!(req.tool, Some("read_file".to_string()));
+        assert_eq!(req.agent, "test-agent");
         assert_eq!(req.held_since_ms, 5000);
+        assert!(req.allow_always);
+    }
+
+    #[test]
+    fn testPendingRequestRequiresAgentAndAllowAlways() {
+        let missing_agent = r#"{"id":"req-1","server":"github","tool":"read_file","code":null,"state":"held","held_since_ms":5000,"allow_always":true}"#;
+        let missing_allow_always = r#"{"id":"req-1","server":"github","tool":"read_file","code":null,"agent":"test-agent","state":"held","held_since_ms":5000}"#;
+
+        assert!(serde_json::from_str::<PendingRequest>(missing_agent).is_err());
+        assert!(serde_json::from_str::<PendingRequest>(missing_allow_always).is_err());
     }
 
     #[test]
     fn testPendingResponseDeserialization() {
-        let json = r#"{"requests":[{"id":"req-1","server":"s","tool":null,"state":"held","held_since_ms":0}]}"#;
+        let json = r#"{"requests":[{"id":"req-1","server":"s","tool":null,"code":null,"agent":"codex-cli","state":"held","held_since_ms":0,"allow_always":true}]}"#;
         let resp: PendingResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.requests.len(), 1);
         assert!(resp.requests[0].tool.is_none());
@@ -252,6 +262,7 @@ mod tests {
             server: server.to_string(),
             tool: tool.map(str::to_string),
             code: tool.map(str::to_string),
+            agent: "test-agent".to_string(),
             state: "held".to_string(),
             held_since_ms: 0,
             allow_always,

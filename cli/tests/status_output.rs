@@ -143,35 +143,20 @@ fn test_status_claude_code_burn_control_active_via_shim_without_loader() {
 }
 
 #[test]
-fn test_status_cline_execution_active_via_shim_without_loader() {
-    // Cline's CLI gets its CLINE_COMMAND_PERMISSIONS policy from the shim
-    // sourcing cline-policy.sh — no shell-RC loader and no launchd plist needed
-    // (the plist only covers the VS Code extension host).
+fn test_status_cline_execution_active_via_hook() {
+    // cline execution is now a live-hook adapter: the kyris governance file-hook
+    // at ~/.cline/hooks/PreToolUse.cjs (auto-discovered, no env/launchd delivery).
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
     write_kyrisd_config(home, "127.0.0.1:1");
 
-    let ext_dir = home
-        .join(".vscode")
-        .join("extensions")
-        .join("saoudrizwan.claude-dev-3.0.0");
-    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
-
-    let env_dir = home.join(".kyris").join("env");
-    fs::create_dir_all(&env_dir).expect("create env dir");
+    let hooks_dir = home.join(".cline").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("create cline hooks dir");
     fs::write(
-        env_dir.join("cline-policy.sh"),
-        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
+        hooks_dir.join("PreToolUse.cjs"),
+        "// kyris hook check --agent cline\n",
     )
-    .expect("write cline policy env");
-
-    let bin_dir = home.join(".kyris").join("bin");
-    fs::create_dir_all(&bin_dir).expect("create bin dir");
-    fs::write(
-        bin_dir.join("cline"),
-        "#!/bin/sh\nfor __kyris_env in \"$HOME/.kyris/env/cline.sh\" \"$HOME/.kyris/env/cline\"-*.sh; do\n  [ -f \"$__kyris_env\" ] && . \"$__kyris_env\"\ndone\nexec cline \"$@\"\n",
-    )
-    .expect("write cline shim");
+    .expect("write cline hook");
 
     let output = run_status(home, None);
     assert!(output.status.success());
@@ -182,8 +167,8 @@ fn test_status_cline_execution_active_via_shim_without_loader() {
         .find(|l| l.contains("cline") && l.contains("cmd:"))
         .expect("cline line in status output");
     assert!(
-        line.contains("cmd:policy"),
-        "expected cmd:policy (active via shim, no loader), got: {line}"
+        line.contains("cmd:hook"),
+        "expected cmd:hook (live-hook adapter active), got: {line}"
     );
 }
 
@@ -218,24 +203,20 @@ fn test_status_claude_code_burn_control_active_with_loader_sourced() {
 }
 
 #[test]
-fn test_status_cline_execution_none_without_loader_sourced() {
+fn test_status_cline_execution_none_without_hook() {
+    // Detected via providers.json (routing configured) but no governance hook
+    // installed → execution none.
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
     write_kyrisd_config(home, "127.0.0.1:1");
 
-    let ext_dir = home
-        .join(".vscode")
-        .join("extensions")
-        .join("saoudrizwan.claude-dev-3.0.0");
-    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
-
-    let env_dir = home.join(".kyris").join("env");
-    fs::create_dir_all(&env_dir).expect("create env dir");
+    let settings_dir = home.join(".cline").join("data").join("settings");
+    fs::create_dir_all(&settings_dir).expect("create cline settings dir");
     fs::write(
-        env_dir.join("cline-policy.sh"),
-        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
+        settings_dir.join("providers.json"),
+        "{\"version\":1,\"providers\":{}}",
     )
-    .expect("write cline policy env");
+    .expect("write cline providers");
 
     let output = run_status(home, None);
     assert!(output.status.success());
@@ -246,78 +227,9 @@ fn test_status_cline_execution_none_without_loader_sourced() {
         .find(|l| l.contains("cline") && l.contains("cmd:"))
         .expect("cline line in status output");
     assert!(
-        line.contains("cmd:none/policy"),
-        "expected cmd:none/policy, got: {line}"
+        line.contains("cmd:none/hook"),
+        "expected cmd:none/hook, got: {line}"
     );
-}
-
-#[test]
-fn test_status_cline_execution_active_with_loader_sourced() {
-    let temp_home = TempDir::new().expect("temp home");
-    let home = temp_home.path();
-    write_kyrisd_config(home, "127.0.0.1:1");
-
-    let ext_dir = home
-        .join(".vscode")
-        .join("extensions")
-        .join("saoudrizwan.claude-dev-3.0.0");
-    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
-
-    let env_dir = home.join(".kyris").join("env");
-    fs::create_dir_all(&env_dir).expect("create env dir");
-    fs::write(
-        env_dir.join("cline-policy.sh"),
-        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
-    )
-    .expect("write cline policy env");
-
-    fs::write(home.join(".zshrc"), "source \"$HOME/.kyris/env/load.sh\"\n").expect("write .zshrc");
-
-    let output = run_status(home, None);
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .find(|l| l.contains("cline") && l.contains("cmd:"))
-        .expect("cline line in status output");
-    assert!(line.contains("policy"), "expected cmd:policy, got: {line}");
-}
-
-#[test]
-fn test_status_cline_execution_active_via_launchd_plist() {
-    let temp_home = TempDir::new().expect("temp home");
-    let home = temp_home.path();
-    write_kyrisd_config(home, "127.0.0.1:1");
-
-    let ext_dir = home
-        .join(".vscode")
-        .join("extensions")
-        .join("saoudrizwan.claude-dev-3.0.0");
-    fs::create_dir_all(&ext_dir).expect("create cline extension dir");
-
-    let env_dir = home.join(".kyris").join("env");
-    fs::create_dir_all(&env_dir).expect("create env dir");
-    fs::write(
-        env_dir.join("cline-policy.sh"),
-        "export CLINE_COMMAND_PERMISSIONS='{\"allow\":[\"echo\"]}'\n",
-    )
-    .expect("write cline policy env");
-
-    let plist_dir = home.join("Library").join("LaunchAgents");
-    fs::create_dir_all(&plist_dir).expect("create LaunchAgents dir");
-    fs::write(plist_dir.join("is.kyr.cline-policy.plist"), "<plist/>\n")
-        .expect("write cline plist");
-
-    let output = run_status(home, None);
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .find(|l| l.contains("cline") && l.contains("cmd:"))
-        .expect("cline line in status output");
-    assert!(line.contains("policy"), "expected cmd:policy, got: {line}");
 }
 
 #[test]
@@ -414,34 +326,8 @@ fn test_status_does_not_show_shell_hooks_section() {
     }
 }
 
-#[test]
-fn test_status_reports_degraded_cline_policy() {
-    let temp_home = TempDir::new().expect("temp home");
-    write_kyrisd_config(temp_home.path(), "127.0.0.1:1");
-
-    let env_dir = temp_home.path().join(".kyris").join("env");
-    fs::create_dir_all(&env_dir).expect("create env dir");
-    fs::write(
-        env_dir.join("cline-policy.sh"),
-        "export CLINE_COMMAND_PERMISSIONS='{}'\n",
-    )
-    .expect("write cline policy env");
-
-    let policy_dir = temp_home.path().join(".agentpact").join("policy");
-    fs::create_dir_all(&policy_dir).expect("create policy dir");
-    fs::write(
-        policy_dir.join("pact.yaml"),
-        "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"rm·-rf·*\": ask\n",
-    )
-    .expect("write pact policy");
-
-    let output = run_status(temp_home.path(), None);
-    assert!(output.status.success());
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("cline compiled policy degraded"),
-        "{stdout}"
-    );
-    assert!(stdout.contains("ask rules dropped"), "{stdout}");
-}
+// (Removed test_status_reports_degraded_cline_policy: cline is now a live-hook
+// agent with no compiled command policy, so the "compiled policy degraded / ask
+// rules dropped" warning no longer applies to it — the hook handles `ask`
+// natively. The warning path remains for the agents that still emit a compiled
+// policy fallback, codex + gemini.)

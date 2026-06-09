@@ -17,6 +17,7 @@ fn bench_hold(c: &mut Criterion) {
                 "github".into(),
                 Some("read_file".into()),
                 None,
+                "test-agent".into(),
                 true,
             );
             i += 1;
@@ -36,6 +37,7 @@ fn bench_claim_complete(c: &mut Criterion) {
                 "github".into(),
                 None,
                 None,
+                "test-agent".into(),
                 true,
             );
             let claim = store.claim(black_box(&id)).unwrap();
@@ -59,6 +61,7 @@ fn bench_prune(c: &mut Criterion) {
                         "github".into(),
                         None,
                         None,
+                        "test-agent".into(),
                         true,
                     );
                     let claim = store.claim(&id).unwrap();
@@ -83,6 +86,7 @@ fn bench_list_held(c: &mut Criterion) {
             "github".into(),
             Some("read_file".into()),
             None,
+            "test-agent".into(),
             true,
         );
         receivers.push(rx);
@@ -95,6 +99,7 @@ fn bench_list_held(c: &mut Criterion) {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
         let claim = store.claim(&id).unwrap();

@@ -261,6 +261,7 @@ fn fail_open_allow(server_name: &str, tool_name: &str) -> PactDecision {
         "[kyris-mcp] agentpactd unavailable, allowing {server_name}/{tool_name} due to policy"
     );
     kyris_core::fail_open_log::record(
+        "kyris-mcp",
         "call",
         tool_name,
         server_name,
@@ -338,6 +339,7 @@ async fn resolve_ask_via_kyrisd(
             // the daemon falls back to plain-text informativeText. Adding
             // the serialized args is a follow-up.
             code: None,
+            agent: "kyris-mcp",
             // Authoritative server signal: only offer "Always" when the daemon
             // would actually persist the grant (e.g. not a non-cacheable call).
             allow_always,

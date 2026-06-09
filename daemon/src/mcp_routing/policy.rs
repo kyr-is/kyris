@@ -83,7 +83,7 @@ pub async fn check_permission(
             // block the agent's routed MCP tool call. A down daemon must never
             // block; the call is spooled to the fail-open log for the audit trail.
             tracing::warn!(error = %e, "agentpactd unavailable, allowing (fail-open)");
-            fail_open_log::record("call", &tool, server_name, working_dir);
+            fail_open_log::record("kyris-mcp", "call", &tool, server_name, working_dir);
             PolicyDecision::Allow
         }
     }

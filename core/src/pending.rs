@@ -41,12 +41,6 @@ pub enum Resolution {
 }
 
 /// Identity + display payload for a `PACT_ASK` request held in kyrisd.
-///
-/// Bundles the five name-shaped strings that always travel together so
-/// `hold_poll_resolve` and `hold_poll_resolve_with_timeout` keep a tight
-/// signature. Borrowed for the lifetime of the call — no allocation; the
-/// fields are typically slices of caller-owned `String`s already on the
-/// stack.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingApproval<'a> {
     /// Approval ID from agentpactd's `PACT_ASK` response. kyrisd keys its
@@ -64,23 +58,12 @@ pub struct PendingApproval<'a> {
     /// MCP args) for the popup's syntect-highlighted accessoryView. `None`
     /// lets the daemon fall back to plain-text informativeText.
     pub code: Option<&'a str>,
+    /// Source agent or integration surface (`codex-cli`, `claude-code`,
+    /// `kyris-mcp`, ...).
+    pub agent: &'a str,
     /// Whether the popup may offer "Always". `false` (e.g. privilege
     /// escalation, which agentpactd never persists) greys out the button.
-    /// Defaults to `true` for callers that don't set it via `..Default`.
     pub allow_always: bool,
-}
-
-impl Default for PendingApproval<'_> {
-    fn default() -> Self {
-        Self {
-            approval_id: "",
-            approval_token: "",
-            server: "",
-            tool: "",
-            code: None,
-            allow_always: true,
-        }
-    }
 }
 
 /// Hold a `PACT_ASK` request in kyrisd and poll until the user resolves it
@@ -114,6 +97,7 @@ pub async fn hold_poll_resolve_with_timeout(
         "server": approval.server,
         "tool": approval.tool,
         "code": approval.code,
+        "agent": approval.agent,
         "allow_always": approval.allow_always,
     });
 

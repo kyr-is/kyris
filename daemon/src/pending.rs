@@ -23,6 +23,7 @@ pub struct PendingInfo {
     pub server: String,
     pub tool: Option<String>,
     pub code: Option<String>,
+    pub agent: String,
     pub state: PendingState,
     pub held_since_ms: u64,
     /// Whether answering "Always" would persist a standing override (the
@@ -36,6 +37,7 @@ struct PendingEntry {
     server: String,
     tool: Option<String>,
     code: Option<String>,
+    agent: String,
     state: PendingState,
     created: Instant,
     allow_always: bool,
@@ -65,6 +67,7 @@ impl PendingStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn hold(
         &self,
         id: String,
@@ -72,6 +75,7 @@ impl PendingStore {
         server: String,
         tool: Option<String>,
         code: Option<String>,
+        agent: String,
         allow_always: bool,
     ) -> oneshot::Receiver<Resolution> {
         let (tx, rx) = oneshot::channel();
@@ -80,6 +84,7 @@ impl PendingStore {
             server,
             tool,
             code,
+            agent,
             state: PendingState::Held,
             created: Instant::now(),
             allow_always,
@@ -195,6 +200,7 @@ impl PendingStore {
                 server: entry.server.clone(),
                 tool: entry.tool.clone(),
                 code: entry.code.clone(),
+                agent: entry.agent.clone(),
                 state: entry.state,
                 held_since_ms: entry.created.elapsed().as_millis() as u64,
                 allow_always: entry.allow_always,
@@ -260,6 +266,7 @@ mod tests {
             "github".into(),
             Some("read_file".into()),
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -271,6 +278,7 @@ mod tests {
 
         let info = &store.list()[0];
         assert_eq!(info.state, PendingState::Approved);
+        assert_eq!(info.agent, "test-agent");
     }
 
     #[test]
@@ -282,6 +290,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -309,6 +318,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -326,6 +336,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -347,6 +358,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -364,6 +376,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -381,6 +394,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -400,6 +414,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
         let _rx2 = store.hold(
@@ -408,6 +423,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -428,6 +444,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -446,6 +463,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -464,6 +482,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -480,6 +499,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -498,6 +518,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
         assert_eq!(store.get_state("req-1"), Some(PendingState::Held));
@@ -516,6 +537,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -533,6 +555,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 
@@ -559,6 +582,7 @@ mod tests {
             "github".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
         let _rx2 = store.hold(
@@ -567,6 +591,7 @@ mod tests {
             "gitlab".into(),
             None,
             None,
+            "test-agent".into(),
             true,
         );
 

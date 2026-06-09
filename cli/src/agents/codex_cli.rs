@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use crate::config_writer::{
     ConfigValidator, NoopValidator, TomlShapeValidator, WellFormedJsonValidator,
 };
@@ -227,6 +229,135 @@ fn write_json_unmanaged(path: &Path, value: &serde_json::Value) -> Result<(), St
     std::fs::write(path, serialized).map_err(|e| format!("Cannot write {}: {e}", path.display()))
 }
 
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted = serde_json::Map::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                if let Some(value) = map.get(key) {
+                    sorted.insert(key.clone(), canonical_json(value));
+                }
+            }
+            serde_json::Value::Object(sorted)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonical_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn codex_toml_version(value: &toml::Value) -> String {
+    let json = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
+    let canonical = canonical_json(&json);
+    let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &serialized);
+    let hex = digest.as_ref().iter().fold(String::new(), |mut out, byte| {
+        use std::fmt::Write;
+        let _ = write!(out, "{byte:02x}");
+        out
+    });
+    format!("sha256:{hex}")
+}
+
+fn codex_kyris_hook_command(script_path: &Path) -> String {
+    super::configure::shell_command(script_path)
+}
+
+fn codex_kyris_hook_key(hooks_path: &Path) -> String {
+    format!("{}:pre_tool_use:0:0", hooks_path.display())
+}
+
+#[derive(Serialize)]
+struct CodexHookTrustIdentity {
+    event_name: &'static str,
+    matcher: &'static str,
+    hooks: Vec<CodexHookTrustHandler>,
+}
+
+#[derive(Serialize)]
+struct CodexHookTrustHandler {
+    r#type: &'static str,
+    command: String,
+    #[serde(rename = "commandWindows")]
+    command_windows: Option<String>,
+    #[serde(rename = "timeout")]
+    timeout_sec: u64,
+    r#async: bool,
+    #[serde(rename = "statusMessage")]
+    status_message: Option<String>,
+}
+
+fn codex_kyris_hook_hash(script_path: &Path) -> Result<String, String> {
+    let identity = CodexHookTrustIdentity {
+        event_name: "pre_tool_use",
+        matcher: "",
+        hooks: vec![CodexHookTrustHandler {
+            r#type: "command",
+            command: codex_kyris_hook_command(script_path),
+            command_windows: None,
+            timeout_sec: 600,
+            r#async: false,
+            status_message: None,
+        }],
+    };
+    let value = toml::Value::try_from(identity)
+        .map_err(|e| format!("cannot build codex hook trust identity: {e}"))?;
+    Ok(codex_toml_version(&value))
+}
+
+fn ensure_codex_kyris_hook_trust(
+    config: &mut toml::Value,
+    hooks_path: &Path,
+    script_path: &Path,
+) -> Result<bool, String> {
+    let key = codex_kyris_hook_key(hooks_path);
+    let hash = codex_kyris_hook_hash(script_path)?;
+    Ok(ensure_toml_string_path(
+        config,
+        &["hooks", "state", key.as_str(), "trusted_hash"],
+        &hash,
+    ))
+}
+
+fn codex_kyris_hook_trusted(config_path: &Path, hooks_path: &Path, script_path: &Path) -> bool {
+    let Ok(config) = read_toml_value(config_path) else {
+        return false;
+    };
+    let Ok(expected_hash) = codex_kyris_hook_hash(script_path) else {
+        return false;
+    };
+    let key = codex_kyris_hook_key(hooks_path);
+    config
+        .get("hooks")
+        .and_then(toml::Value::as_table)
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(toml::Value::as_table)
+        .and_then(|state| state.get(&key))
+        .and_then(toml::Value::as_table)
+        .and_then(|entry| entry.get("trusted_hash"))
+        .and_then(toml::Value::as_str)
+        == Some(expected_hash.as_str())
+}
+
+fn scrub_codex_kyris_hook_trust(config: &mut toml::Value, config_path: &Path) -> bool {
+    let Some(dir) = config_path.parent() else {
+        return false;
+    };
+    let hooks_path = dir.join("hooks.json");
+    let key = codex_kyris_hook_key(&hooks_path);
+    let mut changed = remove_toml_path(config, &["hooks", "state", key.as_str()]);
+    if table_is_empty(config, &["hooks", "state"]) {
+        changed |= remove_toml_path(config, &["hooks", "state"]);
+    }
+    if table_is_empty(config, &["hooks"]) {
+        changed |= remove_toml_path(config, &["hooks"]);
+    }
+    changed
+}
+
 fn table_is_empty(root: &toml::Value, path: &[&str]) -> bool {
     let mut cursor = root;
     for segment in path {
@@ -312,7 +443,9 @@ pub fn scrub_codex_residue() -> Result<Vec<String>, String> {
             continue;
         }
         let mut config = read_toml_value(&path)?;
-        if scrub_codex_config_value(&mut config) {
+        let mut scrubbed = scrub_codex_config_value(&mut config);
+        scrubbed |= scrub_codex_kyris_hook_trust(&mut config, &path);
+        if scrubbed {
             write_codex_config_unmanaged(&path, &config)?;
             changes.push(format!("scrubbed {}", path.display()));
         }
@@ -358,12 +491,21 @@ impl AgentDescriptor for CodexCli {
             return not_detected();
         }
 
+        let config_path = codex_config_path().ok();
         let hooks_path = codex_hooks_path().ok();
-        let has_hook = hooks_path.as_deref().is_some_and(|p| {
+        let script_path = codex_dir().ok().map(|d| d.join("kyris_pretooluse.sh"));
+        let has_registered_hook = hooks_path.as_deref().is_some_and(|p| {
             p.exists() && std::fs::read_to_string(p).is_ok_and(|c| c.contains("kyris"))
         });
+        let has_hook = has_registered_hook
+            && config_path
+                .as_deref()
+                .zip(hooks_path.as_deref())
+                .zip(script_path.as_deref())
+                .is_some_and(|((config, hooks), script)| {
+                    codex_kyris_hook_trusted(config, hooks, script)
+                });
 
-        let config_path = codex_config_path().ok();
         let has_mcp_wrap = config_path.as_deref().is_some_and(|p| {
             read_toml_value(p).is_ok_and(|v| {
                 let serialized = toml::to_string(&v).unwrap_or_default();
@@ -441,9 +583,6 @@ impl AgentDescriptor for CodexCli {
             "[model_providers.kyris]",
         ]
     }
-    fn env_exports(&self, _base_url: &str, _inbound_key: &str) -> Vec<(String, String)> {
-        Vec::new()
-    }
     fn integration_plan(&self) -> AgentIntegrationPlan {
         super::capabilities::apply_declared_capabilities(
             self.canonical_id(),
@@ -508,6 +647,11 @@ impl AgentDescriptor for CodexCli {
         if ensure_codex_shell_env_marker(&mut config) {
             write_codex_config(&config_path, &config, "codex-cli:execution")?;
             changes.push(format!("updated {}", config_path.display()));
+        }
+        let mut config = read_or_empty_codex_config(&config_path)?;
+        if ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path)? {
+            write_codex_config(&config_path, &config, "codex-cli:execution")?;
+            changes.push(format!("trusted kyris hook in {}", config_path.display()));
         }
 
         // ── Command prefix rules (.rules file) ──────────────────────────
@@ -862,6 +1006,84 @@ mod tests {
         let changed = ensure_toml_bool_path(&mut config, &["features", "hooks"], true);
         assert!(changed, "features.hooks should be set in empty config");
         assert_eq!(config["features"]["hooks"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn testCodexKyrisHookTrustWrittenAndVerified() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let hooks_path = dir.path().join("hooks.json");
+        let script_path = dir.path().join("kyris_pretooluse.sh");
+        let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
+
+        assert!(ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap());
+        assert!(!ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap());
+        write_codex_config_unmanaged(&config_path, &config).unwrap();
+
+        let key = codex_kyris_hook_key(&hooks_path);
+        assert_eq!(
+            config["hooks"]["state"][&key]["trusted_hash"].as_str(),
+            Some(codex_kyris_hook_hash(&script_path).unwrap().as_str())
+        );
+        assert!(codex_kyris_hook_trusted(
+            &config_path,
+            &hooks_path,
+            &script_path
+        ));
+    }
+
+    #[test]
+    fn testCodexKyrisHookTrustRequiresMatchingScriptPath() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let hooks_path = dir.path().join("hooks.json");
+        let script_path = dir.path().join("kyris_pretooluse.sh");
+        let other_script_path = dir.path().join("other_pretooluse.sh");
+        let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
+
+        assert!(!codex_kyris_hook_trusted(
+            &config_path,
+            &hooks_path,
+            &script_path
+        ));
+        ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap();
+        write_codex_config_unmanaged(&config_path, &config).unwrap();
+
+        assert!(!codex_kyris_hook_trusted(
+            &config_path,
+            &hooks_path,
+            &other_script_path
+        ));
+    }
+
+    #[test]
+    fn testScrubCodexKyrisHookTrustRemovesOnlyKyrisEntry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let hooks_path = dir.path().join("hooks.json");
+        let script_path = dir.path().join("kyris_pretooluse.sh");
+        let other_key = "/tmp/other-hooks.json:pre_tool_use:0:0";
+        let mut config: toml::Value = toml::from_str(&format!(
+            r#"
+[hooks.state."{other_key}"]
+trusted_hash = "sha256:other"
+"#
+        ))
+        .expect("parse config");
+
+        ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap();
+        assert!(scrub_codex_kyris_hook_trust(&mut config, &config_path));
+
+        let kyris_key = codex_kyris_hook_key(&hooks_path);
+        assert!(
+            config["hooks"]["state"]
+                .as_table()
+                .is_some_and(|state| !state.contains_key(&kyris_key))
+        );
+        assert_eq!(
+            config["hooks"]["state"][other_key]["trusted_hash"].as_str(),
+            Some("sha256:other")
+        );
     }
 
     #[test]

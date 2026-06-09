@@ -7,6 +7,7 @@
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 
 use serde::Serialize;
 
@@ -64,10 +65,31 @@ pub fn record(entry: &PromptRecord<'_>) {
         }
     };
 
-    if let Err(e) = writeln!(file, "{line}") {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        eprintln!(
+            "[kyris] prompt_log: lock failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+
+    let mut bytes = line.into_bytes();
+    bytes.push(b'\n');
+    let write_result = file.write_all(&bytes);
+    let unlock_result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+
+    if let Err(e) = write_result {
         eprintln!(
             "[kyris] prompt_log: write failed for {}: {e}",
             path.display()
+        );
+    }
+    if unlock_result != 0 {
+        eprintln!(
+            "[kyris] prompt_log: unlock failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
         );
     }
 }

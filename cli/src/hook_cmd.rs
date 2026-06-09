@@ -123,7 +123,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
             // agentpactd (the decider) is unreachable — never freeze the
             // developer's shell. Fail open (spool for the audit trail) and let
             // the command run; the human at the terminal is the operator.
-            kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
+            kyris_core::fail_open_log::record("shell", action, &args.cmd, "shell", cwd);
             std::process::exit(0);
         }
     };
@@ -173,6 +173,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
             ),
             None => poll_segment(
                 "shell",
+                "shell",
                 &sock_path,
                 socket_timeout,
                 approval_id,
@@ -199,7 +200,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
         // the human approved actually runs here. A real deny / denial / timeout
         // still blocks below.
         Err(block) if block_from_daemon_unavailable(block.source) => {
-            kyris_core::fail_open_log::record(action, &args.cmd, "shell", cwd);
+            kyris_core::fail_open_log::record("shell", action, &args.cmd, "shell", cwd);
             std::process::exit(0);
         }
         Err(block) => {
@@ -290,7 +291,7 @@ fn tty_prompt_segment(
         "shell",
         Some(seg),
         Some(seg),
-        "unknown",
+        "shell",
         allow_always,
         None,
     );
@@ -305,7 +306,7 @@ fn tty_prompt_segment(
             "shell",
             Some(seg),
             Some(seg),
-            "unknown",
+            "shell",
             allow_always,
             Some("tty_error"),
         );
@@ -342,7 +343,7 @@ fn tty_prompt_segment(
         "shell",
         Some(seg),
         Some(seg),
-        "unknown",
+        "shell",
         allow_always,
         Some(outcome),
     );
@@ -395,6 +396,7 @@ fn run_hold(args: HookHoldArgs) {
     // `resolve-shell`), and a breaker ask never persists an override — so
     // "Always" is never offered here.
     match poll_segment(
+        "shell",
         "shell",
         &sock_path,
         socket_timeout,
@@ -741,7 +743,7 @@ fn dispatch_preview_outcome(
             // EmptyStdout shape (NOT the native allow shape, which would suppress
             // the agent's own prompt for a command the daemon never actually
             // cleared). Spool it for the audit trail.
-            kyris_core::fail_open_log::record(ctx.action, ctx.detail, ctx.agent, ctx.cwd);
+            kyris_core::fail_open_log::record(ctx.agent, ctx.action, ctx.detail, "shell", ctx.cwd);
             audit_log_hook(
                 ctx.audit_conn,
                 ctx.hook_id,
@@ -890,6 +892,7 @@ fn drive_per_segment(
         |seg| classify_segment(ctx, seed_pid, seg, command_group),
         |approval_id, approval_token, seg, allow_always| {
             poll_segment(
+                ctx.agent,
                 ctx.action,
                 ctx.sock_path,
                 ctx.socket_timeout,
@@ -934,7 +937,7 @@ fn drive_per_segment(
             // human still decides via the agent's prompt. Spool it so the audit
             // trail shows kyris punted this command. A real deny / user denial /
             // rendered-then-timed-out ask always blocks below.
-            kyris_core::fail_open_log::record(ctx.action, ctx.detail, ctx.agent, ctx.cwd);
+            kyris_core::fail_open_log::record(ctx.agent, ctx.action, ctx.detail, "shell", ctx.cwd);
             audit_log_hook(
                 ctx.audit_conn,
                 ctx.hook_id,
@@ -1037,7 +1040,7 @@ fn classify_segment(
         },
         Ok((McpPermissionDecision::Deny { reason, .. }, _)) => SegClass::Deny { reason },
         Err(reason) => {
-            kyris_core::fail_open_log::record(ctx.action, seg, ctx.agent, ctx.cwd);
+            kyris_core::fail_open_log::record(ctx.agent, ctx.action, seg, "shell", ctx.cwd);
             SegClass::Unavailable { reason }
         }
     }
@@ -1046,7 +1049,9 @@ fn classify_segment(
 /// Drive one segment's approval popup via kyrisd and return the outcome
 /// **without** emitting an agent response — the per-segment caller emits
 /// exactly once after the whole command resolves.
+#[allow(clippy::too_many_arguments)]
 fn poll_segment(
+    agent: &str,
     server: &str,
     sock_path: &str,
     socket_timeout: std::time::Duration,
@@ -1095,6 +1100,7 @@ fn poll_segment(
                 server,
                 tool: seg,
                 code: Some(seg),
+                agent,
                 // Authoritative server signal from the per-segment PACT_ASK:
                 // the popup greys out "Always" when the daemon would not
                 // persist the grant (privilege/control/remote-destroy,

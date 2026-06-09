@@ -35,7 +35,49 @@ pub trait AgentDescriptor {
         NativeEvidence::default()
     }
     fn kyris_content_markers(&self) -> &'static [&'static str];
-    fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)>;
+    /// Declares how an env-routed (`EnvVarProxy`) agent is pointed at kyrisd:
+    /// which provider base-URL env vars to repoint, any auth-skip flags, and the
+    /// provider CLI's custom-headers env var (+ multi-header separator) that
+    /// carries kyrisd's gate secret and agent-id attribution. `None` (the
+    /// default) → the agent is config-routed or has no burn-control surface, so
+    /// `env_exports` is empty. This is the single declarative source for env
+    /// routing; agents supply data, not construction code.
+    fn provider_routing(&self) -> Option<ProviderRouting> {
+        None
+    }
+    /// Routing env written to `~/.kyris/env/<id>.sh` and delivered on every
+    /// launch. Built uniformly from [`Self::provider_routing`]: every base-URL
+    /// var is repointed at kyrisd, the auth-skip flags are set verbatim, and the
+    /// gate secret + agent-id ride in the agent's custom-headers env var. The
+    /// agent's OWN provider credential (subscription OAuth or the user's API key)
+    /// is deliberately NOT set, so it flows through to the provider untouched for
+    /// kyrisd to forward and classify included-vs-overage. Override only for a
+    /// routing shape this declarative form cannot express.
+    fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
+        let Some(routing) = self.provider_routing() else {
+            return Vec::new();
+        };
+        let mut exports: Vec<(String, String)> = routing
+            .base_url_vars
+            .iter()
+            .map(|var| ((*var).to_string(), base_url.to_string()))
+            .collect();
+        exports.extend(
+            routing
+                .auth_skip_flags
+                .iter()
+                .map(|(var, val)| ((*var).to_string(), (*val).to_string())),
+        );
+        exports.push((
+            routing.custom_headers_var.to_string(),
+            format!(
+                "x-kyris-inbound: {inbound_key}{}x-kyris-agent-id: {}",
+                routing.header_separator,
+                self.canonical_id()
+            ),
+        ));
+        exports
+    }
     fn integration_plan(&self) -> AgentIntegrationPlan;
     fn expected_surfaces(&self) -> (bool, bool, bool) {
         self.integration_plan().expected_surfaces()
@@ -205,13 +247,6 @@ impl<M: 'static> SurfaceIntegration<M> {
         Self::Adapted {
             mechanisms,
             ceiling: None,
-        }
-    }
-
-    pub fn adapted_with_ceiling(mechanisms: &'static [M], ceiling: CoverageCeiling) -> Self {
-        Self::Adapted {
-            mechanisms,
-            ceiling: Some(ceiling),
         }
     }
 
@@ -434,32 +469,25 @@ pub enum AllowResponse {
     Json { body: serde_json::Value },
 }
 
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum PrimaryProvider {
-    OpenAI,
-    Google,
-}
-
-pub fn provider_env_exports(
-    provider: PrimaryProvider,
-    base_url: &str,
-    inbound_key: &str,
-) -> Vec<(String, String)> {
-    match provider {
-        PrimaryProvider::OpenAI => vec![
-            ("OPENAI_BASE_URL".to_string(), format!("{base_url}/v1")),
-            ("OPENAI_API_KEY".to_string(), inbound_key.to_string()),
-        ],
-        PrimaryProvider::Google => vec![
-            ("GOOGLE_GEMINI_BASE_URL".to_string(), base_url.to_string()),
-            ("GEMINI_API_KEY".to_string(), inbound_key.to_string()),
-            (
-                "GEMINI_API_KEY_AUTH_MECHANISM".to_string(),
-                "bearer".to_string(),
-            ),
-        ],
-    }
+/// Declarative routing for an env-routed (`EnvVarProxy`) agent — consumed by
+/// [`AgentDescriptor::env_exports`]'s default impl. All cross-agent variation
+/// (provider base-URL var names, auth-skip flags, the custom-headers env var and
+/// its multi-header separator) lives here as data, so adding an env-routed agent
+/// is one [`AgentDescriptor::provider_routing`] declaration with no construction
+/// code. The agent's own provider credential is never part of this — it flows
+/// through to the provider untouched (see `env_exports`).
+pub struct ProviderRouting {
+    /// Provider base-URL env vars to repoint at kyrisd (each set to `base_url`).
+    pub base_url_vars: &'static [&'static str],
+    /// Provider auth-skip flags set verbatim (e.g. `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1`).
+    pub auth_skip_flags: &'static [(&'static str, &'static str)],
+    /// The provider CLI's custom-headers env var carrying the gate secret +
+    /// agent-id (Claude Code: `ANTHROPIC_CUSTOM_HEADERS`; Gemini CLI:
+    /// `GEMINI_CLI_CUSTOM_HEADERS`).
+    pub custom_headers_var: &'static str,
+    /// Separator the CLI's parser expects between multiple headers in that var
+    /// (Claude Code: `"\n"`; Gemini CLI: `", "`).
+    pub header_separator: &'static str,
 }
 
 pub fn which_exists(cmd: &str) -> bool {

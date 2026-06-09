@@ -136,6 +136,35 @@ pub fn remove_json_command_hook(root: &mut Value, phase: &str, command_substr: &
     phase_hooks.len() != before
 }
 
+/// Ensure the string `value` is present in the array at `path` (creating
+/// intermediate objects and the array if absent). Returns whether it was added.
+/// Reusable for any "membership in a JSON array" config (e.g. opencode's
+/// top-level `plugin` list).
+pub fn ensure_json_array_contains(root: &mut Value, path: &[&str], value: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        let object = as_json_object(cursor);
+        cursor = object
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    let object = as_json_object(cursor);
+    let array = object
+        .entry(path[path.len() - 1].to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(items) = array.as_array_mut() else {
+        return false;
+    };
+    if items.iter().any(|v| v.as_str() == Some(value)) {
+        return false;
+    }
+    items.push(Value::String(value.to_string()));
+    true
+}
+
 fn entry_has_command(entry: &Value, command: &str) -> bool {
     if entry.get("type").and_then(Value::as_str) == Some("command")
         && entry.get("command").and_then(Value::as_str) == Some(command)
@@ -215,6 +244,31 @@ pub fn set_json_value_path(root: &mut Value, path: &[&str], value: Value) -> boo
     }
     object.insert(leaf, value);
     true
+}
+
+/// Remove the string leaf at `path` iff it currently equals `expected`. Returns
+/// whether anything was removed. Used to migrate away a kyris-owned value (e.g. an
+/// `apiKey` wrongly set to the gate key) without disturbing a user's real value.
+pub fn remove_json_string_if_equals(root: &mut Value, path: &[&str], expected: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        let Some(next) = cursor.get_mut(*key) else {
+            return false;
+        };
+        cursor = next;
+    }
+    let Some(object) = cursor.as_object_mut() else {
+        return false;
+    };
+    let leaf = path[path.len() - 1];
+    if object.get(leaf).and_then(Value::as_str) == Some(expected) {
+        object.remove(leaf);
+        return true;
+    }
+    false
 }
 
 pub fn ensure_toml_string_path(root: &mut toml::Value, path: &[&str], value: &str) -> bool {

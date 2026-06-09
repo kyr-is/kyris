@@ -9,7 +9,7 @@ use super::probe::{
 use super::registry::{
     AgentDescriptor, AgentIntegrationPlan, AllowResponse, AttributionMechanism,
     BurnControlMechanism, ExecutionMechanism, HookProtocol, McpConfigFormat, McpConfigLocation,
-    SurfaceIntegration, ToolMapping, ToolMechanism,
+    ProviderRouting, SurfaceIntegration, ToolMapping, ToolMechanism,
 };
 
 pub struct ClaudeCode;
@@ -43,47 +43,28 @@ fn claude_code_detected() -> bool {
         || crate::integration::home_dir().is_ok_and(|h| h.join(".claude").is_dir())
 }
 
-fn claude_code_env_exports(
-    base_url: &str,
-    inbound_key: &str,
-    agent_id: &str,
-) -> Vec<(String, String)> {
-    vec![
-        ("ANTHROPIC_BASE_URL".to_string(), base_url.to_string()),
-        // Deliver the kyrisd gate secret in a dedicated header (parsed by Claude
-        // Code's ANTHROPIC_CUSTOM_HEADERS) so the agent's OWN credential —
-        // subscription OAuth or the user's API key — flows through to the
-        // provider untouched. That lets kyrisd forward it and classify usage as
-        // included (subscription/burn-only) vs overage (API key). We deliberately
-        // do NOT set ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN, which would override
-        // the subscription OAuth.
-        (
-            "ANTHROPIC_CUSTOM_HEADERS".to_string(),
-            // Two newline-separated headers (Claude Code's documented format for
-            // multiple): the kyrisd gate secret, and the agent id so kyrisd can
-            // attribute the model-call burn to this agent on the gateway record.
-            format!("x-kyris-inbound: {inbound_key}\nx-kyris-agent-id: {agent_id}"),
-        ),
-        (
-            "ANTHROPIC_BEDROCK_BASE_URL".to_string(),
-            base_url.to_string(),
-        ),
-        ("CLAUDE_CODE_SKIP_BEDROCK_AUTH".to_string(), "1".to_string()),
-        (
-            "ANTHROPIC_VERTEX_BASE_URL".to_string(),
-            base_url.to_string(),
-        ),
-        ("CLAUDE_CODE_SKIP_VERTEX_AUTH".to_string(), "1".to_string()),
-        (
-            "ANTHROPIC_FOUNDRY_BASE_URL".to_string(),
-            base_url.to_string(),
-        ),
-        (
-            "ANTHROPIC_BEDROCK_MANTLE_BASE_URL".to_string(),
-            base_url.to_string(),
-        ),
-    ]
-}
+// Claude Code's multi-backend base-URL vars all repoint at kyrisd; the gate
+// secret + agent-id ride in ANTHROPIC_CUSTOM_HEADERS (newline-separated, Claude
+// Code's documented multi-header format). The agent's OWN credential —
+// subscription OAuth or the user's API key — is deliberately NOT set here, so it
+// flows through to the provider untouched for kyrisd to forward and classify
+// included-vs-overage. The actual env is built by the trait's default
+// `env_exports` from this declaration.
+const CLAUDE_CODE_ROUTING: ProviderRouting = ProviderRouting {
+    base_url_vars: &[
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+        "ANTHROPIC_FOUNDRY_BASE_URL",
+        "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    ],
+    auth_skip_flags: &[
+        ("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1"),
+        ("CLAUDE_CODE_SKIP_VERTEX_AUTH", "1"),
+    ],
+    custom_headers_var: "ANTHROPIC_CUSTOM_HEADERS",
+    header_separator: "\n",
+};
 
 impl AgentDescriptor for ClaudeCode {
     fn id(&self) -> &'static str {
@@ -168,8 +149,8 @@ impl AgentDescriptor for ClaudeCode {
     fn kyris_content_markers(&self) -> &'static [&'static str] {
         &["agentpact_pretooluse", "kyris-mcp"]
     }
-    fn env_exports(&self, base_url: &str, inbound_key: &str) -> Vec<(String, String)> {
-        claude_code_env_exports(base_url, inbound_key, self.canonical_id())
+    fn provider_routing(&self) -> Option<ProviderRouting> {
+        Some(CLAUDE_CODE_ROUTING)
     }
     fn integration_plan(&self) -> AgentIntegrationPlan {
         super::capabilities::apply_declared_capabilities(
@@ -419,8 +400,7 @@ mod tests {
 
     #[test]
     fn testClaudeCodeExportsMultiBackend() {
-        let exports =
-            claude_code_env_exports("http://127.0.0.1:4710", "sk-test", "anthropic/claude-code");
+        let exports = ClaudeCode.env_exports("http://127.0.0.1:4710", "sk-test");
         let keys: Vec<&str> = exports.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"ANTHROPIC_BASE_URL"));
         assert!(keys.contains(&"ANTHROPIC_BEDROCK_BASE_URL"));

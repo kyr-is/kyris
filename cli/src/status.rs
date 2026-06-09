@@ -152,15 +152,12 @@ fn check_native_integrations() {
 type PolicyCompiler = fn(Option<&std::path::Path>) -> Result<(serde_json::Value, u32), String>;
 
 fn check_compiled_policy_degradation() {
+    // Only agents that actually EMIT a compiled policy (as a fallback/ceiling)
+    // can have ask rules dropped. cline + opencode are pure live-hook now (their
+    // governance is the daemon-mediated hook — no compiled command policy), so
+    // they're excluded; codex + gemini still write a compiled policy alongside
+    // their hook.
     let compilers: &[(&str, PolicyCompiler)] = &[
-        (
-            "cline",
-            crate::compile_policy::compile_cline_permissions_summary,
-        ),
-        (
-            "opencode",
-            crate::compile_policy::compile_opencode_permissions,
-        ),
         (
             "codex-cli",
             crate::compile_policy::compile_codex_permissions,

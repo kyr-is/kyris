@@ -8,15 +8,28 @@ pub fn log_path() -> PathBuf {
     crate::paths::fail_open_path()
 }
 
-pub fn record(action: &str, detail: &str, mcp_server: &str, working_dir: Option<&str>) {
+pub fn record(
+    agent: &str,
+    action: &str,
+    detail: &str,
+    mcp_server: &str,
+    working_dir: Option<&str>,
+) {
     let path = log_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    record_to(&path, action, detail, mcp_server, working_dir);
+    record_to(&path, agent, action, detail, mcp_server, working_dir);
 }
 
-fn record_to(path: &Path, action: &str, detail: &str, mcp_server: &str, working_dir: Option<&str>) {
+fn record_to(
+    path: &Path,
+    agent: &str,
+    action: &str,
+    detail: &str,
+    mcp_server: &str,
+    working_dir: Option<&str>,
+) {
     let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -33,13 +46,13 @@ fn record_to(path: &Path, action: &str, detail: &str, mcp_server: &str, working_
     let line = serde_json::json!({
         "id": id.to_string(),
         "timestamp": ts,
-        "agent": "unknown",
+        "agent": agent,
         "action": action,
         "detail": detail,
         "decision": "auto",
         "working_dir": wd,
         "mcp_server": mcp_server,
-        "attribution_method": "unknown",
+        "attribution_method": "kyris",
         "mode": "log",
         "event_kind": "action",
         "coverage_state": "unknown",
@@ -62,6 +75,7 @@ mod tests {
 
         record_to(
             &path,
+            "test-agent",
             "call",
             "read_file",
             "github-mcp",
@@ -72,8 +86,10 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(parsed["action"], "call");
+        assert_eq!(parsed["agent"], "test-agent");
         assert_eq!(parsed["detail"], "read_file");
         assert_eq!(parsed["mcp_server"], "github-mcp");
+        assert_eq!(parsed["attribution_method"], "kyris");
         assert_eq!(parsed["source"], "fail-open");
         assert_eq!(parsed["coverage_state"], "unknown");
         assert_eq!(parsed["working_dir"], "/tmp/project");
@@ -84,7 +100,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fail-open.jsonl");
 
-        record_to(&path, "call", "write_file", "mcp-server", None);
+        record_to(
+            &path,
+            "test-agent",
+            "call",
+            "write_file",
+            "mcp-server",
+            None,
+        );
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value =

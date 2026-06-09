@@ -309,6 +309,7 @@ async fn forward_mcp_post(
                 server_name.clone(),
                 tool_name,
                 None,
+                "kyris-mcp".to_string(),
                 allow_always,
             );
 

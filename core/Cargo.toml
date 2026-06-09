@@ -29,6 +29,7 @@ uuid = { workspace = true }
 # CSPRNG for minting the local hook<->daemon auth secrets in the file-backed
 # secret store (see `secret.rs`) — the same RNG the daemon/cli standardize on.
 aws-lc-rs = { workspace = true }
+libc = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"], optional = true }
 reqwest = { workspace = true, features = ["rustls", "json"], optional = true }
 
