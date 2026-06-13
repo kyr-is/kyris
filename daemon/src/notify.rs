@@ -56,7 +56,7 @@ pub enum ApprovalOutcome {
 /// monospaced text — the right surface for shell commands and file paths
 /// (whose readability suffers in the standard `informativeText` font).
 /// When `None`, the popup uses `body` alone.
-/// `allow_always` controls whether the "Always" button is offered; `false`
+/// `allow_always` controls whether the "For session" button is offered; `false`
 /// greys it out (e.g. privilege escalation, which agentpactd never persists).
 #[cfg(feature = "tray")]
 pub async fn ask_approval(

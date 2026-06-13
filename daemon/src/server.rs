@@ -980,8 +980,13 @@ struct HoldRequest {
     /// Source agent or integration surface (`codex-cli`, `claude-code`,
     /// `kyris-mcp`, ...).
     agent: String,
-    /// Whether the popup may offer "Always".
+    /// Whether the popup may offer "For session".
     allow_always: bool,
+    /// Pre-formatted "why this needs approval" body the holder rendered from
+    /// agentpactd's structured ask-context. Shown as the popup's informative
+    /// text. Absent for paths without ask-context (breaker holds, older callers).
+    #[serde(default)]
+    detail: Option<String>,
     /// Caller-sized lifetime for this pending entry, in seconds — the
     /// holder's own poll window plus margin, so the dialog outlives the
     /// wait instead of timing out mid-poll on long windows (codex's hook
@@ -1008,6 +1013,7 @@ async fn hold_pending(
     let dialog_code = body.code.clone();
     let dialog_agent = body.agent.clone();
     let dialog_allow_always = body.allow_always;
+    let dialog_detail = body.detail.clone();
 
     let _rx = state.pending.hold(
         body.id.clone(),
@@ -1017,6 +1023,7 @@ async fn hold_pending(
         dialog_code.clone(),
         body.agent,
         dialog_allow_always,
+        body.detail,
     );
     kyris_core::prompt_log::record_now(
         &body.id,
@@ -1064,10 +1071,14 @@ async fn hold_pending(
             // itself — no need for a "Review and approve:" prompt. The
             // no-code path keeps prose because there's nothing else to
             // show the user.
-            let body_line = if dialog_code.is_some() {
-                String::new()
-            } else {
-                format!("Agent wants to run {tool_label}. Allow?")
+            // Prefer the daemon's structured "why" (effects, classification,
+            // what "For session" does) when present — that is the whole point of the
+            // ask-context. Fall back to the lean code-speaks-for-itself empty
+            // body, then to prose when there's nothing else to show.
+            let body_line = match dialog_detail.as_deref() {
+                Some(detail) if !detail.is_empty() => detail.to_string(),
+                _ if dialog_code.is_some() => String::new(),
+                _ => format!("Agent wants to run {tool_label}. Allow?"),
             };
             let outcome = crate::notify::ask_approval(
                 &format!("Allow {dialog_server}"),
@@ -2422,6 +2433,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let app = Router::new().route(
@@ -2583,6 +2595,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let app = Router::new().route(
@@ -3083,6 +3096,7 @@ mod tests {
                     code: None,
                     agent: "test-agent",
                     allow_always: true,
+                    detail: None,
                 },
             )
             .await
@@ -3145,6 +3159,7 @@ mod tests {
                     code: None,
                     agent: "test-agent",
                     allow_always: true,
+                    detail: None,
                 },
             )
             .await

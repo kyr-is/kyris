@@ -369,7 +369,7 @@ pub fn show_approval_alert(
         content_view.addSubview(&scroll);
     }
 
-    // --- Buttons: [Always]   [No] [Yes]  (Yes is default, rightmost) ---
+    // --- Buttons: [For session]   [No] [Yes]  (Yes is default, rightmost) ---
     let handler = ApprovalAction::new(mtm);
     let target: &AnyObject = &handler;
 
@@ -405,9 +405,9 @@ pub fn show_approval_alert(
     // Tag = MODAL_CODE_*; ApprovalAction calls stopModalWithCode:tag.
     let yes_btn = make_button("Yes", yes_x, MODAL_CODE_YES, "\r"); // Return: default
     let no_btn = make_button("No", no_x, MODAL_CODE_NO, "\u{1b}"); // Escape: cancel
-    let always_btn = make_button("Always", always_x, MODAL_CODE_ALWAYS, "");
+    let always_btn = make_button("For session", always_x, MODAL_CODE_ALWAYS, "");
     // Privilege escalations (and anything agentpactd won't persist) can't be
-    // "Always"-remembered — grey the button out. The server-side guard in
+    // granted "For session" — grey the button out. The server-side guard in
     // `should_persist_override` is authoritative regardless; this is UX.
     if !allow_always {
         always_btn.setEnabled(false);

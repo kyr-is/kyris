@@ -67,9 +67,13 @@ pub struct PendingApproval<'a> {
     /// Source agent or integration surface (`codex-cli`, `claude-code`,
     /// `kyris-mcp`, ...).
     pub agent: &'a str,
-    /// Whether the popup may offer "Always". `false` (e.g. privilege
+    /// Whether the popup may offer "For session". `false` (e.g. privilege
     /// escalation, which agentpactd never persists) greys out the button.
     pub allow_always: bool,
+    /// Pre-formatted "why this needs approval" body the daemon attached to the
+    /// `PACT_ASK` (rendered from its structured ask-context). Shown as the
+    /// popup's informative text. `None` → the popup's terse default.
+    pub detail: Option<&'a str>,
 }
 
 /// Hold a `PACT_ASK` request in kyrisd and poll until the user resolves it
@@ -111,6 +115,7 @@ pub async fn hold_poll_resolve_with_timeout(
         "code": approval.code,
         "agent": approval.agent,
         "allow_always": approval.allow_always,
+        "detail": approval.detail,
         "ttl_seconds": max_wait.as_secs().saturating_add(60),
     });
 

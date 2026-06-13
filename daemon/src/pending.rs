@@ -26,10 +26,14 @@ pub struct PendingInfo {
     pub agent: String,
     pub state: PendingState,
     pub held_since_ms: u64,
-    /// Whether answering "Always" would persist a standing override (the
-    /// daemon's authoritative signal). `kyris pending` offers "always" only
-    /// when this is true.
+    /// Whether answering "For session" would record a session-scoped grant
+    /// (the daemon's authoritative signal). `kyris pending` offers the
+    /// "session" choice only when this is true.
     pub allow_always: bool,
+    /// Pre-formatted "why this needs approval" body (from agentpactd's
+    /// structured ask-context), shown as the approval dialog's informative
+    /// text. `None` for paths without ask-context.
+    pub detail: Option<String>,
 }
 
 struct PendingEntry {
@@ -41,6 +45,7 @@ struct PendingEntry {
     state: PendingState,
     created: Instant,
     allow_always: bool,
+    detail: Option<String>,
     resolver: Option<oneshot::Sender<Resolution>>,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -77,6 +82,7 @@ impl PendingStore {
         code: Option<String>,
         agent: String,
         allow_always: bool,
+        detail: Option<String>,
     ) -> oneshot::Receiver<Resolution> {
         let (tx, rx) = oneshot::channel();
         let entry = PendingEntry {
@@ -88,6 +94,7 @@ impl PendingStore {
             state: PendingState::Held,
             created: Instant::now(),
             allow_always,
+            detail,
             resolver: Some(tx),
             timeout_handle: None,
         };
@@ -201,6 +208,7 @@ impl PendingStore {
                 tool: entry.tool.clone(),
                 code: entry.code.clone(),
                 agent: entry.agent.clone(),
+                detail: entry.detail.clone(),
                 state: entry.state,
                 held_since_ms: entry.created.elapsed().as_millis() as u64,
                 allow_always: entry.allow_always,
@@ -268,6 +276,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         assert_eq!(store.list_held().len(), 1);
@@ -292,6 +301,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -320,6 +330,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -338,6 +349,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -360,6 +372,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         store.timeout("req-1");
@@ -378,6 +391,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         store.cancel("req-1");
@@ -396,6 +410,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         store.timeout("req-1");
@@ -416,6 +431,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
         let _rx2 = store.hold(
             "req-2".into(),
@@ -425,6 +441,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -446,6 +463,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -465,6 +483,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -484,6 +503,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         store.timeout("req-1");
@@ -501,6 +521,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         store.cancel("req-1");
@@ -520,6 +541,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
         assert_eq!(store.get_state("req-1"), Some(PendingState::Held));
 
@@ -539,6 +561,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         let claim = store.claim("req-1").unwrap();
@@ -557,6 +580,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         store.timeout("req-1");
@@ -584,6 +608,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
         let _rx2 = store.hold(
             "req-1".into(),
@@ -593,6 +618,7 @@ mod tests {
             None,
             "test-agent".into(),
             true,
+            None,
         );
 
         assert_eq!(store.list().len(), 1);

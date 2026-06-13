@@ -148,6 +148,17 @@ pub fn build_permission_respond_request(
 /// `PACT_ASK` → `Ask{id, token}`, `PACT_POLICY_ERROR`/`PACT_PROTOCOL_ERROR`
 /// → `Deny{PolicyError}` (surfacing recovery hint when present),
 /// `PACT_CAP_EXCEEDED` → `Deny{CapExceeded}`, anything else → `Deny{PolicyError}`.
+/// Parse the daemon's structured `ask_context` off a `PACT_ASK` response and
+/// render it into the approval-popup body (see
+/// [`kyris_core::agentpact::format_ask_context`]). `None` when the field is
+/// absent (older daemon) or unparseable — the popup then falls back to its
+/// terse default.
+fn parse_ask_context_detail(response: &serde_json::Value) -> Option<String> {
+    let ctx: agentpact_types::AskContext =
+        serde_json::from_value(response.get("ask_context")?.clone()).ok()?;
+    Some(kyris_core::agentpact::format_ask_context(&ctx))
+}
+
 #[must_use]
 pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermissionDecision {
     match response.get("code").and_then(|code| code.as_str()) {
@@ -203,6 +214,7 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
                         .get("allow_always")
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false),
+                    detail: parse_ask_context_detail(response),
                 }
             }
         }
@@ -466,6 +478,9 @@ pub fn request_hook_permission_preview(
                     .get("allow_always")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                // Preview asks are never shown to the user (no token); skip the
+                // popup body.
+                detail: None,
             },
             _ => parse_mcp_permission_response(&response),
         };
@@ -1369,6 +1384,7 @@ mod tests {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
                 allow_always: false,
+                detail: None,
             }
         );
     }
@@ -1387,6 +1403,7 @@ mod tests {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
                 allow_always: true,
+                detail: None,
             }
         );
     }

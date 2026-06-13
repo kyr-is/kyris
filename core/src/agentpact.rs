@@ -48,13 +48,126 @@ pub enum McpPermissionDecision {
     Ask {
         approval_id: String,
         approval_token: String,
-        /// Authoritative server signal: whether answering "Always" would
-        /// actually persist a standing override. UX surfaces offer "Always"
-        /// only when this is `true`. Defaults to `false` when the daemon omits
+        /// Authoritative server signal: whether answering "For session" would
+        /// actually persist a session-scoped grant. UX surfaces offer the
+        /// "For session" choice (field name stays `allow_always` for wire
+        /// stability) only when this is `true`. Defaults to `false` when the daemon omits
         /// it (older daemon / malformed response) — conservative: a missing
         /// signal means don't advertise a grant that may not stick.
         allow_always: bool,
+        /// Pre-formatted "why this needs approval" body for the approval popup,
+        /// rendered by the wire interpreter from the daemon's structured
+        /// [`agentpact_types::AskContext`] (see [`format_ask_context`]). `None`
+        /// when the daemon sent no ask-context (older daemon / non-popup path).
+        detail: Option<String>,
     },
+}
+
+/// Render the daemon's structured ask-context into a human popup body — one
+/// line per effect (`action resource — note`), then unresolved heads, sandbox
+/// bounds, and what "For session" does. Presentation lives here (kyris owns the UX);
+/// the daemon emits facts.
+#[must_use]
+pub fn format_ask_context(ctx: &agentpact_types::AskContext) -> String {
+    use agentpact_types::RememberInfo;
+    let mut lines: Vec<String> = Vec::new();
+    for effect in &ctx.effects {
+        let mut line = match &effect.resource {
+            Some(resource) => format!("• {} {resource}", effect.action),
+            None => format!("• {}", effect.action),
+        };
+        if let Some(note) = &effect.note {
+            line.push_str(" — ");
+            line.push_str(note);
+        }
+        lines.push(line);
+    }
+    if !ctx.unresolved.is_empty() {
+        lines.push(format!("• unresolved: {}", ctx.unresolved.join(", ")));
+    }
+    if let Some(sandbox) = &ctx.sandbox {
+        lines.push(format!(
+            "Sandboxed — writes bounded to {}",
+            sandbox.writable_roots.join(", ")
+        ));
+    }
+    match &ctx.remember {
+        Some(RememberInfo::Session) => {
+            lines.push(
+                "\u{201c}For session\u{201d} keeps this approval for the rest of the session."
+                    .to_string(),
+            );
+        }
+        Some(RememberInfo::NotRemembered { reason }) => {
+            lines.push(format!("Won\u{2019}t be remembered: {reason}"));
+        }
+        None => {}
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod ask_context_tests {
+    use super::format_ask_context;
+    use agentpact_types::{AskContext, EffectFact, RememberInfo, SandboxFact};
+
+    #[test]
+    fn testFormatRendersEffectsSandboxAndRemember() {
+        let ctx = AskContext {
+            effects: vec![
+                EffectFact {
+                    action: "write".to_string(),
+                    resource: Some(".git/hooks/pre-commit".to_string()),
+                    note: Some("repo control metadata".to_string()),
+                },
+                EffectFact {
+                    action: "network".to_string(),
+                    resource: Some("https://api.example.com".to_string()),
+                    note: None,
+                },
+            ],
+            unresolved: vec!["mystery_tool".to_string()],
+            sandbox: Some(SandboxFact {
+                writable_roots: vec!["/repo".to_string(), "/tmp".to_string()],
+            }),
+            remember: Some(RememberInfo::Session),
+        };
+        let body = format_ask_context(&ctx);
+        assert!(
+            body.contains("write .git/hooks/pre-commit — repo control metadata"),
+            "{body}"
+        );
+        assert!(body.contains("network https://api.example.com"), "{body}");
+        assert!(body.contains("unresolved: mystery_tool"), "{body}");
+        assert!(
+            body.contains("Sandboxed — writes bounded to /repo, /tmp"),
+            "{body}"
+        );
+        assert!(body.contains("\u{201c}For session\u{201d}"), "{body}");
+        assert!(body.contains("rest of the session"), "{body}");
+    }
+
+    #[test]
+    fn testFormatNotRememberedReason() {
+        let ctx = AskContext {
+            effects: vec![EffectFact {
+                action: "remote_delete".to_string(),
+                resource: Some("eks/prod".to_string()),
+                note: None,
+            }],
+            unresolved: Vec::new(),
+            sandbox: None,
+            remember: Some(RememberInfo::NotRemembered {
+                reason: "remote-destroy".to_string(),
+            }),
+        };
+        let body = format_ask_context(&ctx);
+        assert!(body.contains("remote_delete eks/prod"), "{body}");
+        assert!(
+            body.contains("Won\u{2019}t be remembered: remote-destroy"),
+            "{body}"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default)]

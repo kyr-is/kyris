@@ -23,9 +23,13 @@ struct PendingRequest {
     agent: String,
     state: String,
     held_since_ms: u64,
-    /// Daemon's authoritative signal: whether answering "always" would persist
-    /// a standing override.
+    /// Daemon's authoritative signal: whether answering "For session" would
+    /// record a session-scoped grant. (Field name kept for wire stability.)
     allow_always: bool,
+    /// Pre-formatted "why this needs approval" body (from agentpactd's
+    /// structured ask-context). Shown beneath the header before the prompt.
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -86,6 +90,13 @@ pub fn run(_args: PendingArgs) {
                         request.state,
                         request.held_since_ms / 1000,
                     );
+                    if let Some(detail) = request.detail.as_deref().filter(|d| !d.is_empty()) {
+                        // The structured "why" the daemon attached (effects,
+                        // classification, what "For session" does).
+                        for line in detail.lines() {
+                            println!("    {line}");
+                        }
+                    }
 
                     let stdin = std::io::stdin();
                     let mut reader = BufReader::new(stdin.lock());
@@ -155,9 +166,9 @@ fn prompt_decision<R: BufRead, W: Write>(
     writer: &mut W,
 ) -> Option<&'static str> {
     let tool = request.tool.as_deref().unwrap_or("unknown");
-    // Offer "always" only when the daemon says a grant would actually persist.
+    // Offer "session" only when the daemon says a grant would actually persist.
     let choices = if request.allow_always {
-        "[y/n/always/skip]"
+        "[y/n/session/skip]"
     } else {
         "[y/n/skip]"
     };
@@ -176,9 +187,10 @@ fn parse_decision(input: &str, allow_always: bool) -> Option<&'static str> {
     match input.trim().to_lowercase().as_str() {
         "y" | "yes" => Some("approved"),
         "n" | "no" => Some("denied"),
-        // "always" sticks only when persistable; otherwise the daemon would
-        // refuse to persist anyway, so honor it as a one-time approval.
-        "a" | "always" => Some(if allow_always { "always" } else { "approved" }),
+        // "session" grants for the rest of the session, but only when the
+        // daemon says it would persist; otherwise honor it as a one-time
+        // approval. The wire value stays "always" (the protocol token).
+        "session" => Some(if allow_always { "always" } else { "approved" }),
         _ => None,
     }
 }
@@ -203,18 +215,17 @@ mod tests {
     }
 
     #[test]
-    fn testParseDecisionAlwaysWhenPersistable() {
-        assert_eq!(parse_decision("a", true), Some("always"));
-        assert_eq!(parse_decision("always", true), Some("always"));
-        assert_eq!(parse_decision("ALWAYS", true), Some("always"));
+    fn testParseDecisionSessionWhenPersistable() {
+        // The typed token is "session"; the wire value it maps to stays "always".
+        assert_eq!(parse_decision("session", true), Some("always"));
+        assert_eq!(parse_decision("SESSION", true), Some("always"));
     }
 
     #[test]
-    fn testParseDecisionAlwaysWhenNotPersistableMapsToApproved() {
-        // The daemon won't persist this grant, so "always" can only mean
-        // approve-once — never a standing override.
-        assert_eq!(parse_decision("a", false), Some("approved"));
-        assert_eq!(parse_decision("always", false), Some("approved"));
+    fn testParseDecisionSessionWhenNotPersistableMapsToApproved() {
+        // The daemon won't persist this grant, so "session" can only mean
+        // approve-once — never a standing grant.
+        assert_eq!(parse_decision("session", false), Some("approved"));
     }
 
     #[test]
@@ -266,6 +277,7 @@ mod tests {
             state: "held".to_string(),
             held_since_ms: 0,
             allow_always,
+            detail: None,
         }
     }
 
@@ -281,18 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn testPromptHidesAlwaysWhenNotPersistable() {
-        // allow_always=false → the prompt must not advertise "always", and an
-        // "always" answer collapses to a one-time approval.
+    fn testPromptHidesSessionWhenNotPersistable() {
+        // allow_always=false → the prompt must not advertise "session", and a
+        // "session" answer collapses to a one-time approval.
         let (decision, displayed) =
-            run_prompt_req(fixture_aa("github", Some("read_file"), false), "always\n");
+            run_prompt_req(fixture_aa("github", Some("read_file"), false), "session\n");
         assert!(
             displayed.contains("[y/n/skip]"),
-            "must hide always when not persistable: {displayed}"
+            "must hide session option when not persistable: {displayed}"
         );
         assert!(
-            !displayed.contains("always"),
-            "must not advertise always: {displayed}"
+            !displayed.contains("session"),
+            "must not advertise session: {displayed}"
         );
         assert_eq!(decision, Some("approved"));
     }
@@ -313,7 +325,7 @@ mod tests {
             "missing tool name in: {displayed}"
         );
         assert!(
-            displayed.contains("[y/n/always/skip]"),
+            displayed.contains("[y/n/session/skip]"),
             "missing choice list in: {displayed}"
         );
     }
@@ -340,8 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn testPromptAlwaysReturnsAlways() {
-        let (decision, _) = run_prompt("github", Some("read_file"), "always\n");
+    fn testPromptSessionReturnsAlways() {
+        // Typed "session" maps to the "always" wire token (session-scoped grant).
+        let (decision, _) = run_prompt("github", Some("read_file"), "session\n");
         assert_eq!(decision, Some("always"));
     }
 
@@ -377,6 +390,6 @@ mod tests {
         let (decision, displayed) = run_prompt("github", Some("read_file"), "y\n");
         assert_eq!(decision, Some("approved"));
         // The full prompt must appear before any decision logic completes.
-        assert!(displayed.ends_with("[y/n/always/skip] "));
+        assert!(displayed.ends_with("[y/n/session/skip] "));
     }
 }

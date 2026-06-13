@@ -184,7 +184,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     let result = run_segments(
         &segs,
         |seg| classify_segment(&ctx, None, ctx.action, seg, command_group),
-        |approval_id, approval_token, seg, allow_always| {
+        |approval_id, approval_token, seg, allow_always, detail| {
             if host_agent {
                 return PopupResult::Approved {
                     source: "host_agent",
@@ -199,6 +199,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
                     approval_token,
                     seg,
                     allow_always,
+                    detail,
                 ),
                 None => poll_segment(
                     "shell",
@@ -209,6 +210,7 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
                     approval_token,
                     seg,
                     allow_always,
+                    detail,
                     kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
                 ),
             }
@@ -331,6 +333,7 @@ fn read_tty_line(tty: &std::fs::File) -> Option<String> {
 /// decision to agentpactd. Returns the [`PopupResult`] without emitting any
 /// shell output beyond the prompt — the caller maps the aggregate result to
 /// an exit code. A read failure denies safe.
+#[allow(clippy::too_many_arguments)]
 fn tty_prompt_segment(
     tty: &std::fs::File,
     sock_path: &str,
@@ -339,12 +342,15 @@ fn tty_prompt_segment(
     approval_token: &str,
     seg: &str,
     allow_always: bool,
+    // The structured "why" body is a popup affordance; the TTY prompt shows the
+    // command itself, so it is accepted for signature parity and ignored here.
+    _detail: Option<&str>,
 ) -> PopupResult {
     use std::io::Write as _;
 
-    // Offer "always" only when the daemon says a grant would persist.
+    // Offer "session" only when the daemon says a grant would persist.
     let choices = if allow_always {
-        "[y/n/always]"
+        "[y/n/session]"
     } else {
         "[y/n]"
     };
@@ -384,9 +390,10 @@ fn tty_prompt_segment(
 
     let (response, source) = match answer.trim() {
         "y" | "Y" | "yes" => (ApprovalResponse::Approved, "user_approved"),
-        // "always" sticks only when persistable; otherwise the daemon would
-        // refuse to persist anyway, so honor it as a one-time approval.
-        "a" | "A" | "always" => {
+        // "session" grants for the rest of the session, but only when the
+        // daemon says it would persist; otherwise honor it as a one-time
+        // approval. The variant/source labels stay `*_always` (wire/code stable).
+        "session" => {
             if allow_always {
                 (ApprovalResponse::Always, "user_always")
             } else {
@@ -458,7 +465,7 @@ fn run_hold(args: HookHoldArgs) {
     //
     // `hold` now serves only the circuit-breaker path (normal asks go through
     // `resolve-shell`), and a breaker ask never persists an override — so
-    // "Always" is never offered here.
+    // "For session" is never offered here.
     match poll_segment(
         "shell",
         "shell",
@@ -468,6 +475,7 @@ fn run_hold(args: HookHoldArgs) {
         &args.token,
         &args.display,
         false,
+        None,
         kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
     ) {
         PopupResult::Approved { .. } => std::process::exit(0),
@@ -1082,6 +1090,9 @@ enum SegClass {
         approval_id: String,
         approval_token: String,
         allow_always: bool,
+        /// Pre-formatted "why this needs approval" popup body from the daemon's
+        /// structured ask-context (`None` → terse default).
+        detail: Option<String>,
     },
     /// Policy denied this segment.
     Deny { reason: String },
@@ -1130,7 +1141,7 @@ fn run_segments<C, P>(
 ) -> Result<&'static str, SegBlock>
 where
     C: FnMut(&str) -> SegClass,
-    P: FnMut(&str, &str, &str, bool) -> PopupResult,
+    P: FnMut(&str, &str, &str, bool, Option<&str>) -> PopupResult,
 {
     let mut source: &'static str = "agentpact_auto";
     for seg in segments {
@@ -1154,7 +1165,14 @@ where
                 approval_id,
                 approval_token,
                 allow_always,
-            } => match prompt(&approval_id, &approval_token, seg, allow_always) {
+                detail,
+            } => match prompt(
+                &approval_id,
+                &approval_token,
+                seg,
+                allow_always,
+                detail.as_deref(),
+            ) {
                 PopupResult::Approved { source: s } => source = s,
                 PopupResult::Blocked {
                     exit_code,
@@ -1314,7 +1332,7 @@ fn drive_batches(
         let result = run_segments(
             &batch.segments,
             |seg| classify_segment(ctx, seed_pid, &batch.action, seg, command_group),
-            |approval_id, approval_token, seg, allow_always| {
+            |approval_id, approval_token, seg, allow_always, detail| {
                 if native_mode {
                     // Do NOT hold: the agent will prompt its own user. Leave the
                     // agentpactd ASK token to expire — recording a deny here
@@ -1341,6 +1359,7 @@ fn drive_batches(
                     approval_token,
                     seg,
                     allow_always,
+                    detail,
                     remaining,
                 )
             },
@@ -1578,12 +1597,14 @@ fn classify_segment(
                 approval_id,
                 approval_token,
                 allow_always,
+                detail,
             },
             _,
         )) => SegClass::Ask {
             approval_id,
             approval_token,
             allow_always,
+            detail,
         },
         Ok((McpPermissionDecision::Deny { reason, .. }, _)) => SegClass::Deny { reason },
         Err(reason) => {
@@ -1610,6 +1631,7 @@ fn poll_segment(
     approval_token: &str,
     seg: &str,
     allow_always: bool,
+    detail: Option<&str>,
     max_wait: std::time::Duration,
 ) -> PopupResult {
     // For a file action `seg` is a path — render it home-relative for the popup
@@ -1654,12 +1676,14 @@ fn poll_segment(
                 code: Some(seg),
                 agent,
                 // Authoritative server signal from the per-segment PACT_ASK:
-                // the popup greys out "Always" when the daemon would not
+                // the popup greys out "For session" when the daemon would not
                 // persist the grant (privilege/control/remote-destroy,
                 // breaker, or no working_dir) — superseding the old
                 // leading-word `sudo` heuristic, which missed wrapper-hidden
                 // privilege like `env sudo …`.
                 allow_always,
+                // Structured "why" body the daemon attached to this ask.
+                detail,
             },
             max_wait,
         )
@@ -2315,7 +2339,7 @@ mod tests {
         let result = run_segments(
             &segs,
             |_seg| SegClass::Auto,
-            |_id, _tok, _seg, _allow| {
+            |_id, _tok, _seg, _allow, _detail| {
                 prompted += 1;
                 PopupResult::Approved {
                     source: "user_approved",
@@ -2341,12 +2365,13 @@ mod tests {
                         approval_id: "apr_1".to_string(),
                         approval_token: "tok_1".to_string(),
                         allow_always: true,
+                        detail: None,
                     }
                 } else {
                     SegClass::Auto
                 }
             },
-            |_id, _tok, seg, allow_always| {
+            |_id, _tok, seg, allow_always, _detail| {
                 prompted.push(seg.to_string());
                 prompted_allow_always = Some(allow_always);
                 PopupResult::Approved {
@@ -2373,9 +2398,10 @@ mod tests {
                     approval_id: "a".to_string(),
                     approval_token: "t".to_string(),
                     allow_always: false,
+                    detail: None,
                 }
             },
-            |_id, _tok, _seg, _allow| PopupResult::Blocked {
+            |_id, _tok, _seg, _allow, _detail| PopupResult::Blocked {
                 exit_code: 2,
                 source: "user_denied",
                 reason: "nope".to_string(),
@@ -2399,7 +2425,7 @@ mod tests {
             |_seg| SegClass::Deny {
                 reason: "blocked by policy".to_string(),
             },
-            |_id, _tok, _seg, _allow| unreachable!("deny must not prompt"),
+            |_id, _tok, _seg, _allow, _detail| unreachable!("deny must not prompt"),
         );
         let block = result.unwrap_err();
         assert_eq!(block.source, "agentpact_deny");
@@ -2418,7 +2444,7 @@ mod tests {
             |_seg| SegClass::Unavailable {
                 reason: "daemon down".to_string(),
             },
-            |_id, _tok, _seg, _allow| unreachable!(),
+            |_id, _tok, _seg, _allow, _detail| unreachable!(),
         );
         let block = result.unwrap_err();
         assert_eq!(block.source, "agentpact_unreachable");

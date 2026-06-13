@@ -320,6 +320,7 @@ async fn forward_mcp_post(
             approval_id,
             approval_token,
             allow_always,
+            detail,
         } => {
             let pending_timeout = config.mcp.pending_timeout_seconds;
             let tool_display = tool_name.as_deref().unwrap_or("unknown tool");
@@ -334,6 +335,7 @@ async fn forward_mcp_post(
                 None,
                 "kyris-mcp".to_string(),
                 allow_always,
+                detail,
             );
 
             let pending = state.pending.clone();
