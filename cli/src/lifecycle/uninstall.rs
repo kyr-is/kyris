@@ -37,9 +37,9 @@ pub fn run(_args: UninstallArgs) {
 
     unload_env_launchd(&log);
 
-    // Call each agent's undo() + undo_burn_control() before manifest cleanup.
-    // This handles: MCP upstream removal from kyrisd.yaml, agent-specific
-    // config cleanup (e.g. resetting codex_hooks flag), and hook/env removal.
+    // Call each agent's per-surface undo before manifest cleanup. This handles:
+    // MCP upstream removal from kyrisd.yaml, agent-specific config cleanup
+    // (e.g. removing codex hook/provider entries), and hook/env removal.
     // Manifest cleanup below then handles remaining non-agent-specific entries.
     undo_all_agents(&log);
 
@@ -61,6 +61,7 @@ pub fn run(_args: UninstallArgs) {
         }
     }
 
+    scrub_codex_residue(&log);
     sweep_well_known_hook_scripts(&log);
     unregister_package(&log);
 
@@ -69,6 +70,21 @@ pub fn run(_args: UninstallArgs) {
     log.info("=== kyris uninstall complete ===");
     if !log.path().as_os_str().is_empty() {
         println!("\nUninstall log: {}", log.path().display());
+    }
+}
+
+fn scrub_codex_residue(log: &InstallLog) {
+    match crate::agents::codex_cli::scrub_codex_residue() {
+        Ok(changes) => {
+            for change in changes {
+                log.info(&change);
+                println!("{change}");
+            }
+        }
+        Err(error) => {
+            log.warn(&format!("codex residue scrub failed: {error}"));
+            eprintln!("Warning: codex residue scrub failed: {error}");
+        }
     }
 }
 

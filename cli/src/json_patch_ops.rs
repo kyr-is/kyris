@@ -368,4 +368,46 @@ mod tests {
     fn roundtripRemovedKey() {
         assert_roundtrip(json!({"a": 1, "b": 2}), json!({"a": 1}));
     }
+
+    #[test]
+    fn roundtripReplaceUserValueRestoresOriginal() {
+        // kyris overwrites a value the user already set — unapply restores the
+        // user's, not kyris's.
+        assert_roundtrip(
+            json!({"baseUrl": "https://user.example"}),
+            json!({"baseUrl": "http://127.0.0.1:4710"}),
+        );
+    }
+
+    #[test]
+    fn roundtripArrayValueRestored() {
+        assert_roundtrip(
+            json!({"args": ["--foo"]}),
+            json!({"args": ["--foo", "--kyris"]}),
+        );
+    }
+
+    #[test]
+    fn roundtripAgentConfigFullKyrisSetup() {
+        // A realistic agent JSON config (cline/opencode shape) gaining the full
+        // kyris integration — a routing baseUrl, an mcpServers.kyris-mcp block
+        // (with the inbound auth header), and a hooks entry — and unapply must
+        // restore the user's original config EXACTLY, leaving their own
+        // mcpServers.other and apiProvider untouched. Mirrors the codex TOML
+        // round-trip on the JSON side.
+        let original = json!({
+            "apiProvider": "anthropic",
+            "mcpServers": {"other": {"command": "x"}},
+        });
+        let kyris_configured = json!({
+            "apiProvider": "anthropic",
+            "baseUrl": "http://127.0.0.1:4710",
+            "mcpServers": {
+                "other": {"command": "x"},
+                "kyris-mcp": {"url": "http://127.0.0.1:4710/mcp", "headers": {"x-kyris-inbound": "sk-kyris-abc"}},
+            },
+            "hooks": {"PreToolUse": [{"command": "kyris_pretooluse"}]},
+        });
+        assert_roundtrip(original, kyris_configured);
+    }
 }

@@ -413,6 +413,11 @@ fn clean_checks() -> Vec<Check> {
         "kyris_pretooluse",
         "agentpact_pretooluse",
         "agentpact_beforetool",
+        "KYRIS_GOVERNED_SUBPROCESS",
+        "model_provider = \"kyris\"",
+        "[model_providers.kyris]",
+        "[permissions.kyris]",
+        "default_permissions = \"kyris\"",
         "/.kyris/",
     ];
 
@@ -420,6 +425,7 @@ fn clean_checks() -> Vec<Check> {
     let agent_configs: &[(&str, &str)] = &[
         (".claude/settings.json", "claude-code"),
         (".codex/hooks.json", "codex-cli"),
+        (".codex/config.toml", "codex-cli config"),
         (".gemini/settings.json", "gemini-cli"),
         (".cline/data/globalState.json", "cline (global state)"),
         (".config/opencode/opencode.json", "opencode"),
@@ -440,6 +446,22 @@ fn clean_checks() -> Vec<Check> {
                 "clean".into()
             },
         });
+    }
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        let path = PathBuf::from(codex_home).join("config.toml");
+        if path != PathBuf::from(&home).join(".codex").join("config.toml") && path.exists() {
+            let has_residue = kyris_markers.iter().any(|m| file_contains(&path, m));
+            checks.push(Check {
+                name: "codex-cli config (CODEX_HOME)",
+                component: "agent-configs",
+                passed: !has_residue,
+                detail: if has_residue {
+                    format!("kyris entries remain in {}", path.display())
+                } else {
+                    "clean".into()
+                },
+            });
+        }
     }
 
     // Cline MCP settings live in VS Code extension global storage — not

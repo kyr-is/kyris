@@ -31,6 +31,9 @@ pub fn routes(state: Arc<AppState>) -> Router {
             "/v1/messages/count_tokens",
             post(handle_count_tokens).with_state(state),
         )
+        // Run handlers to completion even if the client disconnects — the
+        // gateway record must not depend on the downstream connection's fate.
+        .layer(super::RunToCompletionLayer)
 }
 
 /// Classify the cost-coverage of a request from the agent's inbound credential.
@@ -90,14 +93,7 @@ async fn handle_messages(
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
 
-    if let (Some(token), Some(aid)) = (trace_token.as_deref(), agent_id.as_deref()) {
-        tracing::debug!(
-            agent_id = aid,
-            trace_token = token,
-            "native protocol observed"
-        );
-        super::write_native_seen_breadcrumb(aid);
-    }
+    super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
     if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
@@ -105,6 +101,21 @@ async fn handle_messages(
         crate::notify::circuit_breaker_toast(count);
         return Ok(circuit_breaker_response(&trace_id, count));
     }
+
+    // Resolve attribution now, while the peer socket still maps to a live
+    // process — the record is written at stream/handler end, by which time the
+    // agent may have disconnected and exited, and a record without
+    // `working_dir` never becomes sync-eligible.
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.or(peer_agent);
 
     let config = state.config.load();
     let provider = config
@@ -222,9 +233,8 @@ async fn handle_messages(
             model,
             provider_name,
             session_id,
-            trace_token,
-            agent_id,
-            peer_addr,
+            working_dir,
+            agent,
             start,
             plan_status,
         );
@@ -274,17 +284,6 @@ async fn handle_messages(
             false
         }
     };
-
-    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-        (
-            super::relay_trace_attach(&state, token, &trace_id).await,
-            None,
-        )
-    } else {
-        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
-        (attr.working_dir, attr.agent)
-    };
-    let agent = agent_id.clone().or(peer_agent);
 
     if state
         .stats_tx
@@ -355,9 +354,8 @@ fn relay_sse_stream(
     model: String,
     provider_name: String,
     session_id: String,
-    trace_token: Option<String>,
-    agent_id: Option<String>,
-    peer_addr: SocketAddr,
+    working_dir: Option<String>,
+    agent: Option<String>,
     start: std::time::Instant,
     plan_status: PlanStatus,
 ) -> Result<Response, StatusCode> {
@@ -422,19 +420,19 @@ fn relay_sse_stream(
     };
 
     let mut relay = Some(Box::pin(relay));
-    let mut finalized = false;
-    let trace_id_for_stream = trace_id.clone();
-    let model_for_stream = model.clone();
-    let provider_name_for_stream = provider_name;
-    let session_id_for_stream = session_id.clone();
-    let full_stream = futures_util::stream::poll_fn(move |cx| {
-        use std::task::Poll;
-
-        if finalized {
-            return Poll::Ready(None);
-        }
-
-        let finalize_stream = |emit_breaker_chunk: bool| {
+    // The finalize owns (clones of) everything the record needs so it can run
+    // from the guard's Drop as well as from the poll path — a client that
+    // disconnects before end-of-stream must still produce a gateway record
+    // (see `StreamRecordGuard`).
+    let finalize_stream = {
+        let accumulated = accumulated.clone();
+        let line_buf = line_buf.clone();
+        let breaker_tripped = breaker_tripped.clone();
+        let state = state.clone();
+        let trace_id = trace_id.clone();
+        let model = model.clone();
+        let session_id = session_id.clone();
+        move |emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -510,37 +508,25 @@ fn relay_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-                (
-                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                    None,
-                )
-            } else {
-                let attr =
-                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
-                (attr.working_dir, attr.agent)
-            };
-            let agent = agent_id.clone().or(peer_agent);
-
             if state
                 .stats_tx
                 .try_send(StatsEvent {
-                    trace_id: trace_id_for_stream.clone(),
-                    provider: provider_name_for_stream.clone(),
-                    model: model_for_stream.clone(),
+                    trace_id: trace_id.clone(),
+                    provider: provider_name.clone(),
+                    model: model.clone(),
                     tokens,
                     cache_create: stream_tokens.cache_creation_input,
                     cache_read: stream_tokens.cache_read_input,
                     cost,
                     latency_ms,
                     status: status.to_string(),
-                    session_id: Some(session_id_for_stream.clone()),
+                    session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
                     metering: stream_metering,
                     plan_status,
-                    working_dir,
-                    agent,
+                    working_dir: working_dir.clone(),
+                    agent: agent.clone(),
                 })
                 .is_err()
             {
@@ -548,12 +534,19 @@ fn relay_sse_stream(
             }
 
             breaker_chunk
-        };
+        }
+    };
+    let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
+    let full_stream = futures_util::stream::poll_fn(move |cx| {
+        use std::task::Poll;
+
+        if record_guard.is_done() {
+            return Poll::Ready(None);
+        }
 
         if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
             drop(relay.take());
-            finalized = true;
-            if let Some(chunk) = finalize_stream(false) {
+            if let Some(chunk) = record_guard.finalize(false) {
                 return Poll::Ready(Some(Ok(chunk)));
             }
             return Poll::Ready(None);
@@ -569,8 +562,7 @@ fn relay_sse_stream(
             }
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                finalized = true;
-                if let Some(chunk) = finalize_stream(true) {
+                if let Some(chunk) = record_guard.finalize(true) {
                     Poll::Ready(Some(Ok(chunk)))
                 } else {
                     Poll::Ready(None)
@@ -981,6 +973,196 @@ mod tests {
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(forwarded_json["model"], "claude-3-5-sonnet-20241022");
         assert_eq!(forwarded_json["messages"][0]["content"], "hi");
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    /// G-K2: the emitted metering event carries the right `plan_status` at the
+    /// route level (not just the pure `anthropic_plan_status` helper). A
+    /// subscription OAuth credential classifies `Included`; a plain API key
+    /// classifies `Overage`. Both drive the full handler against the fake
+    /// upstream and read the recorded `StatsEvent.plan_status`.
+    #[tokio::test]
+    async fn testAnthropicRouteEmitsIncludedForOauthAndOverageForApiKey() {
+        use kyris_core::record::PlanStatus;
+
+        let recorded = Arc::new(Mutex::new(None));
+        let upstream = Router::new()
+            .route("/v1/messages", post(record_upstream_request))
+            .with_state(recorded.clone());
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            upstream: upstream_url.clone(),
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        // Subscription OAuth (`sk-ant-oat…` bearer) → Included.
+        let included = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .header("x-kyris-session-id", "sess-oauth")
+            .header("authorization", "Bearer sk-ant-oat01-subscription")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(included.status(), StatusCode::OK);
+        let included_event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            included_event.plan_status,
+            PlanStatus::Included,
+            "OAuth subscription credential must emit plan_status=Included"
+        );
+
+        // Plain API key → Overage.
+        let overage = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .header("x-kyris-session-id", "sess-apikey")
+            .header("x-api-key", "sk-ant-api03-billed")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(overage.status(), StatusCode::OK);
+        let overage_event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            overage_event.plan_status,
+            PlanStatus::Overage,
+            "API-key credential must emit plan_status=Overage"
+        );
+
+        let _ = router_shutdown.send(());
+        let _ = upstream_shutdown.send(());
+        router_handle.await.unwrap();
+        upstream_handle.await.unwrap();
+    }
+
+    /// G-K5: `content-encoding` is preserved end-to-end through the full proxy.
+    /// kyrisd buffers the upstream body and rebuilds the caller response, and
+    /// because its reqwest client is built WITHOUT decompression
+    /// (`build_default_provider_client`), the body must travel byte-identical
+    /// with its `content-encoding` intact — the load-bearing half of the
+    /// relay-response-framing fix. (The complementary hop-by-hop framing strip in
+    /// `relay_upstream_headers` is unit-tested directly in
+    /// `testRelayUpstreamHeadersDropsFramingKeepsContent`; it cannot be exercised
+    /// at this layer because reqwest normalizes `transfer-encoding`/chunked away
+    /// before kyrisd ever sees the upstream response headers.)
+    #[tokio::test]
+    async fn testAnthropicRoutePreservesContentEncodingThroughProxy() {
+        let body_bytes = serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string();
+        let body_for_upstream = body_bytes.clone();
+
+        // Fake upstream that advertises a content-encoding. The body is not
+        // actually gzipped — kyrisd never decodes it, so byte-identity is what
+        // matters (its reqwest client has no decompression feature). We do NOT
+        // set `transfer-encoding: chunked` here: hyper owns response framing, so
+        // a manual chunked header on a fixed-length body produces a malformed
+        // response, and reqwest would normalize it away before kyrisd saw it
+        // anyway.
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let body = body_for_upstream.clone();
+                async move {
+                    (
+                        StatusCode::OK,
+                        [
+                            ("content-type", "application/json"),
+                            ("content-encoding", "gzip"),
+                        ],
+                        body,
+                    )
+                }
+            }),
+        );
+        let (upstream_url, upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            upstream: upstream_url.clone(),
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        // reqwest is built without gzip/brotli/deflate features (see Cargo.toml),
+        // so it never transparently decodes a response body — the relayed
+        // `content-encoding` header and the raw bytes are observed verbatim,
+        // which is exactly the property this test relies on.
+        let resp = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .header("x-api-key", "caller-key")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        // content-encoding survives the proxy (kyrisd does not decompress).
+        assert_eq!(
+            resp.headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "content-encoding must be relayed: kyrisd does not decompress the body"
+        );
+        // The relayed response carries kyrisd's own framing (a content-length for
+        // the buffered body), never a hop-by-hop transfer-encoding.
+        assert!(
+            !resp.headers().contains_key("transfer-encoding"),
+            "the relayed response must not carry a hop-by-hop transfer-encoding"
+        );
+        // Body is byte-identical (not decoded/re-encoded).
+        let relayed = resp.bytes().await.unwrap();
+        assert_eq!(
+            relayed.as_ref(),
+            body_bytes.as_bytes(),
+            "relayed body must be byte-identical to the upstream body"
+        );
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());
@@ -1400,6 +1582,108 @@ mod tests {
                 "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
             ),
         )
+    }
+
+    /// An upstream body that sends `first_chunk` and then never ends (endless
+    /// SSE keepalive comments). The relay can't reach graceful end-of-stream,
+    /// so a record can only be emitted through the `StreamRecordGuard` drop
+    /// path once the client disconnects.
+    fn held_open_stream_body(first_chunk: &'static [u8]) -> axum::body::Body {
+        let keepalives = futures_util::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                (),
+            ))
+        });
+        axum::body::Body::from_stream(
+            futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                first_chunk,
+            ))])
+            .chain(keepalives),
+        )
+    }
+
+    /// A streaming client that disconnects after receiving the usage events —
+    /// without reading to end-of-stream — must still produce a gateway record
+    /// (hyper drops the body future on disconnect; `StreamRecordGuard` emits
+    /// from its Drop).
+    #[tokio::test]
+    async fn testAnthropicStreamClientDisconnectStillEmitsStats() {
+        let upstream = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(held_open_stream_body(
+                        b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":120}}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let (upstream_url, _upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "anthropic".to_string(),
+            format: ProviderFormat::Anthropic,
+            upstream: upstream_url.clone(),
+            models: vec!["claude-3-5-sonnet-20241022".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, _router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "stream": true,
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/messages"))
+            .header("x-kyris-session-id", "sess-anthropic-disconnect")
+            .header("x-api-key", "caller-key")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body_stream = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body_stream.next())
+            .await
+            .expect("first chunk within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&first)
+                .unwrap()
+                .contains("message_delta"),
+            "expected the usage events first"
+        );
+        drop(body_stream);
+
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .expect("disconnect must still emit the gateway record")
+            .unwrap();
+        assert_eq!(event.provider, "anthropic");
+        assert_eq!(event.tokens.input, 120);
+        assert_eq!(event.tokens.output, 40);
+        assert_eq!(
+            event.session_id.as_deref(),
+            Some("sess-anthropic-disconnect")
+        );
+
+        router_handle.abort();
+        upstream_handle.abort();
     }
 
     fn make_test_state(

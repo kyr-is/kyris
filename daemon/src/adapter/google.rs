@@ -20,10 +20,14 @@ use crate::metering::{StatsEvent, TokenCounts};
 use crate::server::AppState;
 
 pub fn routes(state: Arc<AppState>) -> Router {
-    Router::new().route(
-        "/v1beta/models/{model_action}",
-        post(handle_model_action).with_state(state),
-    )
+    Router::new()
+        .route(
+            "/v1beta/models/{model_action}",
+            post(handle_model_action).with_state(state),
+        )
+        // Run handlers to completion even if the client disconnects — the
+        // gateway record must not depend on the downstream connection's fate.
+        .layer(super::RunToCompletionLayer)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +93,31 @@ fn caller_api_key(headers: &HeaderMap, raw_query: Option<&str>) -> Option<String
     None
 }
 
+/// Which side of the request the forwarded key came from, for diagnostic tracing
+/// on an upstream rejection. Mirrors [`caller_api_key`]'s precedence (header
+/// first), so it names the source that was actually used.
+fn caller_key_source(headers: &HeaderMap) -> &'static str {
+    if headers.contains_key("x-goog-api-key") {
+        "header:x-goog-api-key"
+    } else {
+        "query:key"
+    }
+}
+
+/// A non-reversible fingerprint of a credential for diagnostic logs: its length
+/// plus the first/last 4 characters. NEVER logs the full secret — enough to tell
+/// "the right key, intact" from "empty / truncated / a different key" when an
+/// upstream rejects it, without leaking the credential into the log.
+fn credential_fingerprint(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= 8 {
+        return format!("len={n} <too-short-to-fingerprint>");
+    }
+    let head: String = s.chars().take(4).collect();
+    let tail: String = s.chars().skip(n - 4).collect();
+    format!("len={n} {head}…{tail}")
+}
+
 fn parse_model_action(model_action: &str) -> Option<(String, GoogleAction)> {
     if let Some(model) = model_action.strip_suffix(":generateContent") {
         return Some((model.to_string(), GoogleAction::GenerateContent));
@@ -113,14 +142,7 @@ async fn handle_generate_content(
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
 
-    if let (Some(token), Some(aid)) = (trace_token.as_deref(), agent_id.as_deref()) {
-        tracing::debug!(
-            agent_id = aid,
-            trace_token = token,
-            "native protocol observed"
-        );
-        super::write_native_seen_breadcrumb(aid);
-    }
+    super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
     if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
@@ -128,6 +150,21 @@ async fn handle_generate_content(
         crate::notify::circuit_breaker_toast(count);
         return Ok(circuit_breaker_error(&trace_id, count));
     }
+
+    // Resolve attribution now, while the peer socket still maps to a live
+    // process — the record is written at handler end, by which time the agent
+    // may have disconnected and exited, and a record without `working_dir`
+    // never becomes sync-eligible.
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.or(peer_agent);
 
     let config = state.config.load();
     let provider = config
@@ -174,6 +211,24 @@ async fn handle_generate_content(
         tracing::error!(error = %e, "failed to read Google generateContent upstream response body");
         StatusCode::BAD_GATEWAY
     })?;
+    // Diagnostic: on an upstream rejection, record HOW the credential was
+    // presented (source + redacted fingerprint) alongside the upstream status
+    // and error body. This is the evidence that distinguishes a kyrisd
+    // forwarding defect (empty/truncated/wrong key) from a genuine upstream 4xx
+    // (the right key, intact, rejected by Google). Never logs the full key.
+    if !status.is_success() {
+        tracing::warn!(
+            trace_id = %trace_id,
+            provider = "google",
+            method = "generateContent",
+            model = %model,
+            upstream_status = status.as_u16(),
+            key_source = caller_key_source(&headers),
+            key_fp = %credential_fingerprint(&caller_key),
+            upstream_body = %String::from_utf8_lossy(&resp_body).chars().take(300).collect::<String>(),
+            "google upstream returned non-2xx — forwarded credential shown by source + redacted fingerprint"
+        );
+    }
     let parsed_tokens = extract_tokens_from_body(&resp_body);
     let metering = if parsed_tokens.is_some() {
         kyris_core::record::Metering::Available
@@ -199,17 +254,6 @@ async fn handle_generate_content(
             false
         }
     };
-
-    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-        (
-            super::relay_trace_attach(&state, token, &trace_id).await,
-            None,
-        )
-    } else {
-        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
-        (attr.working_dir, attr.agent)
-    };
-    let agent = agent_id.clone().or(peer_agent);
 
     if state
         .stats_tx
@@ -267,14 +311,7 @@ async fn handle_stream_generate_content(
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
 
-    if let (Some(token), Some(aid)) = (trace_token.as_deref(), agent_id.as_deref()) {
-        tracing::debug!(
-            agent_id = aid,
-            trace_token = token,
-            "native protocol observed"
-        );
-        super::write_native_seen_breadcrumb(aid);
-    }
+    super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
     if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
@@ -282,6 +319,21 @@ async fn handle_stream_generate_content(
         crate::notify::circuit_breaker_toast(count);
         return Ok(circuit_breaker_error(&trace_id, count));
     }
+
+    // Resolve attribution now, while the peer socket still maps to a live
+    // process — the record is written at stream end, by which time the agent
+    // may have disconnected and exited, and a record without `working_dir`
+    // never becomes sync-eligible.
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.or(peer_agent);
 
     let config = state.config.load();
     let provider = config
@@ -327,6 +379,22 @@ async fn handle_stream_generate_content(
 
     let status = response.status();
     let resp_headers = response.headers().clone();
+    // Same upstream-rejection diagnostic as the non-streaming path. The error
+    // body is consumed downstream by the stream relay, so we log source + status
+    // + redacted key fingerprint here (enough to tell a forwarding defect from a
+    // genuine upstream 4xx); never logs the full key.
+    if !status.is_success() {
+        tracing::warn!(
+            trace_id = %trace_id,
+            provider = "google",
+            method = "streamGenerateContent",
+            model = %model,
+            upstream_status = status.as_u16(),
+            key_source = caller_key_source(&headers),
+            key_fp = %credential_fingerprint(&caller_key),
+            "google streaming upstream returned non-2xx — forwarded credential shown by source + redacted fingerprint"
+        );
+    }
 
     relay_ndjson_stream(
         state,
@@ -337,9 +405,8 @@ async fn handle_stream_generate_content(
         model,
         provider_name,
         session_id,
-        trace_token,
-        agent_id,
-        peer_addr,
+        working_dir,
+        agent,
         start,
     )
 }
@@ -354,9 +421,8 @@ fn relay_ndjson_stream(
     model: String,
     provider_name: String,
     session_id: String,
-    trace_token: Option<String>,
-    agent_id: Option<String>,
-    peer_addr: SocketAddr,
+    working_dir: Option<String>,
+    agent: Option<String>,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
@@ -421,19 +487,19 @@ fn relay_ndjson_stream(
     };
 
     let mut relay = Some(Box::pin(relay));
-    let mut finalized = false;
-    let trace_id_for_stream = trace_id.clone();
-    let model_for_stream = model.clone();
-    let provider_name_for_stream = provider_name;
-    let session_id_for_stream = session_id.clone();
-    let full_stream = futures_util::stream::poll_fn(move |cx| {
-        use std::task::Poll;
-
-        if finalized {
-            return Poll::Ready(None);
-        }
-
-        let finalize_stream = |emit_breaker_chunk: bool| {
+    // The finalize owns (clones of) everything the record needs so it can run
+    // from the guard's Drop as well as from the poll path — a client that
+    // disconnects before end-of-stream must still produce a gateway record
+    // (see `StreamRecordGuard`).
+    let finalize_stream = {
+        let accumulated = accumulated.clone();
+        let line_buf = line_buf.clone();
+        let breaker_tripped = breaker_tripped.clone();
+        let state = state.clone();
+        let trace_id = trace_id.clone();
+        let model = model.clone();
+        let session_id = session_id.clone();
+        move |emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -497,37 +563,25 @@ fn relay_ndjson_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-                (
-                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                    None,
-                )
-            } else {
-                let attr =
-                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
-                (attr.working_dir, attr.agent)
-            };
-            let agent = agent_id.clone().or(peer_agent);
-
             if state
                 .stats_tx
                 .try_send(StatsEvent {
-                    trace_id: trace_id_for_stream.clone(),
-                    provider: provider_name_for_stream.clone(),
-                    model: model_for_stream.clone(),
+                    trace_id: trace_id.clone(),
+                    provider: provider_name.clone(),
+                    model: model.clone(),
                     tokens,
                     cache_create: 0,
                     cache_read: 0,
                     cost,
                     latency_ms,
                     status: status.to_string(),
-                    session_id: Some(session_id_for_stream.clone()),
+                    session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
                     metering: stream_metering,
                     plan_status: kyris_core::record::PlanStatus::Overage,
-                    working_dir,
-                    agent,
+                    working_dir: working_dir.clone(),
+                    agent: agent.clone(),
                 })
                 .is_err()
             {
@@ -535,12 +589,19 @@ fn relay_ndjson_stream(
             }
 
             breaker_chunk
-        };
+        }
+    };
+    let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
+    let full_stream = futures_util::stream::poll_fn(move |cx| {
+        use std::task::Poll;
+
+        if record_guard.is_done() {
+            return Poll::Ready(None);
+        }
 
         if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
             drop(relay.take());
-            finalized = true;
-            if let Some(chunk) = finalize_stream(false) {
+            if let Some(chunk) = record_guard.finalize(false) {
                 return Poll::Ready(Some(Ok(chunk)));
             }
             return Poll::Ready(None);
@@ -556,8 +617,7 @@ fn relay_ndjson_stream(
             }
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                finalized = true;
-                if let Some(chunk) = finalize_stream(true) {
+                if let Some(chunk) = record_guard.finalize(true) {
                     Poll::Ready(Some(Ok(chunk)))
                 } else {
                     Poll::Ready(None)
@@ -848,6 +908,10 @@ mod tests {
         assert_eq!(event.tokens.output, 150);
         assert_eq!(event.session_id.as_deref(), Some("sess-google"));
         assert_eq!(state.circuit_breaker.get_token_count("sess-google"), 450);
+        // G-K2: Google has no subscription-OAuth path — every call is API-key
+        // billed, so the metering event the route emits always classifies
+        // `overage` (asserted at the route level, not just the helper).
+        assert_eq!(event.plan_status, kyris_core::record::PlanStatus::Overage);
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(request.model, "gemini-2.0-flash");
@@ -1207,6 +1271,101 @@ mod tests {
                 "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n"
             ),
         )
+    }
+
+    /// An upstream body that sends `first_chunk` and then never ends. The
+    /// relay can't reach graceful end-of-stream, so a record can only be
+    /// emitted through the `StreamRecordGuard` drop path once the client
+    /// disconnects.
+    fn held_open_stream_body(first_chunk: &'static [u8]) -> axum::body::Body {
+        let keepalives = futures_util::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((Ok::<Bytes, std::io::Error>(Bytes::from_static(b"\n")), ()))
+        });
+        axum::body::Body::from_stream(
+            futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                first_chunk,
+            ))])
+            .chain(keepalives),
+        )
+    }
+
+    /// A streaming client that disconnects after receiving the usage line —
+    /// without reading to end-of-stream — must still produce a gateway record
+    /// (hyper drops the body future on disconnect; `StreamRecordGuard` emits
+    /// from its Drop).
+    #[tokio::test]
+    async fn testGoogleStreamClientDisconnectStillEmitsStats() {
+        let upstream = Router::new().route(
+            "/v1beta/models/{model_action}",
+            post(|| async {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(held_open_stream_body(
+                        b"data: {\"usageMetadata\":{\"promptTokenCount\":70,\"candidatesTokenCount\":30}}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let (upstream_url, _upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "google".to_string(),
+            format: ProviderFormat::Google,
+            upstream: upstream_url.clone(),
+            models: vec!["gemini-2.0-flash".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, _router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "contents": [{"parts": [{"text": "hi"}]}]
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!(
+                "{router_url}/v1beta/models/gemini-2.0-flash:streamGenerateContent"
+            ))
+            .header("x-kyris-session-id", "sess-google-disconnect")
+            .header("x-goog-api-key", "caller-key")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body_stream = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body_stream.next())
+            .await
+            .expect("first chunk within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&first)
+                .unwrap()
+                .contains("usageMetadata"),
+            "expected the usage line first"
+        );
+        drop(body_stream);
+
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .expect("disconnect must still emit the gateway record")
+            .unwrap();
+        assert_eq!(event.provider, "google");
+        assert_eq!(event.tokens.input, 70);
+        assert_eq!(event.tokens.output, 30);
+        assert_eq!(event.session_id.as_deref(), Some("sess-google-disconnect"));
+
+        router_handle.abort();
+        upstream_handle.abort();
     }
 
     fn make_test_state(

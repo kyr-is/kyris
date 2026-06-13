@@ -15,6 +15,126 @@ use axum::http::HeaderMap;
 
 use crate::server::AppState;
 
+/// Runs a streaming relay's record-finalize exactly once, no matter how the
+/// response body ends.
+///
+/// Hyper drops a response-body future the moment the downstream peer goes
+/// away. A relay that only finalizes (emits its gateway `StatsEvent`) when the
+/// body is polled to graceful end-of-stream therefore silently loses the
+/// record whenever the client closes first — `codex exec`, for instance, exits
+/// as soon as it sees `response.completed`, racing the final poll, and the
+/// tokens it burned vanish from metering. The guard closes that hole: the
+/// poll path calls [`finalize`](Self::finalize) on natural end-of-stream or a
+/// breaker trip (and may get a trailing chunk to deliver), and `Drop` runs the
+/// same finalize when the stream is torn down early. By then the usage event
+/// has usually already been relayed and accumulated, so the record carries
+/// real token counts; a mid-generation abort records whatever had arrived,
+/// which still beats no record for a request the upstream billed.
+pub(crate) struct StreamRecordGuard<F: FnMut(bool) -> Option<bytes::Bytes>> {
+    finalize: F,
+    done: bool,
+}
+
+impl<F: FnMut(bool) -> Option<bytes::Bytes>> StreamRecordGuard<F> {
+    pub fn new(finalize: F) -> Self {
+        Self {
+            finalize,
+            done: false,
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    /// Emit the record now (idempotent) and return the optional trailing
+    /// chunk (e.g. a circuit-breaker error event) to append to the stream.
+    pub fn finalize(&mut self, emit_breaker_chunk: bool) -> Option<bytes::Bytes> {
+        if self.done {
+            return None;
+        }
+        self.done = true;
+        (self.finalize)(emit_breaker_chunk)
+    }
+}
+
+impl<F: FnMut(bool) -> Option<bytes::Bytes>> Drop for StreamRecordGuard<F> {
+    fn drop(&mut self) {
+        // Skip during a panic unwind: the finalize closure locks the shared
+        // token accumulators, and a poisoned lock here would turn a task panic
+        // into a process abort (panic-in-drop).
+        if self.done || std::thread::panicking() {
+            return;
+        }
+        // Client disconnected before end-of-stream; no chunk can be delivered,
+        // but the record must still be persisted.
+        let _ = self.finalize(false);
+    }
+}
+
+/// Tower layer that spawns each adapter request's handler future onto the
+/// runtime so it runs to completion even if the client disconnects mid-flight.
+///
+/// Hyper drops a connection's service future when the peer goes away. For the
+/// buffered (non-streaming) handlers the gateway `StatsEvent` is emitted only
+/// after `send()`/`bytes()` complete — exactly the window in which a client
+/// timeout or Ctrl-C would otherwise cancel the future, losing the record for
+/// an upstream call that completed and billed. Spawning decouples the
+/// handler's lifetime from the connection's: the response is discarded if
+/// nobody is left to read it, but the bookkeeping always runs with the real
+/// usage. (Streaming response BODIES outlive their handler and are protected
+/// separately — see [`StreamRecordGuard`].)
+#[derive(Clone)]
+pub struct RunToCompletionLayer;
+
+impl<S> tower::Layer<S> for RunToCompletionLayer {
+    type Service = RunToCompletion<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RunToCompletion(inner)
+    }
+}
+
+#[derive(Clone)]
+pub struct RunToCompletion<S>(S);
+
+impl<S, B> tower::Service<axum::http::Request<B>> for RunToCompletion<S>
+where
+    S: tower::Service<axum::http::Request<B>, Response = axum::response::Response>,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.0.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        use axum::response::IntoResponse as _;
+        use tracing::Instrument as _;
+
+        // Keep the request's tracing span: tokio::spawn would otherwise detach
+        // the handler's logs from the request that caused them.
+        let fut = tokio::spawn(self.0.call(req).instrument(tracing::Span::current()));
+        Box::pin(async move {
+            match fut.await {
+                Ok(result) => result,
+                Err(join_error) => {
+                    tracing::error!(error = %join_error, "adapter handler task failed");
+                    Ok(axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
+            }
+        })
+    }
+}
+
 pub fn extract_session_id(headers: &HeaderMap) -> String {
     headers
         .get("x-kyris-session-id")
@@ -148,12 +268,32 @@ pub async fn relay_trace_attach(
 
 pub fn write_native_seen_breadcrumb(agent_id: &str) {
     let dir = kyris_core::paths::agents_dir().join(".native-seen");
-    let path = dir.join(agent_id);
+    // The header carries the canonical `vendor/product` id; reconcile reads the
+    // bare registry handle (and a slash would nest the path into an uncreated
+    // subdirectory, silently dropping the breadcrumb).
+    let path = dir.join(kyris_core::live_evidence::bare_agent_id(agent_id));
     if path.exists() {
         return;
     }
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(&path, chrono::Utc::now().to_rfc3339());
+}
+
+/// One call per provider-adapter request, after header extraction: any request
+/// carrying `x-kyris-agent-id` proves the burn-control surface live (the
+/// adapted env/config routing delivered the agent's traffic here), and one
+/// also carrying a trace token is native-protocol evidence.
+pub fn record_agent_traffic(agent_id: Option<&str>, trace_token: Option<&str>) {
+    let Some(aid) = agent_id else { return };
+    kyris_core::live_evidence::record(aid, kyris_core::live_evidence::SURFACE_BURN_CONTROL);
+    if let Some(token) = trace_token {
+        tracing::debug!(
+            agent_id = aid,
+            trace_token = token,
+            "native protocol observed"
+        );
+        write_native_seen_breadcrumb(aid);
+    }
 }
 
 /// CWD and agent attribution for the process owning a peer connection, resolved
@@ -223,6 +363,9 @@ pub fn resolve_peer_attribution_sync(
     resolve_peer_attribution_blocking(socket, peer_addr, need_agent)
 }
 
+// NB: `RunToCompletionLayer` is applied inside each adapter's own `routes()`
+// (not here) so the protection travels with the adapter router — including
+// when one is mounted directly, as the adapters' unit tests do.
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new()
         .merge(anthropic::routes(state.clone()))

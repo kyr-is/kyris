@@ -334,6 +334,19 @@ flowchart TD
 
 That honesty matters because it keeps the tool trustworthy. Kyris is strongest when it is boringly clear about what it really intercepted, what it only observed, and what it never saw at all.
 
+### 2.7 Why Kyris Enforces The Workspace
+
+Kyris treats the directory an agent is launched from as that session's permitted domain: inside it, the agent should work freely; outside it, nothing changes without an explicit decision. That boundary is not a constraint to apologize for — it is the mechanism that makes agent autonomy safe to grant. Four reasons:
+
+- **A boundary you can enforce beats judgment you have to trust.** Allow/ask/deny decisions are made from what a command *declares* it will do. Declarations can be incomplete, and a command's behavior can diverge from its classification. "Does this write stay inside the workspace?" is a question with a checkable answer, independent of how well the command was understood.
+- **The boundary is what makes fewer prompts possible.** Every prompt buys confidence about one command. A workspace boundary buys the same confidence wholesale: if nothing outside the workspace can be touched, routine workspace edits no longer need per-command confirmation — the boundary absorbs the risk the prompts were covering. Autonomy inside, control at the edge.
+- **Mistakes become breakage, not damage.** Kyris guards against agent mistakes, not malicious agents. With an enforced boundary, a misclassified or surprising command fails at the edge instead of quietly modifying something outside the project — the failure is visible and recoverable rather than discovered later.
+- **One boundary covers everything.** Kyris launches every supported agent through a small wrapper, and a boundary imposed at launch is inherited by every process the agent ever spawns — every shell, every command, every helper — including paths no hook sees. It is the only control that is both agent-agnostic and total.
+
+By default the workspace boundary is enforced on the decision path: writes and deletes outside the workspace ask or deny, and writes inside it follow the `workspace_writes` policy (default ask).
+
+Kernel enforcement is also available, **experimental and off by default**. Run `kyris sandbox enable` and each newly launched agent runs inside an OS sandbox (macOS Seatbelt) whose writable root is its launch directory — the whole agent process tree, jailed at the kernel. Inside a verified jail, workspace writes stop prompting entirely (they auto-allow), because a misclassified or surprising write can no longer escape the boundary: it fails at the kernel, not at our judgement. Each governed action records whether it ran sandboxed, so the audit trail never conflates a kernel-confined run with an advisory one. `kyris sandbox disable` reverts instantly. It is experimental because the per-agent set of dirs an agent may write outside its workspace (its own config/state/caches) is still being tuned against real agents; until that settles, an agent may occasionally be blocked from writing one of its own files. Coverage claims stay honest per §2.6 regardless: an action is only reported as kernel-enforced when it actually ran inside a verified jail.
+
 <hr>
 
 ## 3. For Developers
@@ -401,7 +414,7 @@ This repo is deliberately kept small. It separates pure types, shared local logi
 | `mcp/` | `kyris-mcp` | Minimal stdio MCP wrapper for governed `tools/call` paths |
 | `hooks/helper/` | `kyris-hook` | Tiny helper binary for the shell-hook protocol boundary (check, respond, send). Native agent hooks use `kyris hook check` instead. |
 | `hooks/` | Zsh and Bash hook scripts | Transport glue only; shell scripts do not own JSON protocol logic |
-| `integrations/` | Agent-specific integration assets | Compiled policy template for Cline. Live hook scripts are generated at runtime by `hook_script_source()` in `cli/src/agents/configure.rs`. |
+| `integrations/` | Agent-specific integration assets | Legacy compiled-policy assets. Live hook scripts, bridges, and plugins are generated at runtime by shared code in `cli/src/agents/configure.rs`. |
 | `config/` | Runtime defaults and examples | Includes `default.yaml`, `example.yaml`, and pricing data |
 | `service/` | Service definitions | Currently the `launchd` plist for `kyrisd` |
 
@@ -465,17 +478,58 @@ flowchart TD
   duckdb --> kyrisCli
 ```
 
-**Native hook response contract.** `kyris hook check` (the PreToolUse / BeforeTool adapter for live native hooks) always fires before the agent applies its own permission rules. The agent's reaction is determined purely by the hook's response shape, not by its allowlist or approval mode — the agent only consults its built-in rules when the hook explicitly stays silent.
+**Native hook response contract.** `kyris hook check` is the shared decision engine behind every live agent adapter. The installed hook, bridge, or plugin translates the agent's native payload into Kyris's normalized action model, calls `agentpactd`, then emits the response shape that that agent expects. The hook response shape and its real effect are intentionally modeled separately because agents differ: an exit-0 JSON allow suppresses Claude Code's native prompt, Gemini CLI parses an allow-shaped response but still applies its own confirmation path, and Codex CLI needs a separate `PermissionRequest` hook to suppress the native approval prompt.
 
 | Hook response | Agent reaction |
 | --- | --- |
 | Exit 2 + stderr message | Block. Tool is denied; the message surfaces to the LLM. No prompt. |
-| Exit 0 + empty stdout | No decision. Agent falls back to its built-in permission rules — allowlist, approval mode, or its own prompt. |
-| Exit 0 + JSON body in the agent's expected shape | Allow. Agent treats the hook as authoritative and skips its own permission flow. No prompt. |
+| Exit 0 + empty stdout | No decision. Backstopped agents fall back to their built-in permission rules. Agents without a native backstop must not silently defer in enforce mode, so Kyris denies unmapped or daemon-unavailable actions instead. |
+| Exit 0 + JSON body in the agent's expected shape | Agent-specific allow / ask response. Whether it suppresses the native prompt is declared on the agent's `HookRuntime`, not inferred from JSON alone. |
 
-Per-agent allow shape lives on `HookProtocol::allow_response` in `cli/src/agents/registry.rs`. Today: Claude Code and Gemini CLI return the JSON shape (`hookSpecificOutput.permissionDecision=allow` and the Gemini equivalent), so when kyris allows, the only approval surface the developer ever sees is kyris's own popup. Codex CLI uses empty stdout, so on an allow Codex still applies its own sandbox / approval-mode rules and may or may not prompt — kyris can't tell from outside. The JSON shape exists because Claude Code's hook ignores exit-0+empty-stdout and falls back to its built-in prompt, which would double-prompt after kyris already approved; the regression test guarding this is `testClaudeCodeAllowEmitsHookSpecificOutput` in `cli/src/agents/claude_code.rs`.
+Per-agent response shape lives on `HookProtocol::allow_response`, prompt behavior lives on `HookRuntime::allow_suppresses_agent_prompt`, and native ask behavior lives on `HookProtocol::native_ask` in `cli/src/agents/registry.rs`. Codex CLI additionally declares `permission_request_allow`, which lets Kyris answer Codex's native `PermissionRequest` hook after AgentPact or a recent Kyris approval already allowed the action.
 
-### 3.4 Design Decisions That Matter
+### 3.4 Interface To Agents
+Agent support is implemented as a small descriptor plus shared delivery code, not as a separate installer for each agent. The central contract is `AgentDescriptor` in `cli/src/agents/registry.rs`; each supported agent implements it in `cli/src/agents/<agent>.rs`.
+
+The descriptor has four jobs.
+
+1. **Declare the plan.** `integration_plan()` states the intended coverage for execution, tool, and burn-control surfaces. A surface can be `None`, `AgentPactNative`, or `Adapted` with typed mechanisms. Execution mechanisms include `LiveHookAdapter`, `ShellHook`, and `CompiledPolicy`; tool mechanisms include `LiveHookAdapter` and `McpWrapping`; burn-control mechanisms include `EnvVarProxy`, `ConfigRewrite`, `KyrisdModelProvider`, and `AgentPactUsageReport`.
+2. **Describe native hook semantics.** `hook_protocol()` declares payload fields, governed tool mappings, safe pass-through tools, agent-owned tools, allow / ask response shapes, MCP tool naming, and the `HookRuntime`. `HookRuntime` records the agent hook timeout, timeout posture, whether native permissions still backstop an empty response, and whether the allow response actually suppresses the agent prompt.
+3. **Expose config locations.** `mcp_configs()`, `burn_control_config_paths()`, `provider_routing()`, `env_exports()`, and the configure / undo methods tell the shared machinery where to rewrite MCP servers, where to route provider traffic, and how to restore user files.
+4. **Report evidence.** `probe()` reports installed state, managed files, and per-surface status. Reconcile also reads `.live-seen` breadcrumbs written by live execution hooks, `kyris-mcp`, and `kyrisd` so `kyris agents <id>` can distinguish "configured" from "observed working live."
+
+The current Phase 1 descriptors are:
+
+| Agent | Canonical id | Execution | Tool | Burn control | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | `anthropic/claude-code` | live hook | MCP wrapping | env proxy | Multi-scope MCP config; Claude's JSON allow suppresses the native prompt. |
+| Codex CLI | `openai/codex-cli` | live hook + compiled policy | MCP wrapping | kyrisd model provider | Uses both `PreToolUse` and `PermissionRequest`; the latter completes the allow path without double prompting. |
+| Gemini CLI | `google/gemini-cli` | live hook + compiled policy | MCP wrapping | env proxy | Compiled policy is used for native prompt suppression; JSON hook allow alone does not suppress Gemini's prompt. |
+| Cline | `cline/cline` | live hook bridge | MCP wrapping | config rewrite | No native backstop in CLI mode, so Kyris denies instead of silently deferring when it cannot classify a live-hook action. |
+| OpenCode | `opencode/opencode` | live hook plugin | MCP wrapping | config rewrite | No native backstop after Kyris installs permissive native permissions, so the plugin is the gate. |
+
+For live execution hooks, the shared flow is:
+
+```text
+agent native hook payload
+  -> installed shell script / JS bridge / plugin
+  -> kyris hook check --agent <id>
+  -> HookProtocol maps native tool name and detail into AgentPact action
+  -> agentpactd returns allow / ask / deny
+  -> kyris emits the agent-specific hook response
+```
+
+`tool_mappings` are for side-effecting actions that AgentPact can govern, such as shell execution, file reads, writes, deletes, and MCP tool calls. `pass_through_tools` are known no-side-effect coordination primitives that Kyris intentionally allows without contacting `agentpactd`. `agent_owned_tools` are known tools whose native agent control should stay in charge, such as agent-native web domain prompts or session-control operations. Unknown tools defer only when `HookRuntime.native_backstop` is true; otherwise they deny in enforce mode because empty stdout would be a silent allow.
+
+For MCP, the descriptor returns every config location that can launch MCP servers. The shared rewrite registers the original upstream in `kyrisd.yaml`, then rewrites stdio servers through `kyris-mcp wrap --agent <canonical-id>` and HTTP servers through `kyrisd`'s `/mcp/<server>/` route with `x-kyris-agent-id` attribution. Undo is manifest-driven so it can restore files even when the current working directory no longer matches the setup-time project.
+
+For burn control, the interface supports two broad delivery styles. Env-routed agents declare `ProviderRouting`, and the shared `env_exports()` points provider base URLs at `kyrisd` while carrying `x-kyris-inbound` and `x-kyris-agent-id` in the agent's custom header mechanism. Config-routed agents implement `configure_burn_control_surface()` to write the agent's provider config directly. Kyris only claims burn-control coverage when the probe can verify that the effective provider path really points at `kyrisd`.
+
+Native AgentPact adoption is modeled as promotion, not as a separate agent implementation. `capabilities.json` declarations can promote individual surfaces to `AgentPactNative`; reconcile then removes the adapted bridge for that surface and reports native coverage while keeping other adapted surfaces in place. This lets an agent adopt AgentPact one surface at a time without breaking the existing Kyris descriptor.
+
+When adding or changing an agent, keep the descriptor declarative and put reusable delivery in shared code. Add or update registry invariants when a new mechanism requires a companion artifact, when timeout or backstop semantics change, or when a new native approval path is introduced. The high-risk tables are tool names and config locations; stale entries should fail tests or show degraded status rather than quietly expanding the ungoverned path.
+
+### 3.5 Design Decisions That Matter
 Several decisions are intentional enough that contributors should treat them as constraints, not suggestions.
 
 - **No per-project Kyris config.** Project-specific policy belongs in AgentPact's directory walk-up tree. `kyrisd.yaml` is machine-wide.
@@ -485,7 +539,7 @@ Several decisions are intentional enough that contributors should treat them as 
 - **`kyris-types` is a stability boundary.** Pure shared types stay separate so local crates and future hosted systems can share a contract without dragging in runtime dependencies.
 - **`kyris-mcp` stays intentionally minimal.** Stdout is reserved for JSON-RPC, so the wrapper avoids database, web stack, and heavy observability dependencies on purpose.
 
-### 3.5 Current Scope And Extension Points
+### 3.6 Current Scope And Extension Points
 Kyris is deliberately narrow today: macOS-first developer tooling, not a universal governance platform pretending to be finished.
 
 The current extension points line up with that scope.
@@ -493,8 +547,9 @@ The current extension points line up with that scope.
 | Area | Current shape | Where you extend it |
 | --- | --- | --- |
 | Provider routing | Anthropic, OpenAI, and Google passthrough adapters in `kyrisd` | `daemon/src/adapter/` |
-| Live agent hooks | Claude Code, Codex CLI, Gemini CLI | `cli/src/agents/configure.rs` (`hook_script_source()`) and `cli/src/hook_cmd.rs` |
-| Compiled policy | Cline, OpenCode, Codex CLI permission rendering | `cli/src/compile_policy.rs` and `integrations/compiled-policy/cline/` (template) |
+| Agent descriptors | Claude Code, Codex CLI, Gemini CLI, Cline, OpenCode | `cli/src/agents/registry.rs` plus `cli/src/agents/<agent>.rs` |
+| Live agent hooks | Claude Code, Codex CLI, Gemini CLI, Cline, OpenCode | `cli/src/agents/configure.rs` for shared hook delivery and `cli/src/hook_cmd.rs` for the shared decision engine |
+| Compiled policy | Codex CLI and Gemini CLI permission rendering | `cli/src/compile_policy.rs` |
 | Query and reporting UX | Timeline, history, replay, stats, scan, status | `cli/src/` |
 | Local runtime packaging | Config templates, service definitions, install flow | `config/`, `service/`, `install.sh` |
 
@@ -505,7 +560,7 @@ What should not happen in a contribution here is just as important.
 - Do not make blanket burn-control claims for traffic Kyris does not own.
 - Do not turn AgentPact policy into a Kyris-only policy dialect.
 
-### 3.6 Testing And Further Reading
+### 3.7 Testing And Further Reading
 Tests live with the crates they exercise rather than under one monolithic top-level test directory. If you are changing behavior, start with the crate that owns that surface.
 
 The standard local checks are:

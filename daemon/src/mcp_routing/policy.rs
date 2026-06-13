@@ -45,6 +45,7 @@ pub fn set_test_agentpact_socket(path: Option<PathBuf>) {
     *TEST_AGENTPACT_SOCKET.lock().expect("lock test socket") = path;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn check_permission(
     server_name: &str,
     path: &str,
@@ -52,6 +53,7 @@ pub async fn check_permission(
     working_dir: Option<&str>,
     mcp_operation: Option<&str>,
     annotations: &ToolAnnotations,
+    declared_agent: Option<&str>,
     socket_timeout: Duration,
 ) -> PolicyDecision {
     if !is_tools_call_request(path, body) {
@@ -73,24 +75,24 @@ pub async fn check_permission(
         working_dir,
         mcp_operation,
         annotations,
+        declared_agent,
         socket_timeout,
     )
     .await
     {
         Ok(decision) => decision,
         Err(e) => {
-            if agentpact::allow_on_daemon_unavailable() {
-                tracing::warn!(error = %e, "agentpactd unavailable, allowing due to policy");
-                fail_open_log::record("call", &tool, server_name, working_dir);
-                PolicyDecision::Allow
-            } else {
-                tracing::warn!(error = %e, "agentpactd permission.request failed, blocking");
-                PolicyDecision::Deny("agentpact_unavailable".to_string())
-            }
+            // agentpactd (the decider) is unreachable — fail open rather than
+            // block the agent's routed MCP tool call. A down daemon must never
+            // block; the call is spooled to the fail-open log for the audit trail.
+            tracing::warn!(error = %e, "agentpactd unavailable, allowing (fail-open)");
+            fail_open_log::record("kyris-mcp", "call", &tool, server_name, working_dir);
+            PolicyDecision::Allow
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn request_permission(
     sock: &Path,
     server_name: &str,
@@ -98,6 +100,7 @@ async fn request_permission(
     working_dir: Option<&str>,
     mcp_operation: Option<&str>,
     annotations: &ToolAnnotations,
+    declared_agent: Option<&str>,
     socket_timeout: Duration,
 ) -> Result<PolicyDecision, String> {
     let socket = sock.to_string_lossy().to_string();
@@ -107,6 +110,7 @@ async fn request_permission(
         working_dir: working_dir.map(str::to_owned),
         mcp_operation: mcp_operation.map(str::to_owned),
         annotations: annotations.clone(),
+        declared_agent: declared_agent.map(str::to_owned),
     };
     tokio::task::spawn_blocking(move || {
         agentpact::request_mcp_tool_permission(
@@ -185,6 +189,7 @@ mod tests {
             None,
             None,
             &ToolAnnotations::default(),
+            None,
             Duration::from_millis(50),
         )
         .await;

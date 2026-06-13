@@ -244,15 +244,6 @@ pub struct ClineCompilationGaps {
     pub ask_dropped: Vec<String>,
 }
 
-pub fn compile_cline_permissions_summary(
-    policy_path: Option<&Path>,
-) -> Result<(serde_json::Value, u32), String> {
-    let (output, gaps) = compile_cline_permissions(policy_path)?;
-    #[allow(clippy::cast_possible_truncation)]
-    let count = gaps.ask_dropped.len() as u32;
-    Ok((output, count))
-}
-
 pub fn compile_opencode_permissions(
     policy_path: Option<&Path>,
 ) -> Result<(serde_json::Value, u32), String> {
@@ -344,7 +335,14 @@ pub fn serialize_codex_rules_file(rules: &serde_json::Value) -> String {
         let tokens: Vec<&str> = prefix.split_whitespace().collect();
         let pattern = tokens
             .iter()
-            .map(|t| format!("\"{t}\""))
+            .map(|t| {
+                // Escape for a Starlark double-quoted string literal: backslash
+                // first, then the quote. A raw `"` token (e.g. from `tr -d '"'`)
+                // otherwise produces `"""` — an unfinished string literal that
+                // makes codex fail to load the whole rules file.
+                let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let decision = permission.to_ascii_lowercase();
@@ -356,56 +354,91 @@ pub fn serialize_codex_rules_file(rules: &serde_json::Value) -> String {
     out
 }
 
+/// Gemini in-file priority for compiled DENY rules: near the top of the user
+/// tier (effective `4 + 900/1000`), so a kyris deny is hard to shadow
+/// accidentally — only a deliberately higher user rule or the admin tier (5.x)
+/// outranks it.
+const GEMINI_DENY_PRIORITY: u32 = 900;
+/// Compiled ALLOW rules sit LOW in the user tier (effective `4.100`): they
+/// beat gemini's defaults (1.x) — which is what suppresses the redundant
+/// native prompt for catalog-auto commands — while any user-authored rule
+/// above 100, and every kyris deny, still wins.
+const GEMINI_ALLOW_PRIORITY: u32 = 100;
+
 pub fn compile_gemini_permissions(
     policy_path: Option<&Path>,
 ) -> Result<(serde_json::Value, u32), String> {
     let level = load_merged_policy(policy_path)?;
 
+    // Only allow + deny compile. Ask rules are deliberately DROPPED: the live
+    // hook owns asks (kyris popup), and a user-tier ask rule (4.x) would both
+    // re-prompt natively after a kyris approval AND override the user's own
+    // gemini-side "Always allow" persistence (3.95). In hook-less compiled-only
+    // fallback the dropped asks fall to gemini's defaults — the recorded
+    // CoverageCeiling::Compiled degradation.
+    let mut ask_dropped: u32 = 0;
+    let mut decision_for = |perm: &Permission| -> Option<(&'static str, u32)> {
+        match perm {
+            Permission::Auto | Permission::Inform => Some(("allow", GEMINI_ALLOW_PRIORITY)),
+            Permission::Deny => Some(("deny", GEMINI_DENY_PRIORITY)),
+            Permission::Ask => {
+                ask_dropped += 1;
+                None
+            }
+        }
+    };
+
     let mut rules = Vec::new();
 
     for (command_id, perm) in &level.commands {
-        let shell_cmd = id_to_shell(command_id);
-        let decision = match perm {
-            Permission::Auto | Permission::Inform => "ALLOW",
-            Permission::Deny => "DENY",
-            Permission::Ask => "ASK_USER",
+        let Some((decision, priority)) = decision_for(perm) else {
+            continue;
         };
-        let pattern = regex::escape(&shell_cmd);
+        // `commandPrefix` is gemini's own convenience: ITS loader compiles the
+        // prefix into the correct regex against the NUL-delimited
+        // stable-stringified args. A hand-built `argsPattern` like
+        // `^git status…` can never match that representation — the old shape
+        // every rule used, one of the reasons the file was dead.
         rules.push(serde_json::json!({
             "toolName": "run_shell_command",
-            "argsPattern": format!("^{pattern}(\\s|$)"),
+            "commandPrefix": id_to_shell(command_id),
             "decision": decision,
-            "priority": 5.0,
+            "priority": priority,
         }));
     }
 
     for (path_pattern, perm) in &level.paths {
-        let decision = match perm {
-            Permission::Auto | Permission::Inform => "ALLOW",
-            Permission::Deny => "DENY",
-            Permission::Ask => "ASK_USER",
+        let Some((decision, priority)) = decision_for(perm) else {
+            continue;
         };
         let escaped = regex::escape(path_pattern).replace(r"\*", ".*");
+        // Anchor BOTH ends to the argument FIELD (mirroring gemini's own
+        // commandRegex compilation against stable-stringified args). The
+        // leading `"file_path":"` cannot occur inside an escaped JSON string
+        // value, so file CONTENT mentioning a path can't trip the rule; the
+        // trailing `"` closes the value so an exact path (no glob) matches
+        // ONLY that path — without it an allow on `/tmp/safe` would also
+        // auto-approve `/tmp/safeEVIL`. A glob's trailing `.*` still consumes
+        // up to the closing quote, so wildcards stay broad.
+        let pattern = format!("\"file_path\":\"{escaped}\"");
         for tool_name in ["read_file", "write_file", "replace"] {
             rules.push(serde_json::json!({
                 "toolName": tool_name,
-                "argsPattern": escaped,
+                "argsPattern": pattern,
                 "decision": decision,
-                "priority": 5.0,
+                "priority": priority,
             }));
         }
     }
 
     for ((server, tool), perm) in &level.mcp {
-        let decision = match perm {
-            Permission::Auto | Permission::Inform => "ALLOW",
-            Permission::Deny => "DENY",
-            Permission::Ask => "ASK_USER",
+        let Some((decision, priority)) = decision_for(perm) else {
+            continue;
         };
         rules.push(serde_json::json!({
             "toolName": format!("mcp_{server}_{tool}"),
             "decision": decision,
-            "priority": 5.0,
+            "priority": priority,
         }));
     }
 
@@ -414,44 +447,136 @@ pub fn compile_gemini_permissions(
             .as_str()
             .unwrap_or("")
             .cmp(b["toolName"].as_str().unwrap_or(""));
-        tool_cmp.then_with(|| {
-            a["argsPattern"]
-                .as_str()
-                .unwrap_or("")
-                .cmp(b["argsPattern"].as_str().unwrap_or(""))
-        })
+        tool_cmp
+            .then_with(|| {
+                a["commandPrefix"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["commandPrefix"].as_str().unwrap_or(""))
+            })
+            .then_with(|| {
+                a["argsPattern"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["argsPattern"].as_str().unwrap_or(""))
+            })
     });
 
-    Ok((serde_json::Value::Array(rules), 0))
+    Ok((serde_json::Value::Array(rules), ask_dropped))
+}
+
+/// One compiled rule, serialized to a `[[rule]]` table (gemini's loader key —
+/// a `[[rules]]` array is silently ignored). Field order is the emitted order.
+/// Pattern fields are real TOML strings (NOT hand-quoted literals) so the
+/// `toml` serializer escapes quotes/backslashes — a prefix like `tr -d "'"`
+/// carries a single quote that a `'…'` literal would terminate early,
+/// producing invalid TOML that breaks Gemini's policy load.
+#[derive(serde::Serialize)]
+struct GeminiPolicyRule {
+    #[serde(rename = "toolName", skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+    #[serde(rename = "commandPrefix", skip_serializing_if = "Option::is_none")]
+    command_prefix: Option<String>,
+    #[serde(rename = "argsPattern", skip_serializing_if = "Option::is_none")]
+    args_pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct GeminiPolicyFile {
+    rule: Vec<GeminiPolicyRule>,
+}
+
+/// Whether a policy TOML would actually LOAD rules in Gemini CLI. This mirrors
+/// gemini's loader contract (`policy/toml-loader.ts`, verified at 0567b25a2):
+/// rules live in a top-level **`[[rule]]`** array-of-tables; `toolName`,
+/// `decision`, and `priority` are all REQUIRED (one rule failing zod makes
+/// gemini skip the ENTIRE file); decision is the lowercase enum
+/// `allow | deny | ask_user`; priority is an integral number in `0..=999`
+/// (gemini's check is JS `Number.isInteger`, so a zero-fraction TOML float
+/// passes). A file failing any of this loads ZERO rules — silently — so the
+/// probe must not count it as an adapted surface.
+///
+/// Single-source note: this validator and [`serialize_gemini_policy_toml`]
+/// together define kyris's understanding of gemini's contract; the serializer
+/// output must satisfy the validator
+/// (`testSerializerOutputLoadsInGemini`).
+pub fn gemini_policy_file_is_loadable(contents: &str) -> bool {
+    // `toml::from_str` parses a DOCUMENT; `str::parse::<toml::Value>` would
+    // parse a single value and reject `[[rule]]` tables.
+    let Ok(value) = toml::from_str::<toml::Value>(contents) else {
+        return false;
+    };
+    let Some(rules) = value.get("rule").and_then(toml::Value::as_array) else {
+        return false;
+    };
+    if rules.is_empty() {
+        return false;
+    }
+    rules.iter().all(|rule| {
+        let Some(table) = rule.as_table() else {
+            return false;
+        };
+        let tool_ok = match table.get("toolName") {
+            Some(toml::Value::String(_)) => true,
+            Some(toml::Value::Array(names)) => {
+                !names.is_empty() && names.iter().all(toml::Value::is_str)
+            }
+            _ => false,
+        };
+        let decision_ok = table
+            .get("decision")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|d| matches!(d, "allow" | "deny" | "ask_user"));
+        let priority_ok = match table.get("priority") {
+            Some(toml::Value::Integer(p)) => (0..=999).contains(p),
+            Some(toml::Value::Float(p)) => p.fract() == 0.0 && (0.0..=999.0).contains(p),
+            _ => false,
+        };
+        tool_ok && decision_ok && priority_ok
+    })
 }
 
 pub fn serialize_gemini_policy_toml(rules: &serde_json::Value) -> String {
-    use std::fmt::Write;
     let mut out = String::from("# Generated by Kyris — AgentPact compiled policy for Gemini CLI\n");
-    out.push_str("# Admin tier (priority 5.x) — overrides all lower-priority rules\n\n");
+    out.push_str(
+        "# Loads at the USER tier (~/.gemini/policies = effective priority 4.x);\n\
+         # kyris denies sit at 900 (hard to shadow), allows at 100 (any user rule\n\
+         # above 100 and every deny outranks them). Admin tier (5.x) always wins.\n\n",
+    );
     let Some(arr) = rules.as_array() else {
         return out;
     };
-    for (i, rule) in arr.iter().enumerate() {
-        let _ = writeln!(out, "[[rules]]");
-        if let Some(tool_name) = rule["toolName"].as_str() {
-            let _ = writeln!(out, "toolName = \"{tool_name}\"");
-        }
-        if let Some(pattern) = rule["argsPattern"].as_str() {
-            let _ = writeln!(out, "argsPattern = '{pattern}'");
-        }
-        if let Some(decision) = rule["decision"].as_str() {
-            let _ = writeln!(out, "decision = \"{decision}\"");
-        }
-        if let Some(priority) = rule["priority"].as_f64() {
-            if priority.fract() == 0.0 {
-                let _ = writeln!(out, "priority = {priority:.1}");
-            } else {
-                let _ = writeln!(out, "priority = {priority}");
-            }
-        }
-        if i + 1 < arr.len() {
-            out.push('\n');
+    if arr.is_empty() {
+        return out;
+    }
+
+    let policy = GeminiPolicyFile {
+        rule: arr
+            .iter()
+            .map(|rule| GeminiPolicyRule {
+                tool_name: rule["toolName"].as_str().map(str::to_string),
+                command_prefix: rule["commandPrefix"].as_str().map(str::to_string),
+                args_pattern: rule["argsPattern"].as_str().map(str::to_string),
+                decision: rule["decision"].as_str().map(str::to_string),
+                priority: rule["priority"]
+                    .as_u64()
+                    .and_then(|p| u32::try_from(p).ok()),
+            })
+            .collect(),
+    };
+    // toml::to_string emits `[[rule]]` array-of-tables and escapes every string
+    // value correctly — no manual quoting, so no quote/backslash can break the file.
+    match toml::to_string(&policy) {
+        Ok(body) => out.push_str(&body),
+        // A serialize failure here is not expected (all values are plain
+        // scalars); surface it as a comment rather than emitting a broken file.
+        Err(e) => {
+            use std::fmt::Write;
+            let _ = writeln!(out, "# ERROR: failed to serialize policy: {e}");
         }
     }
     out
@@ -482,6 +607,19 @@ pub struct CodexPermissionsTable {
 ///
 /// Empty tables are omitted; callers should skip writing `[permissions.kyris]`
 /// when both maps are empty.
+///
+/// Resolve a policy filesystem glob into a Codex-accepted path. Absolute, `~/`,
+/// `~`, and `:special` paths pass through unchanged; a relative glob (`./x` or
+/// `x`) is resolved against `workspace_root` (Codex rejects relative paths). The
+/// trailing glob (`*`) survives as a literal path component.
+fn to_codex_fs_path(glob: &str, workspace_root: &Path) -> String {
+    if glob == "~" || glob.starts_with('/') || glob.starts_with("~/") || glob.starts_with(':') {
+        return glob.to_string();
+    }
+    let rel = glob.strip_prefix("./").unwrap_or(glob);
+    workspace_root.join(rel).to_string_lossy().into_owned()
+}
+
 pub fn compile_codex_permissions_table(
     policy_path: Option<&Path>,
 ) -> Result<CodexPermissionsTable, String> {
@@ -492,12 +630,20 @@ pub fn compile_codex_permissions_table(
     let mut url_paths_dropped: Vec<String> = Vec::new();
     let mut ask_collapsed: Vec<String> = Vec::new();
 
+    // Codex requires absolute / `~/` / `:special` filesystem paths and REJECTS
+    // the whole config on a relative one. Policy globs may be project-relative
+    // (`./src/*`), so resolve them against the workspace (the cwd at setup time)
+    // into absolute paths Codex accepts. The glob tail (`*`) is preserved.
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     for (path_glob, perm) in &level.paths {
         if *perm == Permission::Ask {
             ask_collapsed.push(path_glob.clone());
         }
         let mode = permission_to_file_mode(*perm);
-        filesystem.insert(path_glob.clone(), mode.as_codex_token().to_string());
+        filesystem.insert(
+            to_codex_fs_path(path_glob, &workspace_root),
+            mode.as_codex_token().to_string(),
+        );
     }
 
     for (domain_key, perm) in &level.urls {
@@ -599,6 +745,43 @@ fn dirs_home() -> Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn testToCodexFsPathResolvesRelativeAndKeepsValid() {
+        let base = std::path::Path::new("/work/proj");
+        // Relative globs resolve against the workspace root (Codex rejects relative
+        // paths); the glob tail survives.
+        assert_eq!(
+            to_codex_fs_path("./secrets/*", base),
+            "/work/proj/secrets/*"
+        );
+        assert_eq!(to_codex_fs_path("src/*", base), "/work/proj/src/*");
+        // Already-Codex-valid forms pass through unchanged.
+        assert_eq!(to_codex_fs_path("/etc/passwd", base), "/etc/passwd");
+        assert_eq!(to_codex_fs_path("~/.ssh/*", base), "~/.ssh/*");
+        assert_eq!(to_codex_fs_path("~", base), "~");
+        assert_eq!(
+            to_codex_fs_path(":workspace_roots", base),
+            ":workspace_roots"
+        );
+    }
+
+    #[test]
+    fn testSerializeCodexRulesEscapesQuoteTokens() {
+        // A command token that is a raw quote (e.g. from `tr -d "`) must be
+        // escaped, or codex fails to load the whole rules file with
+        // "unfinished string literal".
+        let rules = serde_json::json!([{"prefix": "tr -d \"", "permission": "Auto"}]);
+        let out = serialize_codex_rules_file(&rules);
+        assert!(
+            !out.contains("\"\"\""),
+            "unescaped quote token produced invalid `\"\"\"`: {out}"
+        );
+        assert!(
+            out.contains("\\\""),
+            "quote token should be backslash-escaped: {out}"
+        );
+    }
     use std::io::Write as _;
 
     fn writeTempYaml(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
@@ -954,24 +1137,31 @@ spec:
 
         let (output, ask_dropped) = compile_gemini_permissions(Some(policy_dir.as_path())).unwrap();
         let rules = output.as_array().unwrap();
-        assert_eq!(ask_dropped, 0);
+        // Ask rules are DROPPED (the live hook owns asks; a user-tier ask rule
+        // would re-prompt natively and override gemini-side always-allows).
+        assert_eq!(ask_dropped, 1);
 
-        let by_tool: std::collections::HashMap<&str, &serde_json::Value> = rules
+        // Shell rules use gemini's own commandPrefix convenience — gemini
+        // compiles it into the correct regex against its NUL-delimited
+        // stable-stringified args, which a hand-built argsPattern cannot match.
+        let by_prefix: std::collections::HashMap<&str, &serde_json::Value> = rules
             .iter()
-            .filter_map(|r| r["argsPattern"].as_str().map(|p| (p, r)))
+            .filter_map(|r| r["commandPrefix"].as_str().map(|p| (p, r)))
             .collect();
 
-        let npm_pattern = format!("^{}(\\s|$)", regex::escape("npm install"));
-        let rm_pattern = format!("^{}(\\s|$)", regex::escape("rm -rf"));
-        let docker_pattern = format!("^{}(\\s|$)", regex::escape("docker build"));
-
-        assert_eq!(by_tool[npm_pattern.as_str()]["decision"], "ALLOW");
-        assert_eq!(by_tool[rm_pattern.as_str()]["decision"], "DENY");
-        assert_eq!(by_tool[docker_pattern.as_str()]["decision"], "ASK_USER");
+        assert_eq!(by_prefix["npm install"]["decision"], "allow");
+        assert_eq!(by_prefix["npm install"]["priority"], 100);
+        assert_eq!(by_prefix["rm -rf"]["decision"], "deny");
+        assert_eq!(by_prefix["rm -rf"]["priority"], 900);
+        assert!(!by_prefix.contains_key("docker build"), "ask rule dropped");
+        assert_eq!(rules.len(), 2);
 
         for rule in rules {
             assert_eq!(rule["toolName"], "run_shell_command");
-            assert_eq!(rule["priority"], 5.0);
+            assert!(
+                rule.get("argsPattern")
+                    .is_none_or(serde_json::Value::is_null)
+            );
         }
     }
 
@@ -1009,8 +1199,8 @@ spec:
             })
             .collect();
 
-        assert_eq!(by_tool["mcp_filesystem_delete_file"], "DENY");
-        assert_eq!(by_tool["mcp_filesystem_read_file"], "ALLOW");
+        assert_eq!(by_tool["mcp_filesystem_delete_file"], "deny");
+        assert_eq!(by_tool["mcp_filesystem_read_file"], "allow");
     }
 
     #[test]
@@ -1036,10 +1226,11 @@ spec:
 
         let (output, ask_dropped) = compile_gemini_permissions(Some(policy_dir.as_path())).unwrap();
         let rules = output.as_array().unwrap();
-        assert_eq!(ask_dropped, 0);
+        // The ask path rule is dropped once per emitted-tool fan-out source.
+        assert_eq!(ask_dropped, 1);
 
-        // 3 path patterns × 3 file tools each = 9 rules
-        assert_eq!(rules.len(), 9);
+        // 2 surviving path patterns × 3 file tools each = 6 rules
+        assert_eq!(rules.len(), 6);
 
         let safe_rules: Vec<_> = rules
             .iter()
@@ -1047,8 +1238,17 @@ spec:
             .collect();
         assert_eq!(safe_rules.len(), 3);
         for r in &safe_rules {
-            assert_eq!(r["decision"], "ALLOW");
-            assert_eq!(r["priority"], 5.0);
+            assert_eq!(r["decision"], "allow");
+            assert_eq!(r["priority"], 100);
+            // Field-anchored so file CONTENT mentioning a path can't match.
+            assert!(
+                r["argsPattern"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("\"file_path\":\""),
+                "got: {}",
+                r["argsPattern"]
+            );
         }
         let safe_tools: std::collections::HashSet<&str> = safe_rules
             .iter()
@@ -1058,23 +1258,37 @@ spec:
         assert!(safe_tools.contains("write_file"));
         assert!(safe_tools.contains("replace"));
 
+        // An EXACT path (no glob) is closed on both ends so it matches only
+        // that path — `/etc/secrets` must not also match `/etc/secretsX`.
+        for r in &safe_rules {
+            // The glob `/tmp/safe/*` stays open-ended (ends with `.*"`).
+            assert!(
+                r["argsPattern"].as_str().unwrap().ends_with(".*\""),
+                "glob rule: {}",
+                r["argsPattern"]
+            );
+        }
         let secrets_rules: Vec<_> = rules
             .iter()
             .filter(|r| r["argsPattern"].as_str().unwrap().contains("secrets"))
             .collect();
         assert_eq!(secrets_rules.len(), 3);
         for r in &secrets_rules {
-            assert_eq!(r["decision"], "DENY");
+            assert_eq!(r["decision"], "deny");
+            assert_eq!(r["priority"], 900);
+            assert_eq!(
+                r["argsPattern"].as_str().unwrap(),
+                "\"file_path\":\"/etc/secrets\"",
+                "exact path must be closed-anchored"
+            );
         }
 
-        let config_rules: Vec<_> = rules
-            .iter()
-            .filter(|r| r["argsPattern"].as_str().unwrap().contains("config"))
-            .collect();
-        assert_eq!(config_rules.len(), 3);
-        for r in &config_rules {
-            assert_eq!(r["decision"], "ASK_USER");
-        }
+        // The ask path rule must not be emitted at all.
+        assert!(
+            !rules
+                .iter()
+                .any(|r| r["argsPattern"].as_str().unwrap().contains("config"))
+        );
     }
 
     #[test]
@@ -1082,26 +1296,29 @@ spec:
         let rules = serde_json::json!([
             {
                 "toolName": "run_shell_command",
-                "argsPattern": "^npm\\ install(\\s|$)",
-                "decision": "ALLOW",
-                "priority": 5.0,
+                "commandPrefix": "npm install",
+                "decision": "allow",
+                "priority": 100,
             },
             {
                 "toolName": "run_shell_command",
-                "argsPattern": "^rm\\ \\-rf(\\s|$)",
-                "decision": "DENY",
-                "priority": 5.0,
+                "commandPrefix": "rm -rf",
+                "decision": "deny",
+                "priority": 900,
             },
         ]);
         let toml = serialize_gemini_policy_toml(&rules);
         assert!(toml.contains("# Generated by Kyris"));
-        assert!(toml.contains("[[rules]]"));
         assert!(toml.contains("toolName = \"run_shell_command\""));
-        assert!(toml.contains("decision = \"ALLOW\""));
-        assert!(toml.contains("decision = \"DENY\""));
-        assert!(toml.contains("priority = 5.0"));
-        let rule_count = toml.matches("[[rules]]").count();
-        assert_eq!(rule_count, 2);
+        assert!(toml.contains("commandPrefix = \"npm install\""));
+        assert!(toml.contains("decision = \"allow\""));
+        assert!(toml.contains("decision = \"deny\""));
+        assert!(toml.contains("priority = 100"));
+        assert!(toml.contains("priority = 900"));
+        // Gemini's loader key is [[rule]]; [[rules]] is silently ignored.
+        assert_eq!(toml.matches("[[rule]]").count(), 2);
+        assert!(!toml.contains("[[rules]]"));
+        assert!(gemini_policy_file_is_loadable(&toml));
     }
 
     #[test]
@@ -1109,7 +1326,82 @@ spec:
         let rules = serde_json::json!([]);
         let toml = serialize_gemini_policy_toml(&rules);
         assert!(toml.contains("# Generated by Kyris"));
-        assert!(!toml.contains("[[rules]]"));
+        assert!(!toml.contains("[[rule]]"));
+    }
+
+    #[test]
+    fn testGeminiPolicyLoadableAcceptsGeminiContractShape() {
+        // The shape gemini's toml-loader actually accepts: [[rule]] tables,
+        // lowercase decisions, integer priority.
+        let contents = r#"
+[[rule]]
+toolName = "run_shell_command"
+commandPrefix = "git status"
+decision = "allow"
+priority = 100
+
+[[rule]]
+toolName = ["read_file", "write_file"]
+decision = "ask_user"
+priority = 10
+"#;
+        assert!(gemini_policy_file_is_loadable(contents));
+    }
+
+    #[test]
+    fn testGeminiPolicyLoadableRejectsWrongShapes() {
+        // Wrong array key ([[rules]] vs [[rule]]).
+        assert!(!gemini_policy_file_is_loadable(
+            "[[rules]]\ntoolName = \"x\"\ndecision = \"allow\"\npriority = 5\n"
+        ));
+        // Wrong decision case.
+        assert!(!gemini_policy_file_is_loadable(
+            "[[rule]]\ntoolName = \"x\"\ndecision = \"ALLOW\"\npriority = 5\n"
+        ));
+        // priority and toolName are REQUIRED — one bad rule kills the file.
+        assert!(!gemini_policy_file_is_loadable(
+            "[[rule]]\ntoolName = \"x\"\ndecision = \"allow\"\n"
+        ));
+        assert!(!gemini_policy_file_is_loadable(
+            "[[rule]]\ndecision = \"allow\"\npriority = 5\n"
+        ));
+        // Out-of-range / fractional priority.
+        assert!(!gemini_policy_file_is_loadable(
+            "[[rule]]\ntoolName = \"x\"\ndecision = \"allow\"\npriority = 1000\n"
+        ));
+        assert!(!gemini_policy_file_is_loadable(
+            "[[rule]]\ntoolName = \"x\"\ndecision = \"allow\"\npriority = 5.5\n"
+        ));
+        // Empty / missing rules.
+        assert!(!gemini_policy_file_is_loadable("# just a comment\n"));
+        // Zero-fraction float priority passes (JS Number.isInteger semantics).
+        assert!(gemini_policy_file_is_loadable(
+            "[[rule]]\ntoolName = \"x\"\ndecision = \"allow\"\npriority = 5.0\n"
+        ));
+    }
+
+    #[test]
+    fn testSerializerOutputLoadsInGemini() {
+        // Finding 5 FIXED: the serializer emits gemini's real loader contract
+        // ([[rule]], lowercase decisions, required integer priority), so the
+        // probe validator accepts it. This locks serializer and validator
+        // together — loosening either side breaks here first.
+        let (rules, _) = (
+            serde_json::json!([
+                {"toolName": "run_shell_command", "commandPrefix": "git status",
+                 "decision": "allow", "priority": 100},
+                {"toolName": "read_file",
+                 "argsPattern": "\"file_path\":\"/etc/secrets",
+                 "decision": "deny", "priority": 900},
+                {"toolName": "mcp_fs_delete", "decision": "deny", "priority": 900}
+            ]),
+            0,
+        );
+        let toml = serialize_gemini_policy_toml(&rules);
+        assert!(
+            gemini_policy_file_is_loadable(&toml),
+            "serializer output must satisfy the loader contract:\n{toml}"
+        );
     }
 
     #[test]
@@ -1117,13 +1409,38 @@ spec:
         let rules = serde_json::json!([
             {
                 "toolName": "mcp_filesystem_read_file",
-                "decision": "ALLOW",
-                "priority": 5.0,
+                "decision": "allow",
+                "priority": 100,
             },
         ]);
         let toml = serialize_gemini_policy_toml(&rules);
         assert!(toml.contains("toolName = \"mcp_filesystem_read_file\""));
         assert!(!toml.contains("argsPattern"));
+        assert!(gemini_policy_file_is_loadable(&toml));
+    }
+
+    #[test]
+    fn testSerializeGeminiPolicyTomlEscapesQuotesAndBackslashes() {
+        // A pattern carrying a single quote (e.g. from `tr -d "'"`) and regex
+        // backslashes must still produce VALID TOML. The old `'…'` literal
+        // terminated early on the quote and broke Gemini's policy load.
+        let pattern = r#"^OAK=\$\(grep \| tr \-d "'"\)(\s|$)"#;
+        let rules = serde_json::json!([
+            {
+                "toolName": "run_shell_command",
+                "commandPrefix": pattern,
+                "decision": "allow",
+                "priority": 100,
+            },
+        ]);
+        let serialized = serialize_gemini_policy_toml(&rules);
+        let parsed: toml::Value = toml::from_str(&serialized)
+            .unwrap_or_else(|e| panic!("output must be valid TOML: {e}\n{serialized}"));
+        assert_eq!(
+            parsed["rule"][0]["commandPrefix"].as_str(),
+            Some(pattern),
+            "pattern must round-trip through TOML unchanged"
+        );
     }
 
     #[test]

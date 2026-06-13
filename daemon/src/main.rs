@@ -17,6 +17,10 @@ use std::time::Instant;
 use kyrisd::{build_info, config, crash, logging, server};
 
 fn main() {
+    // Must run before anything else: core dumps off, ptrace attach denied,
+    // loader env vars cleared. Fail-fast inside on error.
+    agentpact_hardening::pre_main_hardening();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("{}", build_info::version_line());

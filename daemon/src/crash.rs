@@ -104,6 +104,37 @@ fn write_report(crash_dir: &std::path::Path, report: &str) -> Option<PathBuf> {
     std::fs::write(&path, report).ok().map(|()| path)
 }
 
+/// The newest panic crash report (a `*.txt` under the crash dir) modified at or
+/// after `threshold`, if any. Used at startup to tell a **panic** (the previous
+/// daemon left a report, so we know the cause) from an **uncatchable external
+/// kill** (SIGKILL / OOM / power loss leaves NO report — the panic hook never
+/// ran). The caller passes the dead daemon's PID-file mtime as `threshold`, so a
+/// report from that daemon's own run (written after it started) is matched while
+/// stale reports from older runs are ignored.
+pub fn most_recent_report_since(threshold: std::time::SystemTime) -> Option<PathBuf> {
+    most_recent_report_since_in(&fallback_crash_dir(), threshold)
+}
+
+fn most_recent_report_since_in(
+    dir: &std::path::Path,
+    threshold: std::time::SystemTime,
+) -> Option<PathBuf> {
+    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "txt") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified >= threshold && newest.as_ref().is_none_or(|(_, t)| modified > *t) {
+            newest = Some((path, modified));
+        }
+    }
+    newest.map(|(path, _)| path)
+}
+
 fn payload_message(info: &std::panic::PanicHookInfo<'_>) -> String {
     let payload = info.payload();
     if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -146,6 +177,28 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .unwrap()
                 .starts_with("kyrisd-"),
+        );
+    }
+
+    #[test]
+    fn testMostRecentReportSinceMatchesNewerReportOnly() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = std::time::SystemTime::now();
+        let report = write_report(dir.path(), "panic").expect("write succeeds");
+
+        // A report written after the threshold is a panic of "this" daemon.
+        assert_eq!(
+            most_recent_report_since_in(dir.path(), before).as_deref(),
+            Some(report.as_path()),
+        );
+        // No report newer than a future threshold → it was killed externally.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_hours(1);
+        assert!(most_recent_report_since_in(dir.path(), future).is_none());
+        // A non-report file is ignored.
+        std::fs::write(dir.path().join("not-a-report.log"), "x").unwrap();
+        assert_eq!(
+            most_recent_report_since_in(dir.path(), before).as_deref(),
+            Some(report.as_path()),
         );
     }
 }

@@ -41,12 +41,21 @@ pub use agentpact_types::Mode;
 /// own ancestor chain so the daemon can find the token the native hook
 /// anchored to the agent.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_hook_permission_request(
     request_id_prefix: &str,
     action: &str,
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    // Declared agent identity in canonical `vendor/name` form. The value is
+    // install-time-owned (written into the agent's hook config by `kyris
+    // agents setup`, surfaced here via the hook's `--agent` flag), so the
+    // daemon can attribute exactly without enumerating install layouts;
+    // agentpactd validates it against caller→agent ancestry and cross-checks
+    // lineage. None for callers with no installed identity (the shell gate),
+    // which attribute via lineage as before.
+    declared_agent: Option<&str>,
     anchor_pid: Option<u32>,
     ppid_chain: Option<&[u32]>,
 ) -> serde_json::Value {
@@ -63,6 +72,9 @@ pub fn build_hook_permission_request(
     });
     if let Some(pid) = seed_boundary_pid {
         request["seed_boundary_pid"] = serde_json::json!(pid);
+    }
+    if let Some(agent) = declared_agent {
+        request["agent"] = serde_json::json!(agent);
     }
     if let Some(pid) = anchor_pid {
         request["anchor_pid"] = serde_json::json!(pid);
@@ -102,13 +114,17 @@ pub fn build_mcp_permission_request(
     if let Some(d) = mcp_ctx.annotations.destructive_hint {
         context["destructive_hint"] = serde_json::json!(d);
     }
-    serde_json::json!({
+    let mut request = serde_json::json!({
         "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
         "method": "permission.request",
         "action": "call",
         "detail": tool_name,
         "context": context,
-    })
+    });
+    if let Some(ref agent) = mcp_ctx.declared_agent {
+        request["agent"] = serde_json::json!(agent);
+    }
+    request
 }
 
 /// Builds a `permission.respond` to deliver a user decision back to agentpactd.
@@ -238,7 +254,7 @@ const RETRY_BACKOFFS: &[u64] = &[50, 100, 250];
 /// it could never be received intact, and it is auto-denied regardless.
 /// Guarding here makes that deny deterministic: it avoids transmitting a
 /// payload the daemon would reject mid-read, which could otherwise surface as
-/// a transport error and fail *open* under `on_daemon_unavailable: allow`.
+/// a transport error and fail *open* (a down daemon defers to the agent).
 fn oversized_execute_deny(action: &str, detail: &str) -> Option<McpPermissionDecision> {
     (action == "execute" && detail.len() > agentpact_types::MAX_COMMAND_LENGTH_CEILING).then(|| {
         McpPermissionDecision::Deny {
@@ -331,9 +347,16 @@ pub fn request_hook_permission(
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    declared_agent: Option<&str>,
     anchor_pid: Option<u32>,
     ppid_chain: Option<&[u32]>,
     command_group: Option<(&str, &str)>,
+    // How long the caller's approval hold can keep an `Ask` open, in seconds.
+    // Sized from the caller's poll window (plus margin) so the approval token
+    // outlives the hold — without it the daemon's default TTL expires the
+    // token mid-wait on long windows (codex holds for days). `None` keeps the
+    // daemon default; the daemon clamps oversized requests.
+    approval_ttl_secs: Option<u64>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     if let Some(deny) = oversized_execute_deny(action, detail) {
@@ -345,6 +368,7 @@ pub fn request_hook_permission(
         detail,
         working_dir,
         seed_boundary_pid,
+        declared_agent,
         anchor_pid,
         ppid_chain,
     );
@@ -354,6 +378,9 @@ pub fn request_hook_permission(
     if let Some((group, original)) = command_group {
         request["command_group"] = serde_json::json!(group);
         request["original_command"] = serde_json::json!(original);
+    }
+    if let Some(ttl) = approval_ttl_secs {
+        request["approval_ttl_secs"] = serde_json::json!(ttl);
     }
     send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
         let decision = parse_mcp_permission_response(&response);
@@ -395,6 +422,7 @@ pub fn send_command_commit(socket_path: &str, command_group: &str, socket_timeou
 ///
 /// Returns an error when `agentpactd` is unreachable or returns a
 /// malformed response.
+#[allow(clippy::too_many_arguments)]
 pub fn request_hook_permission_preview(
     socket_path: &str,
     request_id_prefix: &str,
@@ -402,6 +430,7 @@ pub fn request_hook_permission_preview(
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    declared_agent: Option<&str>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     if let Some(deny) = oversized_execute_deny(action, detail) {
@@ -409,13 +438,16 @@ pub fn request_hook_permission_preview(
     }
     // Preview is strictly side-effect-free: it never mints or consumes
     // exec_tokens, so anchor_pid and ppid_chain would do nothing here and
-    // are intentionally omitted from the preview API.
+    // are intentionally omitted from the preview API. The declared agent IS
+    // passed so the preview evaluates agent-scoped policy the same way the
+    // real request will.
     let mut request = build_hook_permission_request(
         request_id_prefix,
         action,
         detail,
         working_dir,
         seed_boundary_pid,
+        declared_agent,
         None,
         None,
     );
@@ -529,6 +561,35 @@ pub fn resolve_agent(
         .map(String::from)
 }
 
+/// Register the calling process as the root of a jailed (OS-sandboxed) agent
+/// session with `agentpactd`. Sent by `kyris-exec` immediately before it execs
+/// the sandboxed agent in place, so the caller's PID (which the daemon reads
+/// from the socket peer credentials, NOT from this message) becomes the jail
+/// root. `profile_summary` is an audit-only description of the active sandbox.
+///
+/// Returns `true` only on an explicit `PACT_OK`. Best-effort by contract: a
+/// `false` (daemon down, error) means the jail still applies but the daemon
+/// cannot attribute it, so governed commands fall back to advisory behavior
+/// (no `workspace_writes` Auto flip) — the caller must NOT block the launch.
+#[must_use]
+pub fn register_jailed_session(
+    socket_path: &str,
+    profile_summary: &str,
+    writable_roots: &[String],
+    socket_timeout: Option<Duration>,
+) -> bool {
+    let request = serde_json::json!({
+        "id": format!("kyris-exec-{}", uuid::Uuid::now_v7()),
+        "method": "session.register",
+        "profile_summary": profile_summary,
+        "writable_roots": writable_roots,
+    });
+    match send_daemon_request_to_socket(socket_path, &request, socket_timeout) {
+        Ok(response) => response.get("code").and_then(|c| c.as_str()) == Some("PACT_OK"),
+        Err(_) => false,
+    }
+}
+
 /// Sends a user approval decision back to `agentpactd`.
 ///
 /// On success returns an optional advisory **warning** the daemon attached to
@@ -600,16 +661,6 @@ pub fn probe_daemon_health(socket_path: &str, timeout: Duration) -> bool {
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
-#[must_use]
-pub fn allow_on_daemon_unavailable() -> bool {
-    let state = read_daemon_state();
-    state
-        .as_ref()
-        .and_then(|v| v.get("on_daemon_unavailable"))
-        .and_then(|val| val.as_str())
-        == Some("allow")
-}
-
 /// Reads `daemon.state` and checks that `protocol_version` matches
 /// `PROTOCOL_VERSION`. Missing state file or missing field = Ok (pass-through).
 ///
@@ -662,10 +713,6 @@ pub fn check_daemon_protocol_version(state: &serde_json::Value) -> Result<(), St
              Upgrade agentpact: brew upgrade agentpact"
         ))
     }
-}
-
-fn read_daemon_state() -> Option<serde_json::Value> {
-    read_daemon_state_at(&daemon_state_path()?)
 }
 
 fn read_daemon_state_at(path: &std::path::Path) -> Option<serde_json::Value> {
@@ -946,6 +993,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Duration::from_millis(50),
         );
         match result {
@@ -973,6 +1022,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Duration::from_millis(50),
         );
         assert!(
@@ -991,6 +1042,8 @@ mod tests {
             "test",
             "read",
             &big,
+            None,
+            None,
             None,
             None,
             None,
@@ -1096,7 +1149,7 @@ mod tests {
 
     #[test]
     fn testProtocolVersionMissingFieldIsOk() {
-        let state = serde_json::json!({"on_daemon_unavailable": "block"});
+        let state = serde_json::json!({"on_log_broken": "block"});
         assert!(check_daemon_protocol_version(&state).is_ok());
     }
 
@@ -1128,11 +1181,13 @@ mod tests {
                     read_only_hint: Some(true),
                     destructive_hint: None,
                 },
+                declared_agent: Some("anthropic/claude-code".to_string()),
             },
         );
         assert_eq!(request["method"], "permission.request");
         assert_eq!(request["action"], "call");
         assert_eq!(request["detail"], "read_file");
+        assert_eq!(request["agent"], "anthropic/claude-code");
         assert_eq!(request["context"]["mcp_server"], "github");
         assert_eq!(request["context"]["working_dir"], "/tmp/repo");
         assert_eq!(request["context"]["mcp_operation"], "tools/call");
@@ -1155,8 +1210,10 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(request["method"], "permission.request");
+        assert!(request["agent"].is_null());
         assert_eq!(request["action"], "execute");
         assert_eq!(request["detail"], "ls -la");
         assert_eq!(request["context"]["working_dir"], "/tmp/repo");
@@ -1173,8 +1230,16 @@ mod tests {
 
     #[test]
     fn testBuildHookPermissionRequestNoWorkingDir() {
-        let request =
-            build_hook_permission_request("kyris-hook", "call", "unknown", None, None, None, None);
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "call",
+            "unknown",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(request["action"], "call");
         assert!(request["context"]["working_dir"].is_null());
     }
@@ -1187,10 +1252,12 @@ mod tests {
             "git status",
             Some("/tmp"),
             Some(12345),
+            Some("google/gemini-cli"),
             None,
             None,
         );
         assert_eq!(request["seed_boundary_pid"], 12345);
+        assert_eq!(request["agent"], "google/gemini-cli");
     }
 
     #[test]
@@ -1203,6 +1270,7 @@ mod tests {
             "execute",
             "git status",
             Some("/tmp"),
+            None,
             None,
             Some(54321),
             None,
@@ -1222,6 +1290,7 @@ mod tests {
             Some("/tmp"),
             None,
             None,
+            None,
             Some(&[9999, 5678, 4321]),
         );
         assert_eq!(request["ppid_chain"][0], 9999);
@@ -1238,6 +1307,7 @@ mod tests {
             "kyris-hook",
             "execute",
             "ls",
+            None,
             None,
             None,
             None,

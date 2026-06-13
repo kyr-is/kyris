@@ -549,4 +549,43 @@ mod tests {
             "top = true\n[providers.kyris]\nname = \"Kyris\"\nurl = \"http://...\"\n[mcp.kyris-mcp]\ntype = \"http\"\n",
         );
     }
+
+    #[test]
+    fn roundtripReplaceUserValueRestoresOriginal() {
+        // kyris overwrites a key the user already set — unapply must restore the
+        // USER's value, not leave kyris's (or delete the key).
+        assert_roundtrip(
+            "openai_base_url = \"https://my-proxy.example/v1\"\n",
+            "openai_base_url = \"http://127.0.0.1:4710/v1\"\n",
+        );
+    }
+
+    #[test]
+    fn roundtripArrayOfTables() {
+        assert_roundtrip(
+            "[[servers]]\nname = \"a\"\n",
+            "[[servers]]\nname = \"a\"\n\n[[servers]]\nname = \"b\"\n",
+        );
+    }
+
+    #[test]
+    fn roundtripCodexConfigFullKyrisSetup() {
+        // The exact codex setup->undo scenario, as a structural round-trip: a
+        // vanilla codex config gains the FULL kyris routing — `model_provider`,
+        // `default_permissions`, `[features] hooks`, `[model_providers.kyris]`,
+        // a shell env marker, and a `[permissions.kyris]` tree — and unapply
+        // must restore the vanilla config EXACTLY, leaving the user's own
+        // `model`, `[model_providers.openai]` untouched.
+        let vanilla = "model = \"gpt-5\"\n\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\nwire_api = \"responses\"\n";
+        let kyris_configured = "\
+model = \"gpt-5\"\n\
+model_provider = \"kyris\"\n\
+default_permissions = \"kyris\"\n\
+\n[features]\nhooks = true\n\
+\n[model_providers.openai]\nname = \"OpenAI\"\nbase_url = \"https://api.openai.com/v1\"\nwire_api = \"responses\"\n\
+\n[model_providers.kyris]\nname = \"Kyris\"\nbase_url = \"http://127.0.0.1:4710/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nsupports_websockets = false\n\
+\n[model_providers.kyris.http_headers]\nx-kyris-inbound = \"sk-kyris-abc\"\n\
+\n[permissions.kyris.filesystem]\n\"./src\" = \"write\"\n";
+        assert_roundtrip(vanilla, kyris_configured);
+    }
 }

@@ -492,19 +492,25 @@ where
     Ok(())
 }
 
+/// Flush the stats pipeline on shutdown.
+///
+/// In-flight HTTP requests are ALREADY drained by the server's graceful
+/// shutdown (`serve_with_graceful_shutdown`) before this runs, so there is
+/// nothing here to wait on for request draining — dropping the stats sender
+/// lets the writer task finish the channel, bounded by `drain_timeout` so a
+/// stuck writer can't hang exit. (A previous version slept the full
+/// `drain_timeout` unconditionally here, which made EVERY shutdown take the
+/// whole budget — ~30s by default — even when idle. That delayed clean exit
+/// past the test harness's force-kill window, leaving a stale PID file that the
+/// next start reported as "previous daemon crashed".)
 async fn drain_and_flush_stats(
     stats_tx: mpsc::Sender<StatsEvent>,
     stats_writer_handle: tokio::task::JoinHandle<()>,
     drain_timeout: Duration,
 ) -> Result<(), String> {
-    tracing::info!(
-        drain_timeout_seconds = drain_timeout.as_secs(),
-        "draining in-flight requests"
-    );
-    tokio::time::sleep(drain_timeout).await;
-
+    tracing::info!("flushing stats pipeline on shutdown");
     drop(stats_tx);
-    tokio::time::timeout(Duration::from_secs(5), stats_writer_handle)
+    tokio::time::timeout(drain_timeout, stats_writer_handle)
         .await
         .map_err(|_| "timed out waiting for stats writer flush".to_string())?
         .map_err(|error| format!("stats writer task failed: {error}"))?;
@@ -556,8 +562,25 @@ fn check_crash_recovery() {
 
         let alive = signal::kill(Pid::from_raw(old_pid), None).is_ok();
         if !alive {
-            tracing::warn!(old_pid, "detected stale PID file — previous daemon crashed");
             let modified = std::fs::metadata(&pid_path).and_then(|m| m.modified()).ok();
+            // Distinguish a panic (the previous daemon wrote a crash report, so
+            // the cause is recorded) from an uncatchable external kill (SIGKILL /
+            // OOM / power loss — the panic hook never ran, so there is NO report).
+            // A report modified after the dead daemon wrote its PID file is that
+            // daemon's own panic; absence of one means it was killed from outside.
+            if let Some(report) = modified.and_then(crate::crash::most_recent_report_since) {
+                tracing::warn!(
+                    old_pid,
+                    crash_report = %report.display(),
+                    "previous daemon panicked — see crash report"
+                );
+            } else {
+                tracing::warn!(
+                    old_pid,
+                    "previous daemon exited without a panic report — killed externally \
+                     (SIGKILL / OOM / power loss / forced restart), not a Rust panic"
+                );
+            }
             let duration = modified.and_then(|m| m.elapsed().ok()).map_or_else(
                 || "unknown".to_string(),
                 |d| {
@@ -893,6 +916,7 @@ async fn resolve_pending(
         return StatusCode::BAD_REQUEST;
     };
 
+    let pending_info = state.pending.list().into_iter().find(|p| p.id == id);
     let claim = match state.pending.claim(&id) {
         Ok(claim) => claim,
         Err(ResolveError::NotFound | ResolveError::NoLongerResolvable(_)) => {
@@ -911,6 +935,33 @@ async fn resolve_pending(
     state
         .pending
         .complete_claim(claim, decision.allows_execution());
+    if let Some(info) = pending_info {
+        let command = info.code.as_deref().or(info.tool.as_deref());
+        let decision_label = match decision {
+            ResolveDecision::Approved => "approved",
+            ResolveDecision::Always => "always",
+            ResolveDecision::Denied => "denied",
+        };
+        kyris_core::prompt_log::record_now(
+            &id,
+            "api",
+            "resolved",
+            &info.server,
+            info.tool.as_deref(),
+            command,
+            &info.agent,
+            info.allow_always,
+            Some(decision_label),
+        );
+        crate::approvals_log::record(&crate::approvals_log::ApprovalRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            pending_id: &id,
+            server: &info.server,
+            command,
+            agent: &info.agent,
+            decision: decision_label,
+        });
+    }
     StatusCode::OK
 }
 
@@ -923,26 +974,30 @@ struct HoldRequest {
     /// Optional verbatim code/command/path to render in the popup's
     /// accessoryView. Distinct from `tool` because `tool` is a short
     /// label ("Bash", "Read"); `code` is what the user actually needs
-    /// to read to decide ("git push --force origin main"). Older
-    /// callers omit it — the popup falls back to plain body text.
+    /// to read to decide ("git push --force origin main").
     #[serde(default)]
     code: Option<String>,
-    /// Whether the popup may offer "Always". Defaults to `true` for older
-    /// callers; `false` greys out the button (e.g. privilege escalation,
-    /// which agentpactd never persists anyway).
-    #[serde(default = "default_allow_always")]
+    /// Source agent or integration surface (`codex-cli`, `claude-code`,
+    /// `kyris-mcp`, ...).
+    agent: String,
+    /// Whether the popup may offer "Always".
     allow_always: bool,
-}
-
-fn default_allow_always() -> bool {
-    true
+    /// Caller-sized lifetime for this pending entry, in seconds — the
+    /// holder's own poll window plus margin, so the dialog outlives the
+    /// wait instead of timing out mid-poll on long windows (codex's hook
+    /// holds for days). Absent → the `mcp.pending_timeout_seconds` config
+    /// default (older callers).
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 async fn hold_pending(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HoldRequest>,
 ) -> StatusCode {
-    let pending_timeout = state.config.load().mcp.pending_timeout_seconds;
+    let pending_timeout = body
+        .ttl_seconds
+        .unwrap_or_else(|| state.config.load().mcp.pending_timeout_seconds);
     let pending = state.pending.clone();
     let timeout_id = body.id.clone();
 
@@ -951,6 +1006,7 @@ async fn hold_pending(
     let dialog_server = body.server.clone();
     let dialog_tool = body.tool.clone();
     let dialog_code = body.code.clone();
+    let dialog_agent = body.agent.clone();
     let dialog_allow_always = body.allow_always;
 
     let _rx = state.pending.hold(
@@ -958,7 +1014,20 @@ async fn hold_pending(
         body.approval_token,
         body.server,
         body.tool,
+        dialog_code.clone(),
+        body.agent,
         dialog_allow_always,
+    );
+    kyris_core::prompt_log::record_now(
+        &body.id,
+        "api",
+        "held",
+        &dialog_server,
+        dialog_tool.as_deref(),
+        dialog_code.as_deref().or(dialog_tool.as_deref()),
+        &dialog_agent,
+        dialog_allow_always,
+        None,
     );
     let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(pending_timeout)).await;
@@ -976,6 +1045,17 @@ async fn hold_pending(
             server = %dialog_server,
             tool = ?dialog_tool,
             "dispatching approval dialog"
+        );
+        kyris_core::prompt_log::record_now(
+            &body.id,
+            "tray",
+            "dispatch",
+            &dialog_server,
+            dialog_tool.as_deref(),
+            dialog_code.as_deref().or(dialog_tool.as_deref()),
+            &dialog_agent,
+            dialog_allow_always,
+            None,
         );
         tokio::spawn(async move {
             let tool_label = dialog_tool.as_deref().unwrap_or("unknown tool");
@@ -996,6 +1076,12 @@ async fn hold_pending(
                 dialog_allow_always,
             )
             .await;
+            let prompt_outcome = match outcome {
+                crate::notify::ApprovalOutcome::Yes => "approved",
+                crate::notify::ApprovalOutcome::No => "denied",
+                crate::notify::ApprovalOutcome::Always => "always",
+                crate::notify::ApprovalOutcome::CouldNotShow => "could_not_show",
+            };
             // CouldNotShow means the panel never became visible to the user
             // — treat as "no answer yet" and leave the request pending so
             // the menu-bar attention path (or `kyris pending`) can pick it
@@ -1003,12 +1089,34 @@ async fn hold_pending(
             // every request whenever the user is in a fullscreen app or on
             // a different Space — the exact failure mode this design fixes.
             let Some(decision) = decision_for_approval_outcome(outcome) else {
+                kyris_core::prompt_log::record_now(
+                    &dialog_id,
+                    "tray",
+                    "not_shown",
+                    &dialog_server,
+                    dialog_tool.as_deref(),
+                    dialog_code.as_deref().or(dialog_tool.as_deref()),
+                    &dialog_agent,
+                    dialog_allow_always,
+                    Some(prompt_outcome),
+                );
                 tracing::warn!(
                     pending_id = %dialog_id,
                     "approval panel could not be shown — leaving request pending"
                 );
                 return;
             };
+            kyris_core::prompt_log::record_now(
+                &dialog_id,
+                "tray",
+                "resolved",
+                &dialog_server,
+                dialog_tool.as_deref(),
+                dialog_code.as_deref().or(dialog_tool.as_deref()),
+                &dialog_agent,
+                dialog_allow_always,
+                Some(prompt_outcome),
+            );
             // Best-effort log of the user's answer for `kyris approvals`
             // recall and offline catalog mining. Records the verbatim command
             // (multi-line preserved via JSON `\n` escaping); the agent's tool
@@ -1021,7 +1129,7 @@ async fn hold_pending(
                 pending_id: &dialog_id,
                 server: &dialog_server,
                 command,
-                agent: "unknown",
+                agent: &dialog_agent,
                 decision: match decision {
                     ResolveDecision::Approved => "approved",
                     ResolveDecision::Always => "always",
@@ -2037,7 +2145,10 @@ mod tests {
             .send(sample_event("trace-drain", Some("sess-drain")))
             .await
             .unwrap();
-        drain_and_flush_stats(stats_tx, writer_handle, Duration::from_millis(0))
+        // `drain_timeout` now bounds the stats-writer flush (it no longer gates a
+        // blind pre-sleep), so give the writer a real budget to persist the
+        // queued event before the handle is awaited.
+        drain_and_flush_stats(stats_tx, writer_handle, Duration::from_secs(5))
             .await
             .unwrap();
 
@@ -2308,6 +2419,8 @@ mod tests {
             "tok-1".into(),
             "github".into(),
             Some("read_file".into()),
+            None,
+            "test-agent".into(),
             true,
         );
 
@@ -2384,14 +2497,74 @@ mod tests {
                 "id": "req-ext-1",
                 "approval_token": "apt-ext-1",
                 "server": "github",
-                "tool": "read_file"
+                "tool": "read_file",
+                "agent": "test-agent",
+                "allow_always": true
             }))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(state.pending.list_held().len(), 1);
-        assert_eq!(state.pending.list_held()[0].id, "req-ext-1");
+        let held = state.pending.list_held();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, "req-ext-1");
+        assert_eq!(held[0].agent, "test-agent");
+
+        let _ = shutdown_tx.send(());
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn testHoldPendingEndpointRequiresAgentAndAllowAlways() {
+        let dir = tempfile::tempdir().unwrap();
+        let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        let state = make_test_state(config, dir.path());
+
+        let app = Router::new().route(
+            "/api/pending/hold",
+            axum::routing::post(hold_pending).with_state(state.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let missing_agent = client
+            .post(format!("{addr}/api/pending/hold"))
+            .json(&serde_json::json!({
+                "id": "req-missing-agent",
+                "approval_token": "apt-missing-agent",
+                "server": "github",
+                "tool": "read_file",
+                "allow_always": true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_agent.status(), 422);
+
+        let missing_allow_always = client
+            .post(format!("{addr}/api/pending/hold"))
+            .json(&serde_json::json!({
+                "id": "req-missing-aa",
+                "approval_token": "apt-missing-aa",
+                "server": "github",
+                "tool": "read_file",
+                "agent": "test-agent"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_allow_always.status(), 422);
+        assert!(state.pending.list_held().is_empty());
 
         let _ = shutdown_tx.send(());
         handle.await.unwrap();
@@ -2407,6 +2580,8 @@ mod tests {
             "tok-s-1".into(),
             "github".into(),
             Some("read_file".into()),
+            None,
+            "test-agent".into(),
             true,
         );
 
@@ -2906,6 +3081,7 @@ mod tests {
                     server: "github",
                     tool: "read_file",
                     code: None,
+                    agent: "test-agent",
                     allow_always: true,
                 },
             )
@@ -2967,6 +3143,7 @@ mod tests {
                     server: "github",
                     tool: "write_file",
                     code: None,
+                    agent: "test-agent",
                     allow_always: true,
                 },
             )
@@ -3042,6 +3219,8 @@ mod tests {
                 "approval_token": "test-token",
                 "server": "anthropic",
                 "tool": "agent",
+                "agent": "test-agent",
+                "allow_always": true
             }))
             .send()
             .await
@@ -3062,6 +3241,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["id"], "e2e-list-1");
         assert_eq!(requests[0]["server"], "anthropic");
+        assert_eq!(requests[0]["agent"], "test-agent");
         assert_eq!(requests[0]["state"], "held");
 
         let _ = shutdown_tx.send(());

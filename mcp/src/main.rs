@@ -19,27 +19,34 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 4 || args[1] != "wrap" {
-        eprintln!("Usage: kyris-mcp wrap --server <name> <cmd> [args...]");
+        eprintln!("Usage: kyris-mcp wrap --server <name> [--agent <id>] <cmd> [args...]");
         return ExitCode::from(1);
     }
 
+    // Leading flags before the wrapped command, in any order. `--agent` is the
+    // owning agent's id (stamped by the kyris MCP rewrite) used only for
+    // tool-surface live-evidence attribution; pre-upgrade wraps omit it.
     let mut server_name = None;
+    let mut agent_id: Option<String> = None;
     let mut cmd_start = 2;
-
-    let mut i = 2;
-    while i < args.len() {
-        if args[i] == "--server" && i + 1 < args.len() {
-            server_name = Some(args[i + 1].clone());
-            cmd_start = i + 2;
-            break;
+    while cmd_start < args.len() {
+        match args[cmd_start].as_str() {
+            "--server" if cmd_start + 1 < args.len() => {
+                server_name = Some(args[cmd_start + 1].clone());
+                cmd_start += 2;
+            }
+            "--agent" if cmd_start + 1 < args.len() => {
+                agent_id = Some(args[cmd_start + 1].clone());
+                cmd_start += 2;
+            }
+            _ => break,
         }
-        i += 1;
     }
 
     let server_name = server_name.unwrap_or_else(|| "unknown".to_string());
 
     if cmd_start >= args.len() {
-        eprintln!("Usage: kyris-mcp wrap --server <name> <cmd> [args...]");
+        eprintln!("Usage: kyris-mcp wrap --server <name> [--agent <id>] <cmd> [args...]");
         return ExitCode::from(1);
     }
 
@@ -62,7 +69,16 @@ fn main() -> ExitCode {
         .expect("build tokio runtime");
 
     rt.block_on(async {
-        match relay::run_wrapper(&server_name, cmd, cmd_args, has_tty, socket_timeout).await {
+        match relay::run_wrapper(
+            &server_name,
+            agent_id.as_deref(),
+            cmd,
+            cmd_args,
+            has_tty,
+            socket_timeout,
+        )
+        .await
+        {
             Ok(code) => ExitCode::from(code),
             Err(e) => {
                 let msg = format!("server={server_name} {e}");

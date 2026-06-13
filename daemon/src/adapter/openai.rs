@@ -20,6 +20,65 @@ use crate::metering::{StatsEvent, TokenCounts};
 use crate::server::AppState;
 use crate::streaming;
 
+/// `ChatGPT` subscription (login) tokens are only valid at `OpenAI`'s `ChatGPT` codex
+/// backend — NOT api.openai.com, which rejects them ("missing scopes:
+/// api.responses.write"). codex signals subscription auth by attaching a
+/// `ChatGPT-Account-ID` header (api-key auth omits it) and natively sends such
+/// requests to this base URL; kyrisd mirrors that choice. (api.openai.com is the
+/// default for api-key auth — see `ProviderConfig::default_for`.)
+const CHATGPT_CODEX_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Pick the Responses upstream from the caller's credential type. A `ChatGPT`
+/// subscription login (signalled by `ChatGPT-Account-ID`) routes to the `ChatGPT`
+/// codex backend at `/responses`; an API key routes to `{upstream}/v1/responses`.
+fn responses_upstream_url(
+    provider: &kyris_core::config::ProviderConfig,
+    headers: &HeaderMap,
+) -> String {
+    if headers.contains_key("chatgpt-account-id") {
+        format!("{CHATGPT_CODEX_UPSTREAM}/responses")
+    } else {
+        format!("{}/v1/responses", provider.upstream)
+    }
+}
+
+/// Classify the cost-coverage of a request from the caller's credential type —
+/// the `OpenAI` twin of `anthropic_plan_status`. A `ChatGPT` subscription login
+/// attaches `ChatGPT-Account-ID` (the same signal `responses_upstream_url`
+/// trusts to pick the subscription backend); API-key auth omits it.
+/// Subscription → `Included` (plan-covered), API key → `Overage` (billed).
+fn openai_plan_status(headers: &HeaderMap) -> kyris_core::record::PlanStatus {
+    if headers.contains_key("chatgpt-account-id") {
+        kyris_core::record::PlanStatus::Included
+    } else {
+        kyris_core::record::PlanStatus::Overage
+    }
+}
+
+/// Whether a caller request header should be forwarded upstream. kyrisd must NOT
+/// leak its own routing headers (`x-kyris-*`, the inbound key above all) and must
+/// let the HTTP client recompute framing/length headers. Everything else the
+/// caller sent — authorization, content-type, `ChatGPT-Account-ID`, `OpenAI-Beta`,
+/// the `x-codex-*` session/turn headers — is forwarded so the upstream sees a
+/// faithful request (the `ChatGPT` backend in particular requires these).
+fn is_forwardable_request_header(name: &str) -> bool {
+    !name.starts_with("x-kyris-")
+        && !matches!(
+            name,
+            "host"
+                | "content-length"
+                | "accept-encoding"
+                | "connection"
+                | "keep-alive"
+                | "transfer-encoding"
+                | "te"
+                | "trailer"
+                | "upgrade"
+                | "proxy-authorization"
+                | "proxy-authenticate"
+        )
+}
+
 pub fn routes(state: Arc<AppState>) -> Router {
     Router::new()
         .route(
@@ -27,6 +86,9 @@ pub fn routes(state: Arc<AppState>) -> Router {
             post(handle_completions).with_state(state.clone()),
         )
         .route("/v1/responses", post(handle_responses).with_state(state))
+        // Run handlers to completion even if the client disconnects — the
+        // gateway record must not depend on the downstream connection's fate.
+        .layer(super::RunToCompletionLayer)
 }
 
 async fn handle_completions(
@@ -60,15 +122,11 @@ async fn handle_completions(
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
+    // Cost-coverage from the caller's credential type (ChatGPT subscription →
+    // Included, API key → Overage).
+    let plan_status = openai_plan_status(&headers);
 
-    if let (Some(token), Some(aid)) = (trace_token.as_deref(), agent_id.as_deref()) {
-        tracing::debug!(
-            agent_id = aid,
-            trace_token = token,
-            "native protocol observed"
-        );
-        super::write_native_seen_breadcrumb(aid);
-    }
+    super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
     if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
@@ -76,6 +134,21 @@ async fn handle_completions(
         crate::notify::circuit_breaker_toast(count);
         return Ok(circuit_breaker_error(&trace_id, count));
     }
+
+    // Resolve attribution now, while the peer socket still maps to a live
+    // process — the record is written at stream/handler end, by which time the
+    // agent may have disconnected and exited, and a record without
+    // `working_dir` never becomes sync-eligible.
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.or(peer_agent);
 
     if is_stream {
         inject_stream_usage(&mut body_value);
@@ -172,9 +245,9 @@ async fn handle_completions(
             model,
             provider_name,
             session_id,
-            trace_token,
-            agent_id,
-            peer_addr,
+            working_dir,
+            agent,
+            plan_status,
             start,
         );
     }
@@ -212,17 +285,6 @@ async fn handle_completions(
         }
     };
 
-    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-        (
-            super::relay_trace_attach(&state, token, &trace_id).await,
-            None,
-        )
-    } else {
-        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
-        (attr.working_dir, attr.agent)
-    };
-    let agent = agent_id.clone().or(peer_agent);
-
     if state
         .stats_tx
         .try_send(StatsEvent {
@@ -245,7 +307,7 @@ async fn handle_completions(
             mcp_server: None,
             mcp_tool: None,
             metering,
-            plan_status: kyris_core::record::PlanStatus::Overage,
+            plan_status,
             working_dir,
             agent,
         })
@@ -309,15 +371,11 @@ async fn handle_responses(
     let session_id = super::extract_session_id(&headers);
     let trace_token = super::extract_trace_token(&headers);
     let agent_id = super::extract_agent_id(&headers);
+    // Cost-coverage from the caller's credential type (ChatGPT subscription →
+    // Included, API key → Overage) — the same header that picks the upstream.
+    let plan_status = openai_plan_status(&headers);
 
-    if let (Some(token), Some(aid)) = (trace_token.as_deref(), agent_id.as_deref()) {
-        tracing::debug!(
-            agent_id = aid,
-            trace_token = token,
-            "native protocol observed"
-        );
-        super::write_native_seen_breadcrumb(aid);
-    }
+    super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
     if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
     {
@@ -325,6 +383,22 @@ async fn handle_responses(
         crate::notify::circuit_breaker_toast(count);
         return Ok(circuit_breaker_error(&trace_id, count));
     }
+
+    // Resolve attribution now, while the peer socket still maps to a live
+    // process — the record is written at stream/handler end, by which time the
+    // agent may have disconnected and exited (codex exec quits on
+    // `response.completed`), and a record without `working_dir` never becomes
+    // sync-eligible.
+    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
+        (
+            super::relay_trace_attach(&state, token, &trace_id).await,
+            None,
+        )
+    } else {
+        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
+        (attr.working_dir, attr.agent)
+    };
+    let agent = agent_id.or(peer_agent);
 
     // No body rewriting: the Responses API returns token usage natively (in the
     // response object / the streaming `response.completed` event), so kyrisd
@@ -344,18 +418,21 @@ async fn handle_responses(
         });
     let provider_name = provider.name.clone();
 
-    // Pure passthrough: forward the caller's `authorization` header or fail
-    // fast. kyrisd holds no provider credential of its own.
-    let Some(authorization) = headers.get("authorization").cloned() else {
+    // Pure passthrough: the caller's `authorization` (their own credential) is
+    // forwarded with the rest of their headers below. Fail fast if absent —
+    // kyrisd holds no provider credential of its own.
+    if !headers.contains_key("authorization") {
         return Ok(no_credential_error(&trace_id));
-    };
+    }
 
     let clients = state.provider_clients.load();
     let client = clients
         .get(&provider_name)
         .cloned()
         .unwrap_or_else(|| state.default_provider_client.clone());
-    let upstream_url = format!("{}/v1/responses", provider.upstream);
+    // Route by credential type: a ChatGPT subscription login goes to the ChatGPT
+    // codex backend, an API key to api.openai.com (see `responses_upstream_url`).
+    let upstream_url = responses_upstream_url(&provider, &headers);
 
     let outbound_body = serde_json::to_vec(&body_value).map_err(|e| {
         tracing::warn!(error = %e, "failed to serialize OpenAI responses outbound body");
@@ -368,18 +445,22 @@ async fn handle_responses(
         provider.timeout_seconds
     };
 
-    let response = client
+    let mut request = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
-        .header("authorization", &authorization)
-        .header("content-type", "application/json")
-        .body(outbound_body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "OpenAI responses upstream request failed");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .body(outbound_body);
+    // Forward the caller's headers faithfully (codex's ChatGPT-Account-ID,
+    // OpenAI-Beta, x-codex-* session/turn headers, content-type, authorization),
+    // minus kyrisd's own x-kyris-* routing headers and framing/length headers.
+    for (name, value) in &headers {
+        if is_forwardable_request_header(name.as_str()) {
+            request = request.header(name, value);
+        }
+    }
+    let response = request.send().await.map_err(|e| {
+        tracing::error!(error = %e, "OpenAI responses upstream request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
@@ -394,9 +475,9 @@ async fn handle_responses(
             model,
             provider_name,
             session_id,
-            trace_token,
-            agent_id,
-            peer_addr,
+            working_dir,
+            agent,
+            plan_status,
             start,
         );
     }
@@ -431,17 +512,6 @@ async fn handle_responses(
         }
     };
 
-    let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-        (
-            super::relay_trace_attach(&state, token, &trace_id).await,
-            None,
-        )
-    } else {
-        let attr = super::resolve_peer_attribution(&state, peer_addr, agent_id.is_none()).await;
-        (attr.working_dir, attr.agent)
-    };
-    let agent = agent_id.clone().or(peer_agent);
-
     if state
         .stats_tx
         .try_send(StatsEvent {
@@ -464,7 +534,7 @@ async fn handle_responses(
             mcp_server: None,
             mcp_tool: None,
             metering,
-            plan_status: kyris_core::record::PlanStatus::Overage,
+            plan_status,
             working_dir,
             agent,
         })
@@ -493,9 +563,9 @@ fn relay_responses_sse_stream(
     model: String,
     provider_name: String,
     session_id: String,
-    trace_token: Option<String>,
-    agent_id: Option<String>,
-    peer_addr: SocketAddr,
+    working_dir: Option<String>,
+    agent: Option<String>,
+    plan_status: kyris_core::record::PlanStatus,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
@@ -557,19 +627,20 @@ fn relay_responses_sse_stream(
     };
 
     let mut relay = Some(Box::pin(relay));
-    let mut finalized = false;
-    let trace_id_for_stream = trace_id.clone();
-    let model_for_stream = model.clone();
-    let provider_name_for_stream = provider_name;
-    let session_id_for_stream = session_id.clone();
-    let full_stream = futures_util::stream::poll_fn(move |cx| {
-        use std::task::Poll;
-
-        if finalized {
-            return Poll::Ready(None);
-        }
-
-        let finalize_stream = |emit_breaker_chunk: bool| {
+    // The finalize owns (clones of) everything the record needs so it can run
+    // from the guard's Drop as well as from the poll path — a client that
+    // disconnects before end-of-stream must still produce a gateway record
+    // (see `StreamRecordGuard`). `codex exec` exits the moment it sees
+    // `response.completed`, so its last turn routinely races the final poll.
+    let finalize_stream = {
+        let accumulated = accumulated.clone();
+        let line_buf = line_buf.clone();
+        let breaker_tripped = breaker_tripped.clone();
+        let state = state.clone();
+        let trace_id = trace_id.clone();
+        let model = model.clone();
+        let session_id = session_id.clone();
+        move |emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -630,37 +701,25 @@ fn relay_responses_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-                (
-                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                    None,
-                )
-            } else {
-                let attr =
-                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
-                (attr.working_dir, attr.agent)
-            };
-            let agent = agent_id.clone().or(peer_agent);
-
             if state
                 .stats_tx
                 .try_send(StatsEvent {
-                    trace_id: trace_id_for_stream.clone(),
-                    provider: provider_name_for_stream.clone(),
-                    model: model_for_stream.clone(),
+                    trace_id: trace_id.clone(),
+                    provider: provider_name.clone(),
+                    model: model.clone(),
                     tokens,
                     cache_create: 0,
                     cache_read: 0,
                     cost,
                     latency_ms,
                     status: status.to_string(),
-                    session_id: Some(session_id_for_stream.clone()),
+                    session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
                     metering: stream_metering,
-                    plan_status: kyris_core::record::PlanStatus::Overage,
-                    working_dir,
-                    agent,
+                    plan_status,
+                    working_dir: working_dir.clone(),
+                    agent: agent.clone(),
                 })
                 .is_err()
             {
@@ -668,12 +727,19 @@ fn relay_responses_sse_stream(
             }
 
             breaker_chunk
-        };
+        }
+    };
+    let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
+    let full_stream = futures_util::stream::poll_fn(move |cx| {
+        use std::task::Poll;
+
+        if record_guard.is_done() {
+            return Poll::Ready(None);
+        }
 
         if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
             drop(relay.take());
-            finalized = true;
-            if let Some(chunk) = finalize_stream(false) {
+            if let Some(chunk) = record_guard.finalize(false) {
                 return Poll::Ready(Some(Ok(chunk)));
             }
             return Poll::Ready(None);
@@ -689,8 +755,7 @@ fn relay_responses_sse_stream(
             }
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                finalized = true;
-                if let Some(chunk) = finalize_stream(true) {
+                if let Some(chunk) = record_guard.finalize(true) {
                     Poll::Ready(Some(Ok(chunk)))
                 } else {
                     Poll::Ready(None)
@@ -719,9 +784,9 @@ fn relay_sse_stream(
     model: String,
     provider_name: String,
     session_id: String,
-    trace_token: Option<String>,
-    agent_id: Option<String>,
-    peer_addr: SocketAddr,
+    working_dir: Option<String>,
+    agent: Option<String>,
+    plan_status: kyris_core::record::PlanStatus,
     start: std::time::Instant,
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
@@ -783,19 +848,19 @@ fn relay_sse_stream(
     };
 
     let mut relay = Some(Box::pin(relay));
-    let mut finalized = false;
-    let trace_id_for_stream = trace_id.clone();
-    let model_for_stream = model.clone();
-    let provider_name_for_stream = provider_name;
-    let session_id_for_stream = session_id.clone();
-    let full_stream = futures_util::stream::poll_fn(move |cx| {
-        use std::task::Poll;
-
-        if finalized {
-            return Poll::Ready(None);
-        }
-
-        let finalize_stream = |emit_breaker_chunk: bool| {
+    // The finalize owns (clones of) everything the record needs so it can run
+    // from the guard's Drop as well as from the poll path — a client that
+    // disconnects before end-of-stream must still produce a gateway record
+    // (see `StreamRecordGuard`).
+    let finalize_stream = {
+        let accumulated = accumulated.clone();
+        let line_buf = line_buf.clone();
+        let breaker_tripped = breaker_tripped.clone();
+        let state = state.clone();
+        let trace_id = trace_id.clone();
+        let model = model.clone();
+        let session_id = session_id.clone();
+        move |emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -856,37 +921,25 @@ fn relay_sse_stream(
                 kyris_core::record::Metering::Available
             };
 
-            let (working_dir, peer_agent) = if let Some(token) = trace_token.as_deref() {
-                (
-                    super::relay_trace_attach_sync(&state, token, &trace_id_for_stream),
-                    None,
-                )
-            } else {
-                let attr =
-                    super::resolve_peer_attribution_sync(&state, peer_addr, agent_id.is_none());
-                (attr.working_dir, attr.agent)
-            };
-            let agent = agent_id.clone().or(peer_agent);
-
             if state
                 .stats_tx
                 .try_send(StatsEvent {
-                    trace_id: trace_id_for_stream.clone(),
-                    provider: provider_name_for_stream.clone(),
-                    model: model_for_stream.clone(),
+                    trace_id: trace_id.clone(),
+                    provider: provider_name.clone(),
+                    model: model.clone(),
                     tokens,
                     cache_create: 0,
                     cache_read: 0,
                     cost,
                     latency_ms,
                     status: status.to_string(),
-                    session_id: Some(session_id_for_stream.clone()),
+                    session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
                     metering: stream_metering,
-                    plan_status: kyris_core::record::PlanStatus::Overage,
-                    working_dir,
-                    agent,
+                    plan_status,
+                    working_dir: working_dir.clone(),
+                    agent: agent.clone(),
                 })
                 .is_err()
             {
@@ -894,12 +947,19 @@ fn relay_sse_stream(
             }
 
             breaker_chunk
-        };
+        }
+    };
+    let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
+    let full_stream = futures_util::stream::poll_fn(move |cx| {
+        use std::task::Poll;
+
+        if record_guard.is_done() {
+            return Poll::Ready(None);
+        }
 
         if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
             drop(relay.take());
-            finalized = true;
-            if let Some(chunk) = finalize_stream(false) {
+            if let Some(chunk) = record_guard.finalize(false) {
                 return Poll::Ready(Some(Ok(chunk)));
             }
             return Poll::Ready(None);
@@ -915,8 +975,7 @@ fn relay_sse_stream(
             }
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                finalized = true;
-                if let Some(chunk) = finalize_stream(true) {
+                if let Some(chunk) = record_guard.finalize(true) {
                     Poll::Ready(Some(Ok(chunk)))
                 } else {
                     Poll::Ready(None)
@@ -1051,6 +1110,81 @@ mod tests {
     use axum::{Router, extract::State, http::HeaderMap, response::IntoResponse, routing::post};
     use kyris_core::config::{KyrisdConfig, ProviderConfig, ProviderFormat};
     use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn testResponsesUpstreamRoutesByCredentialType() {
+        let provider = ProviderConfig::default_for(ProviderFormat::OpenAI);
+
+        // API-key auth (no ChatGPT-Account-ID) -> the standard OpenAI API.
+        let mut api = HeaderMap::new();
+        api.insert("authorization", "Bearer sk-abc".parse().unwrap());
+        assert_eq!(
+            responses_upstream_url(&provider, &api),
+            "https://api.openai.com/v1/responses"
+        );
+
+        // ChatGPT subscription login (ChatGPT-Account-ID present, normalized
+        // lowercase by the http crate) -> the ChatGPT codex backend at /responses.
+        let mut sub = HeaderMap::new();
+        sub.insert("authorization", "Bearer eyJhbGc".parse().unwrap());
+        sub.insert("chatgpt-account-id", "acct-123".parse().unwrap());
+        assert_eq!(
+            responses_upstream_url(&provider, &sub),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn testPlanStatusChatgptSubscriptionIsIncluded() {
+        // The OpenAI twin of `anthropic_plan_status`: a ChatGPT subscription
+        // login (ChatGPT-Account-ID present — the same signal that picks the
+        // chatgpt.com upstream) is plan-covered; API-key auth is billed.
+        let mut sub = HeaderMap::new();
+        sub.insert("authorization", "Bearer eyJhbGc".parse().unwrap());
+        sub.insert("chatgpt-account-id", "acct-123".parse().unwrap());
+        assert_eq!(
+            openai_plan_status(&sub),
+            kyris_core::record::PlanStatus::Included
+        );
+
+        let mut api = HeaderMap::new();
+        api.insert("authorization", "Bearer sk-abc".parse().unwrap());
+        assert_eq!(
+            openai_plan_status(&api),
+            kyris_core::record::PlanStatus::Overage
+        );
+    }
+
+    #[test]
+    fn testForwardableRequestHeaderFiltersKyrisAndFraming() {
+        // kyrisd's own routing headers must never leak upstream (the inbound key
+        // especially), and the client recomputes framing/length headers.
+        for blocked in [
+            "x-kyris-inbound",
+            "x-kyris-agent-id",
+            "x-kyris-session-id",
+            "host",
+            "content-length",
+            "accept-encoding",
+            "connection",
+        ] {
+            assert!(
+                !is_forwardable_request_header(blocked),
+                "{blocked} must not be forwarded"
+            );
+        }
+        // The caller's auth + codex routing headers must pass through.
+        for ok in [
+            "authorization",
+            "content-type",
+            "chatgpt-account-id",
+            "openai-beta",
+            "x-codex-turn-state",
+            "x-codex-installation-id",
+        ] {
+            assert!(is_forwardable_request_header(ok), "{ok} must be forwarded");
+        }
+    }
 
     use crate::{
         circuit_breaker::CircuitBreaker, cost::CostCalculator, pending::PendingStore,
@@ -1210,6 +1344,12 @@ mod tests {
         assert_eq!(event.tokens.output, 100);
         assert_eq!(event.session_id.as_deref(), Some("sess-123"));
         assert_eq!(state.circuit_breaker.get_token_count("sess-123"), 300);
+        // This call authenticated with an API key (no ChatGPT-Account-ID), so
+        // the route classifies it `overage`. The subscription path classifies
+        // `included` (helper-pinned in testPlanStatusChatgptSubscriptionIsIncluded;
+        // not exercisable at route level because that branch targets the real
+        // chatgpt.com backend — see CHATGPT_CODEX_UPSTREAM).
+        assert_eq!(event.plan_status, kyris_core::record::PlanStatus::Overage);
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
@@ -1639,6 +1779,8 @@ mod tests {
         assert_eq!(event.tokens.output, 80);
         assert_eq!(event.session_id.as_deref(), Some("sess-resp-1"));
         assert_eq!(state.circuit_breaker.get_token_count("sess-resp-1"), 230);
+        // API-key credential (no ChatGPT-Account-ID) → billed as overage.
+        assert_eq!(event.plan_status, kyris_core::record::PlanStatus::Overage);
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
@@ -1796,5 +1938,255 @@ mod tests {
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-abc\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}\n\n"
             ),
         )
+    }
+
+    /// An upstream body that sends `first_chunk` and then never ends (endless
+    /// SSE keepalive comments). The relay can't reach graceful end-of-stream,
+    /// so a record can only be emitted through the `StreamRecordGuard` drop
+    /// path once the client disconnects — the next keepalive write surfaces
+    /// the dead socket to hyper, which drops the response body.
+    fn held_open_stream_body(first_chunk: &'static [u8]) -> axum::body::Body {
+        let keepalives = futures_util::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some((
+                Ok::<Bytes, std::io::Error>(Bytes::from_static(b": keepalive\n\n")),
+                (),
+            ))
+        });
+        axum::body::Body::from_stream(
+            futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                first_chunk,
+            ))])
+            .chain(keepalives),
+        )
+    }
+
+    /// Pins the e2e `D/test_01` codex-cli regression: `codex exec` exits — and
+    /// closes its connection — the moment it sees `response.completed`, without
+    /// reading to end-of-stream. Hyper then drops the response-body future, and
+    /// before `StreamRecordGuard` the gateway record was silently lost. The
+    /// usage already relayed must still land as a `StatsEvent`.
+    #[tokio::test]
+    async fn testResponsesStreamClientDisconnectStillEmitsStats() {
+        let upstream = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(held_open_stream_body(
+                        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-abc\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let (upstream_url, _upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "openai".to_string(),
+            format: ProviderFormat::OpenAI,
+            upstream: upstream_url.clone(),
+            models: vec!["gpt-4o".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, _router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "input": "hello"
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/responses"))
+            .header("x-kyris-session-id", "sess-resp-disconnect")
+            .header("authorization", "Bearer caller-key")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read the completion (with its usage) and disconnect like codex does
+        // — without waiting for end-of-stream.
+        let mut body_stream = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body_stream.next())
+            .await
+            .expect("first chunk within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&first)
+                .unwrap()
+                .contains("response.completed"),
+            "expected the completion event first"
+        );
+        drop(body_stream);
+
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .expect("disconnect must still emit the gateway record")
+            .unwrap();
+        assert_eq!(event.provider, "openai");
+        assert_eq!(event.model, "gpt-4o");
+        assert_eq!(event.tokens.input, 100);
+        assert_eq!(event.tokens.output, 50);
+        assert_eq!(event.session_id.as_deref(), Some("sess-resp-disconnect"));
+
+        router_handle.abort();
+        upstream_handle.abort();
+    }
+
+    /// Chat-completions twin of the disconnect regression (separate relay copy,
+    /// same guard requirement).
+    #[tokio::test]
+    async fn testChatStreamClientDisconnectStillEmitsStats() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(held_open_stream_body(
+                        b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":30}}\n\n",
+                    ))
+                    .unwrap()
+            }),
+        );
+        let (upstream_url, _upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "openai".to_string(),
+            format: ProviderFormat::OpenAI,
+            upstream: upstream_url.clone(),
+            models: vec!["gpt-4o".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, _router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "gpt-4o",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("{router_url}/v1/chat/completions"))
+            .header("x-kyris-session-id", "sess-chat-disconnect")
+            .header("authorization", "Bearer caller-key")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body_stream = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(5), body_stream.next())
+            .await
+            .expect("first chunk within 5s")
+            .unwrap()
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&first).unwrap().contains("usage"),
+            "expected the usage chunk first"
+        );
+        drop(body_stream);
+
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .expect("disconnect must still emit the gateway record")
+            .unwrap();
+        assert_eq!(event.tokens.input, 50);
+        assert_eq!(event.tokens.output, 30);
+        assert_eq!(event.session_id.as_deref(), Some("sess-chat-disconnect"));
+
+        router_handle.abort();
+        upstream_handle.abort();
+    }
+
+    /// Buffered (non-streaming) twin: a client that gives up while kyrisd is
+    /// still waiting on the upstream must not lose the record — the upstream
+    /// call completes and bills regardless. `RunToCompletionLayer` keeps the
+    /// handler running after the connection is gone.
+    #[tokio::test]
+    async fn testBufferedClientDisconnectStillEmitsStats() {
+        let upstream = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    serde_json::json!({
+                        "choices": [{"message": {"content": "hello"}}],
+                        "usage": {"prompt_tokens": 200, "completion_tokens": 100}
+                    })
+                    .to_string(),
+                )
+            }),
+        );
+        let (upstream_url, _upstream_shutdown, upstream_handle) = spawn_test_server(upstream).await;
+
+        let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        config.providers = vec![ProviderConfig {
+            name: "openai".to_string(),
+            format: ProviderFormat::OpenAI,
+            upstream: upstream_url.clone(),
+            models: vec!["gpt-4o".to_string()],
+            timeout_seconds: 30,
+            streaming_timeout_seconds: 300,
+        }];
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
+        let app = routes(state.clone());
+        let (router_url, _router_shutdown, router_handle) = spawn_test_server(app).await;
+
+        let request_body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        // The client hangs up after 50ms; the upstream answers at 300ms.
+        let aborted = tokio::time::timeout(
+            Duration::from_millis(50),
+            reqwest::Client::new()
+                .post(format!("{router_url}/v1/chat/completions"))
+                .header("x-kyris-session-id", "sess-buffered-disconnect")
+                .header("authorization", "Bearer caller-key")
+                .json(&request_body)
+                .send(),
+        )
+        .await;
+        assert!(
+            aborted.is_err(),
+            "client should have disconnected before the upstream responded"
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .expect("disconnect must still emit the gateway record")
+            .unwrap();
+        assert_eq!(event.tokens.input, 200);
+        assert_eq!(event.tokens.output, 100);
+        assert_eq!(
+            event.session_id.as_deref(),
+            Some("sess-buffered-disconnect")
+        );
+
+        router_handle.abort();
+        upstream_handle.abort();
     }
 }

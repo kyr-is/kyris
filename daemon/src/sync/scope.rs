@@ -63,6 +63,12 @@ impl SyncScope {
         let Some(dir) = working_dir else {
             return false;
         };
+        // Pure literal matcher: paths are already canonical by the time they get
+        // here. `working_dir` is canonicalized at its source edge (agentpactd at
+        // request ingest; kyrisd's peer-cwd via getcwd), and the configured scope
+        // is canonicalized once at config-load (see `canonicalize_scope_config`
+        // in `daemon_sync`). Keeping this comparison literal makes `SyncScope` a
+        // single-responsibility matcher with no filesystem I/O.
         if self.is_private(dir) {
             return false;
         }
@@ -125,6 +131,40 @@ impl SyncScope {
             path == expanded || path.starts_with(&format!("{expanded}/"))
         }
     }
+}
+
+/// Resolve symlinks in the longest existing leading portion of `path`, keeping
+/// any non-existent tail — and a trailing `*` wildcard — verbatim. This yields
+/// one canonical spelling whether or not the full path exists and whether or not
+/// it ends in `*`. Returns the input unchanged when nothing along it resolves.
+///
+/// Used to canonicalize the user-configured `sync.scope` at config-load (the one
+/// kyrisd-side path edge), so a scope entry typed through a symlinked root
+/// (`/tmp/...`, `~/work` → `/mnt/...`) matches the already-canonical
+/// `working_dir` produced upstream. It is deliberately NOT applied inside
+/// [`SyncScope`] itself, which stays a pure literal matcher.
+pub fn canonicalize_scope_path(path: &str) -> String {
+    // Common case: a concrete, existing directory resolves whole.
+    if let Ok(resolved) = std::fs::canonicalize(path)
+        && let Some(s) = resolved.to_str()
+    {
+        return s.to_string();
+    }
+    // Otherwise resolve the longest existing ancestor and re-attach the tail
+    // (covers wildcard patterns like `/work/*` and not-yet-created dirs).
+    let p = Path::new(path);
+    for ancestor in p.ancestors().skip(1) {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(canon) = std::fs::canonicalize(ancestor)
+            && let Ok(tail) = p.strip_prefix(ancestor)
+            && let Some(s) = canon.join(tail).to_str()
+        {
+            return s.to_string();
+        }
+    }
+    path.to_string()
 }
 
 /// True if `path` or any ancestor *strictly below* `home` is owner-only. `home`

@@ -63,7 +63,7 @@ if [ -z "${BINARY_DIR:-}" ]; then
     BINARY_DIR="$(cd "$(dirname "$BINARY")" && pwd)"
 fi
 
-for bin in kyrisd kyris kyris-mcp kyris-hook; do
+for bin in kyrisd kyris kyris-mcp kyris-hook kyris-exec; do
     [ -x "$BINARY_DIR/$bin" ] || { echo "missing executable: $BINARY_DIR/$bin" >&2; exit 1; }
 done
 
@@ -88,7 +88,7 @@ sed -e "s|{{VERSION}}|${VERSION}|g" \
     -e "s|{{COMMIT}}|${COMMIT}|g" \
     "$TEMPLATE" > "${CONTENTS}/Info.plist"
 
-# Drop all four binaries into Contents/MacOS/. cp -p preserves mode +
+# Drop all five binaries into Contents/MacOS/. cp -p preserves mode +
 # mtime so the bundle is reproducible regardless of where you ran us.
 #
 # Notification delivery: NOT via a sibling helper binary. We tried
@@ -96,7 +96,7 @@ sed -e "s|{{VERSION}}|${VERSION}|g" \
 # only registers the bundle's CFBundleExecutable (kyrisd), not
 # arbitrary other Mach-O files in Contents/MacOS/. UN center calls
 # now live in-process in kyrisd via objc2 — see daemon/src/notify_macos.rs.
-for bin in kyrisd kyris kyris-mcp kyris-hook; do
+for bin in kyrisd kyris kyris-mcp kyris-hook kyris-exec; do
     cp -p "$BINARY_DIR/$bin" "$MACOS_DIR/$bin"
     chmod 755 "$MACOS_DIR/$bin"
 done

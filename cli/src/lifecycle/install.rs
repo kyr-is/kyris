@@ -132,7 +132,7 @@ pub fn run() {
 
     // Wait for kyrisd to be fully ready before reconciling agents. The
     // component installer started kyrisd moments ago; without a wait,
-    // the health check inside configure_burn_control races the daemon's
+    // the health check inside burn-control surface setup races the daemon's
     // startup and may fail even though the daemon is healthy.
     if let Ok(config) = load_or_init_config() {
         let base_url = config.base_url();
@@ -733,4 +733,57 @@ fn check_agent_surfaces() -> bool {
         }
     }
     all_ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// G-K6: the launchd plist renderer is pure but had no unit test. A typo in
+    /// the Label, the binary path, the log paths, or the RunAtLoad/KeepAlive keys
+    /// silently breaks `launchctl bootstrap` (the integration test runs real
+    /// `launchctl` but never asserts the rendered contents).
+    #[test]
+    fn testLaunchdPlistRendersAllRequiredFields() {
+        let binary = "/Users/dev/.kyris/bin/kyrisd";
+        let log = "/Users/dev/.local/state/kyris/log/kyrisd.log";
+        let plist = launchd_plist("is.kyr.kyrisd", Path::new(binary), Path::new(log));
+
+        // Well-formed plist envelope.
+        assert!(plist.starts_with(r#"<?xml version="1.0" encoding="UTF-8"?>"#));
+        assert!(plist.contains("<!DOCTYPE plist"));
+        assert!(plist.contains(r#"<plist version="1.0">"#));
+        assert!(plist.trim_end().ends_with("</plist>"));
+
+        // Label + the binary as the sole ProgramArgument.
+        assert!(plist.contains("<key>Label</key>"));
+        assert!(plist.contains("<string>is.kyr.kyrisd</string>"));
+        assert!(plist.contains(&format!("<string>{binary}</string>")));
+
+        // launchd starts it at load and keeps it alive (both keys → <true/>).
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        assert!(plist.contains("<key>KeepAlive</key>"));
+        assert_eq!(
+            plist.matches("<true/>").count(),
+            2,
+            "both RunAtLoad and KeepAlive must be true"
+        );
+
+        // stdout AND stderr both go to the log path.
+        assert!(plist.contains("<key>StandardOutPath</key>"));
+        assert!(plist.contains("<key>StandardErrorPath</key>"));
+        assert_eq!(
+            plist.matches(&format!("<string>{log}</string>")).count(),
+            2,
+            "the log path must appear for both StandardOutPath and StandardErrorPath",
+        );
+    }
+
+    /// The label is what `launchctl bootout/kickstart` target — pin it so a rename
+    /// can't silently desync the install from the documented service id.
+    #[test]
+    fn testLaunchdLabelIsStable() {
+        assert_eq!(launchd_label(ServiceKind::Kyrisd), "is.kyr.kyrisd");
+    }
 }

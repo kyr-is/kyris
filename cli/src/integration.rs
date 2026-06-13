@@ -103,10 +103,33 @@ pub fn ensure_json_command_hook(
         .or_insert_with(|| Value::Array(Vec::new()));
     let hooks_array = as_json_array(phase_hooks);
 
-    let already_present = hooks_array
-        .iter()
-        .any(|entry| entry_has_command(entry, command));
-    if already_present {
+    // Already registered: still reconcile the per-hook `timeout` — it derives
+    // from the agent's declared HookRuntime, and a declaration change must
+    // reach existing installs (the approval poll window moves with it; a stale
+    // shorter timeout would kill the hook mid-approval).
+    if let Some(existing) = hooks_array
+        .iter_mut()
+        .find(|entry| entry_has_command(entry, command))
+    {
+        let Some(t) = timeout else { return false };
+        let handler = if nested {
+            existing
+                .get_mut("hooks")
+                .and_then(Value::as_array_mut)
+                .and_then(|handlers| {
+                    handlers
+                        .iter_mut()
+                        .find(|h| h.get("command").and_then(Value::as_str) == Some(command))
+                })
+        } else {
+            Some(existing)
+        };
+        if let Some(handler) = handler
+            && handler.get("timeout").and_then(Value::as_i64) != Some(t)
+        {
+            handler["timeout"] = json!(t);
+            return true;
+        }
         return false;
     }
 
@@ -134,6 +157,35 @@ pub fn remove_json_command_hook(root: &mut Value, phase: &str, command_substr: &
     let before = phase_hooks.len();
     phase_hooks.retain(|entry| !entry_has_command_substr(entry, command_substr));
     phase_hooks.len() != before
+}
+
+/// Ensure the string `value` is present in the array at `path` (creating
+/// intermediate objects and the array if absent). Returns whether it was added.
+/// Reusable for any "membership in a JSON array" config (e.g. opencode's
+/// top-level `plugin` list).
+pub fn ensure_json_array_contains(root: &mut Value, path: &[&str], value: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        let object = as_json_object(cursor);
+        cursor = object
+            .entry((*key).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+    }
+    let object = as_json_object(cursor);
+    let array = object
+        .entry(path[path.len() - 1].to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(items) = array.as_array_mut() else {
+        return false;
+    };
+    if items.iter().any(|v| v.as_str() == Some(value)) {
+        return false;
+    }
+    items.push(Value::String(value.to_string()));
+    true
 }
 
 fn entry_has_command(entry: &Value, command: &str) -> bool {
@@ -217,6 +269,31 @@ pub fn set_json_value_path(root: &mut Value, path: &[&str], value: Value) -> boo
     true
 }
 
+/// Remove the string leaf at `path` iff it currently equals `expected`. Returns
+/// whether anything was removed. Used to migrate away a kyris-owned value (e.g. an
+/// `apiKey` wrongly set to the gate key) without disturbing a user's real value.
+pub fn remove_json_string_if_equals(root: &mut Value, path: &[&str], expected: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cursor = root;
+    for key in &path[..path.len() - 1] {
+        let Some(next) = cursor.get_mut(*key) else {
+            return false;
+        };
+        cursor = next;
+    }
+    let Some(object) = cursor.as_object_mut() else {
+        return false;
+    };
+    let leaf = path[path.len() - 1];
+    if object.get(leaf).and_then(Value::as_str) == Some(expected) {
+        object.remove(leaf);
+        return true;
+    }
+    false
+}
+
 pub fn ensure_toml_string_path(root: &mut toml::Value, path: &[&str], value: &str) -> bool {
     if path.is_empty() {
         return false;
@@ -288,48 +365,6 @@ pub fn merge_toml_string_entries(
         }
     }
     changed
-}
-
-/// Remove all entries whose keys are in `keys` from the TOML table at
-/// `table_path`. Removes the table itself (and any now-empty parent tables
-/// in `table_path`) when it becomes empty. Returns `true` if anything changed.
-pub fn remove_toml_table_entries(
-    root: &mut toml::Value,
-    table_path: &[&str],
-    keys: Option<&[&str]>,
-) -> bool {
-    if table_path.is_empty() {
-        return false;
-    }
-    // Navigate to the parent of the target table so we can prune upward.
-    let mut cursor = root;
-    for key in &table_path[..table_path.len() - 1] {
-        let Some(next) = as_toml_table(cursor).get_mut(*key) else {
-            return false;
-        };
-        cursor = next;
-    }
-    let leaf = table_path[table_path.len() - 1];
-    let table = as_toml_table(cursor);
-    let Some(target) = table.get_mut(leaf) else {
-        return false;
-    };
-    match keys {
-        Some(remove_keys) => {
-            let t = as_toml_table(target);
-            let mut changed = false;
-            for k in remove_keys {
-                if t.remove(*k).is_some() {
-                    changed = true;
-                }
-            }
-            if t.is_empty() {
-                table.remove(leaf);
-            }
-            changed
-        }
-        None => table.remove(leaf).is_some(),
-    }
 }
 
 pub fn find_upwards(relative_path: &str) -> Option<PathBuf> {

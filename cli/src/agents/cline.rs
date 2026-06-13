@@ -3,163 +3,258 @@
 use std::path::PathBuf;
 
 use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
-use crate::integration::{read_json_value, set_json_string_path, write_json_value};
-use crate::state::restore_manifest_entry;
-
-use super::probe::{
-    ProbeResult, env_file_has_var, env_loader_sourced, fingerprint, json_has_any_mcp_servers,
-    json_has_mcp_wrap, not_detected,
+use crate::integration::{
+    read_json_value, set_json_string_path, set_json_value_path, write_json_value,
 };
-use super::registry::{AgentDescriptor, McpConfigFormat, McpConfigLocation};
+use crate::state::{restore_manifest_entry_component, write_managed_file};
+
+use super::probe::{ProbeResult, fingerprint, not_detected};
+use super::registry::{
+    AgentDescriptor, AgentIntegrationPlan, AllowResponse, AttributionMechanism,
+    BurnControlMechanism, ExecutionMechanism, HookProtocol, HookRuntime, HookTimeoutPosture,
+    McpConfigFormat, McpConfigLocation, McpToolNaming, SurfaceIntegration, ToolMapping,
+    ToolMechanism, which_exists,
+};
 
 pub struct Cline;
 
-fn vscode_global_storage_dir() -> Result<PathBuf, String> {
-    Ok(crate::integration::home_dir()?
-        .join("Library")
-        .join("Application Support")
-        .join("Code")
-        .join("User")
-        .join("globalStorage")
-        .join("saoudrizwan.claude-dev"))
-}
-
-pub fn cline_global_state_path() -> Result<PathBuf, String> {
+// All paths target the STANDALONE `cline` CLI (`~/.cline/...`), not the VS Code
+// extension. The extension's `CLINE_COMMAND_PERMISSIONS` env / launchd / VS Code
+// globalStorage approach is gone — the CLI never read that env var.
+//
+// COVERAGE LIMIT (review Finding 6): the Cline VS CODE EXTENSION is a separate
+// product line — it runs no file hooks and uses VS Code globalStorage, not
+// `~/.cline/data` — so kyris does NOT govern it. `kyris status` shows the CLI
+// integration; it cannot tell whether the extension is also in use (ungoverned).
+fn cline_settings_dir() -> Result<PathBuf, String> {
     Ok(crate::integration::home_dir()?
         .join(".cline")
         .join("data")
-        .join("globalState.json"))
+        .join("settings"))
+}
+
+/// Provider settings the CLI reads (`{providers:{<id>:{baseUrl,apiKey,headers}}}`).
+pub fn cline_providers_path() -> Result<PathBuf, String> {
+    Ok(cline_settings_dir()?.join("providers.json"))
 }
 
 pub fn cline_mcp_settings_path() -> Result<PathBuf, String> {
-    Ok(vscode_global_storage_dir()?.join("cline_mcp_settings.json"))
+    Ok(cline_settings_dir()?.join("cline_mcp_settings.json"))
 }
 
-fn has_vscode_extension() -> bool {
-    let ext_dir = crate::integration::home_dir()
-        .unwrap_or_else(|_| PathBuf::new())
-        .join(".vscode")
-        .join("extensions");
-    ext_dir.is_dir()
-        && std::fs::read_dir(&ext_dir).is_ok_and(|entries| {
-            entries.filter_map(Result::ok).any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("saoudrizwan.claude-dev")
-            })
-        })
+/// The file-hook lives in the CLI's auto-discovered hooks dir; a file whose name
+/// is `PreToolUse` is mapped to cline's `tool_call` event and run (blocking) on
+/// every tool call. Named `.cjs` so `node` loads it with `require`.
+fn cline_hook_path() -> Result<PathBuf, String> {
+    Ok(crate::integration::home_dir()?
+        .join(".cline")
+        .join("hooks")
+        .join("PreToolUse.cjs"))
 }
 
-fn has_cline_cli() -> bool {
-    super::registry::which_exists("cline")
+fn cline_cli_installed() -> bool {
+    which_exists("cline")
 }
 
-pub fn cline_extension_installed() -> bool {
-    has_vscode_extension() || has_cline_cli()
+fn cline_detected() -> bool {
+    cline_cli_installed()
+        || cline_hook_path().is_ok_and(|p| p.exists())
+        || cline_providers_path().is_ok_and(|p| p.exists())
 }
 
-pub fn cline_is_vscode_only() -> bool {
-    has_vscode_extension() && !has_cline_cli()
+/// The cline file-hook bridge. cline delivers a different hook shape than the
+/// native-hook agents (JSON tool context in, a JSON `{cancel}` control out), so
+/// this reshapes cline's payload into the kyris payload, asks the SHARED decision
+/// engine (`kyris hook check --agent cline` → agentpactd), and blocks the tool by
+/// emitting `{cancel:true}` on deny. The decision engine + `HookProtocol` are
+/// shared with every other agent; only this thin per-agent bridge differs.
+///
+/// The spawn timeout is substituted from the declared [`HookRuntime`]
+/// (`bridge_spawn_timeout_ms`): cline SIGKILLs the whole hook at 120s and
+/// PROCEEDS (fail-open), so the bridge must resolve strictly inside that window
+/// — the engine denies at its poll deadline, and if the engine itself hangs the
+/// bridge's own timeout fires next and emits a DENY (never fail-open on a
+/// timeout; only a missing binary is "ungoverned by absence").
+fn cline_hook_source() -> String {
+    let runtime = Cline
+        .hook_protocol()
+        .expect("cline declares a hook protocol")
+        .runtime;
+    CLINE_HOOK_TEMPLATE.replace(
+        "__SPAWN_TIMEOUT_MS__",
+        &runtime.bridge_spawn_timeout_ms().to_string(),
+    )
 }
 
-fn install_cline_policy_launchd(json: &str, changes: &mut Vec<String>) -> Result<(), String> {
-    let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
+const CLINE_HOOK_TEMPLATE: &str = r#"// SPDX-FileCopyrightText: Copyright 2026 Kyris
+// SPDX-License-Identifier: Apache-2.0
+// Generated by Kyris — AgentPact live governance for cline (file-hook bridge).
+// cline runs this on every tool call (PreToolUse -> tool_call), blocking. It
+// reshapes cline's payload into the kyris hook payload, asks the shared decision
+// engine (kyris hook check -> agentpactd), and blocks the tool by emitting a
+// {cancel:true} control object when governance denies.
+const { spawnSync } = require("node:child_process")
+const { existsSync } = require("node:fs")
+const { homedir } = require("node:os")
 
-    // Write the JSON value to a file so the plist script can read it
-    let value_path = std::path::PathBuf::from(&home)
-        .join(".kyris")
-        .join("env")
-        .join("cline-policy.json");
-    if crate::state::write_managed_file(
-        &value_path,
-        json,
-        "cline",
-        Some(0o600),
-        &WellFormedJsonValidator,
-    )? {
-        changes.push(format!("wrote {}", value_path.display()));
+// Prefer the managed copy, then well-known install paths, then PATH — mirrors the
+// shell adapter's resolution (a real binary at a known path over whatever PATH is).
+function kyrisBin() {
+  for (const c of [
+    homedir() + "/.kyris/bin/kyris",
+    homedir() + "/.local/bin/kyris",
+    "/opt/homebrew/bin/kyris",
+    "/usr/local/bin/kyris",
+  ]) {
+    if (existsSync(c)) return c
+  }
+  return "kyris"
+}
+
+// cline runtime tool name -> the detail kyris governs (command for execute,
+// path for write, patch text for apply_patch). cline accepts MANY run_commands
+// shapes (schemas.ts RunCommands/StructuredCommands unions): commands as a
+// string[] or string, command/cmd singletons, a bare string or string[], and
+// structured {command,args} entries (Windows). Normalize all of them to one
+// compound line so agentpactd splits it into per-segment decisions; an
+// unrecognized shape yields "" (empty detail → governed as an empty execute,
+// never silently skipped).
+function oneCommand(c) {
+  if (typeof c === "string") return c
+  if (c && typeof c === "object" && typeof c.command === "string") {
+    return Array.isArray(c.args) && c.args.length ? c.command + " " + c.args.join(" ") : c.command
+  }
+  return ""
+}
+function detailFor(name, input) {
+  // apply_patch: bare patch string or {input: patchString}.
+  if (name === "apply_patch") {
+    if (typeof input === "string") return input
+    return input && typeof input.input === "string" ? input.input : ""
+  }
+  if (name === "run_commands") {
+    if (typeof input === "string") return input
+    if (Array.isArray(input)) return input.map(oneCommand).filter(Boolean).join(" && ")
+    const i = input || {}
+    const list = i.commands ?? i.command ?? i.cmd
+    if (Array.isArray(list)) return list.map(oneCommand).filter(Boolean).join(" && ")
+    return oneCommand(list)
+  }
+  const i = input || {}
+  if (name === "editor") return typeof i.path === "string" ? i.path : ""
+  return ""
+}
+
+let raw = ""
+process.stdin.on("data", (d) => { raw += d })
+process.stdin.on("end", () => {
+  let p = {}
+  try { p = JSON.parse(raw) } catch { p = {} }
+  const tc = p.tool_call || {}
+  // cwd is the permitted-domain anchor agentpactd resolves policy from; cline has
+  // no top-level cwd, so use the first workspace root.
+  const cwd = (Array.isArray(p.workspaceRoots) && p.workspaceRoots[0]) ||
+    (p.workspaceInfo && p.workspaceInfo.rootPath) || process.cwd()
+  const payload = JSON.stringify({
+    tool_name: tc.name,
+    tool_input: { detail: detailFor(tc.name, tc.input) },
+    cwd,
+  })
+  const res = spawnSync(kyrisBin(), ["hook", "check", "--agent", "cline"], {
+    input: payload,
+    cwd,
+    encoding: "utf8",
+    timeout: __SPAWN_TIMEOUT_MS__,
+    env: { ...process.env, KYRIS_GOVERNED_SUBPROCESS: "cline" },
+  })
+  // A hung engine fails CLOSED: cline kills this hook shortly after and then
+  // RUNS the command (fail-open, 120s), so an unresolved check must become a
+  // deny while we can still deliver one. Only a missing/unrunnable binary fails
+  // open ("kyris not installed -> ungoverned", matching the shell adapter).
+  if (res.error && res.error.code === "ETIMEDOUT") {
+    process.stdout.write(JSON.stringify({ cancel: true, errorMessage: "kyris governance check timed out before a decision" }))
+    return
+  }
+  if (res.error) { process.stdout.write("{}"); return }
+  // exit 0 = allow; nonzero (2 = deny). cline reads the JSON control object
+  // from stdout (not the exit code). `{cancel:true}` STOPS the agent run
+  // (cline maps it to ControlledStopError — it does not gracefully skip just
+  // this tool, and it drops `errorMessage`, so the model is not told why).
+  // Heavier than a per-tool deny, but safe: nothing ungoverned runs. The
+  // errorMessage is kept anyway for the cline-side log / future versions.
+  if (res.status !== 0) {
+    const reason = (res.stderr || res.stdout || "").trim().replace(/^\[agentpact\]\s*/, "")
+    process.stdout.write(JSON.stringify({ cancel: true, errorMessage: reason || "blocked by kyris governance" }))
+  } else {
+    process.stdout.write("{}")
+  }
+})
+"#;
+
+/// Current providers.json as a JSON value, or an empty object if absent.
+fn read_or_empty_providers(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    if path.exists() {
+        read_json_value(path)
+    } else {
+        Ok(serde_json::Value::Object(serde_json::Map::new()))
     }
-
-    // Write a plist that loads the value at login
-    let plist_path = std::path::PathBuf::from(&home)
-        .join("Library")
-        .join("LaunchAgents")
-        .join("is.kyr.cline-policy.plist");
-    let plist_contents = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>is.kyr.cline-policy</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>launchctl setenv CLINE_COMMAND_PERMISSIONS "$(cat {value_path})"</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-</dict>
-</plist>
-"#,
-        value_path = value_path.display()
-    );
-    // launchd plist is XML; we don't have an XML validator. plutil-lint via
-    // CommandValidator could be added later; for now skip schema check.
-    if crate::state::write_managed_file(
-        &plist_path,
-        &plist_contents,
-        "cline",
-        Some(0o644),
-        &NoopValidator,
-    )? {
-        changes.push(format!("wrote {}", plist_path.display()));
-    }
-
-    // Set immediately for the current session
-    let status = std::process::Command::new("launchctl")
-        .args(["setenv", "CLINE_COMMAND_PERMISSIONS", json])
-        .status()
-        .map_err(|e| format!("Failed to run launchctl setenv: {e}"))?;
-    if status.success() {
-        changes.push("set CLINE_COMMAND_PERMISSIONS in launchd session".to_string());
-    }
-
-    // Bootstrap the plist for RunAtLoad
-    let domain = format!("gui/{}", crate::service::uid());
-    let _ = std::process::Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist_path.to_string_lossy()])
-        .status();
-
-    Ok(())
 }
 
-fn uninstall_cline_policy_launchd() {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let plist_path = std::path::PathBuf::from(&home)
-        .join("Library")
-        .join("LaunchAgents")
-        .join("is.kyr.cline-policy.plist");
-
-    if plist_path.exists() {
-        let domain = format!("gui/{}", crate::service::uid());
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &domain, &plist_path.to_string_lossy()])
-            .status();
-        let _ = std::fs::remove_file(&plist_path);
+/// Write kyrisd routing for the `anthropic` provider into cline's
+/// `StoredProviderSettings` document, leaving any other provider entries
+/// intact. Returns whether `config` changed.
+///
+/// The schema is strict (sdk `ProviderSettingsSchema`): a per-entry `settings`
+/// REQUIRES `provider`; the file REQUIRES `version: 1` and a per-entry
+/// `updatedAt` ISO-8601 datetime. A single missing field fails Zod for the
+/// WHOLE file, after which cline's loader silently returns empty settings and
+/// the next save wipes the user's other providers — the Finding-1 data loss.
+fn apply_cline_anthropic_routing(
+    config: &mut serde_json::Value,
+    base_url_v1: &str,
+    inbound_key: &str,
+    agent_id: &str,
+) -> bool {
+    let mut changed = set_json_value_path(config, &["version"], serde_json::json!(1));
+    let fields: [(&[&str], &str); 4] = [
+        // REQUIRED by ProviderSettingsSchema — the field whose absence caused
+        // the data loss; must equal the provider id.
+        (
+            &["providers", "anthropic", "settings", "provider"],
+            "anthropic",
+        ),
+        // The Anthropic AI SDK appends `/messages`, so kyrisd needs the `/v1`
+        // suffix. The agent's own ANTHROPIC_API_KEY is deliberately NOT set —
+        // it flows from env as the upstream credential kyrisd classifies.
+        (
+            &["providers", "anthropic", "settings", "baseUrl"],
+            base_url_v1,
+        ),
+        // Required entry metadata for the Zod schema.
+        (
+            &["providers", "anthropic", "updatedAt"],
+            "2026-01-01T00:00:00.000Z",
+        ),
+        (&["providers", "anthropic", "tokenSource"], "manual"),
+    ];
+    for (path, value) in fields {
+        if set_json_string_path(config, path, value) {
+            changed = true;
+        }
     }
-
-    let _ = std::process::Command::new("launchctl")
-        .args(["unsetenv", "CLINE_COMMAND_PERMISSIONS"])
-        .status();
-
-    let value_path = std::path::PathBuf::from(&home)
-        .join(".kyris")
-        .join("env")
-        .join("cline-policy.json");
-    let _ = std::fs::remove_file(&value_path);
+    for (header, value) in [
+        ("x-kyris-inbound", inbound_key),
+        ("x-kyris-agent-id", agent_id),
+    ] {
+        if set_json_string_path(
+            config,
+            &["providers", "anthropic", "settings", "headers", header],
+            value,
+        ) {
+            changed = true;
+        }
+    }
+    changed
 }
 
 impl AgentDescriptor for Cline {
@@ -170,61 +265,50 @@ impl AgentDescriptor for Cline {
         "Cline"
     }
     fn is_installed(&self) -> bool {
-        cline_extension_installed()
+        cline_detected()
     }
     fn probe(&self) -> ProbeResult {
-        use super::profile::{AdaptedMechanism, CoverageCeiling, SurfaceState};
-        let detected = cline_extension_installed();
-        if !detected {
+        use super::profile::SurfaceState;
+        if !cline_detected() {
             return not_detected();
         }
-        let vscode_only = cline_is_vscode_only();
 
-        let has_env_file = env_file_has_var("cline", "CLINE_COMMAND_PERMISSIONS");
-        let has_launchd_plist = crate::integration::home_dir()
-            .ok()
-            .map(|h| {
-                h.join("Library")
-                    .join("LaunchAgents")
-                    .join("is.kyr.cline-policy.plist")
-            })
-            .is_some_and(|p| p.exists());
-        let env_reachable = (has_env_file && env_loader_sourced()) || has_launchd_plist;
-        let execution = if env_reachable {
-            let state = SurfaceState::adapted(AdaptedMechanism::CompiledPolicy);
-            if vscode_only {
-                state.with_ceiling(CoverageCeiling::Observed)
-            } else {
-                state.with_ceiling(CoverageCeiling::Compiled)
-            }
+        // Live-hook adapter: the kyris governance file-hook is present.
+        let has_live_hook = cline_hook_path().is_ok_and(|p| p.exists());
+        let execution = if has_live_hook {
+            SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter)
         } else {
             SurfaceState::none()
         };
 
         let mcp_path = cline_mcp_settings_path().ok();
-        let has_mcp_wrap = mcp_path
-            .as_deref()
-            .is_some_and(|p| json_has_mcp_wrap(p, "mcpServers"));
-        let has_any_mcp_servers = mcp_path
-            .as_deref()
-            .is_some_and(|p| json_has_any_mcp_servers(p, "mcpServers"));
+        let (has_mcp_wrap, has_any_mcp_servers) = super::probe::mcp_locations_status(self);
         let tool = if has_mcp_wrap {
-            SurfaceState::adapted(AdaptedMechanism::McpWrapping)
+            SurfaceState::adapted(ToolMechanism::McpWrapping)
         } else if !has_any_mcp_servers {
             SurfaceState::not_applicable()
         } else {
             SurfaceState::none()
         };
 
-        let has_base_url_rewrite = cline_global_state_path().ok().is_some_and(|p| {
-            read_json_value(&p).is_ok_and(|v| {
-                v.get("anthropicBaseUrl")
-                    .and_then(|u| u.as_str())
-                    .is_some_and(|u| !u.is_empty())
+        // Value-aware: baseUrl must equal kyrisd's `/v1` endpoint — any
+        // non-empty baseUrl would over-claim (a user's own proxy is not kyris
+        // routing, and without kyrisd.yaml nothing can be routed).
+        let expected_base_url = super::probe::kyrisd_base_url().map(|b| format!("{b}/v1"));
+        let has_base_url_rewrite = expected_base_url.is_some_and(|expected| {
+            cline_providers_path().ok().is_some_and(|p| {
+                read_json_value(&p).is_ok_and(|v| {
+                    v.get("providers")
+                        .and_then(|providers| providers.get("anthropic"))
+                        .and_then(|a| a.get("settings"))
+                        .and_then(|s| s.get("baseUrl"))
+                        .and_then(|u| u.as_str())
+                        == Some(expected.as_str())
+                })
             })
         });
         let burn_control = if has_base_url_rewrite {
-            SurfaceState::adapted(AdaptedMechanism::ConfigRewrite)
+            SurfaceState::adapted(BurnControlMechanism::ConfigRewrite)
         } else {
             SurfaceState::none()
         };
@@ -235,8 +319,11 @@ impl AgentDescriptor for Cline {
         {
             managed_files.push(fp);
         }
+        if let Some(fp) = cline_hook_path().ok().and_then(|p| fingerprint(&p)) {
+            managed_files.push(fp);
+        }
         ProbeResult {
-            detected,
+            detected: true,
             execution,
             tool,
             burn_control,
@@ -244,197 +331,270 @@ impl AgentDescriptor for Cline {
         }
     }
     fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &["kyris-mcp"]
+        &["kyris hook check", "kyris-mcp"]
     }
-    fn env_exports(&self, _base_url: &str, _inbound_key: &str) -> Vec<(String, String)> {
-        Vec::new()
+    fn integration_plan(&self) -> AgentIntegrationPlan {
+        super::capabilities::apply_declared_capabilities(
+            self.canonical_id(),
+            AgentIntegrationPlan {
+                // cline's file-hook system (PreToolUse -> tool_call) gives a real
+                // live-hook adapter — the kyris bridge blocks tool calls in real
+                // time via `kyris hook check` -> agentpactd, like the native-hook
+                // agents.
+                execution: SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+                tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
+                burn_control: SurfaceIntegration::adapted(&[BurnControlMechanism::ConfigRewrite]),
+                attribution: &[
+                    AttributionMechanism::KyrisPathShim,
+                    AttributionMechanism::NativeHookPayload,
+                    AttributionMechanism::ProcessLineage,
+                ],
+                agentpact_native_attribution: false,
+            },
+        )
     }
-    fn expected_surfaces(&self) -> (bool, bool, bool) {
-        (true, true, true)
+    fn hook_protocol(&self) -> Option<HookProtocol> {
+        // The bridge normalizes every cline tool to `tool_input.detail`, so all
+        // mappings share `detail_key = "detail"` (the right string per action:
+        // command for execute, path for write).
+        let detail = || Some("detail".to_string());
+        Some(HookProtocol {
+            tool_name_field: "tool_name".to_string(),
+            detail_fields: vec!["tool_input".to_string()],
+            tool_mappings: vec![
+                ToolMapping {
+                    tool_name: "run_commands".to_string(),
+                    action: "execute".to_string(),
+                    detail_key: detail(),
+                },
+                ToolMapping {
+                    tool_name: "editor".to_string(),
+                    action: "write".to_string(),
+                    detail_key: detail(),
+                },
+                // The patch envelope is parsed per-file by the hook engine
+                // (drive_apply_patch); the bridge sends the raw patch text as
+                // the detail. Mapping it to `write` (its old shape) anchored
+                // the entire patch text inside the workspace lexically —
+                // review Finding 10, the same bug fixed for codex.
+                ToolMapping {
+                    tool_name: "apply_patch".to_string(),
+                    action: "apply_patch".to_string(),
+                    detail_key: detail(),
+                },
+            ],
+            // The read-only / non-mutating tools in cline's DEFAULT set
+            // (constants.ts, verified at 1c1ea0bd5): skip the daemon. The
+            // mutating tools (run_commands/editor/apply_patch) are mapped
+            // above. cline is NO-BACKSTOP, so an unmapped tool is DENIED — this
+            // list must cover every real read-only tool. The stale `commit`
+            // (not a cline tool) was dropped.
+            pass_through_tools: [
+                "read_files",
+                "search_codebase",
+                "fetch_web_content",
+                "ask_question",
+                "skills",
+                "submit_and_exit",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            agent_owned_tools: Vec::new(),
+            default_action: "call".to_string(),
+            // The bridge reads `kyris hook check`'s EXIT CODE (0 allow / 2 deny),
+            // not stdout, so the allow shape is the empty default.
+            allow_response: AllowResponse::EmptyStdout,
+            runtime: HookRuntime {
+                // cline SIGKILLs a tool_call hook at 120s (timeoutMs ?? 120000,
+                // not configurable from the hook file) and then PROCEEDS — the
+                // tightest deadline of any supported agent. The poll window
+                // (110s) and the bridge's spawn timeout (115s) derive from this.
+                agent_hook_timeout_secs: 120,
+                on_timeout: HookTimeoutPosture::FailOpen,
+                // The CLI defaults to toolPolicies {"*": autoApprove}: nothing
+                // gates a tool kyris defers on. A defer is a silent allow →
+                // the engine denies instead (G1).
+                native_backstop: false,
+                allow_suppresses_agent_prompt: false,
+            },
+            // MCP tools surface as `serverName__toolName` (sanitized, runs of
+            // invalid chars collapsed — name-transform.ts). Needed so the
+            // no-backstop deny does not break wrap-governed MCP servers.
+            permission_request_allow: None,
+            mcp_tool_naming: Some(McpToolNaming {
+                server_separator: "__".to_string(),
+                collapse_sanitize_runs: true,
+            }),
+            // cline's native prompt is gated only by per-tool-name
+            // `toolPolicies[name].autoApprove`; its hook output cannot request
+            // approval per call (the `review` directive is parsed but ignored
+            // upstream). kyris's verdict is per-command-content, which that
+            // coarse lever can't mirror, so the kyris popup is the only approval
+            // UX.
+            native_ask: None,
+        })
     }
-    fn surface_design_ceilings(
-        &self,
-    ) -> (
-        Option<super::profile::CoverageCeiling>,
-        Option<super::profile::CoverageCeiling>,
-        Option<super::profile::CoverageCeiling>,
-    ) {
-        // cline has no live-hook path — compiled policy is the maximum
-        // achievable command-control coverage.
-        (Some(super::profile::CoverageCeiling::Compiled), None, None)
-    }
-    fn configure_execution(
+    fn configure_execution_surface(
         &self,
         _base_url: &str,
         _inbound_key: &str,
         _agent_specific: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
-        let (permissions, gaps) = crate::compile_policy::compile_cline_permissions(None)?;
-        let json = serde_json::to_string(&permissions)
-            .map_err(|e| format!("Cannot serialize compiled Cline permissions: {e}"))?;
-
+        let hook_path = cline_hook_path()?;
         let mut changes = Vec::new();
-
-        // Shell env file for terminal Cline CLI. The value must be properly
-        // single-quoted: `\'` does NOT escape a quote inside POSIX single
-        // quotes (backslash is literal there), so JSON containing an apostrophe
-        // would terminate the string early and break sourcing.
-        let contents = format!(
-            "# SPDX-License-Identifier: Apache-2.0\nexport CLINE_COMMAND_PERMISSIONS={}\n",
-            super::prestage::shell_single_quote(&json)
-        );
-        let loader_changes = super::prestage::ensure_env_loader()?;
-        changes.extend(loader_changes);
-        let env_file = crate::state::env_dir()?.join("cline-policy.sh");
-        // Shell env file (export VAR='...') — opaque text, no schema.
-        if crate::state::write_managed_file(
-            &env_file,
-            &contents,
-            "cline",
-            Some(0o600),
+        // Auto-discovered file-hook: just write it (no config registration). The
+        // bridge is opaque JS — no schema to validate.
+        if write_managed_file(
+            &hook_path,
+            &cline_hook_source(),
+            "cline:execution",
+            Some(0o644),
             &NoopValidator,
         )? {
-            changes.push(format!("wrote {}", env_file.display()));
+            changes.push(format!("wrote {}", hook_path.display()));
         }
-
-        // launchctl setenv for VS Code extension host (GUI processes)
-        if has_vscode_extension() {
-            install_cline_policy_launchd(&json, &mut changes)?;
-        }
-
-        if !gaps.ask_dropped.is_empty() {
-            changes.push(format!(
-                "warning: dropped {} ask rules: {}",
-                gaps.ask_dropped.len(),
-                gaps.ask_dropped.join(", ")
-            ));
-
-            let mut profile = crate::state::load_agent_profile("cline")?
-                .unwrap_or_else(|| super::profile::AgentProfile::new_empty("cline"));
-            profile.compilation_gaps = gaps
-                .ask_dropped
-                .iter()
-                .map(|cmd| format!("ask rule not expressible: {cmd}"))
-                .collect();
-            crate::state::save_agent_profile(&profile)?;
-        }
-
         Ok(changes)
     }
-    fn mcp_config(&self) -> Option<McpConfigLocation> {
+    fn mcp_configs(&self) -> Vec<McpConfigLocation> {
         cline_mcp_settings_path()
             .ok()
             .map(|path| McpConfigLocation {
                 path,
                 format: McpConfigFormat::Json {
-                    servers_path: vec!["mcpServers"],
+                    servers_path: vec!["mcpServers".to_string()],
                 },
             })
+            .into_iter()
+            .collect()
     }
     fn burn_control_config_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        if let Ok(path) = cline_mcp_settings_path() {
-            paths.push(path);
-        }
-        if let Ok(path) = cline_global_state_path() {
-            paths.push(path);
-        }
-        paths
+        cline_providers_path().into_iter().collect()
     }
-    fn configure_burn_control(
+    fn configure_tool_surface(
         &self,
         base_url: &str,
         inbound_key: &str,
         _agent_specific: &std::collections::HashMap<String, String>,
     ) -> Result<Vec<String>, String> {
-        let mcp_path = cline_mcp_settings_path()?;
+        // cline has no per-server MCP tool-denylist field (only whole-server
+        // `disabled`/`autoApprove`), so it uses the default (no) extra filter and
+        // relies on the runtime wrap/routing backstop — see configure.rs.
+        super::configure::configure_json_mcp_tool_surface(self, base_url, inbound_key)
+    }
+    fn configure_burn_control_surface(
+        &self,
+        base_url: &str,
+        inbound_key: &str,
+        _agent_specific: &std::collections::HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        let path = cline_providers_path()?;
+        let mut config = read_or_empty_providers(&path)?;
+        let routed = apply_cline_anthropic_routing(
+            &mut config,
+            &format!("{base_url}/v1"),
+            inbound_key,
+            self.canonical_id(),
+        );
+
         let mut changes = Vec::new();
-
-        if mcp_path.exists() {
-            let mut settings = read_json_value(&mcp_path)?;
-            let mcp_result = super::configure::rewrite_json_mcp_servers(
-                &mut settings,
-                &["mcpServers"],
-                base_url,
-                inbound_key,
-            );
-            if mcp_result.changed {
-                write_json_value(&mcp_path, &settings, "cline", &WellFormedJsonValidator)?;
-                changes.push(format!("rewrote MCP servers in {}", mcp_path.display()));
-            }
-            if !mcp_result.http_rewrites.is_empty() {
-                super::configure::upsert_mcp_upstreams(&mcp_result.http_rewrites)?;
-                changes.push("registered MCP upstream(s) in kyrisd.yaml".to_string());
-            }
-        }
-
-        let global_state_path = cline_global_state_path()?;
-        let base_url_v1 = format!("{base_url}/v1");
-        let mut state = read_json_value(&global_state_path)?;
-        let mut state_changed = false;
-        for (key, value) in [
-            ("anthropicBaseUrl", base_url),
-            ("openAiBaseUrl", base_url_v1.as_str()),
-        ] {
-            if set_json_string_path(&mut state, &[key], value) {
-                state_changed = true;
-            }
-        }
-        if state_changed {
+        if routed {
             write_json_value(
-                &global_state_path,
-                &state,
-                "cline",
+                &path,
+                &config,
+                "cline:burn-control",
                 &WellFormedJsonValidator,
             )?;
-            changes.push(format!(
-                "wrote base URLs in {}",
-                global_state_path.display()
-            ));
+            changes.push(format!("wrote anthropic routing in {}", path.display()));
         }
-
         Ok(changes)
     }
-    fn undo(&self) -> Result<(), String> {
-        let policy_file = crate::state::env_dir()?.join("cline-policy.sh");
-        super::undo::remove_file_if_exists(&policy_file)?;
-        uninstall_cline_policy_launchd();
-        self.undo_burn_control()?;
+    fn undo_execution_surface(&self) -> Result<(), String> {
+        let hook_path = cline_hook_path()?;
+        if !restore_manifest_entry_component(&hook_path, "cline:execution")? {
+            super::undo::remove_file_if_exists(&hook_path)?;
+        }
         Ok(())
     }
-    fn undo_burn_control(&self) -> Result<(), String> {
-        // Remove MCP upstreams before restoring the MCP settings file.
-        let mcp_names = super::configure::mcp_server_names_from_agent(self);
-        super::configure::remove_mcp_upstreams(&mcp_names)?;
-
-        let mcp_path = cline_mcp_settings_path()?;
-        if restore_manifest_entry(&mcp_path)? {
-            println!("Reverted {}", mcp_path.display());
-        }
-        let global_state_path = cline_global_state_path()?;
-        if global_state_path.exists() {
-            let mut state = read_json_value(&global_state_path)?;
-            if let Some(obj) = state.as_object_mut() {
-                let mut changed = false;
-                for key in ["anthropicBaseUrl", "openAiBaseUrl"] {
-                    if obj.remove(key).is_some() {
-                        changed = true;
-                    }
-                }
-                if changed {
-                    write_json_value(
-                        &global_state_path,
-                        &state,
-                        "cline",
-                        &WellFormedJsonValidator,
-                    )?;
-                    println!(
-                        "Removed base URL overrides from {}",
-                        global_state_path.display()
-                    );
-                }
-            }
+    fn undo_tool_surface(&self) -> Result<(), String> {
+        super::configure::undo_json_mcp_tool_surface(self)
+    }
+    fn undo_burn_control_surface(&self) -> Result<(), String> {
+        let path = cline_providers_path()?;
+        if restore_manifest_entry_component(&path, "cline:burn-control")? {
+            println!("Reverted {}", path.display());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn testClineRoutingWritesRequiredProviderField() {
+        // Finding 1: omitting settings.provider failed cline's Zod schema for
+        // the WHOLE file → silent empty parse → next save wiped other
+        // providers. The entry must carry provider/baseUrl/updatedAt/headers.
+        let mut config = serde_json::json!({});
+        assert!(apply_cline_anthropic_routing(
+            &mut config,
+            "http://127.0.0.1:4710/v1",
+            "sk-kyris-test",
+            "cline/cline",
+        ));
+        let entry = &config["providers"]["anthropic"];
+        assert_eq!(config["version"], 1);
+        assert_eq!(entry["settings"]["provider"], "anthropic");
+        assert_eq!(entry["settings"]["baseUrl"], "http://127.0.0.1:4710/v1");
+        assert_eq!(
+            entry["settings"]["headers"]["x-kyris-inbound"],
+            "sk-kyris-test"
+        );
+        assert_eq!(
+            entry["settings"]["headers"]["x-kyris-agent-id"],
+            "cline/cline"
+        );
+        assert_eq!(entry["tokenSource"], "manual");
+        assert!(entry["updatedAt"].as_str().unwrap().contains('T'));
+    }
+
+    #[test]
+    fn testClineRoutingPreservesOtherProviders() {
+        // A sibling provider entry must survive (the data-loss regression).
+        let mut config = serde_json::json!({
+            "version": 1,
+            "providers": {"openai": {"settings": {"provider": "openai", "apiKey": "x"}}}
+        });
+        apply_cline_anthropic_routing(&mut config, "http://h/v1", "k", "cline/cline");
+        assert_eq!(config["providers"]["openai"]["settings"]["apiKey"], "x");
+        assert_eq!(
+            config["providers"]["anthropic"]["settings"]["provider"],
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn testClineApplyPatchMapsToPatchAction() {
+        // Finding 10: apply_patch is parsed per-file (drive_apply_patch), not
+        // treated as one write whose path is the whole patch text.
+        let proto = Cline.hook_protocol().expect("hook protocol");
+        let m = proto
+            .tool_mappings
+            .iter()
+            .find(|m| m.tool_name == "apply_patch")
+            .expect("apply_patch mapping");
+        assert_eq!(m.action, "apply_patch");
+        // run_commands/editor keep their actions.
+        assert_eq!(
+            proto
+                .tool_mappings
+                .iter()
+                .find(|m| m.tool_name == "run_commands")
+                .unwrap()
+                .action,
+            "execute"
+        );
     }
 }

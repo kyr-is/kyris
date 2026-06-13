@@ -19,6 +19,20 @@
 //!      real agent binary, found by re-walking PATH. No hardcoded path,
 //!      no agent-update breakage — same pattern rbenv / pyenv / nvm
 //!      shims use.
+//!
+//! ## Session sandbox (gated OFF by default)
+//!
+//! When the marker file `~/.kyris/sandbox.on` exists AND a `kyris-exec`
+//! binary is resolvable, the shim's final step becomes
+//! `exec kyris-exec --session --agent <id> -- <real> "$@"` instead of
+//! `exec <real> "$@"`, jailing the entire agent process tree at launch
+//! (the codex-equivalent "be the parent" move — see `codex-agentpact.md`).
+//! The marker does not exist after a normal install, so this changes
+//! nothing for existing users until a future `kyris sandbox enable`
+//! (or the Phase-3 mechanism) creates it. If the marker is present but
+//! `kyris-exec` cannot be found, the shim launches UNJAILED with a loud
+//! stderr line rather than failing the launch — degraded, indicated, never
+//! silently "sandboxed".
 
 use crate::config_writer::NoopValidator;
 use crate::state::{bin_dir, write_managed_file};
@@ -49,6 +63,17 @@ fn shim_source(agent_id: &str, binary: &str) -> String {
 # they are inside a governed agent and arm the preexec trap.
 export KYRIS_GOVERNED_SUBPROCESS="{agent_id}"
 
+# Source this agent's Kyris env file(s) — base-URL redirect + inbound-key
+# header — so burn-control / gateway routing reaches the agent on EVERY launch.
+# This is the sole env-delivery path (there is no shell-RC env loader): the shim
+# is the one wrapper that always runs when the agent binary is invoked. Guarded
+# with -f so agents that ship no env file are unaffected. The "-"*.sh glob also
+# picks up split files (e.g. cline's cline-policy.sh).
+for __kyris_env in "$HOME/.kyris/env/{agent_id}.sh" "$HOME/.kyris/env/{agent_id}"-*.sh; do
+    [ -f "$__kyris_env" ] && . "$__kyris_env"
+done
+unset __kyris_env
+
 # Strip our own directory from PATH so `command -v {binary}` resolves to
 # the real binary (the next match on PATH). Without this we would loop
 # onto ourselves.
@@ -73,6 +98,21 @@ real=$(command -v {binary} 2>/dev/null) || {{
     printf '[kyris] %s not found on PATH after stripping shim dir\n' "{binary}" >&2
     exit 127
 }}
+
+# Session sandbox (opt-in via the marker file; absent by default → no-op).
+# When enabled, jail the whole agent process tree at launch via kyris-exec.
+# kyris-exec is found on the (post-strip) PATH like the real binary; if the
+# marker is set but the launcher is missing, fall through to an UNJAILED
+# launch with a loud warning — never silently claim confinement, never block
+# the launch.
+if [ -f "$HOME/.kyris/sandbox.on" ]; then
+    __kyris_exec=$(command -v kyris-exec 2>/dev/null)
+    if [ -n "$__kyris_exec" ]; then
+        exec "$__kyris_exec" --session --agent "{agent_id}" -- "$real" "$@"
+    fi
+    printf '[kyris] sandbox.on set but kyris-exec not found; launching %s UNJAILED\n' "{binary}" >&2
+fi
+
 exec "$real" "$@"
 "#
     )
@@ -92,6 +132,28 @@ pub fn install_shim(agent_id: &str) -> Result<Vec<String>, String> {
     } else {
         Ok(Vec::new())
     }
+}
+
+/// True iff the on-disk shim for `agent_id` sources that agent's Kyris env
+/// file. The burn-control / execution probes use this to recognize
+/// shim-delivered env vars as a live delivery path independent of shell-RC
+/// sourcing. A pre-env shim (older kyris) lacks the line → returns false, so
+/// the surface is reported honestly until a reinstall refreshes the shim.
+pub(super) fn shim_delivers_env(agent_id: &str) -> bool {
+    let Some(binary) = binary_name(agent_id) else {
+        return false;
+    };
+    let Ok(dir) = bin_dir() else {
+        return false;
+    };
+    std::fs::read_to_string(dir.join(binary))
+        .is_ok_and(|contents| shim_content_delivers_env(&contents, agent_id))
+}
+
+/// Pure predicate: does shim `contents` source `agent_id`'s Kyris env file?
+/// Split out so it can be tested without a filesystem or HOME dependency.
+fn shim_content_delivers_env(contents: &str, agent_id: &str) -> bool {
+    contents.contains(&format!(".kyris/env/{agent_id}.sh"))
 }
 
 /// Remove an agent's PATH shim. Manifest-tracked, so the normal uninstall
@@ -130,6 +192,47 @@ mod tests {
         assert!(s.contains(r#"__kyris_shim_dir="$HOME/.kyris/bin""#));
         assert!(s.contains("real=$(command -v claude"));
         assert!(s.contains("exec \"$real\" \"$@\""));
+    }
+
+    #[test]
+    fn testShimSourcesAgentEnvFile() {
+        // The shim must deliver the agent's env file on every launch so
+        // burn-control reaches it independent of shell-RC sourcing (fish, GUI).
+        let s = shim_source("claude-code", "claude");
+        assert!(s.contains(r#""$HOME/.kyris/env/claude-code.sh""#));
+        // Split env files (e.g. cline-policy.sh) are picked up via the glob.
+        assert!(s.contains(r#""$HOME/.kyris/env/claude-code"-*.sh"#));
+        assert!(shim_content_delivers_env(&s, "claude-code"));
+    }
+
+    #[test]
+    fn testShimContentDeliversEnvDetectsAbsence() {
+        // A pre-env shim (no env-source line) must be reported as NOT delivering,
+        // so the probe stays honest until a reinstall refreshes the shim.
+        let pre_env =
+            "#!/bin/sh\nexport KYRIS_GOVERNED_SUBPROCESS=\"claude-code\"\nexec claude \"$@\"\n";
+        assert!(!shim_content_delivers_env(pre_env, "claude-code"));
+        assert!(shim_content_delivers_env(
+            &shim_source("cline", "cline"),
+            "cline"
+        ));
+    }
+
+    #[test]
+    fn testShimGatesSandboxBehindMarkerFile() {
+        // The sandbox path must be guarded by the marker file (absent by
+        // default) so a normal install changes no launch behavior, and must
+        // wrap via kyris-exec --session when enabled.
+        let s = shim_source("codex-cli", "codex");
+        assert!(s.contains(r#"if [ -f "$HOME/.kyris/sandbox.on" ]; then"#));
+        assert!(
+            s.contains(r#"exec "$__kyris_exec" --session --agent "codex-cli" -- "$real" "$@""#)
+        );
+        // Degraded path: marker on but launcher missing → loud, unjailed,
+        // still launches (no exit before the final unconditional exec).
+        assert!(s.contains("launching %s UNJAILED"));
+        // The unconditional direct exec remains the default (marker absent).
+        assert!(s.contains(r#"exec "$real" "$@""#));
     }
 
     /// The shim must be runnable by /bin/sh — no bashisms. macOS' /bin/sh is

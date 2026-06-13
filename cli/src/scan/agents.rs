@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 use std::fmt::Write;
 
-use crate::agents::profile::{AdaptedMechanism, CapLevel, SurfaceState};
+use crate::agents::profile::{CapLevel, SurfaceState};
 use crate::agents::registry;
+use crate::agents::registry::MechanismLabel;
 
 use super::scanner::{Finding, FindingCategory, FindingLocation, Severity};
 
@@ -185,11 +186,21 @@ pub fn scan() -> Vec<Finding> {
     findings
 }
 
-fn is_static_mechanism(state: &SurfaceState) -> bool {
-    matches!(
-        state.mechanism,
-        Some(AdaptedMechanism::CompiledPolicy | AdaptedMechanism::ConfigRewrite)
-    )
+/// A surface is "static" when realized via an out-of-band mechanism (compiled
+/// policy, config rewrite, kyrisd model provider) — i.e. not `is_in_band`.
+fn is_static_mechanism<M: MechanismLabel>(state: &SurfaceState<M>) -> bool {
+    state.mechanism.as_ref().is_some_and(|m| !m.is_in_band())
+}
+
+/// `"<name>:<mechanism>"` if the surface is statically enforced, else `None`.
+fn static_surface_label<M: MechanismLabel>(name: &str, s: &SurfaceState<M>) -> Option<String> {
+    is_static_mechanism(s)
+        .then(|| {
+            s.mechanism
+                .as_ref()
+                .map(|m| format!("{name}:{}", m.short()))
+        })
+        .flatten()
 }
 
 fn scan_degraded_surfaces(
@@ -197,34 +208,18 @@ fn scan_degraded_surfaces(
     probe: &crate::agents::probe::ProbeResult,
     findings: &mut Vec<Finding>,
 ) {
-    let mut static_surfaces = Vec::new();
-    if is_static_mechanism(&probe.execution) {
-        static_surfaces.push(("execution", &probe.execution));
-    }
-    if is_static_mechanism(&probe.tool) {
-        static_surfaces.push(("tool", &probe.tool));
-    }
-    if is_static_mechanism(&probe.burn_control) {
-        static_surfaces.push(("burn-control", &probe.burn_control));
-    }
+    let labels: Vec<String> = [
+        static_surface_label("execution", &probe.execution),
+        static_surface_label("tool", &probe.tool),
+        static_surface_label("burn-control", &probe.burn_control),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
-    if static_surfaces.is_empty() {
+    if labels.is_empty() {
         return;
     }
-
-    let labels: Vec<String> = static_surfaces
-        .iter()
-        .map(|(name, s)| {
-            // is_static_mechanism (above) returns true only when mechanism is
-            // Some(CompiledPolicy | ConfigRewrite); the filter above guarantees
-            // this branch's mechanism is non-None.
-            let mech = s
-                .mechanism
-                .as_ref()
-                .expect("static_surfaces filtered by is_static_mechanism");
-            format!("{name}:{mech}")
-        })
-        .collect();
 
     let ask_dropped = check_ask_dropped(agent.id());
     if ask_dropped > 0 {
@@ -306,9 +301,9 @@ fn check_compilation_gaps(agent_id: &str) -> Vec<String> {
 
 fn check_ask_dropped(agent_id: &str) -> u32 {
     type Compiler = fn(Option<&std::path::Path>) -> Result<(serde_json::Value, u32), String>;
+    // cline + opencode are live-hook now (no compiled COMMAND policy → the hook
+    // handles `ask`); only codex + gemini emit a compiled policy that can drop ask.
     let compiler: Option<Compiler> = match agent_id {
-        "cline" => Some(crate::compile_policy::compile_cline_permissions_summary),
-        "opencode" => Some(crate::compile_policy::compile_opencode_permissions),
         "codex-cli" => Some(crate::compile_policy::compile_codex_permissions),
         "gemini-cli" => Some(crate::compile_policy::compile_gemini_permissions),
         _ => None,

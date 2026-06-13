@@ -105,6 +105,9 @@ fn forward_request_headers(
         if is_hop_by_hop(name)
             || name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("x-working-dir")
+            // kyris-internal attribution (tool-surface live evidence) — must
+            // not leak to the external upstream MCP server.
+            || name.eq_ignore_ascii_case("x-kyris-agent-id")
         {
             continue;
         }
@@ -245,6 +248,17 @@ async fn forward_mcp_post(
             });
     }
 
+    // A mediated tools/call proves the owning agent's adapted tool surface
+    // live; the kyris MCP rewrite stamps `x-kyris-agent-id` onto routed HTTP
+    // servers (the wrap's `--agent` twin for stdio).
+    if policy::is_tools_call_request(&path, &body)
+        && let Some(agent) = headers
+            .get("x-kyris-agent-id")
+            .and_then(|v| v.to_str().ok())
+    {
+        kyris_core::live_evidence::record(agent, kyris_core::live_evidence::SURFACE_TOOL);
+    }
+
     let tool_name = policy::extract_tool_name(&path, &body);
     let mcp_operation = extract_json_rpc_method(&body);
     let annotations = tool_name
@@ -252,6 +266,14 @@ async fn forward_mcp_post(
         .map(|t| state.mcp_annotation_cache.lookup(&server_name, t))
         .unwrap_or_default();
     let socket_timeout = Duration::from_millis(config.mcp.socket_timeout_ms);
+    // The routed agent's canonical identity — stamped onto this request by
+    // kyris's own MCP rewrite. Declared to agentpactd so the governance event
+    // attributes the AGENT, not the mediating kyrisd process (whose lineage
+    // is all agentpactd could otherwise see).
+    let declared_agent = headers
+        .get("x-kyris-agent-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.trim().is_empty());
     let decision = policy::check_permission(
         &server_name,
         &path,
@@ -259,6 +281,7 @@ async fn forward_mcp_post(
         working_dir,
         mcp_operation.as_deref(),
         &annotations,
+        declared_agent,
         socket_timeout,
     )
     .await;
@@ -308,6 +331,8 @@ async fn forward_mcp_post(
                 approval_token,
                 server_name.clone(),
                 tool_name,
+                None,
+                "kyris-mcp".to_string(),
                 allow_always,
             );
 
