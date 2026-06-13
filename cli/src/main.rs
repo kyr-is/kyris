@@ -46,6 +46,7 @@ mod operator;
 mod pending;
 mod query;
 mod recent_approvals;
+mod sandbox;
 mod scan;
 mod service;
 mod state;
@@ -79,6 +80,7 @@ enum Command {
     Continue(continue_cmd::ContinueArgs),
     Doctor(doctor::DoctorArgs),
     Scan(scan::ScanArgs),
+    Sandbox(sandbox::SandboxArgs),
     Install,
     Enroll(lifecycle::enroll::EnrollArgs),
     Update(lifecycle::update::UpdateArgs),
@@ -112,6 +114,7 @@ fn main() {
         Command::Continue(args) => continue_cmd::run(args),
         Command::Doctor(args) => doctor::run(args),
         Command::Scan(args) => scan::run(args),
+        Command::Sandbox(args) => sandbox::run(args),
         Command::Install => lifecycle::install::run(),
         Command::Enroll(args) => lifecycle::enroll::run(args),
         Command::Update(args) => lifecycle::update::run(args),

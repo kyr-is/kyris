@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "kyris-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sandbox launcher for kyris session jails: compiles a SandboxSpec (agentpact-sandbox) and execs the command under the OS sandbox in place. The kyris-owned parent at the spawn site."
+
+[[bin]]
+name = "kyris-exec"
+path = "src/main.rs"
+
+[dependencies]
+agentpact-sandbox = { workspace = true }
+agentpact-hardening = { workspace = true }
+# The single sanctioned path to agentpactd (BOUNDARY.md): kyris-exec registers
+# its jailed session through this client rather than hand-building wire frames.
+kyris-agentpact-client = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

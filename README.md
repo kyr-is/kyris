@@ -334,6 +334,19 @@ flowchart TD
 
 That honesty matters because it keeps the tool trustworthy. Kyris is strongest when it is boringly clear about what it really intercepted, what it only observed, and what it never saw at all.
 
+### 2.7 Why Kyris Enforces The Workspace
+
+Kyris treats the directory an agent is launched from as that session's permitted domain: inside it, the agent should work freely; outside it, nothing changes without an explicit decision. That boundary is not a constraint to apologize for — it is the mechanism that makes agent autonomy safe to grant. Four reasons:
+
+- **A boundary you can enforce beats judgment you have to trust.** Allow/ask/deny decisions are made from what a command *declares* it will do. Declarations can be incomplete, and a command's behavior can diverge from its classification. "Does this write stay inside the workspace?" is a question with a checkable answer, independent of how well the command was understood.
+- **The boundary is what makes fewer prompts possible.** Every prompt buys confidence about one command. A workspace boundary buys the same confidence wholesale: if nothing outside the workspace can be touched, routine workspace edits no longer need per-command confirmation — the boundary absorbs the risk the prompts were covering. Autonomy inside, control at the edge.
+- **Mistakes become breakage, not damage.** Kyris guards against agent mistakes, not malicious agents. With an enforced boundary, a misclassified or surprising command fails at the edge instead of quietly modifying something outside the project — the failure is visible and recoverable rather than discovered later.
+- **One boundary covers everything.** Kyris launches every supported agent through a small wrapper, and a boundary imposed at launch is inherited by every process the agent ever spawns — every shell, every command, every helper — including paths no hook sees. It is the only control that is both agent-agnostic and total.
+
+By default the workspace boundary is enforced on the decision path: writes and deletes outside the workspace ask or deny, and writes inside it follow the `workspace_writes` policy (default ask).
+
+Kernel enforcement is also available, **experimental and off by default**. Run `kyris sandbox enable` and each newly launched agent runs inside an OS sandbox (macOS Seatbelt) whose writable root is its launch directory — the whole agent process tree, jailed at the kernel. Inside a verified jail, workspace writes stop prompting entirely (they auto-allow), because a misclassified or surprising write can no longer escape the boundary: it fails at the kernel, not at our judgement. Each governed action records whether it ran sandboxed, so the audit trail never conflates a kernel-confined run with an advisory one. `kyris sandbox disable` reverts instantly. It is experimental because the per-agent set of dirs an agent may write outside its workspace (its own config/state/caches) is still being tuned against real agents; until that settles, an agent may occasionally be blocked from writing one of its own files. Coverage claims stay honest per §2.6 regardless: an action is only reported as kernel-enforced when it actually ran inside a verified jail.
+
 <hr>
 
 ## 3. For Developers

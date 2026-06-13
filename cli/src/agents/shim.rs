@@ -19,6 +19,20 @@
 //!      real agent binary, found by re-walking PATH. No hardcoded path,
 //!      no agent-update breakage — same pattern rbenv / pyenv / nvm
 //!      shims use.
+//!
+//! ## Session sandbox (gated OFF by default)
+//!
+//! When the marker file `~/.kyris/sandbox.on` exists AND a `kyris-exec`
+//! binary is resolvable, the shim's final step becomes
+//! `exec kyris-exec --session --agent <id> -- <real> "$@"` instead of
+//! `exec <real> "$@"`, jailing the entire agent process tree at launch
+//! (the codex-equivalent "be the parent" move — see `codex-agentpact.md`).
+//! The marker does not exist after a normal install, so this changes
+//! nothing for existing users until a future `kyris sandbox enable`
+//! (or the Phase-3 mechanism) creates it. If the marker is present but
+//! `kyris-exec` cannot be found, the shim launches UNJAILED with a loud
+//! stderr line rather than failing the launch — degraded, indicated, never
+//! silently "sandboxed".
 
 use crate::config_writer::NoopValidator;
 use crate::state::{bin_dir, write_managed_file};
@@ -84,6 +98,21 @@ real=$(command -v {binary} 2>/dev/null) || {{
     printf '[kyris] %s not found on PATH after stripping shim dir\n' "{binary}" >&2
     exit 127
 }}
+
+# Session sandbox (opt-in via the marker file; absent by default → no-op).
+# When enabled, jail the whole agent process tree at launch via kyris-exec.
+# kyris-exec is found on the (post-strip) PATH like the real binary; if the
+# marker is set but the launcher is missing, fall through to an UNJAILED
+# launch with a loud warning — never silently claim confinement, never block
+# the launch.
+if [ -f "$HOME/.kyris/sandbox.on" ]; then
+    __kyris_exec=$(command -v kyris-exec 2>/dev/null)
+    if [ -n "$__kyris_exec" ]; then
+        exec "$__kyris_exec" --session --agent "{agent_id}" -- "$real" "$@"
+    fi
+    printf '[kyris] sandbox.on set but kyris-exec not found; launching %s UNJAILED\n' "{binary}" >&2
+fi
+
 exec "$real" "$@"
 "#
     )
@@ -187,6 +216,23 @@ mod tests {
             &shim_source("cline", "cline"),
             "cline"
         ));
+    }
+
+    #[test]
+    fn testShimGatesSandboxBehindMarkerFile() {
+        // The sandbox path must be guarded by the marker file (absent by
+        // default) so a normal install changes no launch behavior, and must
+        // wrap via kyris-exec --session when enabled.
+        let s = shim_source("codex-cli", "codex");
+        assert!(s.contains(r#"if [ -f "$HOME/.kyris/sandbox.on" ]; then"#));
+        assert!(
+            s.contains(r#"exec "$__kyris_exec" --session --agent "codex-cli" -- "$real" "$@""#)
+        );
+        // Degraded path: marker on but launcher missing → loud, unjailed,
+        // still launches (no exit before the final unconditional exec).
+        assert!(s.contains("launching %s UNJAILED"));
+        // The unconditional direct exec remains the default (marker absent).
+        assert!(s.contains(r#"exec "$real" "$@""#));
     }
 
     /// The shim must be runnable by /bin/sh — no bashisms. macOS' /bin/sh is

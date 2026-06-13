@@ -605,8 +605,8 @@ Usage: install.sh [--user] [--local <dir>] [--no-agentpact] [--no-brew]
   (no flag)      Install in user mode (default).
   --user         Explicit form of the default. No sudo required.
   --local <dir>  Copy binaries from local directory instead of downloading.
-                 <dir> should contain kyris, kyrisd, kyris-mcp, kyris-hook binaries
-                 (e.g. target/release/).
+                 <dir> should contain kyris, kyrisd, kyris-mcp, kyris-hook,
+                 kyris-exec binaries (e.g. target/release/).
   --no-brew      Skip brew detection and install via the script path even when
                  Homebrew is available. Symmetric on --uninstall.
   --uninstall    Stop kyrisd and remove install-managed files (binary bundle,
@@ -733,7 +733,7 @@ resolve_version() {
 
 validate_local_dir() {
   [ -d "$LOCAL_DIR" ] || err "Local directory does not exist: $LOCAL_DIR"
-  for bin in kyris kyrisd kyris-mcp kyris-hook; do
+  for bin in kyris kyrisd kyris-mcp kyris-hook kyris-exec; do
     [ -f "$LOCAL_DIR/$bin" ] || err "$bin binary not found in $LOCAL_DIR"
   done
   LOCAL_DIR="$(cd "$LOCAL_DIR" && pwd)"
@@ -1102,7 +1102,7 @@ uninstall_all() {
   # regular files at the same shim paths, which remove_path handles
   # equivalently (rm -rf strips either symlinks or regular files).
   remove_path "$APP_PATH"
-  for bin in kyrisd kyris kyris-mcp kyris-hook; do
+  for bin in kyrisd kyris kyris-mcp kyris-hook kyris-exec; do
     remove_path "$HOME/.local/bin/$bin"
   done
   remove_path "$HOME/.kyris"
@@ -1110,7 +1110,7 @@ uninstall_all() {
   # Clean residue from legacy system-mode installs. Only prompts for sudo if
   # something actually exists at these paths.
   local need_sudo=0
-  for bin in kyris kyrisd kyris-mcp kyris-hook; do
+  for bin in kyris kyrisd kyris-mcp kyris-hook kyris-exec; do
     if [ -e "/usr/local/bin/$bin" ]; then
       need_sudo=1
       break
@@ -1122,7 +1122,7 @@ uninstall_all() {
 
   if [ "$need_sudo" -eq 1 ]; then
     info "Detected legacy system-mode install; sudo required to remove."
-    for bin in kyris kyrisd kyris-mcp kyris-hook; do
+    for bin in kyris kyrisd kyris-mcp kyris-hook kyris-exec; do
       remove_path_sudo "/usr/local/bin/$bin"
     done
     remove_path_sudo "/etc/kyris"
@@ -1204,7 +1204,7 @@ install_kyrisd_bundle() {
 
   # Wipe any prior bundle + shims. Drop shims first so the old bundle
   # isn't held by stale symlinks while we replace it.
-  for bin in kyrisd kyris kyris-mcp kyris-hook; do
+  for bin in kyrisd kyris kyris-mcp kyris-hook kyris-exec; do
     rm -f "$BIN_SHIM_DIR/$bin"
   done
   rm -rf "$APP_PATH"
@@ -1238,11 +1238,11 @@ install_kyrisd_bundle() {
     err "install_kyrisd_bundle: source $source_path is neither a Kyrisd.app nor a directory containing kyrisd"
   fi
 
-  # CLI shims for ALL FOUR binaries. Each is a symlink from
+  # CLI shims for ALL FIVE binaries. Each is a symlink from
   # ~/.local/bin/<name> into the bundle. Keeps the user's PATH clean
   # (only Contents/MacOS/ holds the real binaries) while making
-  # `kyrisd doctor`, `kyris install`, etc. work unchanged.
-  for bin in kyrisd kyris kyris-mcp kyris-hook; do
+  # `kyrisd doctor`, `kyris install`, `kyris-exec`, etc. work unchanged.
+  for bin in kyrisd kyris kyris-mcp kyris-hook kyris-exec; do
     ln -sf "$APP_PATH/Contents/MacOS/$bin" "$BIN_SHIM_DIR/$bin"
     chmod 755 "$BIN_SHIM_DIR/$bin"
   done
@@ -1437,7 +1437,7 @@ verify_uninstall() {
     fi
   fi
 
-  for bin in kyris kyrisd kyris-mcp kyris-hook; do
+  for bin in kyris kyrisd kyris-mcp kyris-hook kyris-exec; do
     for path in "$HOME/.local/bin/$bin" "/usr/local/bin/$bin"; do
       if [ -e "$path" ] || [ -L "$path" ]; then
         info "FAIL: uninstall residue remains at $path"

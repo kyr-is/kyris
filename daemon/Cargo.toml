@@ -22,6 +22,9 @@ kyris-agentpact-client = { workspace = true }
 # library-level use of the resolver/loader, not wire-message
 # construction.
 agentpact = { workspace = true }
+# Pre-main process hardening (core dumps off, ptrace-attach denied,
+# loader env vars cleared) — called as the first statement of main().
+agentpact-hardening = { workspace = true }
 kyris-peer-cwd = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "fs", "signal", "macros", "io-util", "time"] }
 axum = { workspace = true }

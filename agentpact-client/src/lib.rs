@@ -561,6 +561,35 @@ pub fn resolve_agent(
         .map(String::from)
 }
 
+/// Register the calling process as the root of a jailed (OS-sandboxed) agent
+/// session with `agentpactd`. Sent by `kyris-exec` immediately before it execs
+/// the sandboxed agent in place, so the caller's PID (which the daemon reads
+/// from the socket peer credentials, NOT from this message) becomes the jail
+/// root. `profile_summary` is an audit-only description of the active sandbox.
+///
+/// Returns `true` only on an explicit `PACT_OK`. Best-effort by contract: a
+/// `false` (daemon down, error) means the jail still applies but the daemon
+/// cannot attribute it, so governed commands fall back to advisory behavior
+/// (no `workspace_writes` Auto flip) — the caller must NOT block the launch.
+#[must_use]
+pub fn register_jailed_session(
+    socket_path: &str,
+    profile_summary: &str,
+    writable_roots: &[String],
+    socket_timeout: Option<Duration>,
+) -> bool {
+    let request = serde_json::json!({
+        "id": format!("kyris-exec-{}", uuid::Uuid::now_v7()),
+        "method": "session.register",
+        "profile_summary": profile_summary,
+        "writable_roots": writable_roots,
+    });
+    match send_daemon_request_to_socket(socket_path, &request, socket_timeout) {
+        Ok(response) => response.get("code").and_then(|c| c.as_str()) == Some("PACT_OK"),
+        Err(_) => false,
+    }
+}
+
 /// Sends a user approval decision back to `agentpactd`.
 ///
 /// On success returns an optional advisory **warning** the daemon attached to

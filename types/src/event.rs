@@ -55,6 +55,13 @@ pub struct Event {
     pub mode: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub event_kind: String,
+    /// True when the requester ran inside a verified kyris-exec OS sandbox
+    /// (session jail) at decision time. The structural audit truth behind a
+    /// workspace write that auto-allowed because the kernel jail bounded it —
+    /// distinguishing a confined run from an advisory one. Defaults false /
+    /// omitted for the (today universal) un-sandboxed path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox_applied: bool,
     /// Per-segment breakdown for a compound `execute` command the agent issued
     /// as one line (e.g. `cmd1 && cmd2`). The event represents the whole line
     /// (`detail`), with each split segment's own decision/coverage here. Empty
@@ -341,6 +348,7 @@ mod tests {
             coverage_state: CoverageState::default(),
             mode: String::new(),
             event_kind: String::new(),
+            sandbox_applied: false,
             segments: Vec::new(),
         };
         let json = serde_json::to_string(&event).unwrap();
