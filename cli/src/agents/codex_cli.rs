@@ -22,8 +22,8 @@ fn codex_config_validator() -> TomlShapeValidator<CodexConfigShape> {
 use super::probe::{ProbeResult, fingerprint, not_detected, toml_has_any_mcp_servers};
 use super::registry::{
     AgentDescriptor, AgentIntegrationPlan, AllowResponse, AttributionMechanism,
-    BurnControlMechanism, DetailPassThrough, ExecutionMechanism, HookProtocol, McpConfigFormat,
-    McpConfigLocation, SurfaceIntegration, ToolMapping, ToolMechanism,
+    BurnControlMechanism, ExecutionMechanism, HookProtocol, HookRuntime, HookTimeoutPosture,
+    McpConfigFormat, McpConfigLocation, SurfaceIntegration, ToolMapping, ToolMechanism,
 };
 
 pub struct CodexCli;
@@ -266,20 +266,45 @@ fn codex_kyris_hook_command(script_path: &Path) -> String {
     super::configure::shell_command(script_path)
 }
 
-fn codex_kyris_hook_key(hooks_path: &Path) -> String {
-    format!("{}:pre_tool_use:0:0", hooks_path.display())
+/// The hook events kyris registers for codex, as `(hooks.json key, the
+/// snake_case label codex uses in trust-state keys and identity hashes)`.
+/// `PreToolUse` is the governance gate; `PermissionRequest` answers codex's
+/// native approval prompts (allow / abstain — see `run_permission_request`).
+const CODEX_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("PreToolUse", "pre_tool_use"),
+    ("PermissionRequest", "permission_request"),
+];
+
+/// Per-hook `timeout` (seconds) kyris writes on its hooks.json handlers — one
+/// week, i.e. effectively forever. This is the approval-hold ceiling: a kyris
+/// popup ask can wait this long for the developer (walk away, answer from the
+/// tray days later) before codex kills the hook. Codex honors any explicit
+/// value uncapped (`timeout_sec.unwrap_or(600).max(1)`, discovery.rs) and
+/// enforces it with a tokio timer, so large finite values are safe where a
+/// literal "no timeout" does not exist. `HookRuntime.agent_hook_timeout_secs`
+/// and the trust-identity hash both derive from this constant — single source.
+const CODEX_HOOK_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Codex's own default per-hook timeout — the value baked into trust hashes
+/// written by kyris installs that predate the explicit
+/// [`CODEX_HOOK_TIMEOUT_SECS`] pin. Kept only so scrub can recognize (and
+/// remove) those legacy trust entries.
+const CODEX_LEGACY_HOOK_TIMEOUT_SECS: u64 = 600;
+
+fn codex_kyris_hook_key(hooks_path: &Path, event_label: &str) -> String {
+    format!("{}:{event_label}:0:0", hooks_path.display())
 }
 
 #[derive(Serialize)]
 struct CodexHookTrustIdentity {
     event_name: &'static str,
-    matcher: &'static str,
+    matcher: String,
     hooks: Vec<CodexHookTrustHandler>,
 }
 
 #[derive(Serialize)]
 struct CodexHookTrustHandler {
-    r#type: &'static str,
+    r#type: String,
     command: String,
     #[serde(rename = "commandWindows")]
     command_windows: Option<String>,
@@ -290,22 +315,108 @@ struct CodexHookTrustHandler {
     status_message: Option<String>,
 }
 
-fn codex_kyris_hook_hash(script_path: &Path) -> Result<String, String> {
+fn codex_hook_identity_hash(
+    event_label: &'static str,
+    matcher: &str,
+    handler: CodexHookTrustHandler,
+) -> Result<String, String> {
     let identity = CodexHookTrustIdentity {
-        event_name: "pre_tool_use",
-        matcher: "",
-        hooks: vec![CodexHookTrustHandler {
-            r#type: "command",
-            command: codex_kyris_hook_command(script_path),
-            command_windows: None,
-            timeout_sec: 600,
-            r#async: false,
-            status_message: None,
-        }],
+        event_name: event_label,
+        matcher: matcher.to_string(),
+        hooks: vec![handler],
     };
     let value = toml::Value::try_from(identity)
         .map_err(|e| format!("cannot build codex hook trust identity: {e}"))?;
     Ok(codex_toml_version(&value))
+}
+
+/// The hash for the hook entry kyris ITSELF writes for `event_label` (matcher
+/// "", explicit `timeout` = [`CODEX_HOOK_TIMEOUT_SECS`]). Used by configure
+/// when minting the trust entry and by scrub to identify kyris's entries; the
+/// probe instead recomputes from the file (see [`codex_kyris_hook_file_trust`])
+/// so user edits surface as drift.
+fn codex_kyris_hook_hash(script_path: &Path, event_label: &'static str) -> Result<String, String> {
+    codex_kyris_hook_hash_with_timeout(script_path, event_label, CODEX_HOOK_TIMEOUT_SECS)
+}
+
+fn codex_kyris_hook_hash_with_timeout(
+    script_path: &Path,
+    event_label: &'static str,
+    timeout_sec: u64,
+) -> Result<String, String> {
+    codex_hook_identity_hash(
+        event_label,
+        "",
+        CodexHookTrustHandler {
+            r#type: "command".to_string(),
+            command: codex_kyris_hook_command(script_path),
+            command_windows: None,
+            timeout_sec,
+            r#async: false,
+            status_message: None,
+        },
+    )
+}
+
+/// Locate kyris's handler for one hook EVENT in hooks.json and compute the
+/// trust (key, hash) the way CODEX does: keyed by the entry's ACTUAL
+/// `group:handler` indices and hashed from the FILE's field values (timeout
+/// default 600). This is the semantic probe core — the old probe read back
+/// kyris's own constants at a hardcoded `0:0`, so a user-edited entry (→
+/// codex sees Modified, hook silently stops running) or a kyris group
+/// appended after pre-existing user groups (→ trust entry at the wrong key,
+/// hook Untrusted) still showed green.
+fn codex_kyris_hook_file_trust(
+    hooks_path: &Path,
+    script_path: &Path,
+    event_json_key: &str,
+    event_label: &'static str,
+) -> Option<(String, String)> {
+    let value = crate::integration::read_json_value(hooks_path).ok()?;
+    let groups = value.get("hooks")?.get(event_json_key)?.as_array()?;
+    let expected_command = codex_kyris_hook_command(script_path);
+    for (group_idx, group) in groups.iter().enumerate() {
+        let matcher = group.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
+        let Some(handlers) = group.get("hooks").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for (handler_idx, handler) in handlers.iter().enumerate() {
+            if handler.get("command").and_then(|v| v.as_str()) != Some(expected_command.as_str()) {
+                continue;
+            }
+            let trust_handler = CodexHookTrustHandler {
+                r#type: handler
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("command")
+                    .to_string(),
+                command: expected_command.clone(),
+                command_windows: handler
+                    .get("commandWindows")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                timeout_sec: handler
+                    .get("timeout")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(600),
+                r#async: handler
+                    .get("async")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                status_message: handler
+                    .get("statusMessage")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            };
+            let hash = codex_hook_identity_hash(event_label, matcher, trust_handler).ok()?;
+            let key = format!(
+                "{}:{event_label}:{group_idx}:{handler_idx}",
+                hooks_path.display()
+            );
+            return Some((key, hash));
+        }
+    }
+    None
 }
 
 fn ensure_codex_kyris_hook_trust(
@@ -313,23 +424,61 @@ fn ensure_codex_kyris_hook_trust(
     hooks_path: &Path,
     script_path: &Path,
 ) -> Result<bool, String> {
-    let key = codex_kyris_hook_key(hooks_path);
-    let hash = codex_kyris_hook_hash(script_path)?;
-    Ok(ensure_toml_string_path(
-        config,
-        &["hooks", "state", key.as_str(), "trusted_hash"],
-        &hash,
-    ))
+    // One trust entry per registered EVENT, keyed by the entry's ACTUAL
+    // group:handler index in hooks.json (codex's keying) — kyris's group is
+    // APPENDED, so with pre-existing user groups it does not sit at 0:0;
+    // minting at a hardcoded 0:0 left the kyris hook Untrusted (never run)
+    // and clobbered the user's own trust entry. hooks.json is written before
+    // this runs; the 0:0 fallback only covers a read failure of the file just
+    // written.
+    //
+    // Mint ONLY when the file entry hashes to kyris's canonical identity:
+    // blessing a user-edited entry would both endorse an edit kyris didn't
+    // make and break the G3 timing contract (e.g. a user `timeout: 30` kills
+    // the hook far inside the approval window). A drifted entry is indicated,
+    // not silently re-trusted — the probe shows the hook as not live.
+    let mut changed = false;
+    for (event_json_key, event_label) in CODEX_HOOK_EVENTS {
+        let canonical_hash = codex_kyris_hook_hash(script_path, event_label)?;
+        let (key, hash) =
+            match codex_kyris_hook_file_trust(hooks_path, script_path, event_json_key, event_label)
+            {
+                Some((key, file_hash)) if file_hash == canonical_hash => (key, file_hash),
+                Some((key, _)) => {
+                    eprintln!(
+                        "[kyris] codex hooks.json entry at {key} differs from what kyris \
+                         installs (edited?); not re-trusting it — re-run \
+                         `kyris agents setup codex-cli` after reverting the edit, or remove \
+                         the entry"
+                    );
+                    continue;
+                }
+                None => (
+                    codex_kyris_hook_key(hooks_path, event_label),
+                    canonical_hash,
+                ),
+            };
+        changed |= ensure_toml_string_path(
+            config,
+            &["hooks", "state", key.as_str(), "trusted_hash"],
+            &hash,
+        );
+    }
+    Ok(changed)
 }
 
+/// The EXECUTION-surface probe checks the `PreToolUse` entry only: that is the
+/// governance gate. The `PermissionRequest` entry is a UX completion (allow
+/// path) whose absence degrades to double-prompting, not to un-governance.
 fn codex_kyris_hook_trusted(config_path: &Path, hooks_path: &Path, script_path: &Path) -> bool {
     let Ok(config) = read_toml_value(config_path) else {
         return false;
     };
-    let Ok(expected_hash) = codex_kyris_hook_hash(script_path) else {
+    let Some((key, expected_hash)) =
+        codex_kyris_hook_file_trust(hooks_path, script_path, "PreToolUse", "pre_tool_use")
+    else {
         return false;
     };
-    let key = codex_kyris_hook_key(hooks_path);
     config
         .get("hooks")
         .and_then(toml::Value::as_table)
@@ -347,8 +496,53 @@ fn scrub_codex_kyris_hook_trust(config: &mut toml::Value, config_path: &Path) ->
         return false;
     };
     let hooks_path = dir.join("hooks.json");
-    let key = codex_kyris_hook_key(&hooks_path);
-    let mut changed = remove_toml_path(config, &["hooks", "state", key.as_str()]);
+    // The trust entries may sit at any group index (keyed by where the kyris
+    // groups landed in hooks.json, which undo may already have restored), so
+    // identify kyris's entries by their HASHES — the entries kyris writes
+    // always hash to the constant per-event identity (matcher "", the pinned
+    // timeout) — scoped to this hooks.json's keys so a user's identical hook
+    // in another file is untouched. Both the current pinned-timeout hash and
+    // the legacy 600s-default hash are matched, so undo also heals installs
+    // that predate the explicit timeout.
+    let script_path = dir.join("kyris_pretooluse.sh");
+    let kyris_hashes: Vec<String> = CODEX_HOOK_EVENTS
+        .iter()
+        .flat_map(|(_, label)| {
+            [
+                codex_kyris_hook_hash_with_timeout(&script_path, label, CODEX_HOOK_TIMEOUT_SECS),
+                codex_kyris_hook_hash_with_timeout(
+                    &script_path,
+                    label,
+                    CODEX_LEGACY_HOOK_TIMEOUT_SECS,
+                ),
+            ]
+        })
+        .filter_map(Result::ok)
+        .collect();
+    let key_prefix = format!("{}:", hooks_path.display());
+    let kyris_keys: Vec<String> = config
+        .get("hooks")
+        .and_then(toml::Value::as_table)
+        .and_then(|hooks| hooks.get("state"))
+        .and_then(toml::Value::as_table)
+        .map(|state| {
+            state
+                .iter()
+                .filter(|(key, entry)| {
+                    key.starts_with(&key_prefix)
+                        && entry
+                            .get("trusted_hash")
+                            .and_then(toml::Value::as_str)
+                            .is_some_and(|h| kyris_hashes.iter().any(|kh| kh == h))
+                })
+                .map(|(key, _)| key.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut changed = false;
+    for key in &kyris_keys {
+        changed |= remove_toml_path(config, &["hooks", "state", key.as_str()]);
+    }
     if table_is_empty(config, &["hooks", "state"]) {
         changed |= remove_toml_path(config, &["hooks", "state"]);
     }
@@ -418,6 +612,12 @@ fn scrub_codex_config_value(config: &mut toml::Value) -> bool {
     {
         changed |= remove_toml_path(config, &["default_permissions"]);
     }
+    // Residue cleanup of the native-mode approval routing (the manifest undo
+    // restores the user's prior value semantically; this best-effort scrub only
+    // strips kyris's "untrusted" when no manifest is available).
+    if config.get("approval_policy").and_then(toml::Value::as_str) == Some("untrusted") {
+        changed |= remove_toml_path(config, &["approval_policy"]);
+    }
     changed |= remove_toml_path(
         config,
         &[
@@ -454,9 +654,13 @@ pub fn scrub_codex_residue() -> Result<Vec<String>, String> {
     let hooks_path = codex_hooks_path()?;
     if hooks_path.exists() {
         let mut hooks = read_json_value(&hooks_path)?;
-        if remove_json_command_hook(&mut hooks, "PreToolUse", "kyris_pretooluse") {
+        let mut removed = false;
+        for (event_json_key, _) in CODEX_HOOK_EVENTS {
+            removed |= remove_json_command_hook(&mut hooks, event_json_key, "kyris_pretooluse");
+        }
+        if removed {
             write_json_unmanaged(&hooks_path, &hooks)?;
-            changes.push(format!("removed hook from {}", hooks_path.display()));
+            changes.push(format!("removed hook(s) from {}", hooks_path.display()));
         }
     }
 
@@ -596,6 +800,15 @@ impl AgentDescriptor for CodexCli {
                     BurnControlMechanism::KyrisdModelProvider,
                 ]),
                 attribution: &[
+                    // The PATH shim is load-bearing beyond attribution: it puts
+                    // KYRIS_GOVERNED_SUBPROCESS in codex's OWN env, so codex's
+                    // HOOK children inherit the governed-agent marker.
+                    // ShellEnvironmentPolicy covers only exec-tool children —
+                    // without the shim, the kyris hook spawn itself
+                    // (`bash kyris_pretooluse.sh`) reached the shell gate
+                    // unmarked and was prompted on the agent's own TTY (the
+                    // codex composer-garbage bug).
+                    AttributionMechanism::KyrisPathShim,
                     AttributionMechanism::ShellEnvironmentPolicy,
                     AttributionMechanism::NativeHookPayload,
                     AttributionMechanism::PeerProcessObserved,
@@ -626,32 +839,78 @@ impl AgentDescriptor for CodexCli {
 
         let mut changes = super::configure::install_live_hook_adapter(
             "codex-cli",
-            "codex-cli",
-            "PreToolUse",
+            "codex-cli:execution",
+            // PreToolUse = the governance gate; PermissionRequest answers
+            // codex's native approval prompts (allow when kyris can vouch,
+            // abstain otherwise — see hook_cmd::run_permission_request). Same
+            // script; the engine branches on the payload's hook_event_name.
+            &["PreToolUse", "PermissionRequest"],
             &script_path,
             &hooks_path,
             true,
-            // Codex's PreToolUse default is 600s (and its config field is
-            // `timeout_sec`, not `timeout`), so no JSON-hook override here.
-            None,
+            // Pin the per-hook `timeout` (the on-disk field, serde-renamed
+            // from `timeout_sec`; codex's default is 600s) to a week so a
+            // kyris popup ask can wait effectively forever instead of codex
+            // killing the hook at 10 minutes ("hook timed out after 600s" →
+            // fail-open). The trust hash bakes this value — see
+            // CODEX_HOOK_TIMEOUT_SECS.
+            #[allow(clippy::cast_possible_wrap)]
+            Some(CODEX_HOOK_TIMEOUT_SECS as i64),
         )?;
 
+        // One read-modify-write for every config.toml mutation this surface
+        // owns: codex itself rewrites its config while running, so each extra
+        // write cycle widens the lost-update window (neither side locks).
         let mut config = read_or_empty_codex_config(&config_path)?;
+        let mut config_changed = false;
         // `hooks` is codex's canonical feature key (codex 0.133 `features list`);
         // `codex_hooks` is a deprecated alias that warns in `codex doctor`.
         if ensure_toml_bool_path(&mut config, &["features", "hooks"], true) {
-            write_codex_config(&config_path, &config, "codex-cli:execution")?;
-            changes.push(format!("updated {}", config_path.display()));
+            config_changed = true;
+            changes.push(format!(
+                "enabled hooks feature in {}",
+                config_path.display()
+            ));
         }
-        let mut config = read_or_empty_codex_config(&config_path)?;
         if ensure_codex_shell_env_marker(&mut config) {
-            write_codex_config(&config_path, &config, "codex-cli:execution")?;
-            changes.push(format!("updated {}", config_path.display()));
+            config_changed = true;
+            changes.push(format!("set shell env marker in {}", config_path.display()));
         }
-        let mut config = read_or_empty_codex_config(&config_path)?;
+        // Route governed exec/apply_patch to codex's approval ladder so its
+        // PermissionRequest hook fires and its native prompt can render an `ask`
+        // (native approval mode). Without this, a trusted project with an
+        // unrestricted sandbox auto-Skips most commands (no PermissionRequest),
+        // silently bypassing an ask. `untrusted` forces NeedsApproval regardless
+        // of sandbox; `run_permission_request` then suppresses the prompt for a
+        // vouched/`auto` command and abstains for an `ask` so codex prompts. A
+        // no-op for kyris-popup mode (PreToolUse gates the ask before codex's
+        // ladder runs).
+        let prior_approval = config
+            .get("approval_policy")
+            .and_then(toml::Value::as_str)
+            .map(String::from);
+        if ensure_toml_string_path(&mut config, &["approval_policy"], "untrusted") {
+            config_changed = true;
+            if let Some(prior) = prior_approval.as_deref()
+                && prior != "untrusted"
+            {
+                changes.push(format!(
+                    "warning: approval_policy was \"{prior}\" — overridden to \"untrusted\" so \
+                     codex routes governed commands to its approval prompt (restored on \
+                     `kyris agents undo codex-cli`)"
+                ));
+            }
+            changes.push(format!(
+                "set approval_policy=untrusted in {}",
+                config_path.display()
+            ));
+        }
         if ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path)? {
+            config_changed = true;
+            changes.push(format!("trusted kyris hooks in {}", config_path.display()));
+        }
+        if config_changed {
             write_codex_config(&config_path, &config, "codex-cli:execution")?;
-            changes.push(format!("trusted kyris hook in {}", config_path.display()));
         }
 
         // ── Command prefix rules (.rules file) ──────────────────────────
@@ -787,8 +1046,22 @@ impl AgentDescriptor for CodexCli {
         let mut config_changed = false;
         // Route codex through the kyris custom provider by default — the built-in
         // openai provider can't carry the x-kyris-inbound header (reserved ID).
+        // A different existing choice (ollama, a user-defined provider…) is
+        // overridden — burn-control requires the kyris route — but LOUDLY, the
+        // same care `default_permissions` gets; undo restores it.
+        let prior_provider = config
+            .get("model_provider")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
         if ensure_toml_string_path(&mut config, &["model_provider"], "kyris") {
             config_changed = true;
+            if let Some(prior) = prior_provider.filter(|p| p != "kyris") {
+                changes.push(format!(
+                    "warning: model_provider was \"{prior}\" — overridden to \"kyris\" so \
+                     burn-control can route through kyrisd; `kyris agents undo codex-cli` \
+                     restores it"
+                ));
+            }
         }
         if ensure_codex_kyris_model_provider(&mut config, &base_url_v1, inbound_key) {
             config_changed = true;
@@ -813,8 +1086,12 @@ impl AgentDescriptor for CodexCli {
         let mut config = read_or_empty_codex_config(&config_path)?;
 
         let mut config_changed = false;
-        let mcp_result =
-            super::configure::rewrite_codex_mcp_servers(&mut config, base_url, inbound_key);
+        let mcp_result = super::configure::rewrite_codex_mcp_servers(
+            &mut config,
+            base_url,
+            inbound_key,
+            self.canonical_id(),
+        );
         if mcp_result.changed {
             config_changed = true;
         }
@@ -878,16 +1155,26 @@ impl AgentDescriptor for CodexCli {
         }
         Ok(())
     }
-    fn mcp_config(&self) -> Option<McpConfigLocation> {
-        codex_config_path().ok().map(|path| McpConfigLocation {
-            path,
-            format: McpConfigFormat::Toml {
-                servers_key: "mcp_servers",
-            },
-        })
+    fn mcp_configs(&self) -> Vec<McpConfigLocation> {
+        codex_config_path()
+            .ok()
+            .map(|path| McpConfigLocation {
+                path,
+                format: McpConfigFormat::Toml {
+                    servers_key: "mcp_servers",
+                },
+            })
+            .into_iter()
+            .collect()
     }
     fn burn_control_config_paths(&self) -> Vec<PathBuf> {
         codex_config_path().into_iter().collect()
+    }
+    fn supported_settings(&self) -> &'static [(&'static str, &'static str)] {
+        &[(
+            super::registry::APPROVAL_PROMPT_SETTING,
+            super::registry::APPROVAL_PROMPT_SETTING_DESC,
+        )]
     }
     fn hook_protocol(&self) -> Option<HookProtocol> {
         Some(HookProtocol {
@@ -899,22 +1186,90 @@ impl AgentDescriptor for CodexCli {
                     action: "execute".to_string(),
                     detail_key: Some("command".to_string()),
                 },
+                // The patch envelope is parsed by kyris into per-file write +
+                // delete decisions (hook_cmd::drive_apply_patch) — the old
+                // `write`-with-patch-text mapping lexically anchored the
+                // entire patch INSIDE the workspace (review Finding 10).
                 ToolMapping {
                     tool_name: "apply_patch".to_string(),
-                    action: "write".to_string(),
+                    action: "apply_patch".to_string(),
                     detail_key: Some("command".to_string()),
                 },
             ],
-            // Codex CLI internal coordination tools: skip the daemon. See
+            // Codex CLI internal coordination / read-only tools: skip the
+            // daemon. Ids verified against codex 5a440c03 tool handlers. See
             // claude_code.rs and hook_cmd.rs for the design rationale.
-            pass_through_tools: vec!["update_plan".to_string(), "view_image".to_string()],
-            detail_pass_throughs: vec![DetailPassThrough {
-                action: "execute".to_string(),
-                detail_contains: vec![".codex/shell_snapshots/".to_string()],
-                reason: "codex-shell-snapshot".to_string(),
-            }],
+            pass_through_tools: vec![
+                "update_plan".to_string(),
+                "view_image".to_string(),
+                "spawn_agent".to_string(),
+                "wait_agent".to_string(),
+                "close_agent".to_string(),
+                "followup_task".to_string(),
+                "list_agents".to_string(),
+                "request_user_input".to_string(),
+                "tool_search".to_string(),
+                "list_mcp_resources".to_string(),
+                "list_mcp_resource_templates".to_string(),
+                "read_mcp_resource".to_string(),
+                "list_available_plugins_to_install".to_string(),
+            ],
+            // Left to codex's own approval machinery: permission escalation,
+            // plugin installs, inter-agent messaging, batch agent jobs — each
+            // has codex-side controls a kyris pass-through would bypass.
+            agent_owned_tools: vec![
+                "request_permissions".to_string(),
+                "request_plugin_install".to_string(),
+                "send_message".to_string(),
+                "spawn_agents_on_csv".to_string(),
+                "report_agent_job_result".to_string(),
+            ],
+            // The shell-snapshot pass-through is GONE: current codex spawns
+            // snapshot capture directly (never through the tool registry, so
+            // no hook fires — verified shell_snapshot.rs), and the old
+            // substring match was both bypassable and broken under a
+            // non-default CODEX_HOME. An older codex emitting such a command
+            // now warns-and-defers, which its own approval ladder absorbs.
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
+            runtime: HookRuntime {
+                // The explicit per-hook `timeout` kyris writes at install
+                // (CODEX_HOOK_TIMEOUT_SECS, one week): codex honors it
+                // uncapped, so the approval poll window derived from this
+                // value lets a popup ask wait effectively forever. The rest
+                // of the chain is sized per-request from poll_deadline()
+                // (agentpactd approval_ttl_secs, kyrisd hold ttl_seconds).
+                agent_hook_timeout_secs: CODEX_HOOK_TIMEOUT_SECS,
+                // Verified: a timed-out hook is Failed, NOT blocked — codex
+                // proceeds (events/pre_tool_use.rs).
+                on_timeout: HookTimeoutPosture::FailOpen,
+                // Codex's own approval ladder (AskForApproval + sandbox) still
+                // runs after the hook; a defer lands on a real gate.
+                native_backstop: true,
+                // EmptyStdout is the ONLY allow codex accepts at PreToolUse
+                // (JSON permissionDecision:allow parses as Failed); it
+                // suppresses nothing there — native-prompt suppression is the
+                // PermissionRequest hook's job (permission_request_allow).
+                allow_suppresses_agent_prompt: false,
+            },
+            // The PermissionRequest allow shape (verified: codex parses
+            // hookSpecificOutput.decision.behavior; allow suppresses the
+            // native prompt entirely; empty stdout abstains). deny_unknown
+            // _fields upstream — emit exactly these fields.
+            permission_request_allow: Some(serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PermissionRequest",
+                    "decision": {"behavior": "allow"}
+                }
+            })),
+            mcp_tool_naming: None,
+            // Codex's PreToolUse cannot emit "ask" (it parses a JSON allow as
+            // Failed), so an ask is delegated to the PermissionRequest hook
+            // above: PreToolUse abstains, and `run_permission_request` abstains
+            // for an unvouched request so codex's own approval prompt appears.
+            // Requires `approval_policy = "untrusted"` (set by
+            // configure_execution_surface) so governed commands reach that hook.
+            native_ask: Some(super::registry::AskResponse::DeferToNativeApproval),
         })
     }
 }
@@ -1016,16 +1371,140 @@ mod tests {
         let script_path = dir.path().join("kyris_pretooluse.sh");
         let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
 
+        // The probe verifies against the ACTUAL hooks.json entry, so the test
+        // writes the same shape `ensure_json_command_hook` installs.
+        let hooks = serde_json::json!({
+            "hooks": {"PreToolUse": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": codex_kyris_hook_command(&script_path),
+                    "timeout": CODEX_HOOK_TIMEOUT_SECS
+                }]
+            }]}
+        });
+        write_json_unmanaged(&hooks_path, &hooks).unwrap();
+
         assert!(ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap());
         assert!(!ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap());
         write_codex_config_unmanaged(&config_path, &config).unwrap();
 
-        let key = codex_kyris_hook_key(&hooks_path);
+        let key = codex_kyris_hook_key(&hooks_path, "pre_tool_use");
         assert_eq!(
             config["hooks"]["state"][&key]["trusted_hash"].as_str(),
-            Some(codex_kyris_hook_hash(&script_path).unwrap().as_str())
+            Some(
+                codex_kyris_hook_hash(&script_path, "pre_tool_use")
+                    .unwrap()
+                    .as_str()
+            )
         );
         assert!(codex_kyris_hook_trusted(
+            &config_path,
+            &hooks_path,
+            &script_path
+        ));
+    }
+
+    #[test]
+    fn testCodexHookTrustDetectsUserEditedEntry() {
+        // A user edit to the hooks.json entry (here: adding a timeout) changes
+        // the identity codex hashes → codex marks the hook Modified and stops
+        // running it. The probe must show that as NOT live, not read back
+        // kyris's own constants and stay green.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let hooks_path = dir.path().join("hooks.json");
+        let script_path = dir.path().join("kyris_pretooluse.sh");
+        let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
+
+        let hooks = serde_json::json!({
+            "hooks": {"PreToolUse": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": codex_kyris_hook_command(&script_path),
+                    "timeout": 30
+                }]
+            }]}
+        });
+        write_json_unmanaged(&hooks_path, &hooks).unwrap();
+        ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap();
+        write_codex_config_unmanaged(&config_path, &config).unwrap();
+
+        assert!(!codex_kyris_hook_trusted(
+            &config_path,
+            &hooks_path,
+            &script_path
+        ));
+    }
+
+    #[test]
+    fn testCodexHookTrustFollowsActualGroupIndex() {
+        // kyris's group appended AFTER a pre-existing user group lives at key
+        // `1:0` (codex keys trust by actual group:handler index). Configure
+        // must mint there — the old hardcoded `0:0` left the kyris hook
+        // Untrusted (never run) and clobbered the user's own trust entry
+        // (review Finding 8) — and the probe must agree.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let hooks_path = dir.path().join("hooks.json");
+        let script_path = dir.path().join("kyris_pretooluse.sh");
+        let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
+
+        let hooks = serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "^Bash$", "hooks": [{"type": "command", "command": "/usr/local/bin/my-own-hook"}]},
+                {"matcher": "", "hooks": [{
+                    "type": "command",
+                    "command": codex_kyris_hook_command(&script_path),
+                    "timeout": CODEX_HOOK_TIMEOUT_SECS
+                }]}
+            ]}
+        });
+        write_json_unmanaged(&hooks_path, &hooks).unwrap();
+        ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap();
+        write_codex_config_unmanaged(&config_path, &config).unwrap();
+
+        let key = format!("{}:pre_tool_use:1:0", hooks_path.display());
+        assert!(
+            config["hooks"]["state"][&key]["trusted_hash"].is_str(),
+            "trust must be minted at the entry's actual index"
+        );
+        assert!(codex_kyris_hook_trusted(
+            &config_path,
+            &hooks_path,
+            &script_path
+        ));
+    }
+
+    #[test]
+    fn testCodexHookTrustLegacyZeroZeroKeyIsNotTrusted() {
+        // A legacy install minted the trust entry at the hardcoded `0:0` even
+        // when kyris's group sits at index 1 — codex never ran that hook. The
+        // probe must report it dead (and a reconcile re-mint heals it).
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let hooks_path = dir.path().join("hooks.json");
+        let script_path = dir.path().join("kyris_pretooluse.sh");
+
+        let hooks = serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"matcher": "^Bash$", "hooks": [{"type": "command", "command": "/usr/local/bin/my-own-hook"}]},
+                {"matcher": "", "hooks": [{"type": "command", "command": codex_kyris_hook_command(&script_path)}]}
+            ]}
+        });
+        write_json_unmanaged(&hooks_path, &hooks).unwrap();
+
+        let legacy_key = codex_kyris_hook_key(&hooks_path, "pre_tool_use");
+        let mut config: toml::Value = toml::Value::Table(toml::map::Map::default());
+        ensure_toml_string_path(
+            &mut config,
+            &["hooks", "state", legacy_key.as_str(), "trusted_hash"],
+            &codex_kyris_hook_hash(&script_path, "pre_tool_use").unwrap(),
+        );
+        write_codex_config_unmanaged(&config_path, &config).unwrap();
+
+        assert!(!codex_kyris_hook_trusted(
             &config_path,
             &hooks_path,
             &script_path
@@ -1074,7 +1553,7 @@ trusted_hash = "sha256:other"
         ensure_codex_kyris_hook_trust(&mut config, &hooks_path, &script_path).unwrap();
         assert!(scrub_codex_kyris_hook_trust(&mut config, &config_path));
 
-        let kyris_key = codex_kyris_hook_key(&hooks_path);
+        let kyris_key = codex_kyris_hook_key(&hooks_path, "pre_tool_use");
         assert!(
             config["hooks"]["state"]
                 .as_table()

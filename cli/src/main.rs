@@ -45,6 +45,7 @@ mod mcp_cmd;
 mod operator;
 mod pending;
 mod query;
+mod recent_approvals;
 mod scan;
 mod service;
 mod state;

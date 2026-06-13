@@ -105,7 +105,9 @@ fn test_status_claude_code_burn_control_active_via_shim_without_loader() {
     // wrongly reported as off (fish never sources the loader).
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
-    write_kyrisd_config(home, "127.0.0.1:1");
+    // The probe is value-aware: the env var must point at THIS kyrisd (from
+    // kyrisd.yaml), so the fixture's listen address and env URL must agree.
+    write_kyrisd_config(home, "127.0.0.1:4710");
 
     fs::create_dir_all(home.join(".claude")).expect("create .claude");
     fs::write(home.join(".claude").join("settings.json"), "{}").expect("write settings");
@@ -114,7 +116,7 @@ fn test_status_claude_code_burn_control_active_via_shim_without_loader() {
     fs::create_dir_all(&env_dir).expect("create env dir");
     fs::write(
         env_dir.join("claude-code.sh"),
-        "export ANTHROPIC_BASE_URL=http://127.0.0.1:4710\n",
+        "export ANTHROPIC_BASE_URL='http://127.0.0.1:4710'\n",
     )
     .expect("write claude env");
 
@@ -176,7 +178,9 @@ fn test_status_cline_execution_active_via_hook() {
 fn test_status_claude_code_burn_control_active_with_loader_sourced() {
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
-    write_kyrisd_config(home, "127.0.0.1:1");
+    // Value-aware probe: env URL must equal this kyrisd's base URL. The legacy
+    // unquoted export form (pre-quoting installs) must still be recognized.
+    write_kyrisd_config(home, "127.0.0.1:4710");
 
     fs::create_dir_all(home.join(".claude")).expect("create .claude");
     fs::write(home.join(".claude").join("settings.json"), "{}").expect("write settings");
@@ -199,7 +203,10 @@ fn test_status_claude_code_burn_control_active_with_loader_sourced() {
         .lines()
         .find(|l| l.contains("claude-code") && l.contains("burn:"))
         .expect("claude-code line in status output");
-    assert!(line.contains("proxy"), "expected burn:proxy, got: {line}");
+    assert!(
+        line.contains("burn:proxy"),
+        "expected burn:proxy (observed active), got: {line}"
+    );
 }
 
 #[test]
@@ -287,18 +294,32 @@ fn test_status_detects_claude_via_binary_without_dot_claude_dir() {
 
 #[test]
 fn test_status_warns_about_unwrapped_mcp_servers() {
-    // A wrapped tool surface plus an MCP server added after setup (not routed
+    // A wrapped tool surface plus MCP servers added after setup (not routed
     // through kyris) must surface a drift warning prompting a reconcile.
+    // Servers live in ~/.claude.json — user scope at top level, local scope
+    // under projects.<dir> (claude mcp add's default) — NOT settings.json
+    // (review Finding 7); both scopes must be seen.
     let temp_home = TempDir::new().expect("temp home");
     let home = temp_home.path();
     write_kyrisd_config(home, "127.0.0.1:1");
 
     fs::create_dir_all(home.join(".claude")).expect("create .claude");
+    fs::write(home.join(".claude").join("settings.json"), "{}").expect("write settings");
     fs::write(
-        home.join(".claude").join("settings.json"),
-        r#"{"mcpServers":{"wrapped":{"command":"kyris-mcp","args":["wrap"]},"added-later":{"command":"npx","args":["-y","srv"]}}}"#,
+        home.join(".claude.json"),
+        r#"{
+          "mcpServers": {
+            "wrapped": {"command": "kyris-mcp", "args": ["wrap"]},
+            "added-later": {"type": "stdio", "command": "npx", "args": ["-y", "srv"]}
+          },
+          "projects": {
+            "/Users/someone/proj": {
+              "mcpServers": {"local-scope-srv": {"type": "stdio", "command": "uvx", "args": ["x"]}}
+            }
+          }
+        }"#,
     )
-    .expect("write settings");
+    .expect("write user config");
 
     let output = run_status(home, None);
     assert!(output.status.success());
@@ -306,6 +327,10 @@ fn test_status_warns_about_unwrapped_mcp_servers() {
     assert!(
         stdout.contains("added-later") && stdout.contains("not routed through kyris"),
         "expected unwrapped-server drift warning, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("local-scope-srv"),
+        "local-scope (projects.*) servers must be seen too, got: {stdout}"
     );
 }
 

@@ -41,12 +41,21 @@ pub use agentpact_types::Mode;
 /// own ancestor chain so the daemon can find the token the native hook
 /// anchored to the agent.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_hook_permission_request(
     request_id_prefix: &str,
     action: &str,
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    // Declared agent identity in canonical `vendor/name` form. The value is
+    // install-time-owned (written into the agent's hook config by `kyris
+    // agents setup`, surfaced here via the hook's `--agent` flag), so the
+    // daemon can attribute exactly without enumerating install layouts;
+    // agentpactd validates it against caller→agent ancestry and cross-checks
+    // lineage. None for callers with no installed identity (the shell gate),
+    // which attribute via lineage as before.
+    declared_agent: Option<&str>,
     anchor_pid: Option<u32>,
     ppid_chain: Option<&[u32]>,
 ) -> serde_json::Value {
@@ -63,6 +72,9 @@ pub fn build_hook_permission_request(
     });
     if let Some(pid) = seed_boundary_pid {
         request["seed_boundary_pid"] = serde_json::json!(pid);
+    }
+    if let Some(agent) = declared_agent {
+        request["agent"] = serde_json::json!(agent);
     }
     if let Some(pid) = anchor_pid {
         request["anchor_pid"] = serde_json::json!(pid);
@@ -102,13 +114,17 @@ pub fn build_mcp_permission_request(
     if let Some(d) = mcp_ctx.annotations.destructive_hint {
         context["destructive_hint"] = serde_json::json!(d);
     }
-    serde_json::json!({
+    let mut request = serde_json::json!({
         "id": format!("{request_id_prefix}-{}", uuid::Uuid::now_v7()),
         "method": "permission.request",
         "action": "call",
         "detail": tool_name,
         "context": context,
-    })
+    });
+    if let Some(ref agent) = mcp_ctx.declared_agent {
+        request["agent"] = serde_json::json!(agent);
+    }
+    request
 }
 
 /// Builds a `permission.respond` to deliver a user decision back to agentpactd.
@@ -331,9 +347,16 @@ pub fn request_hook_permission(
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    declared_agent: Option<&str>,
     anchor_pid: Option<u32>,
     ppid_chain: Option<&[u32]>,
     command_group: Option<(&str, &str)>,
+    // How long the caller's approval hold can keep an `Ask` open, in seconds.
+    // Sized from the caller's poll window (plus margin) so the approval token
+    // outlives the hold — without it the daemon's default TTL expires the
+    // token mid-wait on long windows (codex holds for days). `None` keeps the
+    // daemon default; the daemon clamps oversized requests.
+    approval_ttl_secs: Option<u64>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     if let Some(deny) = oversized_execute_deny(action, detail) {
@@ -345,6 +368,7 @@ pub fn request_hook_permission(
         detail,
         working_dir,
         seed_boundary_pid,
+        declared_agent,
         anchor_pid,
         ppid_chain,
     );
@@ -354,6 +378,9 @@ pub fn request_hook_permission(
     if let Some((group, original)) = command_group {
         request["command_group"] = serde_json::json!(group);
         request["original_command"] = serde_json::json!(original);
+    }
+    if let Some(ttl) = approval_ttl_secs {
+        request["approval_ttl_secs"] = serde_json::json!(ttl);
     }
     send_daemon_request_with_retry(socket_path, &request, socket_timeout).map(|response| {
         let decision = parse_mcp_permission_response(&response);
@@ -395,6 +422,7 @@ pub fn send_command_commit(socket_path: &str, command_group: &str, socket_timeou
 ///
 /// Returns an error when `agentpactd` is unreachable or returns a
 /// malformed response.
+#[allow(clippy::too_many_arguments)]
 pub fn request_hook_permission_preview(
     socket_path: &str,
     request_id_prefix: &str,
@@ -402,6 +430,7 @@ pub fn request_hook_permission_preview(
     detail: &str,
     working_dir: Option<&str>,
     seed_boundary_pid: Option<u32>,
+    declared_agent: Option<&str>,
     socket_timeout: Duration,
 ) -> Result<(McpPermissionDecision, Option<Vec<String>>), String> {
     if let Some(deny) = oversized_execute_deny(action, detail) {
@@ -409,13 +438,16 @@ pub fn request_hook_permission_preview(
     }
     // Preview is strictly side-effect-free: it never mints or consumes
     // exec_tokens, so anchor_pid and ppid_chain would do nothing here and
-    // are intentionally omitted from the preview API.
+    // are intentionally omitted from the preview API. The declared agent IS
+    // passed so the preview evaluates agent-scoped policy the same way the
+    // real request will.
     let mut request = build_hook_permission_request(
         request_id_prefix,
         action,
         detail,
         working_dir,
         seed_boundary_pid,
+        declared_agent,
         None,
         None,
     );
@@ -932,6 +964,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Duration::from_millis(50),
         );
         match result {
@@ -959,6 +993,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Duration::from_millis(50),
         );
         assert!(
@@ -977,6 +1013,8 @@ mod tests {
             "test",
             "read",
             &big,
+            None,
+            None,
             None,
             None,
             None,
@@ -1114,11 +1152,13 @@ mod tests {
                     read_only_hint: Some(true),
                     destructive_hint: None,
                 },
+                declared_agent: Some("anthropic/claude-code".to_string()),
             },
         );
         assert_eq!(request["method"], "permission.request");
         assert_eq!(request["action"], "call");
         assert_eq!(request["detail"], "read_file");
+        assert_eq!(request["agent"], "anthropic/claude-code");
         assert_eq!(request["context"]["mcp_server"], "github");
         assert_eq!(request["context"]["working_dir"], "/tmp/repo");
         assert_eq!(request["context"]["mcp_operation"], "tools/call");
@@ -1141,8 +1181,10 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(request["method"], "permission.request");
+        assert!(request["agent"].is_null());
         assert_eq!(request["action"], "execute");
         assert_eq!(request["detail"], "ls -la");
         assert_eq!(request["context"]["working_dir"], "/tmp/repo");
@@ -1159,8 +1201,16 @@ mod tests {
 
     #[test]
     fn testBuildHookPermissionRequestNoWorkingDir() {
-        let request =
-            build_hook_permission_request("kyris-hook", "call", "unknown", None, None, None, None);
+        let request = build_hook_permission_request(
+            "kyris-hook",
+            "call",
+            "unknown",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(request["action"], "call");
         assert!(request["context"]["working_dir"].is_null());
     }
@@ -1173,10 +1223,12 @@ mod tests {
             "git status",
             Some("/tmp"),
             Some(12345),
+            Some("google/gemini-cli"),
             None,
             None,
         );
         assert_eq!(request["seed_boundary_pid"], 12345);
+        assert_eq!(request["agent"], "google/gemini-cli");
     }
 
     #[test]
@@ -1189,6 +1241,7 @@ mod tests {
             "execute",
             "git status",
             Some("/tmp"),
+            None,
             None,
             Some(54321),
             None,
@@ -1208,6 +1261,7 @@ mod tests {
             Some("/tmp"),
             None,
             None,
+            None,
             Some(&[9999, 5678, 4321]),
         );
         assert_eq!(request["ppid_chain"][0], 9999);
@@ -1224,6 +1278,7 @@ mod tests {
             "kyris-hook",
             "execute",
             "ls",
+            None,
             None,
             None,
             None,

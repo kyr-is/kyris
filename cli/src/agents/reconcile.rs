@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::lifecycle::log::InstallLog;
 use crate::state::{agents_dir, load_agent_profile, save_agent_profile};
 
-use super::profile::{AgentProfile, CapLevel, NativeEvidence, SurfaceState};
+use super::profile::{AgentProfile, CapLevel, NativeEvidence, SurfaceEvidence, SurfaceState};
 use super::registry::{self, AgentDescriptor};
 
 fn was_configured(agent_id: &str) -> bool {
@@ -62,6 +62,19 @@ fn collect_native_evidence(agent: &dyn AgentDescriptor) -> NativeEvidence {
         evidence.burn_control = check_native_breadcrumb(agent.id());
     }
     evidence
+}
+
+/// Read the `.live-seen` breadcrumbs (recorded by `kyris hook check`,
+/// `kyris-mcp wrap`, and kyrisd when an adapted surface actually works) into a
+/// per-surface snapshot. Unlike native evidence this is read wholesale, never
+/// merged — the breadcrumbs themselves are the durable store.
+fn collect_live_evidence(agent_id: &str) -> SurfaceEvidence {
+    use kyris_core::live_evidence as live;
+    SurfaceEvidence {
+        execution: live::last_seen(agent_id, live::SURFACE_EXECUTION),
+        tool: live::last_seen(agent_id, live::SURFACE_TOOL),
+        burn_control: live::last_seen(agent_id, live::SURFACE_BURN_CONTROL),
+    }
 }
 
 fn promote_surface<M>(
@@ -167,6 +180,7 @@ fn status_snapshot_agent(agent: &dyn AgentDescriptor) -> Result<AgentProfile, St
         profile.burn_control = probe.burn_control;
     }
     profile.managed_files = probe.managed_files;
+    profile.live_evidence = collect_live_evidence(agent.id());
     Ok(profile)
 }
 
@@ -253,6 +267,16 @@ fn reconcile_agent(
             needs_repair = true;
             break;
         }
+    }
+    // MCP drift repair: a server ADDED after setup is invisible to the marker
+    // check above (the file still carries kyris content vouching for its hash
+    // drift), but it runs ungoverned until wrapped. Configure is idempotent,
+    // so re-running it to wrap the newcomer is safe.
+    if !needs_repair
+        && was_configured(agent.id())
+        && !super::configure::unwrapped_mcp_server_names(agent).is_empty()
+    {
+        needs_repair = true;
     }
 
     if needs_repair {
@@ -347,6 +371,7 @@ fn reconcile_agent(
     }
 
     profile.managed_files = probe.managed_files;
+    profile.live_evidence = collect_live_evidence(agent.id());
     profile.last_reconciled = Some(Utc::now());
     save_agent_profile(&profile)?;
     Ok(profile)

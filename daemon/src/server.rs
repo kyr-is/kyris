@@ -982,13 +982,22 @@ struct HoldRequest {
     agent: String,
     /// Whether the popup may offer "Always".
     allow_always: bool,
+    /// Caller-sized lifetime for this pending entry, in seconds — the
+    /// holder's own poll window plus margin, so the dialog outlives the
+    /// wait instead of timing out mid-poll on long windows (codex's hook
+    /// holds for days). Absent → the `mcp.pending_timeout_seconds` config
+    /// default (older callers).
+    #[serde(default)]
+    ttl_seconds: Option<u64>,
 }
 
 async fn hold_pending(
     State(state): State<Arc<AppState>>,
     Json(body): Json<HoldRequest>,
 ) -> StatusCode {
-    let pending_timeout = state.config.load().mcp.pending_timeout_seconds;
+    let pending_timeout = body
+        .ttl_seconds
+        .unwrap_or_else(|| state.config.load().mcp.pending_timeout_seconds);
     let pending = state.pending.clone();
     let timeout_id = body.id.clone();
 

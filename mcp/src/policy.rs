@@ -59,12 +59,14 @@ fn send_permission_request_with_socket(
     tool_name: &str,
     mcp_operation: Option<&str>,
     annotations: &ToolAnnotations,
+    declared_agent: Option<&str>,
     socket_timeout: std::time::Duration,
 ) -> Result<(PermissionRequestOutcome, String), String> {
     let mcp_ctx = McpContext {
         working_dir: current_working_dir(),
         mcp_operation: mcp_operation.map(str::to_owned),
         annotations: annotations.clone(),
+        declared_agent: declared_agent.map(str::to_owned),
     };
     pact_client::request_mcp_tool_permission_with_id(
         sock_path,
@@ -140,12 +142,14 @@ fn prompt_user_tty(server_name: &str, tool_name: &str, allow_always: bool) -> Us
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn check_permission(
     server_name: &str,
     tool_name: &str,
     has_tty: bool,
     mcp_operation: Option<&str>,
     annotations: &ToolAnnotations,
+    declared_agent: Option<&str>,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
     let sock_path = agentpact_socket_path();
@@ -155,18 +159,21 @@ pub async fn check_permission(
         has_tty,
         mcp_operation,
         annotations,
+        declared_agent,
         &sock_path,
         socket_timeout,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn check_permission_with_socket(
     server_name: &str,
     tool_name: &str,
     has_tty: bool,
     mcp_operation: Option<&str>,
     annotations: &ToolAnnotations,
+    declared_agent: Option<&str>,
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
@@ -185,6 +192,7 @@ pub async fn check_permission_with_socket(
     let timeout = socket_timeout;
     let operation = mcp_operation.map(str::to_owned);
     let ann = annotations.clone();
+    let declared = declared_agent.map(str::to_owned);
 
     let outcome = tokio::task::spawn_blocking(move || {
         send_permission_request_with_socket(
@@ -193,6 +201,7 @@ pub async fn check_permission_with_socket(
             &tool,
             operation.as_deref(),
             &ann,
+            declared.as_deref(),
             timeout,
         )
     })
@@ -406,9 +415,11 @@ mod tests {
                     read_only_hint: Some(true),
                     destructive_hint: None,
                 },
+                declared_agent: Some("cline/cline".to_string()),
             },
         );
         assert_eq!(req["method"], "permission.request");
+        assert_eq!(req["agent"], "cline/cline");
         assert_eq!(req["action"], "call");
         assert_eq!(req["detail"], "read_file");
         assert_eq!(req["context"]["mcp_server"], "github");
@@ -531,6 +542,7 @@ mod tests {
             false,
             Some("tools/call"),
             &ToolAnnotations::default(),
+            None,
             &socket_path_string(&socket_path),
             std::time::Duration::from_millis(500),
         )
@@ -577,6 +589,7 @@ mod tests {
             true,
             Some("tools/call"),
             &ToolAnnotations::default(),
+            None,
             "/nonexistent/path.sock",
             std::time::Duration::from_millis(100),
         )
@@ -609,6 +622,7 @@ mod tests {
             false,
             Some("tools/call"),
             &ToolAnnotations::default(),
+            None,
             &socket_path_string(&socket_path),
             std::time::Duration::from_millis(500),
         )
@@ -639,6 +653,7 @@ mod tests {
             true,
             Some("tools/call"),
             &ToolAnnotations::default(),
+            None,
             &socket_path_string(&socket_path),
             std::time::Duration::from_millis(500),
         )

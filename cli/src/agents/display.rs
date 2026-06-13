@@ -127,15 +127,23 @@ pub fn print_detail(descriptor: &dyn AgentDescriptor, profile: &AgentProfile) {
     }
     println!(
         "  command control:   {}",
-        format_control_line(&profile.execution, plan.execution)
+        format_control_line(
+            &profile.execution,
+            plan.execution,
+            profile.live_evidence.execution
+        )
     );
     println!(
         "  mcp control:       {}",
-        format_control_line(&profile.tool, plan.tool)
+        format_control_line(&profile.tool, plan.tool, profile.live_evidence.tool)
     );
     println!(
         "  burn control:      {}",
-        format_control_line(&profile.burn_control, plan.burn_control)
+        format_control_line(
+            &profile.burn_control,
+            plan.burn_control,
+            profile.live_evidence.burn_control
+        )
     );
     if !profile.agent_specific.is_empty() {
         let mut pairs: Vec<_> = profile.agent_specific.iter().collect();
@@ -166,9 +174,14 @@ pub fn print_detail(descriptor: &dyn AgentDescriptor, profile: &AgentProfile) {
     }
 }
 
+/// `live` is the surface's last `.live-seen` breadcrumb. Only an ADAPTED
+/// surface gets the annotation: "configured" is a filesystem claim, "live" is
+/// observed behavior — the distinction the agent-interface review's fourth gap
+/// called for (probes alone over-claim on artifact existence).
 fn format_control_line<M: MechanismLabel>(
     state: &SurfaceState<M>,
     plan: SurfaceIntegration<M>,
+    live: Option<chrono::DateTime<Utc>>,
 ) -> String {
     let planned = plan_label(plan);
     if state.not_applicable {
@@ -182,14 +195,30 @@ fn format_control_line<M: MechanismLabel>(
                 Some(mech) => format!("active via {}", mech.detail()),
                 None => "active".to_string(),
             };
-            if state.is_compiled_only() {
+            let via = if state.is_compiled_only() {
                 format!("{via} (compiled-only, no in-band mediation)")
             } else {
                 via
+            };
+            match live {
+                Some(ts) => format!("{via}, live {}", format_age(ts)),
+                None => format!("{via}, not yet observed live"),
             }
         }
     };
     format!("{observed} (plan: {planned})")
+}
+
+/// Compact "Xm/Xh/Xd ago" for live-evidence timestamps.
+fn format_age(ts: chrono::DateTime<Utc>) -> String {
+    let mins = (Utc::now() - ts).num_minutes().max(0);
+    if mins < 60 {
+        format!("{mins}m ago")
+    } else if mins < 48 * 60 {
+        format!("{}h ago", mins / 60)
+    } else {
+        format!("{}d ago", mins / (24 * 60))
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +231,7 @@ mod tests {
         let line = format_control_line(
             &SurfaceState::<ExecutionMechanism>::none(),
             SurfaceIntegration::AgentPactNative,
+            None,
         );
 
         assert_eq!(line, "- (plan: native)");
@@ -209,12 +239,26 @@ mod tests {
 
     #[test]
     fn testFormatControlLineShowsObservedAndAdaptedPlan() {
+        // Adapted-without-live-evidence must say so — "configured" is a
+        // filesystem claim, not proof the surface works (fourth-gap honesty).
         let line = format_control_line(
             &SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter),
             SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+            None,
         );
 
-        assert_eq!(line, "active via hook (plan: hook)");
+        assert_eq!(line, "active via hook, not yet observed live (plan: hook)");
+    }
+
+    #[test]
+    fn testFormatControlLineShowsLiveEvidenceAge() {
+        let line = format_control_line(
+            &SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter),
+            SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+            Some(Utc::now() - chrono::Duration::minutes(5)),
+        );
+
+        assert_eq!(line, "active via hook, live 5m ago (plan: hook)");
     }
 
     #[test]

@@ -68,6 +68,14 @@ pub struct McpContext {
     pub working_dir: Option<String>,
     pub mcp_operation: Option<String>,
     pub annotations: ToolAnnotations,
+    /// Declared agent identity (canonical `vendor/name`) for the agent whose
+    /// tool call is being mediated. Both MCP surfaces hold it with certainty —
+    /// kyrisd's HTTP routing from the `x-kyris-agent-id` header its own
+    /// rewrite stamped, the stdio wrap from its kyris-written `--agent` flag —
+    /// whereas agentpactd's process-tree attribution would resolve the
+    /// MEDIATOR (kyrisd / kyris-mcp), not the agent. None for pre-upgrade
+    /// wraps and direct use.
+    pub declared_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

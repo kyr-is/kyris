@@ -195,15 +195,19 @@ args = ["-y", "server"]
         "burn-control changes should be kept, got: {config_content}"
     );
 
-    // Codex does not use a PATH shim; kyris marks governed subprocesses
-    // through Codex's shell environment policy instead.
+    // Codex marks its exec-tool children through shell_environment_policy …
     assert!(
         config_content.contains("KYRIS_GOVERNED_SUBPROCESS"),
         "Codex shell-environment marker should be kept, got: {config_content}"
     );
+    // … and ALSO gets the PATH shim: shell_environment_policy covers exec
+    // children only, so the shim is the sole mechanism that marks codex's
+    // HOOK children (the kyris hook spawn itself) as governed. Without it
+    // the shell gate treated the hook spawn as a bare terminal and prompted
+    // on the agent's own TTY (the codex composer-garbage bug).
     assert!(
-        !home.join(".kyris").join("bin").join("codex").exists(),
-        "Codex setup should not install a PATH shim"
+        home.join(".kyris").join("bin").join("codex").exists(),
+        "Codex setup should install the PATH shim"
     );
 
     // Original MCP server is still present (kyris wraps it, not replaces it).

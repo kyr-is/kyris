@@ -7,10 +7,16 @@ pub fn derive(action: Action, attribution_method: AttributionMethod, mode: &str)
     match action {
         Action::Think => CoverageState::Observed,
         Action::Execute | Action::Call | Action::Read | Action::Write => match attribution_method {
-            AttributionMethod::Boundary | AttributionMethod::Lineage if mode == "enforce" => {
+            AttributionMethod::Boundary
+            | AttributionMethod::Lineage
+            | AttributionMethod::Declared
+                if mode == "enforce" =>
+            {
                 CoverageState::Enforced
             }
-            AttributionMethod::Boundary | AttributionMethod::Lineage => CoverageState::Observed,
+            AttributionMethod::Boundary
+            | AttributionMethod::Lineage
+            | AttributionMethod::Declared => CoverageState::Observed,
             AttributionMethod::Unknown => CoverageState::Unknown,
         },
         Action::Unknown => CoverageState::Unknown,
@@ -25,8 +31,8 @@ pub fn derive_for_event(event: &mut Event) {
 pub fn sql_expr() -> &'static str {
     "CASE \
        WHEN action = 'think' THEN 'observed' \
-       WHEN attribution_method IN ('boundary', 'lineage') AND mode = 'enforce' THEN 'enforced' \
-       WHEN attribution_method IN ('boundary', 'lineage') THEN 'observed' \
+       WHEN attribution_method IN ('boundary', 'lineage', 'declared') AND mode = 'enforce' THEN 'enforced' \
+       WHEN attribution_method IN ('boundary', 'lineage', 'declared') THEN 'observed' \
        ELSE 'unknown' \
      END"
 }

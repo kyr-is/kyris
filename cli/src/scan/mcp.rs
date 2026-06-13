@@ -8,31 +8,30 @@ pub fn scan() -> Vec<Finding> {
     let mut findings = Vec::new();
 
     for agent in registry::all_agents() {
-        let Some(mcp) = agent.mcp_config() else {
-            continue;
-        };
-        if !mcp.path.exists() {
-            continue;
-        }
-        let path_str = mcp.path.to_string_lossy().to_string();
-        match mcp.format {
-            McpConfigFormat::Json { servers_path } => {
-                scan_json_mcp_servers(
-                    &path_str,
-                    &servers_path,
-                    agent.id(),
-                    agent.display_name(),
-                    &mut findings,
-                );
+        for mcp in agent.mcp_configs() {
+            if !mcp.path.exists() {
+                continue;
             }
-            McpConfigFormat::Toml { servers_key } => {
-                scan_toml_mcp_servers(
-                    &path_str,
-                    servers_key,
-                    agent.id(),
-                    agent.display_name(),
-                    &mut findings,
-                );
+            let path_str = mcp.path.to_string_lossy().to_string();
+            match mcp.format {
+                McpConfigFormat::Json { servers_path } => {
+                    scan_json_mcp_servers(
+                        &path_str,
+                        &servers_path,
+                        agent.id(),
+                        agent.display_name(),
+                        &mut findings,
+                    );
+                }
+                McpConfigFormat::Toml { servers_key } => {
+                    scan_toml_mcp_servers(
+                        &path_str,
+                        servers_key,
+                        agent.id(),
+                        agent.display_name(),
+                        &mut findings,
+                    );
+                }
             }
         }
     }
@@ -50,7 +49,7 @@ fn is_routed_url(url: &str) -> bool {
 
 fn scan_json_mcp_servers(
     config_path: &str,
-    servers_path: &[&str],
+    servers_path: &[String],
     agent_id: &str,
     agent_name: &str,
     findings: &mut Vec<Finding>,
@@ -64,13 +63,15 @@ fn scan_json_mcp_servers(
 
     let mut cursor = Some(&parsed);
     for key in servers_path {
-        cursor = cursor.and_then(|v| v.get(*key));
+        cursor = cursor.and_then(|v| v.get(key));
     }
     let Some(servers) = cursor.and_then(|v| v.as_object()) else {
         return;
     };
 
     for (name, config) in servers {
+        // Read through cline's `transport` nesting (no-op for flat shapes).
+        let config = crate::agents::configure::json_mcp_fields(config);
         let cmd_str = config.get("command").and_then(|v| v.as_str());
         let cmd_array_first = config
             .get("command")
@@ -198,7 +199,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "claude-code",
             "Claude Code",
             &mut findings,
@@ -222,7 +223,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "claude-code",
             "Claude Code",
             &mut findings,
@@ -243,7 +244,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "cline",
             "Cline",
             &mut findings,
@@ -266,7 +267,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "cline",
             "Cline",
             &mut findings,
@@ -283,7 +284,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "claude-code",
             "Claude Code",
             &mut findings,
@@ -296,7 +297,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             "/nonexistent/settings.json",
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "claude-code",
             "Claude Code",
             &mut findings,
@@ -317,7 +318,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcp"],
+            &["mcp".to_string()],
             "opencode",
             "OpenCode",
             &mut findings,
@@ -339,7 +340,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcp"],
+            &["mcp".to_string()],
             "opencode",
             "OpenCode",
             &mut findings,
@@ -362,7 +363,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcp"],
+            &["mcp".to_string()],
             "opencode",
             "OpenCode",
             &mut findings,
@@ -388,7 +389,7 @@ mod tests {
         let mut findings = Vec::new();
         scan_json_mcp_servers(
             path.to_str().unwrap(),
-            &["mcpServers"],
+            &["mcpServers".to_string()],
             "test-agent",
             "Test",
             &mut findings,

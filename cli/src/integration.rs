@@ -103,10 +103,33 @@ pub fn ensure_json_command_hook(
         .or_insert_with(|| Value::Array(Vec::new()));
     let hooks_array = as_json_array(phase_hooks);
 
-    let already_present = hooks_array
-        .iter()
-        .any(|entry| entry_has_command(entry, command));
-    if already_present {
+    // Already registered: still reconcile the per-hook `timeout` — it derives
+    // from the agent's declared HookRuntime, and a declaration change must
+    // reach existing installs (the approval poll window moves with it; a stale
+    // shorter timeout would kill the hook mid-approval).
+    if let Some(existing) = hooks_array
+        .iter_mut()
+        .find(|entry| entry_has_command(entry, command))
+    {
+        let Some(t) = timeout else { return false };
+        let handler = if nested {
+            existing
+                .get_mut("hooks")
+                .and_then(Value::as_array_mut)
+                .and_then(|handlers| {
+                    handlers
+                        .iter_mut()
+                        .find(|h| h.get("command").and_then(Value::as_str) == Some(command))
+                })
+        } else {
+            Some(existing)
+        };
+        if let Some(handler) = handler
+            && handler.get("timeout").and_then(Value::as_i64) != Some(t)
+        {
+            handler["timeout"] = json!(t);
+            return true;
+        }
         return false;
     }
 

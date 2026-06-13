@@ -27,6 +27,7 @@ pub mod coverage;
 #[path = "enrollment.rs"]
 pub mod credentials;
 pub mod fail_open_log;
+pub mod live_evidence;
 pub mod path_display;
 pub mod paths;
 #[cfg(feature = "pending")]

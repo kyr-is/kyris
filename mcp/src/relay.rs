@@ -20,6 +20,7 @@ type SharedStdout = std::sync::Arc<tokio::sync::Mutex<tokio::io::Stdout>>;
 
 pub async fn run_wrapper(
     server_name: &str,
+    agent_id: Option<&str>,
     cmd: &str,
     args: &[String],
     has_tty: bool,
@@ -46,6 +47,7 @@ pub async fn run_wrapper(
         child_stdin,
         stdout.clone(),
         server_name_owned.clone(),
+        agent_id.map(str::to_string),
         has_tty,
         socket_timeout,
         annotation_cache.clone(),
@@ -335,11 +337,13 @@ fn normalize(msg: &[u8]) -> Vec<u8> {
 ///
 /// The policy task may block on `PACT_ASK` while the reader keeps draining
 /// stdin and forwarding notifications/pings in real time.
+#[allow(clippy::too_many_arguments)]
 async fn relay_agent_to_server(
     stdin: tokio::io::Stdin,
     child_stdin: tokio::process::ChildStdin,
     stdout: SharedStdout,
     server_name: String,
+    agent_id: Option<String>,
     has_tty: bool,
     socket_timeout: std::time::Duration,
     annotation_cache: AnnotationCache,
@@ -358,6 +362,7 @@ async fn relay_agent_to_server(
         child_tx.clone(),
         stdout,
         server_name,
+        agent_id,
         has_tty,
         socket_timeout,
         annotation_cache,
@@ -414,11 +419,13 @@ async fn child_writer_task(
 /// the message to `child_stdin` (via `child_tx`) or sends a JSON-RPC error to
 /// stdout. Non-governed traffic flows through `child_tx` unimpeded while this
 /// task is blocked on a policy check.
+#[allow(clippy::too_many_arguments)]
 async fn policy_check_task(
     mut tool_rx: tokio::sync::mpsc::Receiver<(Vec<u8>, serde_json::Value)>,
     child_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     stdout: SharedStdout,
     server_name: String,
+    agent_id: Option<String>,
     has_tty: bool,
     socket_timeout: std::time::Duration,
     annotation_cache: AnnotationCache,
@@ -432,15 +439,26 @@ async fn policy_check_task(
             .cloned()
             .unwrap_or_default();
 
+        // `--agent` (kyris-stamped, canonical form) doubles as the declared
+        // attribution identity: agentpactd's process-tree resolution would
+        // see this wrapper, not the agent that spawned it.
         let decision = policy::check_permission(
             &server_name,
             &tool_name,
             has_tty,
             Some("tools/call"),
             &annotations,
+            agent_id.as_deref(),
             socket_timeout,
         )
         .await;
+
+        // A mediated tools/call (whatever the verdict) proves the agent's
+        // adapted tool surface live; `--agent` is stamped into the wrap args by
+        // the kyris MCP rewrite. Absent for pre-upgrade wraps and direct use.
+        if let Some(agent) = agent_id.as_deref() {
+            kyris_core::live_evidence::record(agent, kyris_core::live_evidence::SURFACE_TOOL);
+        }
 
         match decision {
             PactDecision::Allow => {

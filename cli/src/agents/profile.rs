@@ -47,8 +47,12 @@ pub struct ManagedFileFingerprint {
     pub content_hash: String,
 }
 
+/// Per-surface observation timestamps. Used with two distinct meanings:
+/// `native_evidence` (the agent spoke the native `AgentPact` protocol — drives
+/// surface promotion) and `live_evidence` (the ADAPTED surface was observed
+/// working end-to-end — upgrades "configured" to "verified live" in status).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct NativeEvidence {
+pub struct SurfaceEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +60,9 @@ pub struct NativeEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub burn_control: Option<DateTime<Utc>>,
 }
+
+/// The promotion-driving evidence kind keeps its semantic name at use sites.
+pub type NativeEvidence = SurfaceEvidence;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentProfile {
@@ -72,6 +79,11 @@ pub struct AgentProfile {
     pub last_native_seen: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "is_native_evidence_empty")]
     pub native_evidence: NativeEvidence,
+    /// When each ADAPTED surface was last observed working live (from the
+    /// `.live-seen` breadcrumbs the surface components record). Snapshot data:
+    /// refreshed wholesale from disk on every status/reconcile, never merged.
+    #[serde(default, skip_serializing_if = "is_native_evidence_empty")]
+    pub live_evidence: SurfaceEvidence,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub agent_specific: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -81,7 +93,7 @@ pub struct AgentProfile {
     pub version: u32,
 }
 
-fn is_native_evidence_empty(ev: &NativeEvidence) -> bool {
+fn is_native_evidence_empty(ev: &SurfaceEvidence) -> bool {
     ev.execution.is_none() && ev.tool.is_none() && ev.burn_control.is_none()
 }
 
@@ -145,6 +157,7 @@ impl AgentProfile {
             last_reconciled: None,
             last_native_seen: None,
             native_evidence: NativeEvidence::default(),
+            live_evidence: SurfaceEvidence::default(),
             agent_specific: HashMap::new(),
             compilation_gaps: Vec::new(),
             disabled: false,
@@ -162,7 +175,7 @@ impl AgentProfile {
     }
 }
 
-impl NativeEvidence {
+impl SurfaceEvidence {
     pub fn merge_missing_from(&mut self, other: Self) -> bool {
         let mut changed = false;
         if self.execution.is_none() && other.execution.is_some() {
@@ -215,6 +228,11 @@ mod tests {
                 tool: None,
                 burn_control: Some(Utc::now()),
             },
+            live_evidence: SurfaceEvidence {
+                execution: Some(Utc::now()),
+                tool: None,
+                burn_control: None,
+            },
             agent_specific: HashMap::from([("max-budget-usd".to_string(), "50".to_string())]),
             compilation_gaps: Vec::new(),
             disabled: false,
@@ -235,6 +253,8 @@ mod tests {
         assert!(restored.last_native_seen.is_none());
         assert!(restored.native_evidence.burn_control.is_some());
         assert!(restored.native_evidence.execution.is_none());
+        assert!(restored.live_evidence.execution.is_some());
+        assert!(restored.live_evidence.tool.is_none());
         assert_eq!(restored.agent_specific.get("max-budget-usd").unwrap(), "50");
         assert_eq!(restored.version, 1);
     }

@@ -577,6 +577,33 @@ pub fn restore_manifest_entry(path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Restore EVERY manifest entry recorded under `component`, regardless of
+/// path. The recovery path for dynamically-enumerated config locations
+/// (Claude Code's cwd-dependent `.mcp.json`, per-project scopes): undo must
+/// invert what setup actually RECORDED, not what a re-enumeration from a
+/// different cwd happens to find. Returns the restored paths, in recorded
+/// order.
+pub fn restore_manifest_component(component: &str) -> Result<Vec<PathBuf>, String> {
+    let entries = load_manifest()?;
+    let (matching, remaining): (Vec<ManifestEntry>, Vec<ManifestEntry>) =
+        entries.into_iter().partition(|e| e.component == component);
+    if matching.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut restored = Vec::new();
+    for entry in &matching {
+        unapply_entry(entry)?;
+        restored.push(PathBuf::from(&entry.path));
+    }
+    if remaining.is_empty() {
+        remove_if_exists(&manifest_path()?)?;
+    } else {
+        save_manifest(&remaining)?;
+    }
+    cleanup_kyris_dirs()?;
+    Ok(restored)
+}
+
 /// Unapply and remove the manifest entry for one component on `path`.
 /// Returns `Ok(true)` if a matching entry was found.
 pub fn restore_manifest_entry_component(path: &Path, component: &str) -> Result<bool, String> {

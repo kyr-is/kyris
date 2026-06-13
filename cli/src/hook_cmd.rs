@@ -15,7 +15,9 @@ use std::io::Read as _;
 use kyris_agentpact_client::{self as pact_client, ApprovalResponse, McpPermissionDecision};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
 
-use crate::agents::registry::{self, AllowResponse, DetailPassThrough, HookProtocol, ToolMapping};
+use crate::agents::registry::{
+    self, AllowResponse, ApprovalMode, AskResponse, HookProtocol, ToolMapping,
+};
 
 #[derive(Args)]
 pub struct HookArgs {
@@ -116,6 +118,8 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
         &args.cmd,
         cwd,
         None,
+        // The shell gate carries no installed identity — never declare one.
+        None,
         socket_timeout,
     ) {
         Ok(pair) => pair,
@@ -151,6 +155,17 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
         sock_path: &sock_path,
         socket_timeout,
         started_at: std::time::Instant::now(),
+        // The human at the terminal is the backstop, and no agent hook
+        // deadline races the shell gate.
+        native_backstop: true,
+        allow_suppresses_agent_prompt: false,
+        poll_deadline: kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
+        log_mode_fallback: false,
+        has_permission_request: false,
+        // The shell gate is not an agent: it prompts inline on the TTY or via
+        // kyris's popup — there is no agent native prompt to defer to.
+        approval_mode: ApprovalMode::KyrisPopup,
+        native_ask: None,
     };
 
     // Open the controlling terminal once. Present → prompt inline; absent
@@ -158,29 +173,45 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     // popup, exactly as the no-TTY `kyris hook hold` path does today.
     let tty = open_tty();
 
+    // When this gate runs INSIDE a governed agent (codex/claude/gemini each set
+    // a per-agent marker on the commands they spawn), that agent's OWN hook
+    // already gated this command on its single approval surface — its TUI in
+    // native mode, its popup otherwise. Defer an ask to it rather than opening a
+    // SECOND surface for the same command. A deny still blocks below; auto runs
+    // silently. Only the bare terminal (no agent) prompts here.
+    let host_agent = inside_governed_agent();
+
     let result = run_segments(
         &segs,
-        |seg| classify_segment(&ctx, None, seg, command_group),
-        |approval_id, approval_token, seg, allow_always| match tty.as_ref() {
-            Some(tty) => tty_prompt_segment(
-                tty,
-                &sock_path,
-                socket_timeout,
-                approval_id,
-                approval_token,
-                seg,
-                allow_always,
-            ),
-            None => poll_segment(
-                "shell",
-                "shell",
-                &sock_path,
-                socket_timeout,
-                approval_id,
-                approval_token,
-                seg,
-                allow_always,
-            ),
+        |seg| classify_segment(&ctx, None, ctx.action, seg, command_group),
+        |approval_id, approval_token, seg, allow_always| {
+            if host_agent {
+                return PopupResult::Approved {
+                    source: "host_agent",
+                };
+            }
+            match tty.as_ref() {
+                Some(tty) => tty_prompt_segment(
+                    tty,
+                    &sock_path,
+                    socket_timeout,
+                    approval_id,
+                    approval_token,
+                    seg,
+                    allow_always,
+                ),
+                None => poll_segment(
+                    "shell",
+                    "shell",
+                    &sock_path,
+                    socket_timeout,
+                    approval_id,
+                    approval_token,
+                    seg,
+                    allow_always,
+                    kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
+                ),
+            }
         },
     );
 
@@ -210,21 +241,54 @@ fn run_resolve_shell(args: HookResolveShellArgs) -> ! {
     }
 }
 
+/// Whether the shell gate is running INSIDE a governed agent's subprocess, by
+/// the per-agent marker each one sets on the commands it spawns: codex's
+/// `KYRIS_GOVERNED_SUBPROCESS` (also exported by the hook wrappers), Claude
+/// Code's `CLAUDECODE`, and Gemini CLI's `GEMINI_CLI` — plus
+/// `__KYRIS_GUARD_RESULT=1`, the cached verdict of the SHELL hook's own
+/// detector (`bash_hook.sh` / `zsh_hook.sh`), whose ppid-walk slow path
+/// recognizes agents launched WITHOUT the shim. The shell hook arms its trap
+/// based on that detector, so this function must agree with it: when the
+/// shell side decided "governed agent" but this check said "bare terminal",
+/// an ask landed on the interactive TTY prompt inside an agent's hook
+/// subprocess — an invisible blocking read of /dev/tty that stole the
+/// agent's terminal input (the codex `[I]11;rgb:…` composer-garbage bug).
+/// When true, the agent's OWN hook is the single approval surface for the
+/// command, so the shell gate defers an ask to it instead of opening a
+/// second one. False means a bare terminal (no agent), where the shell gate
+/// prompts itself.
+fn inside_governed_agent() -> bool {
+    std::env::var_os("KYRIS_GOVERNED_SUBPROCESS").is_some()
+        || std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("GEMINI_CLI").is_some()
+        || std::env::var_os("__KYRIS_GUARD_RESULT").is_some_and(|v| v == "1")
+}
+
 /// Open the controlling terminal for interactive prompting. Returns `None`
-/// when there is no TTY (an agent-spawned non-interactive shell), in which
-/// case the caller falls back to kyrisd's pending-approval popup.
+/// when there is no usable TTY (an agent-spawned non-interactive shell), in
+/// which case the caller falls back to kyrisd's pending-approval popup.
 fn open_tty() -> Option<std::fs::File> {
     // A TUI agent (Claude Code et al.) owns the controlling terminal in raw
     // mode with focus/mouse reporting enabled. Opening and blocking-reading
     // /dev/tty here would steal the agent's input bytes (focus `\e[I`/`\e[O`
     // events, keystrokes) and desync its TUI, freezing its input line. When we
-    // detect a TUI-agent context, report "no TTY" so the caller falls back to
-    // kyrisd's out-of-band pending-approval flow and never touches the agent's
-    // terminal.
-    if std::env::var_os("CLAUDECODE").is_some()
-        || std::env::var_os("KYRIS_GOVERNED_SUBPROCESS").is_some()
-    {
+    // detect a governed-agent context, report "no TTY" so the caller falls
+    // back to kyrisd's out-of-band pending-approval flow and never touches
+    // the agent's terminal.
+    if inside_governed_agent() {
         return None;
+    }
+    // Safety net for contexts no marker covers (an agent launched around the
+    // shim with its hook ancestry invisible to every detector): the prompt is
+    // printed to stderr, so if stderr is NOT a terminal the human cannot see
+    // it — a blocking /dev/tty read would silently eat whatever terminal owns
+    // this process group. Only prompt when the prompt is actually visible;
+    // otherwise fall back to the kyrisd popup.
+    {
+        use std::io::IsTerminal as _;
+        if !std::io::stderr().is_terminal() {
+            return None;
+        }
     }
     std::fs::OpenOptions::new()
         .read(true)
@@ -404,6 +468,7 @@ fn run_hold(args: HookHoldArgs) {
         &args.token,
         &args.display,
         false,
+        kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
     ) {
         PopupResult::Approved { .. } => std::process::exit(0),
         PopupResult::Blocked {
@@ -415,8 +480,29 @@ fn run_hold(args: HookHoldArgs) {
     }
 }
 
+/// Canonical `vendor/name` identity for a kyris-integrated agent id, used as
+/// the DECLARED attribution identity on agentpactd requests. The hook's
+/// `--agent` value was written into the agent's hook config by `kyris agents
+/// setup` (install-time-owned, not chosen by the agent at runtime), so the
+/// daemon can attribute exactly with zero signature-catalog knowledge of the
+/// agent's install layout. Returns None for ids with no registered
+/// integration — notably the shell gate's `"shell"` — which keep attributing
+/// via lineage.
+fn declared_canonical_agent(agent: &str) -> Option<String> {
+    registry::agent_by_id(agent).map(|a| a.canonical_id().to_string())
+}
+
 fn discover_agent_pid() -> Option<u32> {
-    let sig_table = agentpact::attribution::signatures::SignatureTable::default_phase1();
+    // Same catalog agentpactd loads (single source): resolved via the daemon
+    // config's defaults-dir logic. Discovery failing here is non-fatal — the
+    // request still carries the declared `--agent` identity plus `anchor_pid`,
+    // which the daemon can seed a boundary from with ancestry validation.
+    let sig_table = agentpact::config::DaemonConfig::load()
+        .ok()
+        .map(|c| c.defaults_dir.join("agents.yaml"))
+        .and_then(|p| {
+            agentpact::attribution::signatures::SignatureTable::load_from_yaml(&p).ok()
+        })?;
     let refresh_kind = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::OnlyIfNotSet)
         .with_cmd(UpdateKind::OnlyIfNotSet);
@@ -521,32 +607,31 @@ fn run_check(args: HookCheckArgs) {
         .and_then(|p| hook_input[&p.tool_name_field].as_str())
         .map(str::to_string);
 
-    let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
-
-    // Fast-path: agent-internal commands that are expressed through otherwise
-    // governable tools. They are not the user's requested side effect, so
-    // sending them to agentpactd would both produce noisy audit events and, for
-    // Codex shell snapshots, deny ordinary commands before their real command
-    // is evaluated.
-    if let Some(proto) = protocol.as_ref()
-        && let Some(pass) = matching_detail_pass_through(proto, &action, &detail)
+    // One script serves both of codex's hook events; the payload's
+    // hook_event_name distinguishes a native-approval consultation
+    // (PermissionRequest — answer allow / abstain) from the governance
+    // gate (PreToolUse — the rest of this function). Gated on the agent
+    // DECLARING the integration: run_permission_request abstains with empty
+    // stdout, which a no-backstop bridge would read as allow — an agent
+    // without the declaration must take the normal governance path no matter
+    // what its payload claims.
+    if protocol
+        .as_ref()
+        .is_some_and(|p| p.permission_request_allow.is_some())
+        && hook_input.get("hook_event_name").and_then(|v| v.as_str()) == Some("PermissionRequest")
     {
-        audit_log_hook(
+        run_permission_request(
+            agent,
+            protocol.as_ref(),
+            &hook_input,
+            log_mode,
             audit_conn.as_ref(),
             &hook_id,
-            agent,
-            &action,
-            &detail,
-            None,
-            "allow",
-            &pass.reason,
-            None,
-            agent_prompt_for(&proto.allow_response),
-            started_at.elapsed(),
+            started_at,
         );
-        emit_allow(&proto.allow_response);
-        std::process::exit(0);
     }
+
+    let (action, detail) = map_payload(protocol.as_ref(), &hook_input);
 
     // Fast-path: tools that do not reach agentpactd. Returns here only when the
     // tool IS governable; otherwise it audits, emits, and exits the process.
@@ -581,24 +666,24 @@ fn run_check(args: HookCheckArgs) {
     let sock_path = pact_client::default_socket_path().display().to_string();
     let socket_timeout = std::time::Duration::from_secs(5);
 
-    // Classify the whole command with a side-effect-free PREVIEW first:
-    // the daemon returns the decision plus the compound `segments` it
-    // parsed, without issuing a token. We then drive per-segment popups
-    // off that split (the hook never parses shell itself). See
-    // `dispatch_preview_outcome`.
-    let outcome = pact_client::request_hook_permission_preview(
-        &sock_path,
-        "kyris-hook",
-        &action,
-        &detail,
-        cwd.as_deref(),
-        seed_pid,
-        socket_timeout,
-    );
-
     let native_allow_response = protocol
         .as_ref()
         .map_or(AllowResponse::EmptyStdout, |p| p.allow_response.clone());
+    // No declared protocol → conservative defaults: assume a native backstop
+    // exists (defer behaves as before), no prompt suppression, global ceiling.
+    let native_backstop = protocol.as_ref().is_none_or(|p| p.runtime.native_backstop);
+    let allow_suppresses_agent_prompt = protocol
+        .as_ref()
+        .is_some_and(|p| p.runtime.allow_suppresses_agent_prompt);
+    let poll_deadline = protocol
+        .as_ref()
+        .map_or(kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT, |p| {
+            p.runtime.poll_deadline()
+        });
+
+    // Native-prompt routing: how an `ask` reaches the human for this agent.
+    let native_ask = protocol.as_ref().and_then(|p| p.native_ask.as_ref());
+    let approval_mode = registry::resolve_approval_mode(agent, native_ask.is_some());
 
     let ctx = PermissionCtx {
         audit_conn: audit_conn.as_ref(),
@@ -611,15 +696,65 @@ fn run_check(args: HookCheckArgs) {
         sock_path: &sock_path,
         socket_timeout,
         started_at,
+        native_backstop,
+        allow_suppresses_agent_prompt,
+        poll_deadline,
+        log_mode_fallback: log_mode,
+        has_permission_request: protocol
+            .as_ref()
+            .is_some_and(|p| p.permission_request_allow.is_some()),
+        approval_mode,
+        native_ask,
     };
+
+    // A patch envelope is governed PER FILE: kyris parses the paths itself
+    // (the daemon's splitter is for shell compounds) and drives a write batch
+    // and a delete batch through the same per-segment machinery.
+    if action == "apply_patch" {
+        drive_apply_patch(&ctx, seed_pid);
+    }
+
+    // Classify the whole command with a side-effect-free PREVIEW first:
+    // the daemon returns the decision plus the compound `segments` it
+    // parsed, without issuing a token. We then drive per-segment popups
+    // off that split (the hook never parses shell itself). See
+    // `dispatch_preview_outcome`.
+    let outcome = pact_client::request_hook_permission_preview(
+        &sock_path,
+        "kyris-hook",
+        &action,
+        &detail,
+        cwd.as_deref(),
+        seed_pid,
+        declared_canonical_agent(ctx.agent).as_deref(),
+        socket_timeout,
+    );
     dispatch_preview_outcome(&ctx, seed_pid, outcome);
 }
 
 /// Handle a tool that does not go through agentpactd. Returns normally only
 /// when `tool` IS governable (a `tool_mappings` entry) — the caller then
-/// proceeds to the daemon round-trip. For a pass-through or unmapped tool it
-/// audits, emits the appropriate allow shape (see [`non_governed_response`]),
-/// and exits the process; it never returns in that case.
+/// proceeds to the daemon round-trip. Otherwise it audits, emits, and exits
+/// the process; it never returns in that case. The non-governable outcomes:
+///
+/// - **pass-through** (a blessed coordination primitive): allow, with the
+///   agent's native allow shape (see [`non_governed_response`]).
+/// - **agent-owned** (known, deliberately left to the agent): `EmptyStdout`
+///   with no warning — the agent's own permission controls (e.g. Claude's
+///   `WebFetch` domain rules) apply untouched. Only meaningful with a native
+///   backstop (locked by a registry invariant).
+/// - **kyris-routed MCP tool** (recognized via the agent's `mcp_tool_naming`
+///   against servers the kyris MCP rewrite routed): allow with `EmptyStdout` —
+///   the actual `tools/call` is governed at the TOOL surface (`kyris-mcp wrap`
+///   / kyrisd `/mcp/` routing), so the hook must not double-gate it. Only
+///   consulted for no-backstop agents; backstopped agents take the unmapped
+///   defer below, preserving their own prompt.
+/// - **unmapped, agent has a native backstop**: warn + defer (`EmptyStdout`) —
+///   the agent's own permission system decides, as if kyris were not installed.
+/// - **unmapped, NO native backstop** (G1): there is nothing behind kyris to
+///   defer to — cline's CLI auto-approves and opencode's native permissions
+///   were set permissive BY kyris — so a defer would silently run an unknown,
+///   possibly side-effecting tool. Deny with an actionable reason instead.
 #[allow(clippy::too_many_arguments)]
 fn handle_non_governed(
     proto: &HookProtocol,
@@ -636,11 +771,81 @@ fn handle_non_governed(
     if governable {
         return;
     }
+
+    if proto.agent_owned_tools.iter().any(|t| t == tool) {
+        audit_log_hook(
+            audit_conn,
+            hook_id,
+            agent,
+            action,
+            detail,
+            None,
+            "allow",
+            "agent_owned",
+            None,
+            agent_prompt_for(&AllowResponse::EmptyStdout, false),
+            started_at.elapsed(),
+        );
+        emit_allow(&AllowResponse::EmptyStdout);
+        std::process::exit(0);
+    }
+
     let pass_through = proto.pass_through_tools.iter().any(|t| t == tool);
+
+    // The no-backstop deny (G1) is an ENFORCE-mode posture. Log mode is
+    // observe-only by contract — kyris must not alter agent behavior there,
+    // even when that behavior is "auto-approve everything".
+    if !pass_through && !proto.runtime.native_backstop && !log_mode {
+        if is_kyris_routed_mcp_tool(proto, agent, tool) {
+            audit_log_hook(
+                audit_conn,
+                hook_id,
+                agent,
+                action,
+                detail,
+                None,
+                "allow",
+                "mcp_tool_surface",
+                None,
+                // Not "agent_decides" — this agent has no prompt behind the
+                // hook; the actual gate is the kyris-mcp wrap / kyrisd /mcp/
+                // routing the call is about to hit.
+                "tool_surface",
+                started_at.elapsed(),
+            );
+            emit_allow(&AllowResponse::EmptyStdout);
+            std::process::exit(0);
+        }
+        let reason = format!(
+            "tool '{tool}' is not governed by kyris, and {agent} has no native \
+             permission backstop behind the kyris hook — allowing it would run \
+             ungoverned. Denied. Update kyris's {agent} tool mappings (then \
+             `kyris agents setup {agent}`), or `kyris agents undo {agent}` to \
+             restore {agent}'s own permission prompts."
+        );
+        audit_log_hook(
+            audit_conn,
+            hook_id,
+            agent,
+            action,
+            detail,
+            None,
+            "deny",
+            "unmapped_no_backstop",
+            None,
+            "none",
+            started_at.elapsed(),
+        );
+        emit_deny(&reason);
+        std::process::exit(2);
+    }
+
     if !pass_through {
+        // Reaches here for backstopped agents (their own permission system
+        // decides) and for no-backstop agents in log mode (observe-only).
         eprintln!(
             "[agentpact] warning: '{tool}' is not in the {agent} mapping table; \
-             deferring to {agent}'s own permission prompt (kyris is not governing it). \
+             handing the decision back to {agent} (kyris is not governing it). \
              Add it to tool_mappings to govern it, or pass_through_tools to bless it."
         );
     }
@@ -660,11 +865,36 @@ fn handle_non_governed(
         "allow",
         source,
         None,
-        agent_prompt_for(&response),
+        agent_prompt_for(&response, proto.runtime.allow_suppresses_agent_prompt),
         started_at.elapsed(),
     );
     emit_allow(&response);
     std::process::exit(0);
+}
+
+/// Whether `tool` is named like an MCP tool of a server the kyris MCP rewrite
+/// routed (wrapped stdio / kyrisd-routed HTTP) — i.e. it is governed at the
+/// tool surface and must not be denied at the hook. Reads the agent's MCP
+/// config; only called on the cold unmapped path of no-backstop agents.
+///
+/// Matched against ALL configured servers by LONGEST sanitized prefix, and
+/// exempted only when that winner is routed: with a single-`_` separator, a
+/// routed server `data` must not bless `data_prod_query` when the longer match
+/// `data_prod` is an UNROUTED server — that tool's calls bypass the tool
+/// surface, so the deny must stand.
+fn is_kyris_routed_mcp_tool(proto: &HookProtocol, agent: &str, tool: &str) -> bool {
+    let Some(naming) = proto.mcp_tool_naming.as_ref() else {
+        return false;
+    };
+    let Some(descriptor) = registry::agent_by_id(agent) else {
+        return false;
+    };
+    let routed = crate::agents::configure::kyris_routed_mcp_server_names(descriptor.as_ref());
+    let all = crate::agents::configure::mcp_server_names_from_agent(descriptor.as_ref());
+    all.iter()
+        .filter(|server| naming.tool_belongs_to_server(tool, server))
+        .max_by_key(|server| naming.sanitized_len(server))
+        .is_some_and(|winner| routed.contains(winner))
 }
 
 /// References needed to route a permission outcome through audit, agent
@@ -677,6 +907,7 @@ fn handle_non_governed(
 /// branches on it. The daemon-unavailable arm has no decision to scout, so
 /// it defers to the agent's own prompt (`EmptyStdout`) regardless of mode —
 /// never suppressing a prompt for a command the daemon never actually cleared.
+#[allow(clippy::struct_excessive_bools)]
 struct PermissionCtx<'a> {
     audit_conn: Option<&'a kyris_core::config::KyrisdConnection>,
     hook_id: &'a str,
@@ -688,6 +919,35 @@ struct PermissionCtx<'a> {
     sock_path: &'a str,
     socket_timeout: std::time::Duration,
     started_at: std::time::Instant,
+    /// From the agent's `HookRuntime`: whether the agent's own permission
+    /// system still gates a tool kyris defers on. When false, every defer path
+    /// (daemon unavailable, unrenderable ask) becomes a DENY — a defer would be
+    /// a silent allow (G1). True for the shell gate: the human at the terminal
+    /// is the backstop.
+    native_backstop: bool,
+    /// From the agent's `HookRuntime`: whether the native allow shape actually
+    /// suppresses the agent's own prompt — drives the `agent_prompt` audit
+    /// field (G2).
+    allow_suppresses_agent_prompt: bool,
+    /// Per-agent no-TTY approval window (`HookRuntime::poll_deadline`): always
+    /// inside the agent's own hook-kill deadline (G3).
+    poll_deadline: std::time::Duration,
+    /// User-level log-mode snapshot, used ONLY where no per-request mode is
+    /// available (agentpactd unreachable): in log mode the no-backstop deny is
+    /// suppressed — observe-only must never alter agent behavior.
+    log_mode_fallback: bool,
+    /// Whether this agent declares a native-approval hook integration
+    /// (`permission_request_allow`) — the only consumer of recent-approval
+    /// notes, so recording is gated on it.
+    has_permission_request: bool,
+    /// Which approval UX to use for an `ask` verdict — the agent's own native
+    /// prompt ([`ApprovalMode::Native`]) or kyris's pending-approval popup
+    /// ([`ApprovalMode::KyrisPopup`]). Resolved from the `approval_prompt`
+    /// setting, defaulting to native where the agent declares a `native_ask`.
+    approval_mode: ApprovalMode,
+    /// How to render a native ask for this agent ([`AskResponse`]); `None` when
+    /// the agent has no native ask channel (kyris popup is then the only path).
+    native_ask: Option<&'a AskResponse>,
 }
 
 /// Route the side-effect-free PREVIEW outcome from agentpactd.
@@ -738,11 +998,17 @@ fn dispatch_preview_outcome(
             drive_per_segment(ctx, seed_pid, segments, log_mode);
         }
         Err(_reason) => {
-            // agentpactd (the decider) is unreachable. Never block the
-            // developer: defer to the AGENT's own permission UX by emitting the
-            // EmptyStdout shape (NOT the native allow shape, which would suppress
-            // the agent's own prompt for a command the daemon never actually
-            // cleared). Spool it for the audit trail.
+            // agentpactd (the decider) is unreachable. With a native backstop,
+            // defer to the AGENT's own permission UX by emitting the EmptyStdout
+            // shape (NOT the native allow shape, which would suppress the
+            // agent's own prompt for a command the daemon never actually
+            // cleared) and spool for the audit trail. Without one (G1), a defer
+            // is a silent allow — deny with an actionable reason instead.
+            // Except in log mode: observe-only must never alter agent behavior
+            // (the daemon is down, so only the user-level mode snapshot exists).
+            if !ctx.native_backstop && !ctx.log_mode_fallback {
+                deny_for_missing_backstop(ctx, None, "agentpact_unreachable");
+            }
             kyris_core::fail_open_log::record(ctx.agent, ctx.action, ctx.detail, "shell", ctx.cwd);
             audit_log_hook(
                 ctx.audit_conn,
@@ -754,7 +1020,7 @@ fn dispatch_preview_outcome(
                 "defer",
                 "agentpact_unreachable",
                 None,
-                agent_prompt_for(&AllowResponse::EmptyStdout),
+                agent_prompt_for(&AllowResponse::EmptyStdout, false),
                 ctx.started_at.elapsed(),
             );
             emit_allow(&AllowResponse::EmptyStdout);
@@ -762,6 +1028,49 @@ fn dispatch_preview_outcome(
         }
     }
 }
+
+/// G1 deny path: a defer-class outcome (daemon unavailable, unrenderable ask)
+/// on an agent with NO native permission backstop. Nothing behind kyris would
+/// gate the command, so "defer" would silently run it — deny instead, with a
+/// reason that names the fix. Audits and exits; never returns.
+fn deny_for_missing_backstop(
+    ctx: &PermissionCtx<'_>,
+    segments: Option<&[String]>,
+    source: &'static str,
+) -> ! {
+    let agent = ctx.agent;
+    let daemon = if source == "kyrisd_unreachable" {
+        "kyrisd (the approval renderer)"
+    } else {
+        "agentpactd (the policy daemon)"
+    };
+    let reason = format!(
+        "{daemon} is unreachable and {agent} has no native permission backstop \
+         behind the kyris hook — running this command would be ungoverned. \
+         Denied. Start the daemon (`kyris status` shows what's down), or \
+         `kyris agents undo {agent}` to restore {agent}'s own permission prompts."
+    );
+    audit_log_hook(
+        ctx.audit_conn,
+        ctx.hook_id,
+        ctx.agent,
+        ctx.action,
+        ctx.detail,
+        segments,
+        "deny",
+        source,
+        None,
+        "none",
+        ctx.started_at.elapsed(),
+    );
+    emit_deny(&reason);
+    std::process::exit(2);
+}
+
+/// Margin added to a caller's poll window when sizing the approval-token TTL
+/// (`approval_ttl_secs`): the user can answer at the very end of the window
+/// and the `permission.respond` round-trip must still find a live token.
+const APPROVAL_TTL_MARGIN_SECS: u64 = 120;
 
 /// A single segment's classification from a real (token-bearing) request.
 enum SegClass {
@@ -882,27 +1191,170 @@ fn drive_per_segment(
     log_mode: bool,
 ) -> ! {
     let segs = segments.unwrap_or_else(|| vec![ctx.detail.to_string()]);
-
     // Compound line (>=2 segments) → drive per-segment but audit as one event.
     let command_group_id = (segs.len() >= 2).then(pact_client::new_command_group);
-    let command_group = command_group_id.as_deref().map(|group| (group, ctx.detail));
+    let batch = ActionBatch {
+        action: ctx.action.to_string(),
+        segments: segs,
+    };
+    drive_batches(ctx, seed_pid, vec![batch], log_mode, command_group_id)
+}
 
-    let result = run_segments(
-        &segs,
-        |seg| classify_segment(ctx, seed_pid, seg, command_group),
-        |approval_id, approval_token, seg, allow_always| {
-            poll_segment(
-                ctx.agent,
-                ctx.action,
-                ctx.sock_path,
-                ctx.socket_timeout,
-                approval_id,
-                approval_token,
-                seg,
-                allow_always,
-            )
-        },
-    );
+/// One governed action applied to a list of details: the daemon's compound
+/// split for `execute`, or one file-path batch of a patch envelope.
+struct ActionBatch {
+    action: String,
+    segments: Vec<String>,
+}
+
+/// Per-file governance for a patch envelope (`apply_patch`): kyris parses the
+/// touched paths itself (the grammar is fixed; the daemon's splitter is for
+/// shell text) and drives a `write` batch and a `delete` batch through the
+/// same real-request machinery — each file is decided against the actual
+/// workspace boundary instead of the old single-request shape, whose "path"
+/// was the entire patch text lexically joined to the cwd (always inside the
+/// workspace, so out-of-tree targets were mis-anchored).
+fn drive_apply_patch(ctx: &PermissionCtx<'_>, seed_pid: Option<u32>) -> ! {
+    let parsed = parse_apply_patch_paths(ctx.detail);
+    if parsed.writes.is_empty() && parsed.deletes.is_empty() {
+        // Not a parseable envelope — never guess paths. Backstopped agents
+        // defer (the agent's own approval still gates the patch); without a
+        // backstop, enforce mode denies (a defer would be a silent allow).
+        if !ctx.native_backstop && !ctx.log_mode_fallback {
+            deny_for_missing_backstop(ctx, None, "unparseable_patch");
+        }
+        eprintln!(
+            "[agentpact] warning: apply_patch payload has no recognizable file \
+             markers; deferring to {}'s own approval",
+            ctx.agent
+        );
+        audit_log_hook(
+            ctx.audit_conn,
+            ctx.hook_id,
+            ctx.agent,
+            ctx.action,
+            ctx.detail,
+            None,
+            "defer",
+            "unparseable_patch",
+            None,
+            agent_prompt_for(&AllowResponse::EmptyStdout, false),
+            ctx.started_at.elapsed(),
+        );
+        emit_allow(&AllowResponse::EmptyStdout);
+        std::process::exit(0);
+    }
+
+    let resolve = |paths: Vec<String>| -> Vec<String> {
+        paths
+            .iter()
+            // "write" engages the relative-path join; patch paths resolve
+            // against the same cwd codex resolves them against.
+            .map(|p| resolve_relative_path("write", p, ctx.cwd))
+            .collect()
+    };
+    let mut batches = Vec::new();
+    if !parsed.writes.is_empty() {
+        batches.push(ActionBatch {
+            action: "write".to_string(),
+            segments: resolve(parsed.writes),
+        });
+    }
+    if !parsed.deletes.is_empty() {
+        batches.push(ActionBatch {
+            action: "delete".to_string(),
+            segments: resolve(parsed.deletes),
+        });
+    }
+
+    // Scout the per-request mode from a side-effect-free preview of the first
+    // path so a repo-local log-mode override is honored (the generic flow gets
+    // this from its whole-command preview).
+    let log_mode = match pact_client::request_hook_permission_preview(
+        ctx.sock_path,
+        "kyris-hook",
+        &batches[0].action,
+        &batches[0].segments[0],
+        ctx.cwd,
+        seed_pid,
+        declared_canonical_agent(ctx.agent).as_deref(),
+        ctx.socket_timeout,
+    ) {
+        Ok((McpPermissionDecision::Allow { mode }, _)) => mode.is_log(),
+        Ok(_) => false,
+        Err(_) => ctx.log_mode_fallback,
+    };
+
+    drive_batches(ctx, seed_pid, batches, log_mode, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn drive_batches(
+    ctx: &PermissionCtx<'_>,
+    seed_pid: Option<u32>,
+    batches: Vec<ActionBatch>,
+    log_mode: bool,
+    command_group_id: Option<String>,
+) -> ! {
+    let command_group = command_group_id.as_deref().map(|group| (group, ctx.detail));
+    let all_segs: Vec<String> = batches
+        .iter()
+        .flat_map(|b| b.segments.iter().cloned())
+        .collect();
+
+    // Native mode delegates an `ask` to the agent's own prompt instead of
+    // holding kyris's popup. We still classify every segment (audit, breaker,
+    // exec token); a single `ask` anywhere makes the whole tool call a native
+    // ask, while a deny still wins.
+    let native_mode = ctx.approval_mode == ApprovalMode::Native && ctx.native_ask.is_some();
+    let mut native_ask_requested = false;
+    let mut source: &'static str = "agentpact_auto";
+    let mut blocked: Option<SegBlock> = None;
+    for batch in &batches {
+        let result = run_segments(
+            &batch.segments,
+            |seg| classify_segment(ctx, seed_pid, &batch.action, seg, command_group),
+            |approval_id, approval_token, seg, allow_always| {
+                if native_mode {
+                    // Do NOT hold: the agent will prompt its own user. Leave the
+                    // agentpactd ASK token to expire — recording a deny here
+                    // would be an audit lie, since the agent may approve.
+                    native_ask_requested = true;
+                    return PopupResult::Approved {
+                        source: "native_ask",
+                    };
+                }
+                // The poll deadline is a budget for the WHOLE hook invocation,
+                // not per popup: N sequential asks (a compound line, a
+                // multi-file patch) must still resolve before the agent's
+                // fail-open hook timeout, or the entire request would run
+                // ungoverned with stale popups left pending. An exhausted
+                // budget makes the remaining asks time out immediately —
+                // a clean deny instead of the agent's timer firing.
+                let remaining = ctx.poll_deadline.saturating_sub(ctx.started_at.elapsed());
+                poll_segment(
+                    ctx.agent,
+                    &batch.action,
+                    ctx.sock_path,
+                    ctx.socket_timeout,
+                    approval_id,
+                    approval_token,
+                    seg,
+                    allow_always,
+                    remaining,
+                )
+            },
+        );
+        match result {
+            // A human approval anywhere in the walk is the significant source.
+            Ok(s) if s != "agentpact_auto" => source = s,
+            Ok(_) => {}
+            Err(block) => {
+                blocked = Some(block);
+                break;
+            }
+        }
+    }
 
     // Finalize the buffered aggregate into one event (best-effort; expiry sweep
     // backstops a dropped commit).
@@ -910,8 +1362,26 @@ fn drive_per_segment(
         pact_client::send_command_commit(ctx.sock_path, group, ctx.socket_timeout);
     }
 
-    match result {
+    let segs = all_segs;
+    match blocked.map_or(Ok(source), Err) {
         Ok(source) => {
+            if native_ask_requested {
+                // An `ask` routed to the agent's native prompt: emit the native
+                // ask shape (or abstain for codex's PermissionRequest) and never
+                // reach the allow path below. Deny would have won above.
+                emit_native_ask(ctx, segs.as_slice(), log_mode);
+            }
+            // The adapted execution surface just worked end-to-end (real
+            // agentpactd decision behind a live agent hook) — record it.
+            record_execution_live_evidence(ctx.agent);
+            // A popup-approved request leaves a short-lived note so the
+            // agent's native-approval hook (codex PermissionRequest) does not
+            // prompt the human a SECOND time for the same request. Only
+            // recorded for agents with a consumer — anything else is dead
+            // state churn.
+            if matches!(source, "user_approved" | "user_always") && ctx.has_permission_request {
+                crate::recent_approvals::record(ctx.agent, ctx.action, ctx.cwd, ctx.detail);
+            }
             let response = effective_allow_response(ctx.native_allow_response, log_mode);
             audit_log_hook(
                 ctx.audit_conn,
@@ -923,7 +1393,7 @@ fn drive_per_segment(
                 "allow",
                 source,
                 None,
-                agent_prompt_for(&response),
+                agent_prompt_for(&response, ctx.allow_suppresses_agent_prompt),
                 ctx.started_at.elapsed(),
             );
             emit_allow(&response);
@@ -932,11 +1402,18 @@ fn drive_per_segment(
         Err(block) if block_from_daemon_unavailable(block.source) => {
             // A daemon was unavailable: either agentpactd (the decider) is down,
             // or it returned a real "ask" but kyrisd (the no-TTY ask renderer)
-            // couldn't show the dialog. Never block the developer — defer to the
-            // AGENT's own permission UX by emitting the EmptyStdout shape, so the
-            // human still decides via the agent's prompt. Spool it so the audit
-            // trail shows kyris punted this command. A real deny / user denial /
-            // rendered-then-timed-out ask always blocks below.
+            // couldn't show the dialog. With a native backstop, never block the
+            // developer — defer to the AGENT's own permission UX by emitting the
+            // EmptyStdout shape, so the human still decides via the agent's
+            // prompt, and spool it so the audit trail shows kyris punted this
+            // command. Without one (G1), a defer is a silent allow — deny,
+            // except in log mode (observe-only must never alter agent behavior;
+            // `log_mode` here is the preview's authoritative per-request mode).
+            // A real deny / user denial / rendered-then-timed-out ask always
+            // blocks below.
+            if !ctx.native_backstop && !log_mode {
+                deny_for_missing_backstop(ctx, Some(segs.as_slice()), block.source);
+            }
             kyris_core::fail_open_log::record(ctx.agent, ctx.action, ctx.detail, "shell", ctx.cwd);
             audit_log_hook(
                 ctx.audit_conn,
@@ -948,13 +1425,14 @@ fn drive_per_segment(
                 "defer",
                 block.source,
                 None,
-                agent_prompt_for(&AllowResponse::EmptyStdout),
+                agent_prompt_for(&AllowResponse::EmptyStdout, false),
                 ctx.started_at.elapsed(),
             );
             emit_allow(&AllowResponse::EmptyStdout);
             std::process::exit(0);
         }
         Err(block) => {
+            record_execution_live_evidence(ctx.agent);
             audit_log_hook(
                 ctx.audit_conn,
                 ctx.hook_id,
@@ -972,6 +1450,64 @@ fn drive_per_segment(
             std::process::exit(block.exit_code);
         }
     }
+}
+
+/// Route an `ask` to the agent's OWN native approval prompt (native mode),
+/// instead of holding kyris's popup. For an [`AskResponse::NativePrompt`] agent
+/// (claude/gemini) this emits the agent's ask JSON; for
+/// [`AskResponse::DeferToNativeApproval`] (codex) it abstains (empty stdout) so
+/// the agent's separate native-approval hook drives the prompt. Audits and exits
+/// 0; never returns. In log mode it defers — observe-only must not force a
+/// prompt.
+fn emit_native_ask(ctx: &PermissionCtx<'_>, segs: &[String], log_mode: bool) -> ! {
+    // The adapted execution surface round-tripped a real decision (the
+    // per-segment classify), so it is live regardless of who renders the ask.
+    record_execution_live_evidence(ctx.agent);
+
+    if log_mode {
+        audit_log_hook(
+            ctx.audit_conn,
+            ctx.hook_id,
+            ctx.agent,
+            ctx.action,
+            ctx.detail,
+            Some(segs),
+            "defer",
+            "log_mode",
+            None,
+            agent_prompt_for(&AllowResponse::EmptyStdout, false),
+            ctx.started_at.elapsed(),
+        );
+        emit_allow(&AllowResponse::EmptyStdout);
+        std::process::exit(0);
+    }
+
+    audit_log_hook(
+        ctx.audit_conn,
+        ctx.hook_id,
+        ctx.agent,
+        ctx.action,
+        ctx.detail,
+        Some(segs),
+        "ask",
+        "native_prompt",
+        None,
+        // The agent's own prompt decides — kyris hands the decision back.
+        agent_prompt_for(&AllowResponse::EmptyStdout, false),
+        ctx.started_at.elapsed(),
+    );
+
+    match ctx.native_ask {
+        Some(AskResponse::NativePrompt { body }) => {
+            println!("{}", serde_json::to_string(body).unwrap_or_default());
+        }
+        // codex (DeferToNativeApproval) or absent: abstain — empty stdout lets
+        // the agent's approval ladder + PermissionRequest hook drive the prompt.
+        Some(AskResponse::DeferToNativeApproval) | None => {
+            emit_allow(&AllowResponse::EmptyStdout);
+        }
+    }
+    std::process::exit(0);
 }
 
 /// Whether a [`SegBlock`] was caused by a daemon being *unavailable* rather than
@@ -1003,6 +1539,7 @@ fn block_from_daemon_unavailable(source: &str) -> bool {
 fn classify_segment(
     ctx: &PermissionCtx<'_>,
     seed_pid: Option<u32>,
+    action: &str,
     seg: &str,
     command_group: Option<(&str, &str)>,
 ) -> SegClass {
@@ -1013,16 +1550,26 @@ fn classify_segment(
     let anchor_pid = Some(std::os::unix::process::parent_id());
     #[cfg(not(unix))]
     let anchor_pid: Option<u32> = None;
+    // Size the approval-token TTL to this caller's hold window: the token
+    // that resolves an Ask must outlive the popup hold (codex's window is
+    // days), plus margin for the respond round-trip after the user answers
+    // at the last moment.
+    let approval_ttl_secs = ctx
+        .poll_deadline
+        .as_secs()
+        .saturating_add(APPROVAL_TTL_MARGIN_SECS);
     match pact_client::request_hook_permission(
         ctx.sock_path,
         "kyris-hook",
-        ctx.action,
+        action,
         seg,
         ctx.cwd,
         seed_pid,
+        declared_canonical_agent(ctx.agent).as_deref(),
         anchor_pid,
         None,
         command_group,
+        Some(approval_ttl_secs),
         ctx.socket_timeout,
     ) {
         Ok((McpPermissionDecision::Allow { .. }, _)) => SegClass::Auto,
@@ -1040,7 +1587,7 @@ fn classify_segment(
         },
         Ok((McpPermissionDecision::Deny { reason, .. }, _)) => SegClass::Deny { reason },
         Err(reason) => {
-            kyris_core::fail_open_log::record(ctx.agent, ctx.action, seg, "shell", ctx.cwd);
+            kyris_core::fail_open_log::record(ctx.agent, action, seg, "shell", ctx.cwd);
             SegClass::Unavailable { reason }
         }
     }
@@ -1049,6 +1596,10 @@ fn classify_segment(
 /// Drive one segment's approval popup via kyrisd and return the outcome
 /// **without** emitting an agent response — the per-segment caller emits
 /// exactly once after the whole command resolves.
+///
+/// `max_wait` is the caller's approval window: the agent hook passes its
+/// per-agent `HookRuntime::poll_deadline` (always inside the agent's own
+/// hook-kill deadline — G3), the shell paths the global ceiling.
 #[allow(clippy::too_many_arguments)]
 fn poll_segment(
     agent: &str,
@@ -1059,6 +1610,7 @@ fn poll_segment(
     approval_token: &str,
     seg: &str,
     allow_always: bool,
+    max_wait: std::time::Duration,
 ) -> PopupResult {
     // For a file action `seg` is a path — render it home-relative for the popup
     // and the fail-open spool (display/privacy only; the decision already ran on
@@ -1109,7 +1661,7 @@ fn poll_segment(
                 // privilege like `env sudo …`.
                 allow_always,
             },
-            kyris_core::pending::NATIVE_HOOK_POLL_TIMEOUT,
+            max_wait,
         )
         .await
     });
@@ -1326,14 +1878,27 @@ fn audit_log_hook(
     post_hook_log_blocking(conn, body);
 }
 
-/// Whether the agent will still get to apply its own permission rules
-/// after kyris's response. Derived from the `AllowResponse` shape kyris
-/// is about to emit. Only meaningful when kyris allows; deny paths
-/// always return `"none"` because exit-2 blocks the action universally.
-fn agent_prompt_for(allow_response: &AllowResponse) -> &'static str {
+/// Whether the agent will still get to apply its own permission rules after
+/// kyris's response. Only meaningful when kyris allows; deny paths always
+/// return `"none"` because exit-2 blocks the action universally.
+///
+/// Derived from the allow shape AND the agent's declared allow EFFECT (G2):
+/// emitting a JSON allow does not by itself silence the agent — gemini parses
+/// its `{"decision":"allow"}` and prompts anyway, while Claude's
+/// `permissionDecision: allow` genuinely suppresses. `EmptyStdout` is "no
+/// decision" everywhere, so the agent always decides.
+fn agent_prompt_for(allow_response: &AllowResponse, suppresses_agent_prompt: bool) -> &'static str {
     match allow_response {
-        AllowResponse::Json { .. } => "none",
-        AllowResponse::EmptyStdout => "agent_decides",
+        AllowResponse::Json { .. } if suppresses_agent_prompt => "none",
+        AllowResponse::Json { .. } | AllowResponse::EmptyStdout => "agent_decides",
+    }
+}
+
+/// Record execution-surface live evidence: a real decision round-tripped
+/// through this agent's live hook. The shell gate is not an agent surface.
+fn record_execution_live_evidence(agent: &str) {
+    if agent != "shell" {
+        kyris_core::live_evidence::record(agent, kyris_core::live_evidence::SURFACE_EXECUTION);
     }
 }
 
@@ -1379,6 +1944,195 @@ fn non_governed_response(
     }
 }
 
+/// File paths a patch envelope touches, split by governed action.
+struct PatchPaths {
+    /// `Add File` / `Update File` / `Move to` destinations — content lands at
+    /// these paths. A move's SOURCE also stays here: it is being modified;
+    /// its simultaneous disappearance is governed as part of that write
+    /// (renames are not escalated to delete policy).
+    writes: Vec<String>,
+    /// `Delete File` — the file is removed outright.
+    deletes: Vec<String>,
+}
+
+/// Parse codex's `apply_patch` envelope markers (apply-patch crate grammar:
+/// `*** Begin Patch`, `*** Add File: `, `*** Update File: `, `*** Move to: `,
+/// `*** Delete File: `; lenient about surrounding whitespace, paths may be
+/// relative to the session cwd). Returns empty lists for text with no
+/// recognizable markers — the caller treats that as unparseable and never
+/// guesses.
+fn parse_apply_patch_paths(patch: &str) -> PatchPaths {
+    let mut paths = PatchPaths {
+        writes: Vec::new(),
+        deletes: Vec::new(),
+    };
+    for line in patch.lines() {
+        // Markers live at COLUMN 0 in the grammar; update-hunk context lines
+        // are space-prefixed, so trimming the start would turn file CONTENT
+        // that mentions a marker into a phantom path. Trim the end only
+        // (\r\n / trailing whitespace).
+        let line = line.trim_end();
+        if let Some(path) = line.strip_prefix("*** Add File:") {
+            paths.writes.push(path.trim().to_string());
+        } else if let Some(path) = line.strip_prefix("*** Update File:") {
+            paths.writes.push(path.trim().to_string());
+        } else if let Some(path) = line.strip_prefix("*** Move to:") {
+            paths.writes.push(path.trim().to_string());
+        } else if let Some(path) = line.strip_prefix("*** Delete File:") {
+            paths.deletes.push(path.trim().to_string());
+        }
+    }
+    paths
+}
+
+/// Answer an agent's NATIVE-approval consultation (codex `PermissionRequest`):
+/// the agent is about to prompt its user for a tool it already cleared through
+/// `PreToolUse`. kyris answers **allow** (suppressing the redundant native
+/// prompt) only when it can vouch for the request:
+///   - agentpactd's side-effect-free preview says Allow (catalog/always — the
+///     command would never have produced a kyris popup), or
+///   - the human JUST approved this exact request through kyris's popup (a
+///     fresh single-use `recent_approvals` note).
+///
+/// Everything else ABSTAINS (empty stdout — codex's documented "no decision"),
+/// letting the native prompt appear: log mode (observe-only), unmapped /
+/// pass-through / agent-owned tools, a Deny or Ask preview without a note, a
+/// down daemon, an unparseable patch. Never deny from here — `PreToolUse`
+/// already blocks what policy forbids; this hook only completes the allow path
+/// (review Finding 9, the kyris-approves-then-codex-prompts-again double
+/// prompt).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_permission_request(
+    agent: &str,
+    protocol: Option<&HookProtocol>,
+    hook_input: &serde_json::Value,
+    log_mode: bool,
+    audit_conn: Option<&kyris_core::config::KyrisdConnection>,
+    hook_id: &str,
+    started_at: std::time::Instant,
+) -> ! {
+    let abstain = |action: &str, detail: &str, source: &str| -> ! {
+        audit_log_hook(
+            audit_conn,
+            hook_id,
+            agent,
+            action,
+            detail,
+            None,
+            "defer",
+            source,
+            None,
+            "agent_decides",
+            started_at.elapsed(),
+        );
+        // Empty stdout, exit 0 — codex's "no decision": the native prompt
+        // appears as if kyris were not installed.
+        std::process::exit(0);
+    };
+
+    let Some(proto) = protocol else {
+        abstain("unknown", "", "no_protocol");
+    };
+    let Some(allow_body) = proto.permission_request_allow.clone() else {
+        abstain("unknown", "", "no_integration");
+    };
+
+    let (action, detail) = map_payload(Some(proto), hook_input);
+    let governable = hook_input[&proto.tool_name_field]
+        .as_str()
+        .is_some_and(|tool| proto.tool_mappings.iter().any(|m| m.tool_name == tool));
+    if !governable {
+        abstain(&action, &detail, "ungoverned_tool");
+    }
+    if log_mode {
+        abstain(&action, &detail, "log_mode");
+    }
+
+    let launch_dir = registry::agent_by_id(agent)
+        .and_then(|a| a.launch_dir_env())
+        .and_then(|var| std::env::var(var).ok());
+    let cwd = derive_session_cwd(launch_dir.as_deref(), hook_input);
+    let detail = resolve_relative_path(&action, &detail, cwd.as_deref());
+
+    // The previews this consultation runs on: per file for a patch envelope,
+    // the whole command otherwise.
+    let requests: Vec<(String, String)> = if action == "apply_patch" {
+        let parsed = parse_apply_patch_paths(&detail);
+        if parsed.writes.is_empty() && parsed.deletes.is_empty() {
+            abstain(&action, &detail, "unparseable_patch");
+        }
+        let resolve = |p: &String| resolve_relative_path("write", p, cwd.as_deref());
+        parsed
+            .writes
+            .iter()
+            .map(|p| ("write".to_string(), resolve(p)))
+            .chain(
+                parsed
+                    .deletes
+                    .iter()
+                    .map(|p| ("delete".to_string(), resolve(p))),
+            )
+            .collect()
+    } else {
+        vec![(action.clone(), detail.clone())]
+    };
+
+    let sock_path = pact_client::default_socket_path().display().to_string();
+    let socket_timeout = std::time::Duration::from_secs(5);
+    let seed_pid = discover_agent_pid();
+
+    let mut all_allow = true;
+    for (req_action, req_detail) in &requests {
+        match pact_client::request_hook_permission_preview(
+            &sock_path,
+            "kyris-hook",
+            req_action,
+            req_detail,
+            cwd.as_deref(),
+            seed_pid,
+            declared_canonical_agent(agent).as_deref(),
+            socket_timeout,
+        ) {
+            Ok((McpPermissionDecision::Allow { mode }, _)) if mode.is_log() => {
+                abstain(&action, &detail, "log_mode");
+            }
+            Ok((McpPermissionDecision::Allow { .. }, _)) => {}
+            Ok(_) => {
+                all_allow = false;
+                break;
+            }
+            // The decider is down: nothing to vouch with — codex's native
+            // prompt is exactly the backstop this situation needs.
+            Err(_) => abstain(&action, &detail, "agentpact_unreachable"),
+        }
+    }
+
+    let source = if all_allow {
+        "agentpact_auto"
+    } else if crate::recent_approvals::consume(agent, &action, cwd.as_deref(), &detail) {
+        "recent_approval"
+    } else {
+        abstain(&action, &detail, "native_prompt");
+    };
+
+    audit_log_hook(
+        audit_conn,
+        hook_id,
+        agent,
+        &action,
+        &detail,
+        None,
+        "allow",
+        source,
+        None,
+        // This allow genuinely suppresses the native prompt — that is its job.
+        "none",
+        started_at.elapsed(),
+    );
+    println!("{}", serde_json::to_string(&allow_body).unwrap_or_default());
+    std::process::exit(0);
+}
+
 fn map_payload(protocol: Option<&HookProtocol>, input: &serde_json::Value) -> (String, String) {
     let Some(protocol) = protocol else {
         let method = input["method"].as_str().unwrap_or("call");
@@ -1403,20 +2157,6 @@ fn map_payload(protocol: Option<&HookProtocol>, input: &serde_json::Value) -> (S
     let detail = extract_detail(protocol, mapping, input, tool);
 
     (action.to_string(), detail)
-}
-
-fn matching_detail_pass_through<'a>(
-    protocol: &'a HookProtocol,
-    action: &str,
-    detail: &str,
-) -> Option<&'a DetailPassThrough> {
-    protocol.detail_pass_throughs.iter().find(|pass| {
-        pass.action == action
-            && pass
-                .detail_contains
-                .iter()
-                .all(|needle| detail.contains(needle))
-    })
 }
 
 fn extract_detail(
@@ -1686,25 +2426,57 @@ mod tests {
     }
 
     #[test]
-    fn testAgentPromptForJsonShapeIsNone() {
-        // Agents whose hook protocol returns a JSON allow shape (Claude
-        // Code, Gemini CLI today) get a definitive allow, suppressing
-        // any prompt the agent would otherwise show.
+    fn testAgentPromptForJsonShapeUsesDeclaredEffectNotShape() {
+        // G2: emitting a JSON allow does not by itself silence the agent.
+        // Claude's permissionDecision:allow genuinely suppresses its prompt
+        // (suppresses=true → "none"); Gemini parses its {"decision":"allow"}
+        // but prompts anyway (suppresses=false → "agent_decides"). The audit
+        // must reflect the EFFECT, not the shape.
         let json = AllowResponse::Json {
             body: serde_json::json!({"hookSpecificOutput": {"permissionDecision": "allow"}}),
         };
-        assert_eq!(agent_prompt_for(&json), "none");
+        assert_eq!(agent_prompt_for(&json, true), "none");
+        assert_eq!(agent_prompt_for(&json, false), "agent_decides");
     }
 
     #[test]
     fn testAgentPromptForEmptyStdoutDefersToAgent() {
-        // Agents whose hook protocol returns empty stdout (Codex CLI
-        // today) leave the decision to the agent's own permission
-        // rules, which may or may not prompt.
+        // EmptyStdout is "no decision" everywhere — the agent's own permission
+        // rules apply regardless of any declared suppression flag.
         assert_eq!(
-            agent_prompt_for(&AllowResponse::EmptyStdout),
+            agent_prompt_for(&AllowResponse::EmptyStdout, false),
             "agent_decides"
         );
+        assert_eq!(
+            agent_prompt_for(&AllowResponse::EmptyStdout, true),
+            "agent_decides"
+        );
+    }
+
+    #[test]
+    fn testAgentPromptMatchesEachAgentsVerifiedAllowEffect() {
+        // Lock the per-agent audit value to the upstream-verified effects:
+        // only Claude Code's allow shape actually suppresses its prompt.
+        for (id, expected) in [
+            ("claude-code", "none"),
+            ("gemini-cli", "agent_decides"),
+            ("codex-cli", "agent_decides"),
+            ("cline", "agent_decides"),
+            ("opencode", "agent_decides"),
+        ] {
+            let proto = registry::agent_by_id(id)
+                .expect("known agent")
+                .hook_protocol()
+                .expect("hook protocol");
+            assert_eq!(
+                agent_prompt_for(
+                    &proto.allow_response,
+                    proto.runtime.allow_suppresses_agent_prompt
+                ),
+                expected,
+                "agent_prompt audit value for {id}"
+            );
+        }
     }
 
     #[test]
@@ -1771,7 +2543,9 @@ mod tests {
             body: serde_json::json!({"hookSpecificOutput": {"permissionDecision": "allow"}}),
         };
         let effective = effective_allow_response(&native, true);
-        assert_eq!(agent_prompt_for(&effective), "agent_decides");
+        // Suppression is declared true here, but the effective shape in log
+        // mode is EmptyStdout — the agent still decides.
+        assert_eq!(agent_prompt_for(&effective, true), "agent_decides");
     }
 
     #[test]
@@ -1822,6 +2596,18 @@ mod tests {
         ));
     }
 
+    /// Neutral runtime contract for synthetic test protocols (backstopped,
+    /// 600s window) — the per-agent declared values are exercised via
+    /// `agent_protocol` below and locked in registry tests.
+    fn test_runtime() -> crate::agents::registry::HookRuntime {
+        crate::agents::registry::HookRuntime {
+            agent_hook_timeout_secs: 600,
+            on_timeout: crate::agents::registry::HookTimeoutPosture::FailOpen,
+            native_backstop: true,
+            allow_suppresses_agent_prompt: false,
+        }
+    }
+
     #[test]
     fn testMapPayloadWithoutProtocol() {
         let input = serde_json::json!({"method": "execute", "detail": "git status"});
@@ -1841,9 +2627,13 @@ mod tests {
                 detail_key: Some("command".to_string()),
             }],
             pass_through_tools: Vec::new(),
-            detail_pass_throughs: Vec::new(),
+            agent_owned_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
+            runtime: test_runtime(),
+            permission_request_allow: None,
+            mcp_tool_naming: None,
+            native_ask: None,
         };
         let input = serde_json::json!({"tool_name": "Bash", "tool_input": "ls -la"});
         let (action, detail) = map_payload(Some(&protocol), &input);
@@ -1862,9 +2652,13 @@ mod tests {
                 detail_key: Some("command".to_string()),
             }],
             pass_through_tools: Vec::new(),
-            detail_pass_throughs: Vec::new(),
+            agent_owned_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
+            runtime: test_runtime(),
+            permission_request_allow: None,
+            mcp_tool_naming: None,
+            native_ask: None,
         };
         let input =
             serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "rm -rf /tmp"}});
@@ -1884,9 +2678,13 @@ mod tests {
                 detail_key: None,
             }],
             pass_through_tools: Vec::new(),
-            detail_pass_throughs: Vec::new(),
+            agent_owned_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
+            runtime: test_runtime(),
+            permission_request_allow: None,
+            mcp_tool_naming: None,
+            native_ask: None,
         };
         let input = serde_json::json!({"tool_name": "CustomTool", "tool_input": {"foo": "bar"}});
         let (action, detail) = map_payload(Some(&protocol), &input);
@@ -1901,9 +2699,13 @@ mod tests {
             detail_fields: vec!["tool_input".to_string()],
             tool_mappings: vec![],
             pass_through_tools: Vec::new(),
-            detail_pass_throughs: Vec::new(),
+            agent_owned_tools: Vec::new(),
             default_action: "call".to_string(),
             allow_response: AllowResponse::EmptyStdout,
+            runtime: test_runtime(),
+            permission_request_allow: None,
+            mcp_tool_naming: None,
+            native_ask: None,
         };
         let input = serde_json::json!({"tool_name": "Read", "tool_input": "/tmp/file"});
         let (action, detail) = map_payload(Some(&protocol), &input);
@@ -2012,36 +2814,98 @@ mod tests {
         let (action, detail) = map_payload(Some(&proto), &input);
         assert_eq!(action, "execute");
         assert_eq!(detail, "cargo build --release");
-        assert!(matching_detail_pass_through(&proto, &action, &detail).is_none());
     }
 
     #[test]
-    fn testCodexCliShellSnapshotPayloadPassesThrough() {
+    fn testCodexCliShellSnapshotIsNoLongerExempt() {
+        // Current codex spawns snapshot capture directly (no hook fires), so
+        // the old `.codex/shell_snapshots/` substring exemption — and the
+        // whole DetailPassThrough mechanism it justified — is gone. A command
+        // merely MENTIONING the snapshot dir maps to a plain governed execute.
         let proto = agent_protocol("codex-cli");
         let input = serde_json::json!({
             "tool_name": "Bash",
-            "tool_input": {"command": "if . '/Users/me/.codex/shell_snapshots/abc.sh' > /dev/null 2>&1\nthen\n\t:\nfi"}
+            "tool_input": {"command": "rm -rf ~ # .codex/shell_snapshots/"}
         });
         let (action, detail) = map_payload(Some(&proto), &input);
         assert_eq!(action, "execute");
-        assert!(matching_detail_pass_through(&proto, &action, &detail).is_some());
-
-        let direct = ". '/Users/me/.codex/shell_snapshots/abc.sh' > /dev/null 2>&1";
-        assert!(matching_detail_pass_through(&proto, "execute", direct).is_some());
+        assert_eq!(detail, "rm -rf ~ # .codex/shell_snapshots/");
     }
 
     #[test]
-    fn testCodexCliApplyPatchPayload() {
+    fn testCodexCliApplyPatchPayloadMapsToPatchAction() {
+        // Review Finding 10: the patch envelope is parsed into per-file
+        // decisions (drive_apply_patch), not treated as one write whose "path"
+        // is the whole patch text.
         let proto = agent_protocol("codex-cli");
         let input = serde_json::json!({
             "tool_name": "apply_patch",
-            "tool_input": {"command": "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-old\n+new"}
+            "tool_input": {"command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"}
         });
         let (action, detail) = map_payload(Some(&proto), &input);
-        assert_eq!(action, "write");
+        assert_eq!(action, "apply_patch");
+        assert!(detail.contains("*** Update File: src/lib.rs"));
+    }
+
+    #[test]
+    fn testParseApplyPatchPathsSplitsWritesAndDeletes() {
+        let patch = "*** Begin Patch\n\
+                     *** Add File: new/thing.rs\n\
+                     +content\n\
+                     *** Update File: src/lib.rs\n\
+                     *** Move to: src/renamed.rs\n\
+                     @@\n\
+                     -a\n\
+                     +b\n\
+                     *** Delete File: old/junk.rs\n\
+                     *** End Patch";
+        let parsed = parse_apply_patch_paths(patch);
         assert_eq!(
-            detail,
-            "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-old\n+new"
+            parsed.writes,
+            vec!["new/thing.rs", "src/lib.rs", "src/renamed.rs"]
+        );
+        assert_eq!(parsed.deletes, vec!["old/junk.rs"]);
+    }
+
+    #[test]
+    fn testParseApplyPatchPathsEmptyForNonPatchText() {
+        // No markers → unparseable; the caller defers/denies, never guesses.
+        let parsed = parse_apply_patch_paths("--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-o\n+n");
+        assert!(parsed.writes.is_empty() && parsed.deletes.is_empty());
+        // Diff body lines mentioning markers must not count: added lines
+        // (+-prefixed) and space-prefixed CONTEXT lines — a patch updating a
+        // file whose content cites the grammar must not grow phantom paths.
+        let parsed = parse_apply_patch_paths("+ say '*** Delete File: x' loudly");
+        assert!(parsed.deletes.is_empty());
+        let parsed = parse_apply_patch_paths(
+            "*** Update File: docs/grammar.md\n @@\n *** Delete File: example.rs\n",
+        );
+        assert_eq!(parsed.writes, vec!["docs/grammar.md"]);
+        assert!(parsed.deletes.is_empty());
+    }
+
+    #[test]
+    fn testCodexPermissionRequestAllowBodyMatchesUpstreamContract() {
+        // Verified upstream shape (hooks/src/schema.rs): camelCase,
+        // hookSpecificOutput.decision.behavior, deny_unknown_fields.
+        let proto = agent_protocol("codex-cli");
+        let body = proto
+            .permission_request_allow
+            .expect("codex declares the PermissionRequest integration");
+        assert_eq!(
+            body["hookSpecificOutput"]["hookEventName"],
+            "PermissionRequest"
+        );
+        assert_eq!(body["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        // Exactly these fields — upstream rejects unknown ones.
+        assert_eq!(body.as_object().unwrap().len(), 1);
+        assert_eq!(body["hookSpecificOutput"].as_object().unwrap().len(), 2);
+        assert_eq!(
+            body["hookSpecificOutput"]["decision"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
         );
     }
 

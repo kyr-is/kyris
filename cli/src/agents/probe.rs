@@ -45,6 +45,13 @@ pub(super) fn not_detected() -> ProbeResult {
     }
 }
 
+/// kyrisd's base URL from `kyrisd.yaml`, read-only (status must never create
+/// config). `None` when kyris isn't installed/configured — in which case no
+/// burn-control routing can be live, so value-aware probes report none.
+pub(super) fn kyrisd_base_url() -> Option<String> {
+    crate::state::load_config().ok().map(|c| c.base_url())
+}
+
 pub(super) fn probe_config_rewrite_burn_control(
     config_path: Option<&std::path::Path>,
     base_url_check: impl FnOnce(&serde_json::Value) -> bool,
@@ -53,7 +60,7 @@ pub(super) fn probe_config_rewrite_burn_control(
 ) -> SurfaceState<BurnControlMechanism> {
     let has_base_url =
         config_path.is_some_and(|p| read_json_value(p).is_ok_and(|v| base_url_check(&v)));
-    let has_env_proxy = env_reaches_agent(agent_id, env_var);
+    let has_env_proxy = env_routes_to_kyrisd(agent_id, env_var);
     if has_base_url || has_env_proxy {
         SurfaceState::adapted(BurnControlMechanism::ConfigRewrite)
     } else {
@@ -61,40 +68,49 @@ pub(super) fn probe_config_rewrite_burn_control(
     }
 }
 
-pub(super) fn json_has_mcp_wrap(path: &std::path::Path, servers_key: &str) -> bool {
-    let Ok(value) = read_json_value(path) else {
-        return false;
-    };
-    value
-        .get(servers_key)
-        .and_then(|s| s.as_object())
-        .is_some_and(|servers| {
-            servers.values().any(|s| {
-                let cmd = s.get("command");
-                let str_match = cmd
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c == "kyris-mcp");
-                let arr_match = cmd
-                    .and_then(|c| c.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|first| first == "kyris-mcp");
-                str_match || arr_match
-            })
-        })
+fn json_servers_at<'v>(
+    value: &'v serde_json::Value,
+    servers_path: &[String],
+) -> Option<&'v serde_json::Map<String, serde_json::Value>> {
+    let mut cur = value;
+    for key in servers_path {
+        cur = cur.get(key)?;
+    }
+    cur.as_object()
 }
 
-/// Returns true iff `path` has at least one entry under `servers_key`. Used
-/// to distinguish "no MCP servers to wrap" (N/A) from "MCP servers exist but
-/// aren't wrapped" (real gap).
-pub(super) fn json_has_any_mcp_servers(path: &std::path::Path, servers_key: &str) -> bool {
+fn json_server_is_wrapped(server: &serde_json::Value) -> bool {
+    // Read through the transport indirection so cline's nested
+    // `transport.command` counts as wrapped, not just the flat form.
+    let server = super::configure::json_mcp_fields(server);
+    let cmd = server.get("command");
+    let str_match = cmd
+        .and_then(|c| c.as_str())
+        .is_some_and(|c| c == "kyris-mcp");
+    let arr_match = cmd
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .is_some_and(|first| first == "kyris-mcp");
+    str_match || arr_match
+}
+
+pub(super) fn json_has_mcp_wrap(path: &std::path::Path, servers_path: &[String]) -> bool {
     let Ok(value) = read_json_value(path) else {
         return false;
     };
-    value
-        .get(servers_key)
-        .and_then(|s| s.as_object())
-        .is_some_and(|servers| !servers.is_empty())
+    json_servers_at(&value, servers_path)
+        .is_some_and(|servers| servers.values().any(json_server_is_wrapped))
+}
+
+/// Returns true iff `path` has at least one entry under `servers_path`. Used
+/// to distinguish "no MCP servers to wrap" (N/A) from "MCP servers exist but
+/// aren't wrapped" (real gap).
+pub(super) fn json_has_any_mcp_servers(path: &std::path::Path, servers_path: &[String]) -> bool {
+    let Ok(value) = read_json_value(path) else {
+        return false;
+    };
+    json_servers_at(&value, servers_path).is_some_and(|servers| !servers.is_empty())
 }
 
 /// TOML analog of [`json_has_any_mcp_servers`]. Used for agents (e.g.,
@@ -109,7 +125,43 @@ pub(super) fn toml_has_any_mcp_servers(path: &std::path::Path, servers_key: &str
         .is_some_and(|servers| !servers.is_empty())
 }
 
-pub(super) fn env_file_has_var(agent_id: &str, var_name: &str) -> bool {
+/// `(has_wrap, has_any)` across EVERY MCP config location the agent declares —
+/// the multi-scope probe core. A wrap in any scope counts as adapted; a server
+/// in any scope counts as "something to wrap" (so N/A is only reported when
+/// every scope is empty).
+pub(super) fn mcp_locations_status(agent: &dyn super::registry::AgentDescriptor) -> (bool, bool) {
+    let mut has_wrap = false;
+    let mut has_any = false;
+    for location in agent.mcp_configs() {
+        match &location.format {
+            super::registry::McpConfigFormat::Json { servers_path } => {
+                has_wrap |= json_has_mcp_wrap(&location.path, servers_path);
+                has_any |= json_has_any_mcp_servers(&location.path, servers_path);
+            }
+            super::registry::McpConfigFormat::Toml { servers_key } => {
+                has_any |= toml_has_any_mcp_servers(&location.path, servers_key);
+                has_wrap |= toml_has_mcp_wrap(&location.path, servers_key);
+            }
+        }
+    }
+    (has_wrap, has_any)
+}
+
+fn toml_has_mcp_wrap(path: &std::path::Path, servers_key: &str) -> bool {
+    let Ok(value) = crate::integration::read_toml_value(path) else {
+        return false;
+    };
+    value
+        .get(servers_key)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|servers| {
+            servers
+                .values()
+                .any(|s| s.get("command").and_then(toml::Value::as_str) == Some("kyris-mcp"))
+        })
+}
+
+fn agent_env_file_matches(agent_id: &str, predicate: impl Fn(&str) -> bool) -> bool {
     let Ok(dir) = env_dir() else {
         return false;
     };
@@ -123,8 +175,20 @@ pub(super) fn env_file_has_var(agent_id: &str, var_name: &str) -> bool {
         let name = name.to_string_lossy();
         name.ends_with(".sh")
             && (name.as_ref() == primary || name.starts_with(dash_prefix.as_str()))
-            && std::fs::read_to_string(entry.path())
-                .is_ok_and(|contents| contents.contains(var_name))
+            && std::fs::read_to_string(entry.path()).is_ok_and(|contents| predicate(&contents))
+    })
+}
+
+/// True iff the agent's env file exports `var_name` whose VALUE is `expected`
+/// — not merely that the var appears. Accepts the quoted form prestage writes
+/// (`export V='url'`) and the unquoted form of pre-quoting installs.
+fn env_file_exports_value(agent_id: &str, var_name: &str, expected: &str) -> bool {
+    let export_prefix = format!("export {var_name}=");
+    agent_env_file_matches(agent_id, |contents| {
+        contents.lines().any(|line| {
+            line.strip_prefix(&export_prefix)
+                .is_some_and(|value| value.trim().trim_matches('\'') == expected)
+        })
     })
 }
 
@@ -135,9 +199,18 @@ pub(super) fn env_file_has_var(agent_id: &str, var_name: &str) -> bool {
 /// `env_file_has_var && env_loader_sourced` checks, which under-reported
 /// burn-control as off whenever the shim — not the shell RC — delivers the env
 /// (e.g. under fish or a GUI launch, where the loader is never sourced).
-pub(super) fn env_reaches_agent(agent_id: &str, var_name: &str) -> bool {
-    env_file_has_var(agent_id, var_name)
-        && (super::shim::shim_delivers_env(agent_id) || env_loader_sourced())
+fn env_delivery_reaches_agent(agent_id: &str) -> bool {
+    super::shim::shim_delivers_env(agent_id) || env_loader_sourced()
+}
+
+/// Semantic burn-control probe: the env file must point `var_name` AT KYRISD
+/// (not merely exist — a var pointing elsewhere is not kyris routing) and the
+/// delivery vehicle must reach the agent. `kyrisd.yaml` absent → false.
+pub(super) fn env_routes_to_kyrisd(agent_id: &str, var_name: &str) -> bool {
+    let Some(base) = kyrisd_base_url() else {
+        return false;
+    };
+    env_file_exports_value(agent_id, var_name, &base) && env_delivery_reaches_agent(agent_id)
 }
 
 /// Legacy/back-compat detector: returns true if the user's shell RC files
