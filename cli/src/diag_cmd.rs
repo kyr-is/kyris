@@ -158,7 +158,7 @@ fn get_log_filter() -> Result<serde_json::Value, String> {
 
 /// Minimal blocking HTTP. Spins a one-shot tokio runtime so this
 /// CLI command stays as a normal `fn` — matches the pattern used by
-/// `kyris pending`, etc.
+/// the other CLI query commands.
 fn blocking_request(
     url: &str,
     method: &str,

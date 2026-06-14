@@ -700,7 +700,7 @@ pub fn extract_tokens_from_sse_json(json: &str) -> Option<StreamTokenCounts> {
 
 fn circuit_breaker_message(token_count: i64) -> String {
     format!(
-        "Circuit breaker: {token_count} tokens generated without a tool call. The human chose to stop; run 'kyris continue' to resume."
+        "Circuit breaker: {token_count} tokens generated without a tool call. The run was stopped — resume from the Kyris dialog, tray, or app."
     )
 }
 
@@ -1354,7 +1354,7 @@ mod tests {
             body["error"]["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("kyris continue")
+                .contains("resume from the Kyris")
         );
 
         let _ = router_shutdown.send(());
@@ -1417,7 +1417,10 @@ mod tests {
             streamed_body.contains("\"type\":\"circuit_breaker\""),
             "{streamed_body}"
         );
-        assert!(streamed_body.contains("kyris continue"), "{streamed_body}");
+        assert!(
+            streamed_body.contains("resume from the Kyris"),
+            "{streamed_body}"
+        );
 
         let _ = router_shutdown.send(());
         router_handle.await.unwrap();

@@ -5,7 +5,7 @@
 
 use std::fmt::Write as _;
 
-use crate::scan::scanner::{Finding, FindingCategory, RiskLevel, Severity, risk_level};
+use crate::audit::scanner::{Finding, FindingCategory, RiskLevel, Severity, risk_level};
 
 const CRITICAL_COLOR: &str = "#dc2626";
 const HIGH_COLOR: &str = "#ea580c";
@@ -361,7 +361,7 @@ footer a{color:#64748b;text-decoration:none}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan::scanner::{FindingCategory, FindingLocation};
+    use crate::audit::scanner::{FindingCategory, FindingLocation};
 
     fn make_finding(severity: Severity, category: FindingCategory) -> Finding {
         Finding {

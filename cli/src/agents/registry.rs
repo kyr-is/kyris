@@ -28,7 +28,6 @@ pub trait AgentDescriptor {
             other => other,
         }
     }
-    fn display_name(&self) -> &'static str;
     fn is_installed(&self) -> bool;
     fn probe(&self) -> ProbeResult;
     fn native_evidence(&self) -> NativeEvidence {
@@ -161,7 +160,7 @@ pub trait AgentDescriptor {
     fn burn_control_config_paths(&self) -> Vec<PathBuf> {
         Vec::new()
     }
-    /// Keys accepted by `kyris agents setup <agent> --set KEY=VALUE`, each with a
+    /// Keys accepted by `kyris agent setup <agent> --set KEY=VALUE`, each with a
     /// short description. Any `--set` key not listed here is rejected fail-fast
     /// rather than silently stored and ignored. Default: none.
     fn supported_settings(&self) -> &'static [(&'static str, &'static str)] {
@@ -693,7 +692,7 @@ pub enum ApprovalMode {
     KyrisPopup,
 }
 
-/// `kyris agents setup <agent> --set approval_prompt=native|kyris` — selects the
+/// `kyris agent setup <agent> --set approval_prompt=native|kyris` — selects the
 /// approval UX for an `ask`. Stored in the agent profile's `agent_specific`.
 pub const APPROVAL_PROMPT_SETTING: &str = "approval_prompt";
 
@@ -708,7 +707,7 @@ pub const APPROVAL_PROMPT_SETTING_DESC: &str = "Approval UX for an `ask`: `kyris
 /// cross-device resolution. Native mode hands the ask to the agent's own
 /// prompt and never learns the outcome (and on codex its safe-command list
 /// can skip the prompt entirely), so it is opt-in:
-/// `kyris agents setup <agent> --set approval_prompt=native`, honored only
+/// `kyris agent setup <agent> --set approval_prompt=native`, honored only
 /// for agents that declare a `native_ask` channel. The native machinery
 /// stays in place — dormant, not removed.
 #[must_use]
@@ -717,7 +716,7 @@ pub fn resolve_approval_mode(agent_id: &str, native_capable: bool) -> ApprovalMo
         return ApprovalMode::KyrisPopup;
     }
     // Single source of truth: the persisted `approval_prompt` agent-profile
-    // setting (`kyris agents setup <agent> --set approval_prompt=native|kyris`).
+    // setting (`kyris agent setup <agent> --set approval_prompt=native|kyris`).
     let setting = crate::state::load_agent_profile(agent_id)
         .ok()
         .flatten()

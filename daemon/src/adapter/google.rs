@@ -631,7 +631,7 @@ fn relay_ndjson_stream(
 
 fn circuit_breaker_message(token_count: i64) -> String {
     format!(
-        "Circuit breaker: {token_count} tokens generated without a tool call. The human chose to stop; run 'kyris continue' to resume."
+        "Circuit breaker: {token_count} tokens generated without a tool call. The run was stopped — resume from the Kyris dialog, tray, or app."
     )
 }
 

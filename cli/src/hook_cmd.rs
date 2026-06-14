@@ -31,7 +31,8 @@ pub enum HookCommand {
     /// Delegate a `PACT_ASK` or circuit-breaker approval to kyrisd's
     /// pending-approval system. Used by shell hooks in non-interactive
     /// (no-TTY) shells where prompting is impossible. Blocks until the
-    /// developer resolves the request via `kyris pending`, then sends
+    /// developer resolves the request via the approval popup, tray, or app,
+    /// then sends
     /// `permission.respond` to agentpactd and exits 0 (approved) or
     /// non-zero (denied/failed).
     Hold(HookHoldArgs),
@@ -54,7 +55,7 @@ pub struct HookHoldArgs {
     /// Approval token from agentpactd.
     #[arg(long)]
     pub token: String,
-    /// Human-readable description shown in `kyris pending` (the command text).
+    /// Human-readable description shown in the approval popup (the command text).
     #[arg(long)]
     pub display: String,
     /// Path to the agentpactd UDS socket (defaults to the standard location).
@@ -490,7 +491,7 @@ fn run_hold(args: HookHoldArgs) {
 
 /// Canonical `vendor/name` identity for a kyris-integrated agent id, used as
 /// the DECLARED attribution identity on agentpactd requests. The hook's
-/// `--agent` value was written into the agent's hook config by `kyris agents
+/// `--agent` value was written into the agent's hook config by `kyris agent
 /// setup` (install-time-owned, not chosen by the agent at runtime), so the
 /// daemon can attribute exactly with zero signature-catalog knowledge of the
 /// agent's install layout. Returns None for ids with no registered
@@ -828,7 +829,7 @@ fn handle_non_governed(
             "tool '{tool}' is not governed by kyris, and {agent} has no native \
              permission backstop behind the kyris hook — allowing it would run \
              ungoverned. Denied. Update kyris's {agent} tool mappings (then \
-             `kyris agents setup {agent}`), or `kyris agents undo {agent}` to \
+             `kyris agent setup {agent}`), or `kyris agent disconnect {agent}` to \
              restore {agent}'s own permission prompts."
         );
         audit_log_hook(
@@ -1056,7 +1057,7 @@ fn deny_for_missing_backstop(
         "{daemon} is unreachable and {agent} has no native permission backstop \
          behind the kyris hook — running this command would be ungoverned. \
          Denied. Start the daemon (`kyris status` shows what's down), or \
-         `kyris agents undo {agent}` to restore {agent}'s own permission prompts."
+         `kyris agent disconnect {agent}` to restore {agent}'s own permission prompts."
     );
     audit_log_hook(
         ctx.audit_conn,
@@ -1664,7 +1665,9 @@ fn poll_segment(
 
     let resolution = rt.block_on(async {
         let client = reqwest::Client::new();
-        eprintln!("[kyris] {server}/{seg} held for approval — resolve with 'kyris pending'");
+        eprintln!(
+            "[kyris] {server}/{seg} held for approval — resolve via the Kyris desktop prompt, tray, or app"
+        );
         kyris_core::pending::hold_poll_resolve_with_timeout(
             &client,
             &conn,
@@ -1697,7 +1700,7 @@ fn poll_segment(
         kyris_core::pending::Resolution::Denied => PopupResult::Blocked {
             exit_code: 2,
             source: "user_denied",
-            reason: "denied by developer via kyris pending".to_string(),
+            reason: "denied by the developer at the approval prompt".to_string(),
         },
         kyris_core::pending::Resolution::Unreachable => {
             // The dialog never rendered (kyrisd is down). Report it as a

@@ -189,7 +189,7 @@ pub fn codex_hooks_path() -> Result<PathBuf, String> {
 
 /// Write codex's `config.toml` with a surface component + schema validator.
 /// The reversible patch is recorded inside `write_toml_value` — shared across
-/// every agent — so `kyris agents undo` reverses every edit, including across
+/// every agent — so `kyris agent disconnect` reverses every edit, including across
 /// the several writes setup performs, with no per-agent recording code.
 fn write_codex_config(
     config_path: &Path,
@@ -448,7 +448,7 @@ fn ensure_codex_kyris_hook_trust(
                     eprintln!(
                         "[kyris] codex hooks.json entry at {key} differs from what kyris \
                          installs (edited?); not re-trusting it — re-run \
-                         `kyris agents setup codex-cli` after reverting the edit, or remove \
+                         `kyris agent setup codex-cli` after reverting the edit, or remove \
                          the entry"
                     );
                     continue;
@@ -680,9 +680,6 @@ impl AgentDescriptor for CodexCli {
     fn id(&self) -> &'static str {
         "codex-cli"
     }
-    fn display_name(&self) -> &'static str {
-        "Codex CLI"
-    }
     fn is_installed(&self) -> bool {
         // Detected when the config file exists (agent has been run at least
         // once) OR when the binary is on PATH (installed but not yet launched).
@@ -897,7 +894,7 @@ impl AgentDescriptor for CodexCli {
                 changes.push(format!(
                     "warning: approval_policy was \"{prior}\" — overridden to \"untrusted\" so \
                      codex routes governed commands to its approval prompt (restored on \
-                     `kyris agents undo codex-cli`)"
+                     `kyris agent disconnect codex-cli`)"
                 ));
             }
             changes.push(format!(
@@ -1058,7 +1055,7 @@ impl AgentDescriptor for CodexCli {
             if let Some(prior) = prior_provider.filter(|p| p != "kyris") {
                 changes.push(format!(
                     "warning: model_provider was \"{prior}\" — overridden to \"kyris\" so \
-                     burn-control can route through kyrisd; `kyris agents undo codex-cli` \
+                     burn-control can route through kyrisd; `kyris agent disconnect codex-cli` \
                      restores it"
                 ));
             }

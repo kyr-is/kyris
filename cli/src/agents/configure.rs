@@ -315,6 +315,18 @@ pub fn setup_agent(
     let base_url = config.base_url();
     let inbound_key = &config.server.inbound_key;
 
+    // `setup` is idempotent and repairs drift. A bare re-run (no `--set`) must
+    // REAPPLY previously-saved settings, not silently reset the agent's config
+    // to defaults — so configure the surfaces with the saved settings merged
+    // under any new `--set` (new values win). This is what lets `setup` subsume
+    // the old `reconcile`: re-running it restores a drifted/reinstalled config
+    // with the user's settings intact.
+    let mut effective = crate::state::load_agent_profile(agent_id)?
+        .map(|p| p.agent_specific)
+        .unwrap_or_default();
+    effective.extend(agent_specific.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let effective = &effective;
+
     let mut changes = super::prestage::prestage_agent(agent_id)?;
 
     if agent.is_installed() {
@@ -323,20 +335,16 @@ pub fn setup_agent(
             changes.extend(super::shim::install_shim(agent_id)?);
         }
         if plan.has_adapted_execution() {
-            changes.extend(agent.configure_execution_surface(
-                &base_url,
-                inbound_key,
-                agent_specific,
-            )?);
+            changes.extend(agent.configure_execution_surface(&base_url, inbound_key, effective)?);
         }
         if plan.has_adapted_tool() {
-            changes.extend(agent.configure_tool_surface(&base_url, inbound_key, agent_specific)?);
+            changes.extend(agent.configure_tool_surface(&base_url, inbound_key, effective)?);
         }
         if plan.has_adapted_burn_control() {
             changes.extend(agent.configure_burn_control_surface(
                 &base_url,
                 inbound_key,
-                agent_specific,
+                effective,
             )?);
         }
 
@@ -351,7 +359,7 @@ pub fn setup_agent(
         verify_governance_daemons(&base_url, agent_id, false)?;
     }
 
-    clear_disabled_flag(agent_id)?;
+    clear_disconnected_flag(agent_id)?;
 
     if !agent_specific.is_empty() {
         save_agent_specific(agent_id, agent_specific)?;
@@ -376,29 +384,6 @@ pub fn setup_agent(
     }
 
     Ok(())
-}
-
-/// Configure agent-owned files only. Used by reconcile auto-configure.
-/// Prestage must have already run. If kyrisd is unreachable, returns an
-/// error — the caller must ensure kyrisd is ready before calling this.
-///
-/// When `skip_burn_control` is true, burn-control configuration is skipped.
-/// Execution and tool surfaces still run; used after native promotion removes
-/// burn-control artifacts without disabling MCP/tool mediation.
-pub fn configure_agent(
-    agent_id: &str,
-    agent_specific: &std::collections::HashMap<String, String>,
-    skip_burn_control: bool,
-    log: Option<&InstallLog>,
-) -> Result<(), String> {
-    configure_agent_surfaces(
-        agent_id,
-        agent_specific,
-        false,
-        false,
-        skip_burn_control,
-        log,
-    )
 }
 
 pub(super) fn configure_agent_surfaces(
@@ -446,7 +431,7 @@ pub(super) fn configure_agent_surfaces(
         if let Err(error) = verify_kyrisd_health(&base_url) {
             return Err(format!(
                 "kyrisd unreachable ({error}). \
-                 Bring kyrisd up (try `launchctl kickstart gui/$UID/is.kyr.kyrisd` or reinstall), then re-run `kyris agents setup {agent_id}`."
+                 Bring kyrisd up (try `launchctl kickstart gui/$UID/is.kyr.kyrisd` or reinstall), then re-run `kyris agent setup {agent_id}`."
             ));
         }
     }
@@ -472,11 +457,11 @@ pub(super) fn configure_agent_surfaces(
     Ok(())
 }
 
-fn clear_disabled_flag(agent_id: &str) -> Result<(), String> {
+fn clear_disconnected_flag(agent_id: &str) -> Result<(), String> {
     if let Some(mut profile) = crate::state::load_agent_profile(agent_id)?
-        && profile.disabled
+        && profile.disconnected
     {
-        profile.disabled = false;
+        profile.disconnected = false;
         crate::state::save_agent_profile(&profile)?;
     }
     Ok(())
@@ -611,7 +596,7 @@ pub fn kyris_routed_mcp_server_names(agent: &dyn super::registry::AgentDescripto
 
 /// Names of MCP servers in the agent's config that are NOT yet routed through
 /// kyris — a stdio server whose `command` isn't `kyris-mcp`. Surfaces config
-/// drift (e.g. an MCP server added *after* `kyris agents setup`, which the
+/// drift (e.g. an MCP server added *after* `kyris agent setup`, which the
 /// configure-time rewrite never saw) so `kyris status` can prompt a reconcile.
 /// URL/HTTP servers are out of scope here.
 pub fn unwrapped_mcp_server_names(agent: &dyn super::registry::AgentDescriptor) -> Vec<String> {
@@ -776,7 +761,7 @@ fn reject_conflicting_http_upstreams(
                              with different upstream URLs ({existing} vs {url}); kyrisd routes \
                              by server name, so one scope would silently reach the other's \
                              upstream. Rename one of the servers, then re-run \
-                             `kyris agents setup {agent_id}`."
+                             `kyris agent setup {agent_id}`."
                         ));
                     }
                 } else {
@@ -1244,7 +1229,7 @@ pub(super) fn apply_json_tool_filters(
 /// duplicates are not added. ADD-ONLY by design, unlike the codex/gemini
 /// filters which replace their dedicated per-server fields: `permissions.deny`
 /// is shared with user-authored rules, so kyris never removes entries (a
-/// policy-dropped deny lingers until `kyris agents undo` restores the file —
+/// policy-dropped deny lingers until `kyris agent disconnect` restores the file —
 /// supplementary steering only; runtime enforcement is the wrap/routing).
 /// Returns whether `settings` changed.
 pub(super) fn apply_claude_mcp_tool_denies(
@@ -1397,7 +1382,7 @@ fn governance_daemons_error(
     }
     Some(format!(
         "{agent_id} configured, but governance is NOT active:\n  - {}\n\
-         The configuration is in place — re-run `kyris agents setup {agent_id}` once the daemon(s) are up.",
+         The configuration is in place — re-run `kyris agent setup {agent_id}` once the daemon(s) are up.",
         down.join("\n  - ")
     ))
 }

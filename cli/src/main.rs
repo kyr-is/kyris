@@ -27,11 +27,13 @@
 )]
 #![cfg_attr(test, allow(non_snake_case))]
 
+mod activity;
 mod agents;
+mod audit;
 mod check;
 mod compile_policy;
 mod config_writer;
-mod continue_cmd;
+mod debug;
 mod diag_cmd;
 mod doctor;
 mod headline;
@@ -42,11 +44,9 @@ mod lifecycle;
 mod logs_cmd;
 mod mcp_cmd;
 mod operator;
-mod pending;
+mod policy;
 mod query;
 mod recent_approvals;
-mod sandbox;
-mod scan;
 mod service;
 mod state;
 mod status;
@@ -64,66 +64,61 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Agents(agents::AgentsArgs),
-    Approvals(query::approvals::ApprovalsArgs),
-    Timeline(query::timeline::TimelineArgs),
-    Replay(query::replay::ReplayArgs),
-    Stats(query::stats::StatsArgs),
-    History(query::history::HistoryArgs),
-    Check(check::CheckArgs),
-    CompilePolicy(compile_policy::CompilePolicyArgs),
-    Diag(diag_cmd::DiagArgs),
-    Hook(hook_cmd::HookArgs),
-    Pending(pending::PendingArgs),
-    Continue(continue_cmd::ContinueArgs),
-    Doctor(doctor::DoctorArgs),
-    Scan(scan::ScanArgs),
-    Sandbox(sandbox::SandboxArgs),
+    // ── Setup ────────────────────────────────────────────────────────────
+    /// Install Kyris local components
     Install,
-    Enroll(lifecycle::enroll::EnrollArgs),
-    Update(lifecycle::update::UpdateArgs),
-    Daemon(lifecycle::daemon_cmd::DaemonArgs),
-    Logs(logs_cmd::LogsArgs),
-    Mcp(mcp_cmd::McpArgs),
-    Disable(lifecycle::run_state::DisableArgs),
-    Enable(lifecycle::run_state::EnableArgs),
+    /// Remove Kyris local integrations
     Uninstall(lifecycle::uninstall::UninstallArgs),
-    Verify(lifecycle::verify::VerifyArgs),
+    /// Update installed Kyris binaries
+    Update(lifecycle::update::UpdateArgs),
+    /// Enroll this machine with the hosted relay
+    Enroll(lifecycle::enroll::EnrollArgs),
+
+    // ── Daily use ────────────────────────────────────────────────────────
+    /// Show effective posture and component health
     Status(status::StatusArgs),
+    /// Manage supported agent integrations
+    Agent(agents::AgentArgs),
+    /// Inspect governed commands, tool calls, and model usage
+    Activity(activity::ActivityArgs),
+    /// Check and change policy behavior
+    Policy(policy::PolicyArgs),
+
+    // ── Support ──────────────────────────────────────────────────────────
+    /// Diagnose local problems
+    Doctor(doctor::DoctorArgs),
+    /// Show log file locations
+    Logs(logs_cmd::LogsArgs),
+    /// Advanced diagnostics and support commands
+    Debug(debug::DebugArgs),
+    /// Print version information
     Version(version::VersionArgs),
+
+    // ── Runtime ABI (hidden; invoked by generated agent configs) ─────────
+    #[command(hide = true)]
+    Hook(hook_cmd::HookArgs),
+    #[command(hide = true)]
+    Mcp(mcp_cmd::McpArgs),
 }
 
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Agents(args) => agents::run(args),
-        Command::Approvals(args) => query::approvals::run(args),
-        Command::Timeline(args) => query::timeline::run(args),
-        Command::Replay(args) => query::replay::run(args),
-        Command::Stats(args) => query::stats::run(args),
-        Command::History(args) => query::history::run(args),
-        Command::Check(args) => check::run(args),
-        Command::CompilePolicy(args) => compile_policy::run(args),
-        Command::Diag(args) => diag_cmd::run(args),
-        Command::Hook(args) => hook_cmd::run(args),
-        Command::Pending(args) => pending::run(args),
-        Command::Continue(args) => continue_cmd::run(args),
-        Command::Doctor(args) => doctor::run(args),
-        Command::Scan(args) => scan::run(args),
-        Command::Sandbox(args) => sandbox::run(args),
         Command::Install => lifecycle::install::run(),
-        Command::Enroll(args) => lifecycle::enroll::run(args),
-        Command::Update(args) => lifecycle::update::run(args),
-        Command::Daemon(args) => lifecycle::daemon_cmd::run(args),
-        Command::Logs(args) => logs_cmd::run(args),
-        Command::Mcp(args) => mcp_cmd::run(args),
-        Command::Disable(args) => lifecycle::run_state::run_disable(args),
-        Command::Enable(args) => lifecycle::run_state::run_enable(args),
         Command::Uninstall(args) => lifecycle::uninstall::run(args),
-        Command::Verify(args) => lifecycle::verify::run(args),
+        Command::Update(args) => lifecycle::update::run(args),
+        Command::Enroll(args) => lifecycle::enroll::run(args),
         Command::Status(args) => status::run(args),
+        Command::Agent(args) => agents::run(args),
+        Command::Activity(args) => activity::run(args),
+        Command::Policy(args) => policy::run(args),
+        Command::Doctor(args) => doctor::run(args),
+        Command::Logs(args) => logs_cmd::run(args),
+        Command::Debug(args) => debug::run(args),
         Command::Version(args) => version::run(args),
+        Command::Hook(args) => hook_cmd::run(args),
+        Command::Mcp(args) => mcp_cmd::run(args),
     }
 }
 
@@ -146,42 +141,72 @@ mod tests {
         assert!(try_parse(&["status"]).is_ok());
     }
 
+    // ── agent group ──────────────────────────────────────────────────────
     #[test]
-    fn testParsePending() {
-        assert!(try_parse(&["pending"]).is_ok());
+    fn testParseAgentBareAndList() {
+        assert!(try_parse(&["agent"]).is_ok());
+        assert!(try_parse(&["agent", "list"]).is_ok());
     }
 
     #[test]
-    fn testParseContinueNoArgsResetsAll() {
-        // No session arg = reset every currently-tripped session.
-        assert!(try_parse(&["continue"]).is_ok());
+    fn testParseAgentStatusAndShorthand() {
+        assert!(try_parse(&["agent", "status"]).is_ok());
+        assert!(try_parse(&["agent", "status", "claude-code"]).is_ok());
+        // bare `kyris agent <id>` is shorthand for status of that agent.
+        assert!(try_parse(&["agent", "claude-code"]).is_ok());
     }
 
     #[test]
-    fn testParseContinueWithSession() {
-        assert!(try_parse(&["continue", "sess-123"]).is_ok());
+    fn testParseAgentSetup() {
+        assert!(try_parse(&["agent", "setup", "claude-code"]).is_ok());
+        assert!(try_parse(&["agent", "setup", "--all"]).is_ok());
+        assert!(try_parse(&["agent", "setup", "codex-cli", "--set", "max-turns=100"]).is_ok());
     }
 
     #[test]
-    fn testParseCheck() {
-        assert!(try_parse(&["check", "git status"]).is_ok());
+    fn testParseAgentDisconnect() {
+        assert!(try_parse(&["agent", "disconnect", "claude-code"]).is_ok());
+        // disconnect targets one agent; no bare form.
+        assert!(try_parse(&["agent", "disconnect"]).is_err());
     }
 
+    // ── activity group ───────────────────────────────────────────────────
     #[test]
-    fn testParseAgents() {
-        assert!(try_parse(&["agents"]).is_ok());
+    fn testParseActivity() {
+        assert!(try_parse(&["activity"]).is_ok());
+        assert!(try_parse(&["activity", "--last", "5"]).is_ok());
+        assert!(try_parse(&["activity", "--agent", "claude-code", "--decision", "ask"]).is_ok());
+        assert!(try_parse(&["activity", "stats"]).is_ok());
+        assert!(try_parse(&["activity", "replay", "sess-1"]).is_ok());
+        assert!(try_parse(&["activity", "trace", "abc-123"]).is_ok());
+        assert!(try_parse(&["activity", "approvals"]).is_ok());
     }
 
+    // ── policy group ─────────────────────────────────────────────────────
     #[test]
-    fn testParseAgentsSetup() {
-        assert!(try_parse(&["agents", "setup", "claude-code"]).is_ok());
+    fn testParsePolicy() {
+        assert!(try_parse(&["policy", "check", "git status"]).is_ok());
+        assert!(try_parse(&["policy", "enable"]).is_ok());
+        assert!(try_parse(&["policy", "disable"]).is_ok());
+        assert!(try_parse(&["policy", "compile", "--agent", "codex-cli"]).is_ok());
+        // bare `policy` shows help (arg_required_else_help) rather than running.
+        assert!(try_parse(&["policy"]).is_err());
     }
 
+    // ── debug group ──────────────────────────────────────────────────────
     #[test]
-    fn testParseAgentsReconcile() {
-        assert!(try_parse(&["agents", "reconcile"]).is_ok());
+    fn testParseDebug() {
+        assert!(try_parse(&["debug", "trace-on"]).is_ok());
+        assert!(try_parse(&["debug", "trace-off"]).is_ok());
+        assert!(try_parse(&["debug", "trace-status"]).is_ok());
+        assert!(try_parse(&["debug", "verify"]).is_ok());
+        assert!(try_parse(&["debug", "verify", "--post-install"]).is_ok());
+        assert!(try_parse(&["debug", "verify", "--post-uninstall"]).is_ok());
+        assert!(try_parse(&["debug", "audit"]).is_ok());
+        assert!(try_parse(&["debug"]).is_err());
     }
 
+    // ── hidden ABI commands still parse ──────────────────────────────────
     #[test]
     fn testParseMcpWrap() {
         assert!(try_parse(&["mcp", "wrap", "node", "server.js"]).is_ok());
@@ -198,64 +223,42 @@ mod tests {
     }
 
     #[test]
-    fn testParseDisable() {
-        assert!(try_parse(&["disable"]).is_ok());
-    }
-
-    #[test]
-    fn testParseEnable() {
-        assert!(try_parse(&["enable"]).is_ok());
-    }
-
-    #[test]
-    fn testParseStopAndStartAreGone() {
-        // Renamed to `disable`/`enable` when the sentinel mechanism
-        // was retired in favor of a pure `mode: log` ↔ `mode: enforce`
-        // toggle. Old verbs must not silently accept.
-        assert!(try_parse(&["stop"]).is_err());
-        assert!(try_parse(&["start"]).is_err());
-    }
-
-    #[test]
-    fn testParseDaemonOnlyHasStatus() {
-        // `kyris daemon start|stop` were replaced by top-level
-        // `kyris disable|enable` (policy mode toggle). `kyris daemon
-        // logs` was replaced by top-level `kyris logs` (all log files).
-        // What remains is the focused kyrisd service probe.
-        assert!(try_parse(&["daemon", "start"]).is_err());
-        assert!(try_parse(&["daemon", "stop"]).is_err());
-        assert!(try_parse(&["daemon", "logs"]).is_err());
-        assert!(try_parse(&["daemon", "status"]).is_ok());
-    }
-
-    #[test]
-    fn testParseDoctor() {
+    fn testParseDoctorAndLogs() {
         assert!(try_parse(&["doctor"]).is_ok());
-    }
-
-    #[test]
-    fn testParseLogs() {
         assert!(try_parse(&["logs"]).is_ok());
     }
 
     #[test]
-    fn testParseLogsTrace() {
-        assert!(try_parse(&["logs", "trace", "abc-123"]).is_ok());
-    }
-
-    #[test]
-    fn testParseVerify() {
-        assert!(try_parse(&["verify"]).is_ok());
-    }
-
-    #[test]
-    fn testParseVerifyPostInstall() {
-        assert!(try_parse(&["verify", "--post-install"]).is_ok());
-    }
-
-    #[test]
-    fn testParseVerifyPostUninstall() {
-        assert!(try_parse(&["verify", "--post-uninstall"]).is_ok());
+    fn testDeletedCommandsRejected() {
+        // The reshape removed/regrouped these; they must NOT silently parse.
+        for old in [
+            "agents",
+            "pending",
+            "approvals",
+            "continue",
+            "timeline",
+            "history",
+            "stats",
+            "replay",
+            "check",
+            "enable",
+            "disable",
+            "compile-policy",
+            "daemon",
+            "diag",
+            "verify",
+            "scan",
+            "sandbox",
+            "stop",
+            "start",
+        ] {
+            assert!(
+                try_parse(&[old]).is_err(),
+                "deleted top-level command `{old}` must not parse"
+            );
+        }
+        // `logs trace` moved to `activity trace`.
+        assert!(try_parse(&["logs", "trace", "abc-123"]).is_err());
     }
 
     #[test]

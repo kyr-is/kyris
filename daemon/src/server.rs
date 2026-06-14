@@ -32,7 +32,7 @@ pub struct AppState {
     pub circuit_breaker: Arc<CircuitBreaker>,
     /// Open "continue or stop?" prompts for runaway sessions, keyed by session.
     /// A trip holds the request here until the human answers (via the desktop
-    /// dialog, `kyris continue`, the tray, or the app's Stop control).
+    /// dialog, the tray, or the app's Stop/Continue control).
     pub gate: Arc<crate::gate::GateRegistry>,
     pub cost_calculator: CostCalculator,
     pub stats_tx: mpsc::Sender<StatsEvent>,
@@ -803,10 +803,11 @@ async fn circuit_breaker_reset(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CircuitBreakerResetRequest>,
 ) -> axum::http::StatusCode {
-    // `kyris continue` is also how a human answers an open runaway prompt:
-    // release any request waiting on this session with Continue. The breaker
-    // reset itself happens inside the gate on Continue, but do it here too so a
-    // plain reset (no prompt open) still clears the session.
+    // This endpoint is also how a human answers an open runaway prompt (the
+    // desktop dialog, tray, and app all land here): release any request waiting
+    // on this session with Continue. The breaker reset itself happens inside the
+    // gate on Continue, but do it here too so a plain reset (no prompt open)
+    // still clears the session.
     state
         .gate
         .resolve(&body.session_id, crate::gate::GateDecision::Continue);
@@ -820,12 +821,12 @@ async fn circuit_breaker_reset(
 }
 
 /// Reset every session that's currently sitting at or above its token
-/// cap. Returns the list of session IDs that were cleared so the CLI
-/// can show the operator exactly which sessions resumed. Empty list
+/// cap. Returns the list of session IDs that were cleared so the caller
+/// (tray / app) can show exactly which sessions resumed. Empty list
 /// is a valid success — no sessions were tripped.
 async fn circuit_breaker_reset_all(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    // Release every open runaway prompt with Continue (the `kyris continue`
-    // no-arg path), then clear every tripped session's counter.
+    // Release every open runaway prompt with Continue (the reset-all path used
+    // by the tray / app), then clear every tripped session's counter.
     state.gate.resolve_all(crate::gate::GateDecision::Continue);
     let cleared = state.circuit_breaker.reset_all_tripped();
     if cleared.is_empty() {
@@ -891,7 +892,7 @@ impl ResolveDecision {
 ///
 /// `CouldNotShow` maps to `None`: the dialog never reached the user (occluded,
 /// off-space, or — on platforms without an approval UI — never attempted), so
-/// the request is left **pending** for `kyris pending` / the menu-bar path
+/// the request is left **pending** for the tray / app to resolve
 /// rather than resolved. Returning `Approved` here would defeat the permission
 /// gate; see `notify::ask_approval`'s non-macOS fallback, which returns
 /// `CouldNotShow` precisely so this leaves the request pending.
@@ -1088,7 +1089,7 @@ async fn hold_pending(
     });
     state.pending.set_timeout_handle(&body.id, handle);
 
-    // Show the approval dialog immediately rather than waiting for `kyris pending`.
+    // Show the approval dialog immediately rather than waiting for the tray / app.
     #[cfg(feature = "tray")]
     {
         let state = state.clone();
@@ -1141,7 +1142,7 @@ async fn hold_pending(
             };
             // CouldNotShow means the panel never became visible to the user
             // — treat as "no answer yet" and leave the request pending so
-            // the menu-bar attention path (or `kyris pending`) can pick it
+            // the menu-bar attention path (or the tray / app) can pick it
             // up. Treating CouldNotShow as Denied would silently reject
             // every request whenever the user is in a fullscreen app or on
             // a different Space — the exact failure mode this design fixes.
@@ -3027,8 +3028,8 @@ mod tests {
     // the approval-prompt flow. They mount all three pending routes against
     // an in-process axum server, drive `hold_poll_resolve` (the same code
     // path `kyris hook check` uses when agentpactd returns Ask), and
-    // simulate the user typing `y` or `n` in `kyris pending` by POSTing
-    // /api/pending/{id}/resolve from a parallel task.
+    // simulate a human approving or denying via the popup / tray / app by
+    // POSTing /api/pending/{id}/resolve from a parallel task.
     //
     // What this catches:
     // - protocol drift between kyris-core's client and kyrisd's handlers
@@ -3154,7 +3155,7 @@ mod tests {
         // first poll cycle so the request is ready when polling starts.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Simulate `kyris pending` user typing "y": POST to /api/pending/<id>/resolve.
+        // Simulate a human approving via the popup / app: POST to /api/pending/<id>/resolve.
         let resolve_resp = reqwest::Client::new()
             .post(format!("{addr}/api/pending/e2e-approve-1/resolve"))
             .header("authorization", "Bearer test-operator-key")
@@ -3214,7 +3215,7 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // Simulate `kyris pending` user typing "n".
+        // Simulate a human denying via the popup / app.
         let resolve_resp = reqwest::Client::new()
             .post(format!("{addr}/api/pending/e2e-deny-1/resolve"))
             .header("authorization", "Bearer test-operator-key")
@@ -3239,9 +3240,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn testEndToEndListPendingReflectsHeldRequest() {
-        // Verifies the kyris pending CLI's `GET /api/pending` listing path
-        // sees a held request — the CLI uses this to display "what's
-        // waiting for approval" before prompting.
+        // Verifies the `GET /api/pending` listing path sees a held request —
+        // the tray / app use this to display "what's waiting for approval"
+        // before prompting.
         let dir = tempfile::tempdir().unwrap();
         let config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         let state = make_test_state(config, dir.path());
@@ -3289,8 +3290,8 @@ mod tests {
             .unwrap();
         assert!(hold_resp.status().is_success());
 
-        // Listing should show the held request — this is what `kyris pending`
-        // displays to the user before prompting.
+        // Listing should show the held request — this is what the tray / app
+        // display to the user before prompting.
         let list_resp = client
             .get(format!("{addr}/api/pending"))
             .header("authorization", "Bearer test-operator-key")

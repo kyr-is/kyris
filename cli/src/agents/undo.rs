@@ -33,7 +33,7 @@ pub fn undo_agent(agent_id: &str) -> Result<(), String> {
     profile.tool = super::profile::SurfaceState::none();
     profile.burn_control = super::profile::SurfaceState::none();
     profile.managed_files.clear();
-    profile.disabled = true;
+    profile.disconnected = true;
     save_agent_profile(&profile)?;
 
     Ok(())

@@ -86,7 +86,7 @@ fn require_writable_opencode_config(path: &std::path::Path) -> Result<(), String
         return Err(format!(
             "{} uses JSONC syntax (comments and/or trailing commas), which kyris cannot \
              manage without losing it. Convert it to standard JSON (rename to opencode.json \
-             or remove the JSONC syntax), then re-run `kyris agents setup opencode`.",
+             or remove the JSONC syntax), then re-run `kyris agent setup opencode`.",
             path.display()
         ));
     }
@@ -249,9 +249,6 @@ fn opencode_plugin_path() -> Result<PathBuf, String> {
 impl AgentDescriptor for OpenCode {
     fn id(&self) -> &'static str {
         "opencode"
-    }
-    fn display_name(&self) -> &'static str {
-        "OpenCode"
     }
     fn is_installed(&self) -> bool {
         which_exists("opencode") || opencode_config_exists()

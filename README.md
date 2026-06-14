@@ -12,7 +12,7 @@ Today the practical target is macOS, with Apple Silicon as the primary supported
 
 ### 1.1 What's Included
 
-- `kyris` CLI for install, setup, status, timeline, stats, history, replay, scan, and daemon control
+- `kyris` CLI for install, agent setup, status, activity inspection, policy control, and diagnostics
 - `kyrisd` local daemon binary for LLM routing, HTTP MCP routing, and local operator workflows
 - `kyris-mcp` stdio MCP wrapper binary
 - `kyris-hook` helper binary for shell and native hook integrations
@@ -67,7 +67,7 @@ Enterprise mode will install `kyrisd` as a root `LaunchDaemon` with tamper-proof
 
 ```sh
 kyris install
-kyris agents
+kyris agent setup --all
 kyris status
 ```
 
@@ -173,18 +173,18 @@ The normal workflow is simple. Exact output depends on what is installed and wha
      agentpactd - Install separately via AgentPact's own installer.
    ```
 
-3. Run `kyris agents setup <agent>` for the agents you use, or `kyris agents` to see what Kyris detected.
+3. Run `kyris agent setup <agent>` for the agents you use, or `kyris agent` to see what Kyris detected.
 
    Example response:
 
    ```text
-   $ kyris agents
+   $ kyris agent
    Agent         Execution        Tool             Burn-Control     Status
    claude-code   adapted(hook)    adapted(hook)    none             ok
    codex-cli     none             none             none             ok
    cline         none             none             none             ok
 
-   $ kyris agents setup claude-code
+   $ kyris agent setup claude-code
    Applied setup for claude-code:
      wrote /Users/alex/.kyris/env/load.sh
      wrote /Users/alex/.kyris/env/claude-code.sh
@@ -235,7 +235,7 @@ The most useful commands for day-to-day use are:
     [+] component versions aligned (kyris=0.1.0, kyrisd=0.1.0, agentpactd=0.1.0)
   ```
 
-- `kyris timeline`
+- `kyris activity`
 
   Example response:
 
@@ -245,7 +245,7 @@ The most useful commands for day-to-day use are:
   2026-04-25T15:03:22Z  claude-code     write      auto     [enforced] kyris/README.md
   ```
 
-- `kyris stats`
+- `kyris activity stats`
 
   Example response:
 
@@ -265,7 +265,7 @@ The most useful commands for day-to-day use are:
     anthropic    claude-4-sonnet-20250301      $  0.2143  (3 requests)
   ```
 
-- `kyris history`
+- `kyris activity` (filtered)
 
   Example response:
 
@@ -274,7 +274,7 @@ The most useful commands for day-to-day use are:
   2026-04-25T15:03:11Z  claude-code     execute    denied   git push --force origin main
   ```
 
-- `kyris replay <session>`
+- `kyris activity replay <session>`
 
   Example response:
 
@@ -296,10 +296,10 @@ Two points are worth being explicit about.
 ### 2.5 Burn Control, Timeline, And Reports
 Kyris is meant to replace a messy reconstruction workflow. Without it, you piece the story together from chat history, terminal scrollback, vendor dashboards, and guesswork. With it, you use one local interface to answer the two questions people ask after every serious agent run: "What happened?" and "What did it cost?"
 
-- `kyris timeline` is the fast answer when you want the full picture: commands, approvals, tool calls, model usage, and coverage in one human-readable stream.
-- `kyris stats` is the burn-control view: where tokens went, which models were active, how decisions broke down, and what Kyris could actually see.
-- `kyris history` is the searchable view when you want to filter by agent, action, decision, or time range.
-- `kyris replay <session>` is the forensic view when you want one session reconstructed in order.
+- `kyris activity` is the fast answer when you want the full picture: commands, approvals, tool calls, model usage, and coverage in one human-readable stream.
+- `kyris activity stats` is the burn-control view: where tokens went, which models were active, how decisions broke down, and what Kyris could actually see.
+- `kyris activity --agent X --since T` (any filter) is the searchable view when you want to narrow by agent, action, decision, or time range.
+- `kyris activity replay <session>` is the forensic view when you want one session reconstructed in order.
 
 If you enroll the machine, in-scope records can also sync to the hosted Kyris product. The local CLI still works without enrollment, and the open-source value proposition should stand on its own even if you never sync anything.
 
@@ -345,7 +345,7 @@ Kyris treats the directory an agent is launched from as that session's permitted
 
 By default the workspace boundary is enforced on the decision path: writes and deletes outside the workspace ask or deny, and writes inside it follow the `workspace_writes` policy (default ask).
 
-Kernel enforcement is also available, **experimental and off by default**. Run `kyris sandbox enable` and each newly launched agent runs inside an OS sandbox (macOS Seatbelt) whose writable root is its launch directory — the whole agent process tree, jailed at the kernel. Inside a verified jail, workspace writes stop prompting entirely (they auto-allow), because a misclassified or surprising write can no longer escape the boundary: it fails at the kernel, not at our judgement. Each governed action records whether it ran sandboxed, so the audit trail never conflates a kernel-confined run with an advisory one. `kyris sandbox disable` reverts instantly. It is experimental because the per-agent set of dirs an agent may write outside its workspace (its own config/state/caches) is still being tuned against real agents; until that settles, an agent may occasionally be blocked from writing one of its own files. Coverage claims stay honest per §2.6 regardless: an action is only reported as kernel-enforced when it actually ran inside a verified jail.
+Kernel enforcement is also a core part of this, **on by default** wherever an OS sandbox backend exists (macOS Seatbelt today; Linux planned). Each newly launched agent runs inside an OS sandbox whose writable root is its launch directory — the whole agent process tree, jailed at the kernel. There is no switch to flip and no marker file; `kyris status` reports whether the jail is active on this host. Inside a verified jail, workspace writes stop prompting entirely (they auto-allow), because a misclassified or surprising write can no longer escape the boundary: it fails at the kernel, not at our judgement. Each governed action records whether it ran sandboxed, so the audit trail never conflates a kernel-confined run with an advisory one. On a platform with no backend the jail is simply inactive (the agent launches normally); the boundary is still enforced on the decision path. Coverage claims stay honest per §2.6 regardless: an action is only reported as kernel-enforced when it actually ran inside a verified jail.
 
 <hr>
 
@@ -496,7 +496,7 @@ The descriptor has four jobs.
 1. **Declare the plan.** `integration_plan()` states the intended coverage for execution, tool, and burn-control surfaces. A surface can be `None`, `AgentPactNative`, or `Adapted` with typed mechanisms. Execution mechanisms include `LiveHookAdapter`, `ShellHook`, and `CompiledPolicy`; tool mechanisms include `LiveHookAdapter` and `McpWrapping`; burn-control mechanisms include `EnvVarProxy`, `ConfigRewrite`, `KyrisdModelProvider`, and `AgentPactUsageReport`.
 2. **Describe native hook semantics.** `hook_protocol()` declares payload fields, governed tool mappings, safe pass-through tools, agent-owned tools, allow / ask response shapes, MCP tool naming, and the `HookRuntime`. `HookRuntime` records the agent hook timeout, timeout posture, whether native permissions still backstop an empty response, and whether the allow response actually suppresses the agent prompt.
 3. **Expose config locations.** `mcp_configs()`, `burn_control_config_paths()`, `provider_routing()`, `env_exports()`, and the configure / undo methods tell the shared machinery where to rewrite MCP servers, where to route provider traffic, and how to restore user files.
-4. **Report evidence.** `probe()` reports installed state, managed files, and per-surface status. Reconcile also reads `.live-seen` breadcrumbs written by live execution hooks, `kyris-mcp`, and `kyrisd` so `kyris agents <id>` can distinguish "configured" from "observed working live."
+4. **Report evidence.** `probe()` reports installed state, managed files, and per-surface status. Reconcile also reads `.live-seen` breadcrumbs written by live execution hooks, `kyris-mcp`, and `kyrisd` so `kyris agent <id>` can distinguish "configured" from "observed working live."
 
 The current Phase 1 descriptors are:
 
@@ -585,69 +585,60 @@ The short version is simple: AgentPact defines the contract, Kyris gets onto the
 
 ## Appendix: CLI Reference
 
-### Lifecycle
+### Setup
 
 | Command | Description |
 |---------|-------------|
 | `kyris install` | Install shell hooks, binaries, and configure detected agents |
-| `kyris uninstall` | Remove all Kyris modifications (restores backups) |
-| `kyris disable` | Switch the user policy (`~/.config/agentpact/policy/pact.yaml`) to `mode: log` so agentpactd records commands but does not prompt or deny. Tray icon shows a red horizontal bar across the kyris glyph to make the non-enforcing state visible. Daemons stay running. Errors if agentpactd is unreachable. |
-| `kyris enable` | Flip the same policy file to `mode: enforce`: catalog-classified commands auto-allow, unclassified commands route to the menu-bar approval popup (or `kyris pending` when no TTY). Tray overlay cleared. Errors if agentpactd is unreachable. |
+| `kyris uninstall [--reset-data]` | Remove all Kyris modifications (restores agent configs) |
 | `kyris update [--check]` | Update Kyris binaries. `--check` prints available update without applying |
 | `kyris enroll [--force] [--relay-url URL]` | Enroll machine with Kyris hosted service via GitHub device flow. `--force` re-authenticates |
-| `kyris verify [--post-install] [--post-uninstall] [--json]` | Verify installation state |
 | `kyris version` | Print version |
 
 ### Agent Management
 
 | Command | Description |
 |---------|-------------|
-| `kyris agents` | Summary of all agents (reconciles first) |
-| `kyris agents <agent>` | Detail view for one agent |
-| `kyris agents status [agent]` | Show agent integration status |
-| `kyris agents setup <agent> [--set KEY=VALUE...]` | Configure one agent. `--set` passes agent-specific settings (e.g. `--set maxSessionTurns=100`) |
-| `kyris agents setup --auto` | Detect installed agents and configure each |
-| `kyris agents reconcile [agent] [--auto]` | Detect reinstalls, repair config. `--auto` debounces (shell startup) |
-| `kyris agents undo <agent>` | Remove all Kyris integrations for an agent |
+| `kyris agent` / `kyris agent list` | Summary of all agents and their integration status |
+| `kyris agent <agent>` | Detail view for one agent (shorthand for `kyris agent status <agent>`) |
+| `kyris agent status [agent]` | Show agent integration status |
+| `kyris agent setup <agent> [--set KEY=VALUE...]` | Configure one agent. Idempotent: re-running repairs drift and re-integrates a disconnected agent. `--set` passes agent-specific settings (e.g. `--set maxSessionTurns=100`); a bare re-run preserves previously-set settings |
+| `kyris agent setup --all` | Detect installed agents and configure each (skips agents you disconnected) |
+| `kyris agent disconnect <agent>` | Remove Kyris's integration from an agent. The agent itself stays installed — it just stops being governed until you `setup` it again |
 
-### Query & Inspection
-
-| Command | Description |
-|---------|-------------|
-| `kyris status` | Show component health: daemons, hooks, agents, enrollment |
-| `kyris timeline [--last N]` | Unified event stream (default last 20) |
-| `kyris history [--agent X] [--action X] [--decision X] [--since T] [--until T] [--dir D] [--sync-state S]` | Filtered event search |
-| `kyris stats [--since DURATION]` | Burn-control summary: tokens, spend, decisions (default 7d) |
-| `kyris replay <session>` | Reconstruct one session in order |
-
-### Policy & Security
+### Activity & Inspection
 
 | Command | Description |
 |---------|-------------|
-| `kyris check <command>` | Test a command against current policy (returns allow/deny) |
-| `kyris compile-policy --agent <agent> [--policy PATH]` | Render AgentPact policy into agent-native permission format |
-| `kyris always list` | Show active "always" overrides across `commands.local.yaml` and `mcp.local.yaml` (kind, selector, created_at, file path) |
-| `kyris always revoke <selector>` | Revoke a named override (command, path, or `server:tool` for MCP) |
-| `kyris always revoke --last` | Revoke the most recently created override across all override files |
-| `kyris scan run [--format terminal\|json\|html] [-o FILE] [--scanners X,Y]` | Security scan: running agents, exposed keys, MCP configs, traffic |
-| `kyris scan patterns list` | List available scan patterns |
+| `kyris status` | Show effective posture and component health: daemons, sandbox, hooks, agents, enrollment |
+| `kyris activity [--agent X] [--action X] [--decision X] [--since T] [--until T] [--dir D] [--sync-state S] [--last N]` | Unified event stream — recent rows by default, filtered when any filter is given |
+| `kyris activity stats [--since DURATION]` | Burn-control summary: tokens, spend, decisions (default 7d) |
+| `kyris activity replay <session>` | Reconstruct one session in order |
+| `kyris activity trace <trace_id>` | Every row sharing a model-call trace id |
+| `kyris activity approvals [--decision D] [--json] [--last N]` | Recall view over popup-resolved approval decisions |
 
-### Diagnostics
+### Policy
 
 | Command | Description |
 |---------|-------------|
-| `kyris doctor` | Probe each subsystem (agentpactd socket, kyrisd `/healthz`, pending approvals) and print `[✓]`/`[!]` per check with a fix suggestion. First line is the headline (`Kyris — enforcing` / `Kyris — enforcement disabled — log only` / `Kyris — errors encountered — may not enforce correctly`). Exits non-zero on any failure. |
+| `kyris policy check <command>` | Test a command against current policy (returns allow/deny) |
+| `kyris policy enable` | Switch the user policy (`~/.config/agentpact/policy/pact.yaml`) to `mode: enforce`: catalog-classified commands auto-allow, unclassified commands route to the desktop approval popup. Errors if agentpactd is unreachable |
+| `kyris policy disable` | Flip the same policy file to `mode: log` so agentpactd records commands but does not prompt or deny. Tray icon shows a red bar across the kyris glyph. Daemons stay running. Errors if agentpactd is unreachable |
+| `kyris policy compile --agent <agent> [--policy PATH]` | Render AgentPact policy into agent-native permission format |
+
+The current enforce/log mode is shown by `kyris status`.
+
+### Support
+
+| Command | Description |
+|---------|-------------|
+| `kyris doctor` | Probe each subsystem (agentpactd socket, kyrisd `/healthz`, pending approvals) and print `[✓]`/`[!]` per check with a fix suggestion. First line is the headline (`Kyris — enforcing` / `Kyris — enforcement disabled — log only` / `Kyris — errors encountered — may not enforce correctly`). Exits non-zero on any failure |
 | `kyris logs` | List log file paths (kyris, kyrisd-launchd, agentpactd, shell fail-open) with size and last-modified time |
-| `kyris daemon status` | Show kyrisd's launchd state and `/healthz` reachability |
+| `kyris debug trace-on [--filter F] [--duration-secs N]` / `trace-off` / `trace-status` | Control kyrisd's runtime log filter for a bounded window |
+| `kyris debug verify [--post-install] [--post-uninstall] [--json]` | Verify installation state |
+| `kyris debug audit [--format terminal\|json\|html] [-o FILE]` | Forensic: detect LLM traffic bypassing Kyris governance (a diagnostics tool, not for daily use) |
 
-Daemon lifecycle is not kyris's responsibility — the launchd plists keep `kyrisd` and `agentpactd` up. Use `kyris disable` / `kyris enable` to toggle whether agentpactd actually enforces (without touching daemon lifecycle), or `kyris uninstall` for a real teardown. There is no separate `kyris daemon logs` — `kyris logs` covers all kyris log files.
-
-### Operator Workflows
-
-| Command | Description |
-|---------|-------------|
-| `kyris pending` | List pending approval requests (PACT_ASK decisions awaiting resolution) |
-| `kyris continue <session>` | Resume/resolve a held session |
+Daemon lifecycle is not kyris's responsibility — the launchd plists keep `kyrisd` and `agentpactd` up. Use `kyris policy disable` / `kyris policy enable` to toggle whether agentpactd actually enforces (without touching daemon lifecycle), or `kyris uninstall` for a real teardown. Held approval requests are resolved at the desktop popup, the tray, or the Kyris app — there is no CLI approval command.
 
 ### Internal (used by hooks, not user-facing)
 

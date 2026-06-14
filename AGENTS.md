@@ -61,7 +61,7 @@ Cargo workspace with nine crates producing four installable binaries (plus a bui
 | Crate | Binary | Purpose |
 |-------|--------|---------|
 | `kyrisd` | `kyrisd` | Local LLM routing proxy. Intercepts agent-to-model traffic, enforces policy, meters usage, writes events to DuckDB. Runs as a `launchd` daemon. |
-| `kyris` (cli) | `kyris` | CLI for queries (`timeline`, `replay`, `stats`, `history`), setup (`install`, `enroll`, `agents setup`), policy compilation, lifecycle management, agent hook delegation (`hook check`), always-allow management (`always`), post-install verification (`verify`). |
+| `kyris` (cli) | `kyris` | CLI for activity inspection (`activity` + `stats`/`replay`/`trace`/`approvals`), setup (`install`, `enroll`, `agent setup`), policy (`policy check`/`compile`/`enable`/`disable`), lifecycle management, agent hook delegation (`hook check`), diagnostics (`debug verify`/`audit`/`trace-*`). |
 | `kyris-mcp` | `kyris-mcp` | MCP server wrapper. Wraps an MCP server command, routing tool calls through `agentpactd` for permission checks. |
 | `kyris-hook` | `kyris-hook` | Shell hook helper (`hooks/helper/`). Lightweight stdlib-only binary invoked by shell preexec hooks to check/respond to `agentpactd` permission requests. |
 
@@ -77,7 +77,7 @@ Cargo workspace with nine crates producing four installable binaries (plus a bui
 |------|----------|
 | `config/` | Default config template (`default.yaml`), example config, pricing tiers. |
 | `service/` | `launchd` plist for `kyrisd` and the `Info.plist.template` used by `scripts/build-app-bundle.sh`. |
-| `integrations/` | Compiled-policy templates. `compiled-policy/cline/template.json` is the only static template — adapters for OpenCode, Codex CLI, and Gemini CLI are generated at runtime by `kyris compile-policy`. Live hook adapters (Claude Code, Codex CLI, Gemini CLI) are generated at agent-setup time by `cli/src/agents/configure.rs`. |
+| `integrations/` | Compiled-policy templates. `compiled-policy/cline/template.json` is the only static template — adapters for OpenCode, Codex CLI, and Gemini CLI are generated at runtime by `kyris policy compile`. Live hook adapters (Claude Code, Codex CLI, Gemini CLI) are generated at agent-setup time by `cli/src/agents/configure.rs`. |
 | `hooks/` | Shell preexec hooks (`zsh_hook.sh`, `zshenv_hook.sh`, `bash_hook.sh`, `bash_env.sh`) and the `kyris-hook` helper crate (`hooks/helper/`). |
 | `scripts/` | Local release helpers: `release-local.sh`, `build-app-bundle.sh`, `build-tar.sh`, `sign-and-notarize.sh`. |
 | `install.sh` | Standalone bash installer (the brew-detecting front door — see `forest/design/kyris.md` §6.5). |

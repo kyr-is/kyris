@@ -24,10 +24,11 @@ fn run_check(
         .current_dir(working_dir)
         .env("HOME", home_dir)
         .env("AGENTPACT_SOCK", socket_path)
+        .arg("policy")
         .arg("check")
         .arg(command)
         .output()
-        .expect("run kyris check")
+        .expect("run kyris policy check")
 }
 
 impl FakeDaemon {

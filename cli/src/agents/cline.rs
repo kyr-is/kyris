@@ -261,9 +261,6 @@ impl AgentDescriptor for Cline {
     fn id(&self) -> &'static str {
         "cline"
     }
-    fn display_name(&self) -> &'static str {
-        "Cline"
-    }
     fn is_installed(&self) -> bool {
         cline_detected()
     }

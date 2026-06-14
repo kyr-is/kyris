@@ -35,11 +35,11 @@ fn run_setup(home: &Path, cwd: &Path, agent: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kyris"))
         .current_dir(cwd)
         .env("HOME", home)
-        .arg("agents")
+        .arg("agent")
         .arg("setup")
         .arg(agent)
         .output()
-        .expect("run kyris agents setup")
+        .expect("run kyris agent setup")
 }
 
 /// An unknown `--set` key is rejected fail-fast, before any side effects, so it
@@ -55,14 +55,14 @@ fn test_setup_rejects_unknown_set_key() {
         .current_dir(home)
         .env("HOME", home)
         .args([
-            "agents",
+            "agent",
             "setup",
             "claude-code",
             "--set",
             "max-budget-usd=50",
         ])
         .output()
-        .expect("run kyris agents setup");
+        .expect("run kyris agent setup");
 
     assert!(
         !output.status.success(),
@@ -95,9 +95,9 @@ fn test_setup_errors_when_agentpactd_unreachable() {
         .env("HOME", home)
         // Force agentpactd unreachable deterministically, independent of host env.
         .env("AGENTPACT_SOCK", home.join("nonexistent-agentpact.sock"))
-        .args(["agents", "setup", "claude-code"])
+        .args(["agent", "setup", "claude-code"])
         .output()
-        .expect("run kyris agents setup");
+        .expect("run kyris agent setup");
 
     assert!(
         !output.status.success(),

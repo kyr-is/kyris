@@ -33,7 +33,8 @@ fn no_tty_deny() -> PactDecision {
         code: DenyCode::PolicyDenied,
         reason: "tool requires approval but no terminal is available".to_string(),
         hint: Some(
-            "Use 'kyris pending' to approve, adjust policy to 'auto', or run from a terminal"
+            "Approve via the Kyris desktop prompt or app, adjust policy to 'auto', \
+             or run from a terminal"
                 .to_string(),
         ),
     }
@@ -338,7 +339,8 @@ async fn resolve_ask_via_kyrisd(
     let client = reqwest::Client::new();
 
     eprintln!(
-        "[kyris-mcp] {server_name}/{tool_name} held for approval — resolve with 'kyris pending'"
+        "[kyris-mcp] {server_name}/{tool_name} held for approval — \
+         resolve via the Kyris desktop prompt, tray, or app"
     );
 
     let resolution = kyris_core::pending::hold_poll_resolve(

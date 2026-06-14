@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn testToolCallClearsAnAlreadyTrippedSession() {
         // A genuine runaway trips; the next turn happening to call a tool
-        // clears it (progress resumed) without needing `kyris continue`.
+        // clears it (progress resumed) without needing a human resume.
         let cb = CircuitBreaker::new();
         assert!(cb.record("sess-1", 200_000, false, 200_000));
         assert!(cb.is_tripped("sess-1"));

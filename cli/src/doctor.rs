@@ -286,7 +286,7 @@ fn check_pending_approvals() -> CheckResult {
                 "{n} approval prompt{} waiting",
                 if n == 1 { "" } else { "s" }
             ),
-            fix: Some("kyris pending"),
+            fix: Some("resolve via the Kyris desktop prompt, tray, or app"),
         },
         None => CheckResult {
             name: "pending approvals",

@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(row.decision.as_deref(), Some("auto"));
     }
     // NOTE: the read-time join over a *real* DuckDB + *real* `events.jsonl` (via
-    // `read_json`) is exercised by the live e2e (`kyris timeline` reads `execute`
+    // `read_json`) is exercised by the live e2e (`kyris activity` reads `execute`
     // events from the log through this path) rather than a unit test: `read_json`
     // is unreliable when ~30 DuckDB-using tests run concurrently in one process
     // (a duckdb-rs limitation, not a kyrisd-runtime one — production kyrisd uses a

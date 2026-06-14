@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use console::Style;
 
-use crate::scan::scanner::{Finding, FindingCategory, RiskLevel, Severity, risk_level};
+use crate::audit::scanner::{Finding, FindingCategory, RiskLevel, Severity, risk_level};
 
 pub fn render(findings: &[Finding]) {
     let bold = Style::new().bold();

@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-use crate::scan::scanner::{Finding, Severity, risk_level};
+use crate::audit::scanner::{Finding, Severity, risk_level};
 
 pub fn build(findings: &[Finding]) -> String {
     let total_score: u32 = findings.iter().map(|f| f.severity as u32).sum();

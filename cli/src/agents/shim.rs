@@ -20,19 +20,23 @@
 //!      no agent-update breakage — same pattern rbenv / pyenv / nvm
 //!      shims use.
 //!
-//! ## Session sandbox (gated OFF by default)
+//! ## Session sandbox (core, always-on where a backend exists)
 //!
-//! When the marker file `~/.kyris/sandbox.on` exists AND a `kyris-exec`
-//! binary is resolvable, the shim's final step becomes
+//! The session jail is a core feature, on by default — there is no enable
+//! switch and no marker file. Where the OS sandbox backend exists (macOS
+//! Seatbelt today; Linux planned) the shim's final step is
 //! `exec kyris-exec --session --agent <id> -- <real> "$@"` instead of
-//! `exec <real> "$@"`, jailing the entire agent process tree at launch
-//! (the codex-equivalent "be the parent" move — see `codex-agentpact.md`).
-//! The marker does not exist after a normal install, so this changes
-//! nothing for existing users until a future `kyris sandbox enable`
-//! (or the Phase-3 mechanism) creates it. If the marker is present but
-//! `kyris-exec` cannot be found, the shim launches UNJAILED with a loud
-//! stderr line rather than failing the launch — degraded, indicated, never
-//! silently "sandboxed".
+//! `exec <real> "$@"`, jailing the entire agent process tree at launch (the
+//! codex-equivalent "be the parent" move — see `codex-agentpact.md`).
+//!
+//! The shim guards on backend availability *before* exec, because `kyris-exec`
+//! exits non-zero when it can't establish a sandbox and `exec` leaves no room
+//! to fall back. On a platform with no backend (non-macOS, or `sandbox-exec`
+//! missing) the shim launches the agent directly — the jail is simply inactive
+//! there, never a launch failure. If the backend exists but the `kyris-exec`
+//! launcher is missing (a broken install), the shim launches UNJAILED with a
+//! loud stderr line rather than failing the launch — degraded, indicated,
+//! never silently "sandboxed". `kyris status` reports the active/inactive state.
 
 use crate::config_writer::NoopValidator;
 use crate::state::{bin_dir, write_managed_file};
@@ -99,18 +103,19 @@ real=$(command -v {binary} 2>/dev/null) || {{
     exit 127
 }}
 
-# Session sandbox (opt-in via the marker file; absent by default → no-op).
-# When enabled, jail the whole agent process tree at launch via kyris-exec.
-# kyris-exec is found on the (post-strip) PATH like the real binary; if the
-# marker is set but the launcher is missing, fall through to an UNJAILED
-# launch with a loud warning — never silently claim confinement, never block
-# the launch.
-if [ -f "$HOME/.kyris/sandbox.on" ]; then
+# Session sandbox (core, always-on where an OS backend exists). Jail the whole
+# agent process tree at launch via kyris-exec. Guard on backend availability
+# FIRST: `exec` cannot fall back, and kyris-exec exits non-zero where it can't
+# sandbox, so we must not exec it on a platform with no backend. macOS Seatbelt
+# is the only backend today. If the backend exists but the launcher is missing
+# (broken install), fall through to an UNJAILED launch with a loud warning —
+# never silently claim confinement, never block the launch.
+if [ "$(uname)" = "Darwin" ] && [ -x /usr/bin/sandbox-exec ]; then
     __kyris_exec=$(command -v kyris-exec 2>/dev/null)
     if [ -n "$__kyris_exec" ]; then
         exec "$__kyris_exec" --session --agent "{agent_id}" -- "$real" "$@"
     fi
-    printf '[kyris] sandbox.on set but kyris-exec not found; launching %s UNJAILED\n' "{binary}" >&2
+    printf '[kyris] OS sandbox available but kyris-exec not found; launching %s UNJAILED\n' "{binary}" >&2
 fi
 
 exec "$real" "$@"
@@ -158,7 +163,7 @@ fn shim_content_delivers_env(contents: &str, agent_id: &str) -> bool {
 
 /// Remove an agent's PATH shim. Manifest-tracked, so the normal uninstall
 /// path (`restore_manifest_entry`) will also clean it up; this helper is for
-/// `kyris agents uninstall <agent>`, which removes just one agent's surfaces.
+/// `kyris agent disconnect <agent>`, which removes just one agent's surfaces.
 pub fn uninstall_shim(agent_id: &str) -> Result<bool, String> {
     let Some(binary) = binary_name(agent_id) else {
         return Ok(false);
@@ -219,19 +224,22 @@ mod tests {
     }
 
     #[test]
-    fn testShimGatesSandboxBehindMarkerFile() {
-        // The sandbox path must be guarded by the marker file (absent by
-        // default) so a normal install changes no launch behavior, and must
-        // wrap via kyris-exec --session when enabled.
+    fn testShimAlwaysJailsWhereBackendExists() {
+        // The session jail is core/always-on: no marker file. It is guarded on
+        // backend availability (macOS + sandbox-exec) so a no-backend platform
+        // launches directly, and wraps via kyris-exec --session where present.
         let s = shim_source("codex-cli", "codex");
-        assert!(s.contains(r#"if [ -f "$HOME/.kyris/sandbox.on" ]; then"#));
+        assert!(!s.contains("sandbox.on"), "marker gate must be gone");
+        assert!(
+            s.contains(r#"if [ "$(uname)" = "Darwin" ] && [ -x /usr/bin/sandbox-exec ]; then"#)
+        );
         assert!(
             s.contains(r#"exec "$__kyris_exec" --session --agent "codex-cli" -- "$real" "$@""#)
         );
-        // Degraded path: marker on but launcher missing → loud, unjailed,
+        // Degraded path: backend present but launcher missing → loud, unjailed,
         // still launches (no exit before the final unconditional exec).
         assert!(s.contains("launching %s UNJAILED"));
-        // The unconditional direct exec remains the default (marker absent).
+        // The direct exec is the fallthrough (no backend, or launcher missing).
         assert!(s.contains(r#"exec "$real" "$@""#));
     }
 

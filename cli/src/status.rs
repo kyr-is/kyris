@@ -23,6 +23,7 @@ pub fn run(_args: StatusArgs) {
 
     check_agentpactd();
     check_kyrisd();
+    check_sandbox();
     check_native_integrations();
     check_enrollment();
     check_versions();
@@ -64,6 +65,25 @@ fn check_kyrisd() {
         status_marker(healthy),
         service
     );
+}
+
+/// Session sandbox (OS jail) state. The jail is core/always-on, but only
+/// enforces where an OS backend exists (macOS Seatbelt today) AND the
+/// `kyris-exec` launcher is resolvable — exactly the guard the PATH shim
+/// applies at launch. This line reports whether it's actually enforcing here.
+fn check_sandbox() {
+    let backend =
+        cfg!(target_os = "macos") && std::path::Path::new("/usr/bin/sandbox-exec").exists();
+    if !backend {
+        println!("  [-] sandbox (OS jail): unavailable on this platform");
+    } else if component_binary_path("kyris-exec").is_some() {
+        println!(
+            "  [{}] sandbox (OS jail): active (Seatbelt)",
+            status_marker(true)
+        );
+    } else {
+        println!("  [!] sandbox (OS jail): backend present but kyris-exec missing — reinstall");
+    }
 }
 
 /// Compact `none`/`native`/`n/a`/<mechanism> cell for one surface.
@@ -137,7 +157,7 @@ fn check_native_integrations() {
             let unwrapped = crate::agents::configure::unwrapped_mcp_server_names(agent.as_ref());
             if !unwrapped.is_empty() {
                 println!(
-                    "  [!] {}: MCP server(s) not routed through kyris: {} — run `kyris agents reconcile {}`",
+                    "  [!] {}: MCP server(s) not routed through kyris: {} — run `kyris agent setup {}`",
                     agent.id(),
                     unwrapped.join(", "),
                     agent.id()

@@ -27,7 +27,7 @@ pub struct PendingInfo {
     pub state: PendingState,
     pub held_since_ms: u64,
     /// Whether answering "For session" would record a session-scoped grant
-    /// (the daemon's authoritative signal). `kyris pending` offers the
+    /// (the daemon's authoritative signal). The approval popup offers the
     /// "session" choice only when this is true.
     pub allow_always: bool,
     /// Pre-formatted "why this needs approval" body (from agentpactd's

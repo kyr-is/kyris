@@ -6,8 +6,8 @@
 //! [`crate::circuit_breaker`]), kyrisd does NOT silently kill the agent with a
 //! 429. It holds the agent's next request and asks the human: *"Agent X burned
 //! N tokens without a tool call. Continue running?"* The human's answer arrives
-//! from any surface — the desktop dialog, `kyris continue` (the reset
-//! endpoint), the tray, or the app's Stop control — and is delivered to every
+//! from any surface — the desktop dialog, the tray, or the app's Stop/Continue
+//! control (each posts to the reset/stop endpoint) — and is delivered to every
 //! request waiting on that session through this registry.
 //!
 //! A `watch` channel per session lets multiple concurrent requests for the same
@@ -23,7 +23,7 @@ use tokio::sync::watch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
     /// Keep going — reset the session's no-action counter and forward the
-    /// request upstream. This is what `kyris continue` signals.
+    /// request upstream. This is what the reset endpoint signals.
     Continue,
     /// Halt the agent — return the 429 / stop event for this request.
     Stop,
@@ -57,8 +57,8 @@ impl GateRegistry {
     }
 
     /// Deliver a decision to every request waiting on this session. No-op if
-    /// nothing is waiting (e.g. `kyris continue` for a session with no open
-    /// prompt — the plain breaker reset still happens at the call site).
+    /// nothing is waiting (e.g. a reset for a session with no open prompt —
+    /// the plain breaker reset still happens at the call site).
     pub fn resolve(&self, session_id: &str, decision: GateDecision) {
         if let Some(tx) = self
             .waiters
@@ -70,8 +70,8 @@ impl GateRegistry {
         }
     }
 
-    /// Resolve every open prompt with the same decision (e.g. `kyris continue`
-    /// with no session arg → Continue all). Returns the resolved session IDs.
+    /// Resolve every open prompt with the same decision (e.g. the reset-all
+    /// endpoint → Continue all). Returns the resolved session IDs.
     pub fn resolve_all(&self, decision: GateDecision) -> Vec<String> {
         let waiters = self.waiters.lock().expect("lock gate waiters");
         let ids: Vec<String> = waiters.keys().cloned().collect();

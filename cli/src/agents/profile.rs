@@ -88,8 +88,12 @@ pub struct AgentProfile {
     pub agent_specific: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compilation_gaps: Vec<String>,
+    /// The user explicitly disconnected this agent (`kyris agent disconnect`):
+    /// Kyris's integration is removed and stays removed — bulk `setup --all`,
+    /// the reconcile watcher, and `install` skip it — until an explicit
+    /// `kyris agent setup <id>` clears this. Omitted from JSON when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub disabled: bool,
+    pub disconnected: bool,
     pub version: u32,
 }
 
@@ -160,7 +164,7 @@ impl AgentProfile {
             live_evidence: SurfaceEvidence::default(),
             agent_specific: HashMap::new(),
             compilation_gaps: Vec::new(),
-            disabled: false,
+            disconnected: false,
             version: 1,
         }
     }
@@ -235,7 +239,7 @@ mod tests {
             },
             agent_specific: HashMap::from([("max-budget-usd".to_string(), "50".to_string())]),
             compilation_gaps: Vec::new(),
-            disabled: false,
+            disconnected: false,
             version: 1,
         };
 

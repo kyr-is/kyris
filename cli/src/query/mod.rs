@@ -7,9 +7,7 @@
 //! the CLI never opens the `DuckDB` file (so kyrisd's exclusive lock is a
 //! non-issue) and never reads the event log directly.
 pub mod approvals;
-pub mod history;
 pub mod render;
 pub mod replay;
 pub mod stats;
-pub mod timeline;
 pub mod trace;

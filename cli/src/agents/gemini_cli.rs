@@ -151,9 +151,6 @@ impl AgentDescriptor for GeminiCli {
     fn id(&self) -> &'static str {
         "gemini-cli"
     }
-    fn display_name(&self) -> &'static str {
-        "Gemini CLI"
-    }
     fn is_installed(&self) -> bool {
         which_exists("gemini") || gemini_settings_exists()
     }
@@ -438,7 +435,7 @@ impl AgentDescriptor for GeminiCli {
                     "warning: gemini is using OAuth/Code Assist and no GEMINI_API_KEY is \
                      available — kyris cannot meter that traffic (the base-URL redirect is \
                      ignored on the OAuth path). Provide a GEMINI_API_KEY and re-run \
-                     `kyris agents setup gemini-cli` to enable burn-control."
+                     `kyris agent setup gemini-cli` to enable burn-control."
                         .to_string(),
                 );
             }

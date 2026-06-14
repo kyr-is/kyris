@@ -730,6 +730,12 @@ pub fn compile_mcp_tool_filters(
 /// URL path components stripped from url keys (Codex is host-only) and
 /// ask rules that collapsed to deny/none (no prompt path at the sandbox layer).
 /// Returns an empty Vec when all rules compile without loss.
+///
+/// Test-only since the user-facing surface that consumed it (`kyris scan
+/// agents`) was removed in the CLI reshape; the underlying
+/// `compile_codex_permissions_table().gaps` it wraps is production code, and
+/// these tests keep the codex gap-detection covered.
+#[cfg(test)]
 pub fn detect_codex_gaps(policy_path: Option<&Path>) -> Vec<String> {
     compile_codex_permissions_table(policy_path)
         .map(|table| table.gaps)

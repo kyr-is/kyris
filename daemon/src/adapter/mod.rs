@@ -303,8 +303,8 @@ pub fn record_agent_traffic(agent_id: Option<&str>, trace_token: Option<&str>) {
 /// ("Agent X burned N tokens without a tool call — continue running?"), then
 /// return their decision. The prompt is surfaced once (the first waiter fires
 /// the desktop dialog + toast); concurrent requests for the same session share
-/// the answer. The decision can also arrive from `kyris continue` (the reset
-/// endpoint), the tray, or the app's Stop control via [`crate::gate`].
+/// the answer. The decision can also arrive from the tray or the app's
+/// Stop/Continue control (the reset/stop endpoint) via [`crate::gate`].
 ///
 /// On `Continue` the session's no-action counter is reset so the request can
 /// proceed. The wait has a multi-day backstop timeout (see
@@ -322,8 +322,8 @@ pub async fn await_token_gate(
         let agent_label = agent.unwrap_or_else(|| "An agent".to_string());
         crate::notify::token_gate_toast(&agent_label, token_count);
         // The modal continue/stop dialog only exists in tray builds; without it
-        // the toast above plus `kyris continue` / the stop endpoint are how the
-        // human answers (otherwise the decision_timeout backstop applies).
+        // the toast above plus the tray / app (the reset/stop endpoint) are how
+        // the human answers (otherwise the decision_timeout backstop applies).
         #[cfg(feature = "tray")]
         {
             let body = format!(
@@ -343,7 +343,7 @@ pub async fn await_token_gate(
                         state2.gate.resolve(&session2, GateDecision::Stop);
                     }
                     // Dialog could not be shown (fullscreen app, etc.). Leave the
-                    // prompt open for `kyris continue` / the tray / the app.
+                    // prompt open for the tray / the app to resolve.
                     crate::notify::ApprovalOutcome::CouldNotShow => {}
                 }
             });

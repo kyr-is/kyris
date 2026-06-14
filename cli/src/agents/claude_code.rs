@@ -94,9 +94,6 @@ impl AgentDescriptor for ClaudeCode {
     fn id(&self) -> &'static str {
         "claude-code"
     }
-    fn display_name(&self) -> &'static str {
-        "Claude Code"
-    }
     fn is_installed(&self) -> bool {
         claude_code_detected()
     }
@@ -118,7 +115,7 @@ impl AgentDescriptor for ClaudeCode {
         // Drift check: if the hook is registered in settings.json but the
         // on-disk script differs from what the current kyris would write,
         // treat the surface as not-adapted so `kyris status` flags it and
-        // the user knows to re-run `kyris install` / `kyris agents reconcile`.
+        // the user knows to re-run `kyris install` / `kyris agent setup`.
         // Without this, an older kyris version's hook script (which may have
         // emitted empty stdout, causing the double-prompt symptom) stays in
         // place silently forever.

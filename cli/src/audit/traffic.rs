@@ -20,19 +20,19 @@ const CHECKS: &[TrafficCheck] = &[
         agent: "Claude Code / Anthropic",
         env_var: "ANTHROPIC_BASE_URL",
         expected_prefix: "http://127.0.0.1:4710",
-        setup_cmd: "kyris agents setup claude-code",
+        setup_cmd: "kyris agent setup claude-code",
     },
     TrafficCheck {
         agent: "Codex CLI / OpenAI",
         env_var: "OPENAI_BASE_URL",
         expected_prefix: "http://127.0.0.1:4710",
-        setup_cmd: "kyris agents setup codex-cli",
+        setup_cmd: "kyris agent setup codex-cli",
     },
     TrafficCheck {
         agent: "Gemini CLI / Google",
         env_var: "GOOGLE_GEMINI_BASE_URL",
         expected_prefix: "http://127.0.0.1:4710",
-        setup_cmd: "kyris agents setup gemini-cli",
+        setup_cmd: "kyris agent setup gemini-cli",
     },
 ];
 
@@ -192,7 +192,7 @@ fn scan_history_contents(
                 },
                 evidence: Some(evidence.clone()),
                 remediation: "Route LLM traffic through kyrisd. \
-                              Run `kyris agents setup <agent>` to configure your agent."
+                              Run `kyris agent setup <agent>` to configure your agent."
                     .to_string(),
             });
         }
@@ -287,7 +287,7 @@ mod tests {
             agent: "Test Agent",
             env_var: "TEST_BASE_URL",
             expected_prefix: "http://127.0.0.1:4710",
-            setup_cmd: "kyris agents setup test",
+            setup_cmd: "kyris agent setup test",
         }
     }
 
@@ -491,7 +491,7 @@ mod tests {
         let contents = "curl https://api.openai.com/v1/chat\n";
         let findings = scan_contents(".bash_history", HistoryFormat::Bash, contents);
         assert!(!findings.is_empty());
-        assert!(findings[0].remediation.contains("kyris agents setup"));
+        assert!(findings[0].remediation.contains("kyris agent setup"));
     }
 
     #[test]
