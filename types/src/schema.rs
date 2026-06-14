@@ -199,13 +199,19 @@ fn circuit_breaker_config() -> Value {
                 "type": "integer",
                 "minimum": 0,
                 "default": 200_000,
-                "description": "Maximum tokens per session before the circuit breaker trips"
+                "description": "Max output tokens generated without a tool/shell/MCP call before the runaway prompt fires (a tool call resets the counter)"
             },
             "session_idle_minutes": {
                 "type": "integer",
                 "minimum": 0,
                 "default": 30,
                 "description": "Minutes of idle time before a session's token counter resets"
+            },
+            "decision_timeout_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 604_800,
+                "description": "How long the runaway 'continue or stop?' prompt holds the request waiting for a human before defaulting to stop (7 days)"
             }
         }
     })

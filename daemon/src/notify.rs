@@ -106,10 +106,16 @@ pub fn send_toast(title: &str, body: &str) {
     {}
 }
 
-pub fn circuit_breaker_toast(token_count: i64) {
+/// Fallback notification for the runaway "continue or stop?" prompt — shown
+/// alongside the modal dialog so the ask is still discoverable if the dialog
+/// can't be presented (fullscreen app, headless). The dialog is the primary
+/// surface; `kyris continue` is the CLI way out.
+pub fn token_gate_toast(agent_label: &str, token_count: i64) {
     send_toast(
-        "Kyris: Circuit Breaker",
-        &format!("Circuit breaker: {token_count} tokens. Run `kyris continue` to resume."),
+        "Kyris: agent burning tokens",
+        &format!(
+            "{agent_label} burned {token_count} tokens without a tool call. Approve to continue, or run `kyris continue`."
+        ),
     );
 }
 

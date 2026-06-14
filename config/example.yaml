@@ -50,10 +50,16 @@ mcp:
       upstream: "http://localhost:8081"
       working_dir: "/path/to/project"
 
+# Runaway guard. `max_tokens` caps model OUTPUT tokens generated without any
+# tool/shell/MCP call (a tool call resets the counter). Crossing it holds the
+# next request and prompts a human "continue or stop?" rather than auto-killing;
+# `decision_timeout_seconds` is how long that prompt waits before defaulting to
+# stop (7 days). Either answer clears the counter.
 circuit_breaker:
   enabled: true
   max_tokens: 200000
   session_idle_minutes: 30
+  decision_timeout_seconds: 604800
 
 # The relay this install talks to (the single home for the relay URL — NOT in
 # credentials.json). Read by the daemon at runtime (pricing fetch from

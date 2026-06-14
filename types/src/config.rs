@@ -220,10 +220,23 @@ pub struct McpServerConfig {
 pub struct CircuitBreakerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Cap on model output tokens burned **without any tool/shell/MCP call**
+    /// since the last one. A response that takes an action resets the count to
+    /// zero, so a working agent never approaches it; only a no-action runaway
+    /// does. Crossing it gates the next request on a human "continue or stop?"
+    /// — it does not auto-kill the agent. (This used to be a cumulative
+    /// input+output cap, which N-counted re-sent context and falsely tripped.)
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
     #[serde(default = "default_session_idle_minutes")]
     pub session_idle_minutes: u64,
+    /// How long the runaway "continue or stop?" prompt holds the agent's
+    /// request waiting for a human, before defaulting to stop. Deliberately
+    /// long (7 days) — the agent should wait for a person rather than receive a
+    /// confusing automatic 429; the timeout is only a backstop so an
+    /// unattended, never-answered prompt cannot pin a connection indefinitely.
+    #[serde(default = "default_decision_timeout_seconds")]
+    pub decision_timeout_seconds: u64,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -232,6 +245,7 @@ impl Default for CircuitBreakerConfig {
             enabled: true,
             max_tokens: default_max_tokens(),
             session_idle_minutes: default_session_idle_minutes(),
+            decision_timeout_seconds: default_decision_timeout_seconds(),
         }
     }
 }
@@ -389,6 +403,11 @@ fn default_max_tokens() -> u64 {
 }
 fn default_session_idle_minutes() -> u64 {
     30
+}
+fn default_decision_timeout_seconds() -> u64 {
+    // 7 days. The agent waits for a human; this is only a never-answered
+    // backstop, not a cadence anyone should hit in practice.
+    604_800
 }
 fn default_fetch_interval_hours() -> u64 {
     6

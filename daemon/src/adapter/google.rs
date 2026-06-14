@@ -144,13 +144,6 @@ async fn handle_generate_content(
 
     super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
-    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
-    {
-        let count = state.circuit_breaker.get_token_count(&session_id);
-        crate::notify::circuit_breaker_toast(count);
-        return Ok(circuit_breaker_error(&trace_id, count));
-    }
-
     // Resolve attribution now, while the peer socket still maps to a live
     // process — the record is written at handler end, by which time the agent
     // may have disconnected and exited, and a record without `working_dir`
@@ -193,6 +186,19 @@ async fn handle_generate_content(
         "{}/v1beta/models/{}:generateContent?key={}",
         provider.upstream, model, caller_key
     );
+
+    // Runaway gate (see openai::handle_completions): hold a tripped session's
+    // request on a human "continue or stop?" decision instead of sending.
+    // generateContent is non-streaming, so a true 429 on Stop is fine.
+    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
+    {
+        let count = state.circuit_breaker.get_token_count(&session_id);
+        match super::await_token_gate(state.clone(), session_id.clone(), agent.clone(), count).await
+        {
+            super::GateDecision::Stop => return Ok(circuit_breaker_error(&trace_id, count)),
+            super::GateDecision::Continue => {}
+        }
+    }
 
     let response = client
         .post(&upstream_url)
@@ -242,14 +248,14 @@ async fn handle_generate_content(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
+    let had_tool_call = google_body_has_tool_call(&resp_body);
     let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
-            let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
             state
                 .circuit_breaker
-                .record_and_is_tripped(&session_id, total, max)
+                .record(&session_id, tokens.output, had_tool_call, max)
         } else {
             false
         }
@@ -313,13 +319,6 @@ async fn handle_stream_generate_content(
 
     super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
-    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
-    {
-        let count = state.circuit_breaker.get_token_count(&session_id);
-        crate::notify::circuit_breaker_toast(count);
-        return Ok(circuit_breaker_error(&trace_id, count));
-    }
-
     // Resolve attribution now, while the peer socket still maps to a live
     // process — the record is written at stream end, by which time the agent
     // may have disconnected and exited, and a record without `working_dir`
@@ -363,19 +362,56 @@ async fn handle_stream_generate_content(
         provider.upstream, model, caller_key
     );
 
-    let response = client
+    let req_builder = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(
             provider.streaming_timeout_seconds,
         ))
         .header("content-type", "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "upstream request failed");
-            StatusCode::BAD_GATEWAY
-        })?;
+        .body(body.to_vec());
+
+    // Runaway gate (see openai::handle_completions): hold a tripped session's
+    // request on a human "continue or stop?" decision instead of sending.
+    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
+    {
+        let count = state.circuit_breaker.get_token_count(&session_id);
+        return Ok(super::gated_streaming_response(
+            state.clone(),
+            session_id.clone(),
+            agent.clone(),
+            count,
+            trace_id.clone(),
+            google_stop_chunk(count),
+            move || {
+                Box::pin(async move {
+                    let response = req_builder.send().await.map_err(|e| {
+                        tracing::error!(error = %e, "upstream request failed (after continue)");
+                        StatusCode::BAD_GATEWAY
+                    })?;
+                    let status = response.status();
+                    let resp_headers = response.headers().clone();
+                    relay_ndjson_stream(
+                        state,
+                        response,
+                        status,
+                        resp_headers,
+                        trace_id,
+                        model,
+                        provider_name,
+                        session_id,
+                        working_dir,
+                        agent,
+                        start,
+                    )
+                })
+            },
+        ));
+    }
+
+    let response = req_builder.send().await.map_err(|e| {
+        tracing::error!(error = %e, "upstream request failed");
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
@@ -427,13 +463,14 @@ fn relay_ndjson_stream(
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
     let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let breaker_tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whether any response in this stream emitted a `functionCall` part (resets
+    // the runaway counter; only no-tool output accumulates toward the cap).
+    let had_tool_call = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let relay = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
-        let state = state.clone();
+        let had_tool_call = had_tool_call.clone();
 
         response
             .bytes_stream()
@@ -455,38 +492,19 @@ fn relay_ndjson_stream(
                                     acc.output = tokens.output;
                                 }
                             }
+                            if google_json_has_tool_call(json_str) {
+                                had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         *buf = remainder.to_string();
                     }
-
-                    {
-                        let acc = accumulated.lock().expect("lock accumulated");
-                        let total = acc.input + acc.output;
-                        let max = state.config.load().circuit_breaker.max_tokens as i64;
-                        if total > max {
-                            breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                            crate::notify::circuit_breaker_toast(total);
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "code": 429,
-                                    "message": circuit_breaker_message(total),
-                                    "status": "RESOURCE_EXHAUSTED"
-                                }
-                            });
-                            let err_chunk = format!("{payload}\n");
-                            let mut combined = chunk.to_vec();
-                            combined.extend_from_slice(err_chunk.as_bytes());
-                            return Ok::<Bytes, reqwest::Error>(Bytes::from(combined));
-                        }
-                    }
-
-                    Ok(chunk)
+                    Ok::<Bytes, reqwest::Error>(chunk)
                 }
                 Err(e) => Err(e),
             })
     };
 
-    let mut relay = Some(Box::pin(relay));
+    let mut relay = Box::pin(relay);
     // The finalize owns (clones of) everything the record needs so it can run
     // from the guard's Drop as well as from the poll path — a client that
     // disconnects before end-of-stream must still produce a gateway record
@@ -494,12 +512,12 @@ fn relay_ndjson_stream(
     let finalize_stream = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
+        let had_tool_call = had_tool_call.clone();
         let state = state.clone();
         let trace_id = trace_id.clone();
         let model = model.clone();
         let session_id = session_id.clone();
-        move |emit_breaker_chunk: bool| {
+        move |_emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -516,6 +534,9 @@ fn relay_ndjson_stream(
                             acc.output = tokens.output;
                         }
                     }
+                    if google_json_has_tool_call(json_str) {
+                        had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -526,36 +547,18 @@ fn relay_ndjson_stream(
                     .cost_calculator
                     .calculate(&model, tokens.input, tokens.output, None, None);
 
-            let mut breaker_chunk = None;
-            let mut status = "success";
-            {
+            let tool = had_tool_call.load(std::sync::atomic::Ordering::Relaxed);
+            let crossed = {
                 let config = state.config.load();
                 if config.circuit_breaker.enabled {
-                    let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
-                    if state
+                    state
                         .circuit_breaker
-                        .record_and_is_tripped(&session_id, total, max)
-                    {
-                        status = "circuit_breaker";
-                        // The mid-stream relay already injects the breaker chunk
-                        // when the cap is crossed during the stream; only append
-                        // one here on a natural end-of-stream crossing that
-                        // wasn't already signalled.
-                        if emit_breaker_chunk && !already {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "code": 429,
-                                    "message": circuit_breaker_message(total),
-                                    "status": "RESOURCE_EXHAUSTED"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("{payload}\n")));
-                        }
-                    }
+                        .record(&session_id, tokens.output, tool, max)
+                } else {
+                    false
                 }
-            }
+            };
 
             let stream_metering = if tokens.input == 0 && tokens.output == 0 {
                 kyris_core::record::Metering::Unavailable
@@ -574,7 +577,12 @@ fn relay_ndjson_stream(
                     cache_read: 0,
                     cost,
                     latency_ms,
-                    status: status.to_string(),
+                    status: if crossed {
+                        "circuit_breaker"
+                    } else {
+                        "success"
+                    }
+                    .to_string(),
                     session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
@@ -588,7 +596,7 @@ fn relay_ndjson_stream(
                 crate::storage::record_dropped(1);
             }
 
-            breaker_chunk
+            None
         }
     };
     let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
@@ -599,29 +607,12 @@ fn relay_ndjson_stream(
             return Poll::Ready(None);
         }
 
-        if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-            drop(relay.take());
-            if let Some(chunk) = record_guard.finalize(false) {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            return Poll::Ready(None);
-        }
-
-        let r = relay.as_mut().expect("relay alive before breaker trip");
-        match futures_util::Stream::poll_next(r.as_mut(), cx) {
-            Poll::Ready(Some(chunk)) => {
-                if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Ready(Some(chunk))
-            }
+        match futures_util::Stream::poll_next(relay.as_mut(), cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(chunk)),
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                if let Some(chunk) = record_guard.finalize(true) {
-                    Poll::Ready(Some(Ok(chunk)))
-                } else {
-                    Poll::Ready(None)
-                }
+                record_guard.finalize(false);
+                Poll::Ready(None)
             }
         }
     });
@@ -640,8 +631,50 @@ fn relay_ndjson_stream(
 
 fn circuit_breaker_message(token_count: i64) -> String {
     format!(
-        "Circuit breaker: {token_count} tokens consumed in this session without human input. Run 'kyris continue' to resume."
+        "Circuit breaker: {token_count} tokens generated without a tool call. The human chose to stop; run 'kyris continue' to resume."
     )
+}
+
+/// The SSE "stop" event for a Google stream gated then stopped by the human. A
+/// true 429 is impossible once a 200 SSE response has begun, so the agent is
+/// halted with an in-stream error event (`alt=sse`, so `data:`-framed).
+fn google_stop_chunk(token_count: i64) -> Bytes {
+    let payload = serde_json::json!({
+        "error": {
+            "code": 429,
+            "message": circuit_breaker_message(token_count),
+            "status": "RESOURCE_EXHAUSTED"
+        }
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// Whether a Gemini `GenerateContentResponse` value contains a `functionCall`
+/// part — the model invoked a tool, so the runaway counter resets (see
+/// [`crate::circuit_breaker`]).
+fn google_value_has_tool_call(v: &serde_json::Value) -> bool {
+    v.get("candidates")
+        .and_then(|c| c.as_array())
+        .is_some_and(|cands| {
+            cands.iter().any(|c| {
+                c.get("content")
+                    .and_then(|content| content.get("parts"))
+                    .and_then(|parts| parts.as_array())
+                    .is_some_and(|parts| {
+                        parts
+                            .iter()
+                            .any(|p| p.get("functionCall").is_some_and(|f| !f.is_null()))
+                    })
+            })
+        })
+}
+
+fn google_body_has_tool_call(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| google_value_has_tool_call(&v))
+}
+
+fn google_json_has_tool_call(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json).is_ok_and(|v| google_value_has_tool_call(&v))
 }
 
 fn circuit_breaker_error(trace_id: &str, token_count: i64) -> Response {
@@ -907,7 +940,8 @@ mod tests {
         assert_eq!(event.tokens.input, 300);
         assert_eq!(event.tokens.output, 150);
         assert_eq!(event.session_id.as_deref(), Some("sess-google"));
-        assert_eq!(state.circuit_breaker.get_token_count("sess-google"), 450);
+        // Output-only no-tool counting (was 450 = input+output).
+        assert_eq!(state.circuit_breaker.get_token_count("sess-google"), 150);
         // G-K2: Google has no subscription-OAuth path — every call is API-key
         // billed, so the metering event the route emits always classifies
         // `overage` (asserted at the route level, not just the helper).
@@ -1021,7 +1055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testGoogleStreamRouteReturnsJsonBreakerErrorWhenSessionIsTripped() {
+    async fn testGoogleStreamRouteEmitsSseStopEventWhenHumanStopsTrippedSession() {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "google".to_string(),
@@ -1031,6 +1065,9 @@ mod tests {
             timeout_seconds: 30,
             streaming_timeout_seconds: 300,
         }];
+        // No GUI → prompt unanswered → 0s timeout defaults to Stop, delivered as
+        // an in-stream SSE error event (the stream is already a 200).
+        config.circuit_breaker.decision_timeout_seconds = 0;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let (state, _stats_rx) = make_test_state(config, temp_dir.path());
@@ -1052,18 +1089,19 @@ mod tests {
                 "{router_url}/v1beta/models/gemini-2.0-flash:streamGenerateContent"
             ))
             .header("x-kyris-session-id", "sess-google-tripped")
+            .header("x-goog-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("application/json")
+            Some("text/event-stream")
         );
         let body = response.text().await.unwrap();
         assert!(body.contains("\"RESOURCE_EXHAUSTED\""), "{body}");
@@ -1074,7 +1112,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testGoogleStreamRouteInjectsBreakerErrorWhenUsageCrossesThreshold() {
+    async fn testGoogleStreamRouteDoesNotInterruptMidStreamButTripsForNext() {
+        // Per-request boundary, not a mid-stream interrupter: a stream that
+        // crosses the cap in flight is relayed verbatim, and the session is left
+        // tripped so the next request gets gated.
         let recorded = Arc::new(Mutex::new(None));
         let upstream = Router::new()
             .route(
@@ -1093,10 +1134,12 @@ mod tests {
             timeout_seconds: 30,
             streaming_timeout_seconds: 300,
         }];
+        // The mock emits 150 output tokens; a 90-token cap is crossed at
+        // end-of-stream (not mid-stream).
         config.circuit_breaker.max_tokens = 90;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
         let app = routes(state.clone());
         let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
 
@@ -1120,11 +1163,20 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let streamed_body = response.text().await.unwrap();
+        // No mid-stream injection: upstream bytes pass through untouched.
         assert!(
-            streamed_body.contains("\"RESOURCE_EXHAUSTED\""),
-            "{streamed_body}"
+            !streamed_body.contains("RESOURCE_EXHAUSTED"),
+            "stream must not be interrupted mid-flight: {streamed_body}"
         );
-        assert!(streamed_body.contains("Circuit breaker"), "{streamed_body}");
+        assert!(streamed_body.contains("hello"), "{streamed_body}");
+
+        // Crossing recorded at the boundary → session tripped, next call gated.
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, "circuit_breaker");
+        assert!(state.circuit_breaker.is_tripped("sess-google-threshold"));
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(request.query.get("alt").map(String::as_str), Some("sse"));
@@ -1267,7 +1319,7 @@ mod tests {
             StatusCode::OK,
             [("content-type", "text/event-stream")],
             concat!(
-                "data: {\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":0}}\n\n",
+                "data: {\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":150}}\n\n",
                 "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\n"
             ),
         )
@@ -1376,6 +1428,7 @@ mod tests {
         let state = Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(config)),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
+            gate: Arc::new(crate::gate::GateRegistry::new()),
             cost_calculator: CostCalculator::new(),
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),

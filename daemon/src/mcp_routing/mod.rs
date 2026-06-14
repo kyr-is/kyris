@@ -791,6 +791,7 @@ mod tests {
         Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(config)),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
+            gate: Arc::new(crate::gate::GateRegistry::new()),
             cost_calculator: CostCalculator::new(),
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),

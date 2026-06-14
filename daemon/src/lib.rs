@@ -33,6 +33,7 @@ pub mod config;
 pub mod cost;
 pub mod crash;
 pub mod fail_open_log;
+pub mod gate;
 pub mod logging;
 pub mod mcp_routing;
 pub mod metering;

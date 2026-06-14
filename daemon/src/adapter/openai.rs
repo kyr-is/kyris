@@ -128,13 +128,6 @@ async fn handle_completions(
 
     super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
-    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
-    {
-        let count = state.circuit_breaker.get_token_count(&session_id);
-        crate::notify::circuit_breaker_toast(count);
-        return Ok(circuit_breaker_error(&trace_id, count));
-    }
-
     // Resolve attribution now, while the peer socket still maps to a live
     // process — the record is written at stream/handler end, by which time the
     // agent may have disconnected and exited, and a record without
@@ -202,22 +195,69 @@ async fn handle_completions(
         "provider_selected"
     );
 
-    let response = client
+    let req_builder = client
         .post(&upstream_url)
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .header("authorization", &authorization)
         .header("content-type", "application/json")
-        .body(outbound_body)
-        .send()
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                upstream = %provider.upstream,
-                error = %e,
-                "upstream_request_failed"
-            );
-            StatusCode::BAD_GATEWAY
-        })?;
+        .body(outbound_body);
+
+    // Runaway gate: if this session crossed the no-action token cap, hold the
+    // request on a human "continue or stop?" decision rather than sending. On
+    // Continue the breaker is reset and the request proceeds; on Stop the agent
+    // is halted (a 429 for non-stream, an in-stream error for streaming).
+    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
+    {
+        let count = state.circuit_breaker.get_token_count(&session_id);
+        if is_stream {
+            return Ok(super::gated_streaming_response(
+                state.clone(),
+                session_id.clone(),
+                agent.clone(),
+                count,
+                trace_id.clone(),
+                openai_stop_chunk(count),
+                move || {
+                    Box::pin(async move {
+                        let response = req_builder.send().await.map_err(|e| {
+                            tracing::error!(error = %e, "upstream_request_failed (after continue)");
+                            StatusCode::BAD_GATEWAY
+                        })?;
+                        let status = response.status();
+                        let resp_headers = response.headers().clone();
+                        relay_sse_stream(
+                            state,
+                            response,
+                            status,
+                            resp_headers,
+                            trace_id,
+                            model,
+                            provider_name,
+                            session_id,
+                            working_dir,
+                            agent,
+                            plan_status,
+                            start,
+                        )
+                    })
+                },
+            ));
+        }
+        match super::await_token_gate(state.clone(), session_id.clone(), agent.clone(), count).await
+        {
+            super::GateDecision::Stop => return Ok(circuit_breaker_error(&trace_id, count)),
+            super::GateDecision::Continue => {}
+        }
+    }
+
+    let response = req_builder.send().await.map_err(|e| {
+        tracing::error!(
+            upstream = %provider.upstream,
+            error = %e,
+            "upstream_request_failed"
+        );
+        StatusCode::BAD_GATEWAY
+    })?;
 
     let status = response.status();
     let resp_headers = response.headers().clone();
@@ -272,14 +312,14 @@ async fn handle_completions(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
+    let had_tool_call = chat_body_has_tool_call(&resp_body);
     let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
-            let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
             state
                 .circuit_breaker
-                .record_and_is_tripped(&session_id, total, max)
+                .record(&session_id, tokens.output, had_tool_call, max)
         } else {
             false
         }
@@ -377,13 +417,6 @@ async fn handle_responses(
 
     super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
-    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
-    {
-        let count = state.circuit_breaker.get_token_count(&session_id);
-        crate::notify::circuit_breaker_toast(count);
-        return Ok(circuit_breaker_error(&trace_id, count));
-    }
-
     // Resolve attribution now, while the peer socket still maps to a live
     // process — the record is written at stream/handler end, by which time the
     // agent may have disconnected and exited (codex exec quits on
@@ -457,6 +490,52 @@ async fn handle_responses(
             request = request.header(name, value);
         }
     }
+    // Runaway gate (see handle_completions): hold a tripped session's request
+    // on a human "continue or stop?" decision instead of sending.
+    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
+    {
+        let count = state.circuit_breaker.get_token_count(&session_id);
+        if is_stream {
+            return Ok(super::gated_streaming_response(
+                state.clone(),
+                session_id.clone(),
+                agent.clone(),
+                count,
+                trace_id.clone(),
+                openai_stop_chunk(count),
+                move || {
+                    Box::pin(async move {
+                        let response = request.send().await.map_err(|e| {
+                            tracing::error!(error = %e, "OpenAI responses upstream request failed (after continue)");
+                            StatusCode::BAD_GATEWAY
+                        })?;
+                        let status = response.status();
+                        let resp_headers = response.headers().clone();
+                        relay_responses_sse_stream(
+                            state,
+                            response,
+                            status,
+                            resp_headers,
+                            trace_id,
+                            model,
+                            provider_name,
+                            session_id,
+                            working_dir,
+                            agent,
+                            plan_status,
+                            start,
+                        )
+                    })
+                },
+            ));
+        }
+        match super::await_token_gate(state.clone(), session_id.clone(), agent.clone(), count).await
+        {
+            super::GateDecision::Stop => return Ok(circuit_breaker_error(&trace_id, count)),
+            super::GateDecision::Continue => {}
+        }
+    }
+
     let response = request.send().await.map_err(|e| {
         tracing::error!(error = %e, "OpenAI responses upstream request failed");
         StatusCode::BAD_GATEWAY
@@ -499,14 +578,14 @@ async fn handle_responses(
         .cost_calculator
         .calculate(&model, tokens.input, tokens.output, None, None);
 
+    let had_tool_call = responses_body_has_tool_call(&resp_body);
     let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
-            let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
             state
                 .circuit_breaker
-                .record_and_is_tripped(&session_id, total, max)
+                .record(&session_id, tokens.output, had_tool_call, max)
         } else {
             false
         }
@@ -570,13 +649,15 @@ fn relay_responses_sse_stream(
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
     let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let breaker_tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whether any response in this stream made a tool/shell/MCP call. A tool
+    // call means the agent is taking action, so the runaway counter resets;
+    // only no-tool output accumulates toward the cap.
+    let had_tool_call = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let relay = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
-        let state = state.clone();
+        let had_tool_call = had_tool_call.clone();
 
         response
             .bytes_stream()
@@ -588,45 +669,26 @@ fn relay_responses_sse_stream(
                         let snapshot = buf.clone();
                         let (lines, remainder) = streaming::split_sse_lines(&snapshot);
                         for line in &lines {
-                            if let Some(json) = streaming::parse_sse_line(line)
-                                && let Some(tokens) = extract_responses_tokens_from_sse_json(json)
-                            {
-                                let mut acc = accumulated.lock().expect("lock accumulated");
-                                acc.input += tokens.input;
-                                acc.output += tokens.output;
+                            if let Some(json) = streaming::parse_sse_line(line) {
+                                if let Some(tokens) = extract_responses_tokens_from_sse_json(json) {
+                                    let mut acc = accumulated.lock().expect("lock accumulated");
+                                    acc.input += tokens.input;
+                                    acc.output += tokens.output;
+                                }
+                                if responses_sse_has_tool_call(json) {
+                                    had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         *buf = remainder.to_string();
                     }
-
-                    {
-                        let acc = accumulated.lock().expect("lock accumulated");
-                        let total = acc.input + acc.output;
-                        let max = state.config.load().circuit_breaker.max_tokens as i64;
-                        if total > max {
-                            breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                            crate::notify::circuit_breaker_toast(total);
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": circuit_breaker_message(total),
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            let err_chunk = format!("data: {payload}\n\n");
-                            let mut combined = chunk.to_vec();
-                            combined.extend_from_slice(err_chunk.as_bytes());
-                            return Ok::<Bytes, reqwest::Error>(Bytes::from(combined));
-                        }
-                    }
-
-                    Ok(chunk)
+                    Ok::<Bytes, reqwest::Error>(chunk)
                 }
                 Err(e) => Err(e),
             })
     };
 
-    let mut relay = Some(Box::pin(relay));
+    let mut relay = Box::pin(relay);
     // The finalize owns (clones of) everything the record needs so it can run
     // from the guard's Drop as well as from the poll path — a client that
     // disconnects before end-of-stream must still produce a gateway record
@@ -635,12 +697,12 @@ fn relay_responses_sse_stream(
     let finalize_stream = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
+        let had_tool_call = had_tool_call.clone();
         let state = state.clone();
         let trace_id = trace_id.clone();
         let model = model.clone();
         let session_id = session_id.clone();
-        move |emit_breaker_chunk: bool| {
+        move |_emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -648,11 +710,14 @@ fn relay_responses_sse_stream(
             if !remaining.is_empty() {
                 let mut acc = accumulated.lock().expect("lock accumulated");
                 for line in remaining.lines() {
-                    if let Some(json) = streaming::parse_sse_line(line)
-                        && let Some(tokens) = extract_responses_tokens_from_sse_json(json)
-                    {
-                        acc.input += tokens.input;
-                        acc.output += tokens.output;
+                    if let Some(json) = streaming::parse_sse_line(line) {
+                        if let Some(tokens) = extract_responses_tokens_from_sse_json(json) {
+                            acc.input += tokens.input;
+                            acc.output += tokens.output;
+                        }
+                        if responses_sse_has_tool_call(json) {
+                            had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -664,36 +729,18 @@ fn relay_responses_sse_stream(
                     .cost_calculator
                     .calculate(&model, tokens.input, tokens.output, None, None);
 
-            let mut breaker_chunk = None;
-            let mut status = "success";
-            {
+            let tool = had_tool_call.load(std::sync::atomic::Ordering::Relaxed);
+            let crossed = {
                 let config = state.config.load();
                 if config.circuit_breaker.enabled {
-                    let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
-                    if state
+                    state
                         .circuit_breaker
-                        .record_and_is_tripped(&session_id, total, max)
-                    {
-                        status = "circuit_breaker";
-                        // The mid-stream relay already injects the breaker chunk
-                        // when the cap is crossed during the stream; only append
-                        // one here on a natural end-of-stream crossing that
-                        // wasn't already signalled.
-                        if emit_breaker_chunk && !already {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
-                        }
-                    }
+                        .record(&session_id, tokens.output, tool, max)
+                } else {
+                    false
                 }
-            }
+            };
 
             let stream_metering = if tokens.input == 0 && tokens.output == 0 {
                 kyris_core::record::Metering::Unavailable
@@ -712,7 +759,12 @@ fn relay_responses_sse_stream(
                     cache_read: 0,
                     cost,
                     latency_ms,
-                    status: status.to_string(),
+                    status: if crossed {
+                        "circuit_breaker"
+                    } else {
+                        "success"
+                    }
+                    .to_string(),
                     session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
@@ -726,7 +778,7 @@ fn relay_responses_sse_stream(
                 crate::storage::record_dropped(1);
             }
 
-            breaker_chunk
+            None
         }
     };
     let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
@@ -737,29 +789,12 @@ fn relay_responses_sse_stream(
             return Poll::Ready(None);
         }
 
-        if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-            drop(relay.take());
-            if let Some(chunk) = record_guard.finalize(false) {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            return Poll::Ready(None);
-        }
-
-        let r = relay.as_mut().expect("relay alive before breaker trip");
-        match futures_util::Stream::poll_next(r.as_mut(), cx) {
-            Poll::Ready(Some(chunk)) => {
-                if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Ready(Some(chunk))
-            }
+        match futures_util::Stream::poll_next(relay.as_mut(), cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(chunk)),
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                if let Some(chunk) = record_guard.finalize(true) {
-                    Poll::Ready(Some(Ok(chunk)))
-                } else {
-                    Poll::Ready(None)
-                }
+                record_guard.finalize(false);
+                Poll::Ready(None)
             }
         }
     });
@@ -791,13 +826,14 @@ fn relay_sse_stream(
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(TokenCounts::default()));
     let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let breaker_tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whether any response in this stream made a tool/function call (resets the
+    // runaway counter; only no-tool output accumulates toward the cap).
+    let had_tool_call = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let relay = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
-        let state = state.clone();
+        let had_tool_call = had_tool_call.clone();
 
         response
             .bytes_stream()
@@ -809,45 +845,26 @@ fn relay_sse_stream(
                         let snapshot = buf.clone();
                         let (lines, remainder) = streaming::split_sse_lines(&snapshot);
                         for line in &lines {
-                            if let Some(json) = streaming::parse_sse_line(line)
-                                && let Some(tokens) = extract_tokens_from_sse_json(json)
-                            {
-                                let mut acc = accumulated.lock().expect("lock accumulated");
-                                acc.input += tokens.input;
-                                acc.output += tokens.output;
+                            if let Some(json) = streaming::parse_sse_line(line) {
+                                if let Some(tokens) = extract_tokens_from_sse_json(json) {
+                                    let mut acc = accumulated.lock().expect("lock accumulated");
+                                    acc.input += tokens.input;
+                                    acc.output += tokens.output;
+                                }
+                                if chat_sse_has_tool_call(json) {
+                                    had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         *buf = remainder.to_string();
                     }
-
-                    {
-                        let acc = accumulated.lock().expect("lock accumulated");
-                        let total = acc.input + acc.output;
-                        let max = state.config.load().circuit_breaker.max_tokens as i64;
-                        if total > max {
-                            breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                            crate::notify::circuit_breaker_toast(total);
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": circuit_breaker_message(total),
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            let err_chunk = format!("data: {payload}\n\n");
-                            let mut combined = chunk.to_vec();
-                            combined.extend_from_slice(err_chunk.as_bytes());
-                            return Ok::<Bytes, reqwest::Error>(Bytes::from(combined));
-                        }
-                    }
-
-                    Ok(chunk)
+                    Ok::<Bytes, reqwest::Error>(chunk)
                 }
                 Err(e) => Err(e),
             })
     };
 
-    let mut relay = Some(Box::pin(relay));
+    let mut relay = Box::pin(relay);
     // The finalize owns (clones of) everything the record needs so it can run
     // from the guard's Drop as well as from the poll path — a client that
     // disconnects before end-of-stream must still produce a gateway record
@@ -855,12 +872,12 @@ fn relay_sse_stream(
     let finalize_stream = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
+        let had_tool_call = had_tool_call.clone();
         let state = state.clone();
         let trace_id = trace_id.clone();
         let model = model.clone();
         let session_id = session_id.clone();
-        move |emit_breaker_chunk: bool| {
+        move |_emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -868,11 +885,14 @@ fn relay_sse_stream(
             if !remaining.is_empty() {
                 let mut acc = accumulated.lock().expect("lock accumulated");
                 for line in remaining.lines() {
-                    if let Some(json) = streaming::parse_sse_line(line)
-                        && let Some(tokens) = extract_tokens_from_sse_json(json)
-                    {
-                        acc.input += tokens.input;
-                        acc.output += tokens.output;
+                    if let Some(json) = streaming::parse_sse_line(line) {
+                        if let Some(tokens) = extract_tokens_from_sse_json(json) {
+                            acc.input += tokens.input;
+                            acc.output += tokens.output;
+                        }
+                        if chat_sse_has_tool_call(json) {
+                            had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -884,36 +904,18 @@ fn relay_sse_stream(
                     .cost_calculator
                     .calculate(&model, tokens.input, tokens.output, None, None);
 
-            let mut breaker_chunk = None;
-            let mut status = "success";
-            {
+            let tool = had_tool_call.load(std::sync::atomic::Ordering::Relaxed);
+            let crossed = {
                 let config = state.config.load();
                 if config.circuit_breaker.enabled {
-                    let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
-                    if state
+                    state
                         .circuit_breaker
-                        .record_and_is_tripped(&session_id, total, max)
-                    {
-                        status = "circuit_breaker";
-                        // The mid-stream relay already injects the breaker chunk
-                        // when the cap is crossed during the stream; only append
-                        // one here on a natural end-of-stream crossing that
-                        // wasn't already signalled.
-                        if emit_breaker_chunk && !already {
-                            let payload = serde_json::json!({
-                                "error": {
-                                    "message": "Circuit breaker: token limit exceeded. Run 'kyris continue' to resume.",
-                                    "type": "circuit_breaker",
-                                    "code": "circuit_breaker"
-                                }
-                            });
-                            breaker_chunk = Some(Bytes::from(format!("data: {payload}\n\n")));
-                        }
-                    }
+                        .record(&session_id, tokens.output, tool, max)
+                } else {
+                    false
                 }
-            }
+            };
 
             let stream_metering = if tokens.input == 0 && tokens.output == 0 {
                 kyris_core::record::Metering::Unavailable
@@ -932,7 +934,12 @@ fn relay_sse_stream(
                     cache_read: 0,
                     cost,
                     latency_ms,
-                    status: status.to_string(),
+                    status: if crossed {
+                        "circuit_breaker"
+                    } else {
+                        "success"
+                    }
+                    .to_string(),
                     session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
@@ -946,7 +953,7 @@ fn relay_sse_stream(
                 crate::storage::record_dropped(1);
             }
 
-            breaker_chunk
+            None
         }
     };
     let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
@@ -957,29 +964,12 @@ fn relay_sse_stream(
             return Poll::Ready(None);
         }
 
-        if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-            drop(relay.take());
-            if let Some(chunk) = record_guard.finalize(false) {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            return Poll::Ready(None);
-        }
-
-        let r = relay.as_mut().expect("relay alive before breaker trip");
-        match futures_util::Stream::poll_next(r.as_mut(), cx) {
-            Poll::Ready(Some(chunk)) => {
-                if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Ready(Some(chunk))
-            }
+        match futures_util::Stream::poll_next(relay.as_mut(), cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(chunk)),
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                if let Some(chunk) = record_guard.finalize(true) {
-                    Poll::Ready(Some(Ok(chunk)))
-                } else {
-                    Poll::Ready(None)
-                }
+                record_guard.finalize(false);
+                Poll::Ready(None)
             }
         }
     });
@@ -996,7 +986,7 @@ fn relay_sse_stream(
 
 fn circuit_breaker_message(token_count: i64) -> String {
     format!(
-        "Circuit breaker: {token_count} tokens consumed in this session without human input. Run 'kyris continue' to resume."
+        "Circuit breaker: {token_count} tokens generated without a tool call. The human chose to stop; run 'kyris continue' to resume."
     )
 }
 
@@ -1015,6 +1005,103 @@ fn circuit_breaker_error(trace_id: &str, token_count: i64) -> Response {
         .header("x-kyris-trace-id", trace_id)
         .body(Body::from(payload.to_string()))
         .expect("build circuit breaker error response")
+}
+
+/// The SSE "stop" event for an `OpenAI` stream gated then stopped by the human.
+/// A true 429 is impossible once a 200 SSE response has begun, so the agent is
+/// halted with an in-stream error event carrying the same shape as the
+/// pre-flight 429 body.
+fn openai_stop_chunk(token_count: i64) -> Bytes {
+    let payload = serde_json::json!({
+        "error": {
+            "message": circuit_breaker_message(token_count),
+            "type": "circuit_breaker",
+            "code": "circuit_breaker"
+        }
+    });
+    Bytes::from(format!("data: {payload}\n\n"))
+}
+
+/// Whether a chat-completions response (object or one SSE chunk) took any
+/// tool/function action — a `tool_calls`/`function_call` in the message/delta,
+/// or a `finish_reason` of `tool_calls`/`function_call`. Such a response resets
+/// the runaway counter (see [`crate::circuit_breaker`]).
+fn chat_value_has_tool_call(v: &serde_json::Value) -> bool {
+    let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        let finish = choice.get("finish_reason").and_then(|f| f.as_str());
+        if matches!(finish, Some("tool_calls" | "function_call")) {
+            return true;
+        }
+        let msg = choice.get("message").or_else(|| choice.get("delta"));
+        msg.is_some_and(|m| {
+            m.get("tool_calls")
+                .and_then(|t| t.as_array())
+                .is_some_and(|a| !a.is_empty())
+                || m.get("function_call").is_some_and(|f| !f.is_null())
+        })
+    })
+}
+
+fn chat_body_has_tool_call(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| chat_value_has_tool_call(&v))
+}
+
+fn chat_sse_has_tool_call(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json).is_ok_and(|v| chat_value_has_tool_call(&v))
+}
+
+/// Whether a Responses-API output-item `type` denotes a tool/function/shell
+/// call (e.g. `function_call`, `local_shell_call`, `custom_tool_call`,
+/// `web_search_call`, `computer_call`) rather than `message` / `reasoning`.
+fn is_responses_call_type(t: &str) -> bool {
+    t == "function_call" || t.ends_with("_call")
+}
+
+fn responses_output_has_tool_call(output: &serde_json::Value) -> bool {
+    output.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(is_responses_call_type)
+        })
+    })
+}
+
+fn responses_body_has_tool_call(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("output").map(responses_output_has_tool_call))
+        .unwrap_or(false)
+}
+
+/// Tool-call detection for a single Responses-API SSE event: the terminal
+/// `response.completed` event carries the full response object with its
+/// `output` array; streaming `response.output_item.*` events carry a single
+/// `item`; and function-call argument-delta events carry a `function_call`
+/// type marker.
+fn responses_sse_has_tool_call(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    if let Some(output) = v.get("response").and_then(|r| r.get("output"))
+        && responses_output_has_tool_call(output)
+    {
+        return true;
+    }
+    if let Some(t) = v
+        .get("item")
+        .and_then(|i| i.get("type"))
+        .and_then(|t| t.as_str())
+        && is_responses_call_type(t)
+    {
+        return true;
+    }
+    v.get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.contains("function_call"))
 }
 
 /// Fail-fast response (401) when the caller supplied no `authorization`
@@ -1343,7 +1430,10 @@ mod tests {
         assert_eq!(event.tokens.input, 200);
         assert_eq!(event.tokens.output, 100);
         assert_eq!(event.session_id.as_deref(), Some("sess-123"));
-        assert_eq!(state.circuit_breaker.get_token_count("sess-123"), 300);
+        // The runaway breaker counts no-tool OUTPUT tokens only (not input) —
+        // this plain-text response made no tool call, so the counter is its 100
+        // output tokens, not 300 input+output.
+        assert_eq!(state.circuit_breaker.get_token_count("sess-123"), 100);
         // This call authenticated with an API key (no ChatGPT-Account-ID), so
         // the route classifies it `overage`. The subscription path classifies
         // `included` (helper-pinned in testPlanStatusChatgptSubscriptionIsIncluded;
@@ -1459,7 +1549,12 @@ mod tests {
             timeout_seconds: 30,
             streaming_timeout_seconds: 300,
         }];
-        config.circuit_breaker.max_tokens = 200;
+        // Output-only counting: the mock returns 100 output tokens, so a 50-token
+        // cap trips after one no-tool response. A 0s decision timeout makes the
+        // unanswered runaway prompt default to Stop immediately (no GUI in tests),
+        // so the second request gets the stop 429 without a multi-day hold.
+        config.circuit_breaker.max_tokens = 50;
+        config.circuit_breaker.decision_timeout_seconds = 0;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
@@ -1485,7 +1580,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(event.session_id.as_deref(), Some("__default"));
-        assert_eq!(state.circuit_breaker.get_token_count("__default"), 300);
+        assert_eq!(state.circuit_breaker.get_token_count("__default"), 100);
         assert!(state.circuit_breaker.is_tripped("__default"));
 
         let response2 = reqwest::Client::new()
@@ -1503,6 +1598,22 @@ mod tests {
                 .unwrap()
                 .contains("circuit_breaker")
         );
+
+        // Stop 429s the request but still resets the counter (synchronously,
+        // before the 429 returns), so the human's decision isn't re-litigated on
+        // every subsequent call.
+        assert_eq!(state.circuit_breaker.get_token_count("__default"), 0);
+        assert!(!state.circuit_breaker.is_tripped("__default"));
+
+        // The next request therefore proceeds normally (200), not another 429.
+        let response3 = reqwest::Client::new()
+            .post(format!("{router_url}/v1/chat/completions"))
+            .header("authorization", "Bearer caller-key")
+            .json(&request_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response3.status(), StatusCode::OK);
 
         let _ = router_shutdown.send(());
         let _ = upstream_shutdown.send(());
@@ -1631,6 +1742,7 @@ mod tests {
         let state = Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(config)),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
+            gate: Arc::new(crate::gate::GateRegistry::new()),
             cost_calculator: CostCalculator::new(),
             stats_tx,
             db,
@@ -1778,7 +1890,8 @@ mod tests {
         assert_eq!(event.tokens.input, 150);
         assert_eq!(event.tokens.output, 80);
         assert_eq!(event.session_id.as_deref(), Some("sess-resp-1"));
-        assert_eq!(state.circuit_breaker.get_token_count("sess-resp-1"), 230);
+        // Output-only no-tool counting (was 230 = input+output).
+        assert_eq!(state.circuit_breaker.get_token_count("sess-resp-1"), 80);
         // API-key credential (no ChatGPT-Account-ID) → billed as overage.
         assert_eq!(event.plan_status, kyris_core::record::PlanStatus::Overage);
 
@@ -1867,9 +1980,10 @@ mod tests {
         assert_eq!(event.tokens.input, 100);
         assert_eq!(event.tokens.output, 50);
         assert_eq!(event.session_id.as_deref(), Some("sess-resp-stream"));
+        // Output-only no-tool counting (was 150 = input+output).
         assert_eq!(
             state.circuit_breaker.get_token_count("sess-resp-stream"),
-            150
+            50
         );
 
         let _ = router_shutdown.send(());

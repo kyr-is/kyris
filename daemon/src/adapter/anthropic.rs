@@ -95,13 +95,6 @@ async fn handle_messages(
 
     super::record_agent_traffic(agent_id.as_deref(), trace_token.as_deref());
 
-    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
-    {
-        let count = state.circuit_breaker.get_token_count(&session_id);
-        crate::notify::circuit_breaker_toast(count);
-        return Ok(circuit_breaker_response(&trace_id, count));
-    }
-
     // Resolve attribution now, while the peer socket still maps to a live
     // process — the record is written at stream/handler end, by which time the
     // agent may have disconnected and exited, and a record without
@@ -191,6 +184,52 @@ async fn handle_messages(
         }
     }
 
+    // Runaway gate (see openai::handle_completions): hold a tripped session's
+    // request on a human "continue or stop?" decision instead of sending.
+    if state.config.load().circuit_breaker.enabled && state.circuit_breaker.is_tripped(&session_id)
+    {
+        let count = state.circuit_breaker.get_token_count(&session_id);
+        if is_stream {
+            return Ok(super::gated_streaming_response(
+                state.clone(),
+                session_id.clone(),
+                agent.clone(),
+                count,
+                trace_id.clone(),
+                anthropic_stop_chunk(count),
+                move || {
+                    Box::pin(async move {
+                        let response = req.send().await.map_err(|e| {
+                            tracing::error!(error = %e, "upstream_request_failed (after continue)");
+                            StatusCode::BAD_GATEWAY
+                        })?;
+                        let status = response.status();
+                        let resp_headers = response.headers().clone();
+                        relay_sse_stream(
+                            state,
+                            response,
+                            status,
+                            resp_headers,
+                            trace_id,
+                            model,
+                            provider_name,
+                            session_id,
+                            working_dir,
+                            agent,
+                            start,
+                            plan_status,
+                        )
+                    })
+                },
+            ));
+        }
+        match super::await_token_gate(state.clone(), session_id.clone(), agent.clone(), count).await
+        {
+            super::GateDecision::Stop => return Ok(circuit_breaker_response(&trace_id, count)),
+            super::GateDecision::Continue => {}
+        }
+    }
+
     let response = req.send().await.map_err(|e| {
         tracing::error!(
             upstream = %provider.upstream,
@@ -272,14 +311,14 @@ async fn handle_messages(
         },
     );
 
+    let had_tool_call = anthropic_body_has_tool_call(&resp_body);
     let breaker_crossed = {
         let config = state.config.load();
         if config.circuit_breaker.enabled {
-            let total = tokens.input + tokens.output;
             let max = config.circuit_breaker.max_tokens as i64;
             state
                 .circuit_breaker
-                .record_and_is_tripped(&session_id, total, max)
+                .record(&session_id, tokens.output, had_tool_call, max)
         } else {
             false
         }
@@ -361,14 +400,15 @@ fn relay_sse_stream(
 ) -> Result<Response, StatusCode> {
     let accumulated = Arc::new(std::sync::Mutex::new(StreamTokenCounts::default()));
     let line_buf = Arc::new(std::sync::Mutex::new(String::new()));
-    let breaker_tripped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Whether any response in this stream emitted a `tool_use` block (resets the
+    // runaway counter; only no-tool output accumulates toward the cap).
+    let had_tool_call = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Build the relay stream that forwards chunks and extracts tokens
     let relay = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
-        let state = state.clone();
+        let had_tool_call = had_tool_call.clone();
 
         response
             .bytes_stream()
@@ -380,46 +420,27 @@ fn relay_sse_stream(
                         let snapshot = buf.clone();
                         let (lines, remainder) = streaming::split_sse_lines(&snapshot);
                         for line in &lines {
-                            if let Some(json) = streaming::parse_sse_line(line)
-                                && let Some(delta) = extract_tokens_from_sse_json(json)
-                            {
-                                accumulated
-                                    .lock()
-                                    .expect("lock accumulated")
-                                    .accumulate(&delta);
+                            if let Some(json) = streaming::parse_sse_line(line) {
+                                if let Some(delta) = extract_tokens_from_sse_json(json) {
+                                    accumulated
+                                        .lock()
+                                        .expect("lock accumulated")
+                                        .accumulate(&delta);
+                                }
+                                if anthropic_sse_has_tool_call(json) {
+                                    had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         *buf = remainder.to_string();
                     }
-
-                    {
-                        let acc = accumulated.lock().expect("lock accumulated");
-                        let total = acc.tokens.input + acc.tokens.output;
-                        let max = state.config.load().circuit_breaker.max_tokens as i64;
-                        if total > max {
-                            breaker_tripped.store(true, std::sync::atomic::Ordering::Relaxed);
-                            crate::notify::circuit_breaker_toast(total);
-                            let payload = serde_json::json!({
-                                "type": "error",
-                                "error": {
-                                    "type": "circuit_breaker",
-                                    "message": circuit_breaker_message(total),
-                                }
-                            });
-                            let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
-                            let mut combined = chunk.to_vec();
-                            combined.extend_from_slice(err_chunk.as_bytes());
-                            return Ok::<Bytes, reqwest::Error>(Bytes::from(combined));
-                        }
-                    }
-
-                    Ok(chunk)
+                    Ok::<Bytes, reqwest::Error>(chunk)
                 }
                 Err(e) => Err(e),
             })
     };
 
-    let mut relay = Some(Box::pin(relay));
+    let mut relay = Box::pin(relay);
     // The finalize owns (clones of) everything the record needs so it can run
     // from the guard's Drop as well as from the poll path — a client that
     // disconnects before end-of-stream must still produce a gateway record
@@ -427,12 +448,12 @@ fn relay_sse_stream(
     let finalize_stream = {
         let accumulated = accumulated.clone();
         let line_buf = line_buf.clone();
-        let breaker_tripped = breaker_tripped.clone();
+        let had_tool_call = had_tool_call.clone();
         let state = state.clone();
         let trace_id = trace_id.clone();
         let model = model.clone();
         let session_id = session_id.clone();
-        move |emit_breaker_chunk: bool| {
+        move |_emit_breaker_chunk: bool| {
             let remaining = {
                 let mut buf = line_buf.lock().expect("lock line buffer");
                 std::mem::take(&mut *buf)
@@ -440,10 +461,13 @@ fn relay_sse_stream(
             if !remaining.is_empty() {
                 let mut acc = accumulated.lock().expect("lock accumulated");
                 for line in remaining.lines() {
-                    if let Some(json) = streaming::parse_sse_line(line)
-                        && let Some(delta) = extract_tokens_from_sse_json(json)
-                    {
-                        acc.accumulate(&delta);
+                    if let Some(json) = streaming::parse_sse_line(line) {
+                        if let Some(delta) = extract_tokens_from_sse_json(json) {
+                            acc.accumulate(&delta);
+                        }
+                        if anthropic_sse_has_tool_call(json) {
+                            had_tool_call.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -470,37 +494,18 @@ fn relay_sse_stream(
                 cache_read,
             );
 
-            let mut breaker_chunk = None;
-            let mut status = "success";
-            {
+            let tool = had_tool_call.load(std::sync::atomic::Ordering::Relaxed);
+            let crossed = {
                 let config = state.config.load();
                 if config.circuit_breaker.enabled {
-                    let total = tokens.input + tokens.output;
                     let max = config.circuit_breaker.max_tokens as i64;
-                    let already = breaker_tripped.load(std::sync::atomic::Ordering::Relaxed);
-                    if state
+                    state
                         .circuit_breaker
-                        .record_and_is_tripped(&session_id, total, max)
-                    {
-                        status = "circuit_breaker";
-                        // The mid-stream relay already injects the breaker chunk
-                        // when the cap is crossed during the stream; only append
-                        // one here on a natural end-of-stream crossing that
-                        // wasn't already signalled.
-                        if emit_breaker_chunk && !already {
-                            let payload = serde_json::json!({
-                                "type": "error",
-                                "error": {
-                                    "type": "circuit_breaker",
-                                    "message": circuit_breaker_message(total),
-                                }
-                            });
-                            let err_chunk = format!("\nevent: error\ndata: {payload}\n\n");
-                            breaker_chunk = Some(Bytes::from(err_chunk));
-                        }
-                    }
+                        .record(&session_id, tokens.output, tool, max)
+                } else {
+                    false
                 }
-            }
+            };
 
             let stream_metering = if tokens.input == 0 && tokens.output == 0 {
                 kyris_core::record::Metering::Unavailable
@@ -519,7 +524,12 @@ fn relay_sse_stream(
                     cache_read: stream_tokens.cache_read_input,
                     cost,
                     latency_ms,
-                    status: status.to_string(),
+                    status: if crossed {
+                        "circuit_breaker"
+                    } else {
+                        "success"
+                    }
+                    .to_string(),
                     session_id: Some(session_id.clone()),
                     mcp_server: None,
                     mcp_tool: None,
@@ -533,7 +543,7 @@ fn relay_sse_stream(
                 crate::storage::record_dropped(1);
             }
 
-            breaker_chunk
+            None
         }
     };
     let mut record_guard = super::StreamRecordGuard::new(finalize_stream);
@@ -544,29 +554,12 @@ fn relay_sse_stream(
             return Poll::Ready(None);
         }
 
-        if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-            drop(relay.take());
-            if let Some(chunk) = record_guard.finalize(false) {
-                return Poll::Ready(Some(Ok(chunk)));
-            }
-            return Poll::Ready(None);
-        }
-
-        let r = relay.as_mut().expect("relay alive before breaker trip");
-        match futures_util::Stream::poll_next(r.as_mut(), cx) {
-            Poll::Ready(Some(chunk)) => {
-                if breaker_tripped.load(std::sync::atomic::Ordering::Relaxed) {
-                    cx.waker().wake_by_ref();
-                }
-                Poll::Ready(Some(chunk))
-            }
+        match futures_util::Stream::poll_next(relay.as_mut(), cx) {
+            Poll::Ready(Some(chunk)) => Poll::Ready(Some(chunk)),
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
-                if let Some(chunk) = record_guard.finalize(true) {
-                    Poll::Ready(Some(Ok(chunk)))
-                } else {
-                    Poll::Ready(None)
-                }
+                record_guard.finalize(false);
+                Poll::Ready(None)
             }
         }
     });
@@ -707,8 +700,61 @@ pub fn extract_tokens_from_sse_json(json: &str) -> Option<StreamTokenCounts> {
 
 fn circuit_breaker_message(token_count: i64) -> String {
     format!(
-        "Circuit breaker: {token_count} tokens consumed in this session without human input. Run 'kyris continue' to resume."
+        "Circuit breaker: {token_count} tokens generated without a tool call. The human chose to stop; run 'kyris continue' to resume."
     )
+}
+
+/// The SSE "stop" event for an Anthropic stream gated then stopped by the
+/// human. A true 429 is impossible once a 200 SSE response has begun, so the
+/// agent is halted with an in-stream `error` event.
+fn anthropic_stop_chunk(token_count: i64) -> Bytes {
+    let payload = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "circuit_breaker",
+            "message": circuit_breaker_message(token_count),
+        }
+    });
+    Bytes::from(format!("event: error\ndata: {payload}\n\n"))
+}
+
+/// Whether a Messages response object contains a `tool_use` content block (or a
+/// `stop_reason` of `tool_use`) — the agent took an action, so the runaway
+/// counter resets (see [`crate::circuit_breaker`]).
+fn anthropic_body_has_tool_call(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    if v.get("stop_reason").and_then(|s| s.as_str()) == Some("tool_use") {
+        return true;
+    }
+    v.get("content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        })
+}
+
+/// Tool-call detection for a single Messages SSE event: a `content_block_start`
+/// whose block is a `tool_use`, or a `message_delta` reporting
+/// `stop_reason: tool_use`.
+fn anthropic_sse_has_tool_call(json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    if v.get("content_block")
+        .and_then(|b| b.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("tool_use")
+    {
+        return true;
+    }
+    v.get("delta")
+        .and_then(|d| d.get("stop_reason"))
+        .and_then(|s| s.as_str())
+        == Some("tool_use")
 }
 
 /// Pre-request circuit breaker response (429). Used for both streaming and
@@ -955,7 +1001,8 @@ mod tests {
         assert_eq!(event.cache_create, 20);
         assert_eq!(event.cache_read, 10);
         assert_eq!(event.session_id.as_deref(), Some("sess-anthropic"));
-        assert_eq!(state.circuit_breaker.get_token_count("sess-anthropic"), 150);
+        // Output-only no-tool counting (was 150 = input+output).
+        assert_eq!(state.circuit_breaker.get_token_count("sess-anthropic"), 50);
 
         let request = recorded.lock().unwrap().clone().unwrap();
         assert_eq!(
@@ -1256,16 +1303,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testAnthropicNonStreamRouteReturns429WhenBreakerTripped() {
+    async fn testAnthropicNonStreamRouteReturns429WhenBreakerTrippedAndHumanStops() {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
             format: ProviderFormat::Anthropic,
-            upstream: "http://127.0.0.1:9".to_string(), // unreachable — breaker fires first
+            upstream: "http://127.0.0.1:9".to_string(), // unreachable — gate fires first
             models: vec!["claude-3-5-sonnet-20241022".to_string()],
             timeout_seconds: 30,
             streaming_timeout_seconds: 300,
         }];
+        // No GUI in tests, so the runaway prompt is never answered; a 0s decision
+        // timeout makes it default to Stop immediately → the 429 below.
+        config.circuit_breaker.decision_timeout_seconds = 0;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let (state, _stats_rx) = make_test_state(config, temp_dir.path());
@@ -1284,6 +1334,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic-nonstream-tripped")
+            .header("x-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
@@ -1311,7 +1362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn testAnthropicStreamRouteReturnsSseBreakerErrorWhenSessionIsTripped() {
+    async fn testAnthropicStreamRouteEmitsSseStopEventWhenHumanStopsTrippedSession() {
         let mut config: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
         config.providers = vec![ProviderConfig {
             name: "anthropic".to_string(),
@@ -1321,6 +1372,10 @@ mod tests {
             timeout_seconds: 30,
             streaming_timeout_seconds: 300,
         }];
+        // No GUI → prompt unanswered → 0s timeout defaults to Stop. A stream that
+        // has already returned 200 can't become a 429, so Stop arrives as an
+        // in-stream `event: error` chunk instead.
+        config.circuit_breaker.decision_timeout_seconds = 0;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let (state, _stats_rx) = make_test_state(config, temp_dir.path());
@@ -1340,37 +1395,40 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{router_url}/v1/messages"))
             .header("x-kyris-session-id", "sess-anthropic-tripped")
+            .header("x-api-key", "caller-key")
             .json(&request_body)
             .send()
             .await
             .unwrap();
 
-        // Pre-request circuit breaker: SSE connection not yet established,
-        // so the response is a plain 429 JSON (not a 200 SSE stream).
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Gated streaming response: 200 SSE, with the stop signal delivered as an
+        // in-stream error event (not a 429).
+        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
                 .headers()
                 .get("content-type")
                 .and_then(|value| value.to_str().ok()),
-            Some("application/json")
+            Some("text/event-stream")
         );
-        let body: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(body["error"]["type"], "circuit_breaker");
+        let streamed_body = response.text().await.unwrap();
+        assert!(streamed_body.contains("event: error"), "{streamed_body}");
         assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("kyris continue"),
-            "{body}"
+            streamed_body.contains("\"type\":\"circuit_breaker\""),
+            "{streamed_body}"
         );
+        assert!(streamed_body.contains("kyris continue"), "{streamed_body}");
 
         let _ = router_shutdown.send(());
         router_handle.await.unwrap();
     }
 
     #[tokio::test]
-    async fn testAnthropicStreamRouteInjectsBreakerErrorWhenUsageCrossesThreshold() {
+    async fn testAnthropicStreamRouteDoesNotInterruptMidStreamButTripsForNext() {
+        // The runaway breaker is a per-request boundary check, NOT a mid-stream
+        // interrupter: a stream that crosses the cap while in flight is relayed
+        // verbatim (no injected error), and the session is left tripped so the
+        // *next* request gets gated.
         let recorded = Arc::new(Mutex::new(None));
         let upstream = Router::new()
             .route(
@@ -1389,10 +1447,12 @@ mod tests {
             timeout_seconds: 30,
             streaming_timeout_seconds: 300,
         }];
+        // The mock emits 150 output tokens; a 100-token cap is crossed at
+        // end-of-stream (not mid-stream).
         config.circuit_breaker.max_tokens = 100;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let (state, _stats_rx) = make_test_state(config, temp_dir.path());
+        let (state, mut stats_rx) = make_test_state(config, temp_dir.path());
         let app = routes(state.clone());
         let (router_url, router_shutdown, router_handle) = spawn_test_server(app).await;
 
@@ -1414,11 +1474,21 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let streamed_body = response.text().await.unwrap();
-        assert!(streamed_body.contains("event: error"), "{streamed_body}");
+        // No mid-stream injection: the upstream bytes pass through untouched.
         assert!(
-            streamed_body.contains("\"type\":\"circuit_breaker\""),
-            "{streamed_body}"
+            !streamed_body.contains("circuit_breaker"),
+            "stream must not be interrupted mid-flight: {streamed_body}"
         );
+        assert!(streamed_body.contains("hello"), "{streamed_body}");
+
+        // The crossing is recorded at the request boundary, so the session is
+        // now tripped and the next request would be gated.
+        let event = tokio::time::timeout(Duration::from_secs(5), stats_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, "circuit_breaker");
+        assert!(state.circuit_breaker.is_tripped("sess-anthropic-threshold"));
 
         let request = recorded.lock().unwrap().clone().unwrap();
         let forwarded_json: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
@@ -1579,7 +1649,9 @@ mod tests {
                 "event: message_start\n",
                 "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":120}}}\n\n",
                 "event: content_block_delta\n",
-                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n"
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":150}}\n\n"
             ),
         )
     }
@@ -1694,6 +1766,7 @@ mod tests {
         let state = Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(config)),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
+            gate: Arc::new(crate::gate::GateRegistry::new()),
             cost_calculator: CostCalculator::new(),
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),

@@ -4,12 +4,25 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Instant;
 
+/// Runaway guard. Tracks, per session, the model output tokens burned **since
+/// the last tool/shell/MCP call**. A response that takes any action (a tool
+/// call) resets the counter to zero, so a working agent — which calls a tool on
+/// most turns — never accumulates. Only genuine no-action token burning (a
+/// reasoning/text loop going nowhere, never invoking a tool) climbs toward the
+/// cap. Crossing the cap doesn't kill the agent; it gates the *next* request on
+/// a human "continue or stop?" decision (see `adapter::await_token_gate`).
+///
+/// History: this used to sum `input + output` of every request cumulatively,
+/// which N-counted the re-sent context each turn and tripped productive agents
+/// (codex hit it within a handful of turns). Counting only no-tool *output*
+/// fixed that.
 pub struct CircuitBreaker {
     sessions: RwLock<HashMap<String, SessionState>>,
 }
 
 struct SessionState {
-    total_tokens: i64,
+    /// Output tokens accumulated since the last tool/shell/MCP call.
+    idle_output_tokens: i64,
     max_tokens: i64,
     last_activity: Instant,
 }
@@ -27,41 +40,53 @@ impl CircuitBreaker {
         }
     }
 
-    pub fn record_tokens(&self, session_id: &str, tokens: i64, max_tokens: i64) {
+    /// Record a completed response against its session: a response that made any
+    /// tool/shell/MCP call resets the no-action counter to zero (the agent is
+    /// making progress); otherwise its output tokens add to the counter.
+    /// Returns whether the session is now at/over its cap (i.e. the *next*
+    /// request should be gated on a human decision).
+    pub fn record(
+        &self,
+        session_id: &str,
+        output_tokens: i64,
+        had_tool_call: bool,
+        max_tokens: i64,
+    ) -> bool {
         let mut sessions = self.sessions.write().expect("lock sessions");
         let entry = sessions
             .entry(session_id.to_string())
             .or_insert(SessionState {
-                total_tokens: 0,
+                idle_output_tokens: 0,
                 max_tokens,
                 last_activity: Instant::now(),
             });
-        entry.total_tokens += tokens;
+        if had_tool_call {
+            entry.idle_output_tokens = 0;
+        } else {
+            entry.idle_output_tokens += output_tokens;
+        }
         entry.max_tokens = max_tokens;
         entry.last_activity = Instant::now();
+        entry.idle_output_tokens >= entry.max_tokens
     }
 
-    /// Record a completed call's tokens against its session and report whether
-    /// that pushed the session to/over its cap. Because already-tripped
-    /// sessions are rejected pre-flight (they never reach a record path), a
-    /// `true` here marks the *crossing* call — the single call recorded as
-    /// `circuit_breaker`. Subsequent calls are 429'd pre-flight and unrecorded.
-    pub fn record_and_is_tripped(&self, session_id: &str, tokens: i64, max_tokens: i64) -> bool {
-        self.record_tokens(session_id, tokens, max_tokens);
-        self.is_tripped(session_id)
+    /// Add no-action output tokens to a session (a response with no tool call).
+    /// Convenience used by tests; the adapters use [`record`](Self::record).
+    pub fn record_tokens(&self, session_id: &str, output_tokens: i64, max_tokens: i64) {
+        self.record(session_id, output_tokens, false, max_tokens);
     }
 
     pub fn is_tripped(&self, session_id: &str) -> bool {
         let sessions = self.sessions.read().expect("lock sessions");
         sessions
             .get(session_id)
-            .is_some_and(|s| s.total_tokens >= s.max_tokens)
+            .is_some_and(|s| s.idle_output_tokens >= s.max_tokens)
     }
 
     pub fn reset(&self, session_id: &str) -> bool {
         let mut sessions = self.sessions.write().expect("lock sessions");
         if let Some(state) = sessions.get_mut(session_id) {
-            state.total_tokens = 0;
+            state.idle_output_tokens = 0;
             state.last_activity = Instant::now();
             true
         } else {
@@ -77,8 +102,8 @@ impl CircuitBreaker {
         let now = Instant::now();
         let mut cleared = Vec::new();
         for (id, state) in sessions.iter_mut() {
-            if state.total_tokens >= state.max_tokens {
-                state.total_tokens = 0;
+            if state.idle_output_tokens >= state.max_tokens {
+                state.idle_output_tokens = 0;
                 state.last_activity = now;
                 cleared.push(id.clone());
             }
@@ -93,17 +118,17 @@ impl CircuitBreaker {
 
     pub fn get_token_count(&self, session_id: &str) -> i64 {
         let sessions = self.sessions.read().expect("lock sessions");
-        sessions.get(session_id).map_or(0, |s| s.total_tokens)
+        sessions.get(session_id).map_or(0, |s| s.idle_output_tokens)
     }
 
     pub fn rebuild_from(&self, stored: &[(String, i64, std::time::Duration)], max_tokens: i64) {
         let now = Instant::now();
         let mut sessions = self.sessions.write().expect("lock sessions");
-        for (session_id, total_tokens, elapsed) in stored {
+        for (session_id, idle_output_tokens, elapsed) in stored {
             sessions.insert(
                 session_id.clone(),
                 SessionState {
-                    total_tokens: *total_tokens,
+                    idle_output_tokens: *idle_output_tokens,
                     max_tokens,
                     last_activity: now.checked_sub(*elapsed).unwrap_or(now),
                 },
@@ -115,7 +140,7 @@ impl CircuitBreaker {
         let sessions = self.sessions.read().expect("lock sessions");
         sessions
             .iter()
-            .map(|(id, state)| (id.clone(), state.total_tokens))
+            .map(|(id, state)| (id.clone(), state.idle_output_tokens))
             .collect()
     }
 }
@@ -132,6 +157,43 @@ mod tests {
         assert!(!cb.is_tripped("sess-1"));
         cb.record_tokens("sess-1", 100_000, 200_000);
         assert!(cb.is_tripped("sess-1"));
+    }
+
+    #[test]
+    fn testToolCallResetsIdleCounter() {
+        // No-tool output accumulates toward the cap...
+        let cb = CircuitBreaker::new();
+        assert!(!cb.record("sess-1", 150_000, false, 200_000));
+        assert_eq!(cb.get_token_count("sess-1"), 150_000);
+        // ...but a response that makes a tool call resets it to zero, so a
+        // working agent never trips. Output on the tool-call turn is ignored.
+        assert!(!cb.record("sess-1", 50_000, true, 200_000));
+        assert_eq!(cb.get_token_count("sess-1"), 0);
+        assert!(!cb.is_tripped("sess-1"));
+        // After the reset the counter must climb again from zero.
+        assert!(!cb.record("sess-1", 150_000, false, 200_000));
+        assert!(!cb.is_tripped("sess-1"));
+    }
+
+    #[test]
+    fn testRecordReturnsTrueOnCrossing() {
+        // record() returns whether the session is now at/over the cap — the
+        // signal that the *next* request must be gated on a human decision.
+        let cb = CircuitBreaker::new();
+        assert!(!cb.record("sess-1", 100_000, false, 200_000));
+        assert!(cb.record("sess-1", 100_000, false, 200_000));
+        assert!(cb.is_tripped("sess-1"));
+    }
+
+    #[test]
+    fn testToolCallClearsAnAlreadyTrippedSession() {
+        // A genuine runaway trips; the next turn happening to call a tool
+        // clears it (progress resumed) without needing `kyris continue`.
+        let cb = CircuitBreaker::new();
+        assert!(cb.record("sess-1", 200_000, false, 200_000));
+        assert!(cb.is_tripped("sess-1"));
+        assert!(!cb.record("sess-1", 0, true, 200_000));
+        assert!(!cb.is_tripped("sess-1"));
     }
 
     #[test]

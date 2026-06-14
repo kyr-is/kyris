@@ -11,8 +11,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::http::HeaderMap;
+use axum::body::Body;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 
+use crate::gate::GateDecision;
 use crate::server::AppState;
 
 /// Runs a streaming relay's record-finalize exactly once, no matter how the
@@ -294,6 +297,173 @@ pub fn record_agent_traffic(agent_id: Option<&str>, trace_token: Option<&str>) {
         );
         write_native_seen_breadcrumb(aid);
     }
+}
+
+/// Hold a tripped session's request until the human answers the runaway prompt
+/// ("Agent X burned N tokens without a tool call — continue running?"), then
+/// return their decision. The prompt is surfaced once (the first waiter fires
+/// the desktop dialog + toast); concurrent requests for the same session share
+/// the answer. The decision can also arrive from `kyris continue` (the reset
+/// endpoint), the tray, or the app's Stop control via [`crate::gate`].
+///
+/// On `Continue` the session's no-action counter is reset so the request can
+/// proceed. The wait has a multi-day backstop timeout (see
+/// `circuit_breaker.decision_timeout_seconds`) — by design the agent waits for
+/// a human rather than getting a surprising 429; the timeout only exists so an
+/// unattended, never-answered prompt cannot pin a connection forever.
+pub async fn await_token_gate(
+    state: Arc<AppState>,
+    session_id: String,
+    agent: Option<String>,
+    token_count: i64,
+) -> GateDecision {
+    let (mut rx, first) = state.gate.subscribe(&session_id);
+    if first {
+        let agent_label = agent.unwrap_or_else(|| "An agent".to_string());
+        crate::notify::token_gate_toast(&agent_label, token_count);
+        // The modal continue/stop dialog only exists in tray builds; without it
+        // the toast above plus `kyris continue` / the stop endpoint are how the
+        // human answers (otherwise the decision_timeout backstop applies).
+        #[cfg(feature = "tray")]
+        {
+            let body = format!(
+                "{agent_label} burned {token_count} tokens without a tool call. Continue running?"
+            );
+            let state2 = state.clone();
+            let session2 = session_id.clone();
+            tokio::spawn(async move {
+                let outcome =
+                    crate::notify::ask_approval("Kyris: token limit", &body, None, false).await;
+                match outcome {
+                    crate::notify::ApprovalOutcome::Yes
+                    | crate::notify::ApprovalOutcome::Always => {
+                        state2.gate.resolve(&session2, GateDecision::Continue);
+                    }
+                    crate::notify::ApprovalOutcome::No => {
+                        state2.gate.resolve(&session2, GateDecision::Stop);
+                    }
+                    // Dialog could not be shown (fullscreen app, etc.). Leave the
+                    // prompt open for `kyris continue` / the tray / the app.
+                    crate::notify::ApprovalOutcome::CouldNotShow => {}
+                }
+            });
+        }
+    }
+
+    let timeout = std::time::Duration::from_secs(
+        state.config.load().circuit_breaker.decision_timeout_seconds,
+    );
+    let decision = tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(d) = *rx.borrow() {
+                return d;
+            }
+            if rx.changed().await.is_err() {
+                // Channel dropped without a decision (cleared from under us).
+                return GateDecision::Stop;
+            }
+        }
+    })
+    .await
+    .unwrap_or(GateDecision::Stop);
+
+    // Either answer clears the no-action counter. Continue proceeds with this
+    // request; Stop 429s THIS request but still resets, so the agent's next
+    // request starts from zero and isn't immediately re-prompted — the human
+    // already made a decision about this burst.
+    state.circuit_breaker.reset(&session_id);
+    state.gate.clear(&session_id);
+    decision
+}
+
+/// A deferred upstream call: built but not yet sent, run only if the human
+/// chooses Continue. Returns the relayed streaming [`Response`].
+pub type Continuation =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, StatusCode>> + Send>>;
+
+/// Streaming counterpart of [`await_token_gate`]. Returns an SSE response
+/// immediately (so the agent's HTTP client doesn't time out waiting on
+/// headers), emits keep-alive comments while the human decides, then either
+/// streams the real upstream answer (`Continue`, via `on_continue`) or emits a
+/// provider-shaped stop event (`Stop`). `stop_chunk` is the provider's SSE
+/// framing for the stop signal — a true 429 is impossible once a 200 SSE
+/// response has begun, so the agent is halted with an in-stream error instead.
+pub fn gated_streaming_response<F>(
+    state: Arc<AppState>,
+    session_id: String,
+    agent: Option<String>,
+    token_count: i64,
+    trace_id: String,
+    stop_chunk: bytes::Bytes,
+    on_continue: F,
+) -> Response
+where
+    F: FnOnce() -> Continuation + Send + 'static,
+{
+    use futures_util::StreamExt as _;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
+
+    tokio::spawn(async move {
+        let mut decision_fut = Box::pin(await_token_gate(state, session_id, agent, token_count));
+        // A bare `:` line is a content-free SSE comment — it keeps the
+        // connection alive without polluting the stream the agent parses.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        ticker.tick().await; // first tick fires immediately; skip it
+        let decision = loop {
+            tokio::select! {
+                d = &mut decision_fut => break d,
+                _ = ticker.tick() => {
+                    if tx
+                        .send(Ok(bytes::Bytes::from_static(b": kyris awaiting approval\n\n")))
+                        .await
+                        .is_err()
+                    {
+                        // Client hung up; still resolve the prompt so it doesn't
+                        // linger, then stop relaying.
+                        break decision_fut.await;
+                    }
+                }
+            }
+        };
+
+        match decision {
+            GateDecision::Stop => {
+                let _ = tx.send(Ok(stop_chunk)).await;
+            }
+            GateDecision::Continue => match on_continue().await {
+                Ok(resp) => {
+                    let mut body = resp.into_body().into_data_stream();
+                    while let Some(item) = body.next().await {
+                        let sent = match item {
+                            Ok(b) => tx.send(Ok(b)).await,
+                            Err(e) => tx.send(Err(std::io::Error::other(e))).await,
+                        };
+                        if sent.is_err() {
+                            // Client gone — the relay's own StreamRecordGuard
+                            // still finalizes the metering record on drop.
+                            break;
+                        }
+                    }
+                }
+                Err(code) => {
+                    let payload = format!(
+                        "data: {{\"error\":{{\"message\":\"kyrisd upstream error after continue: {}\",\"type\":\"upstream_error\"}}}}\n\n",
+                        code.as_u16()
+                    );
+                    let _ = tx.send(Ok(bytes::Bytes::from(payload))).await;
+                }
+            },
+        }
+    });
+
+    let body_stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("x-kyris-trace-id", &trace_id)
+        .body(Body::from_stream(body_stream))
+        .expect("build gated streaming response")
 }
 
 /// CWD and agent attribution for the process owning a peer connection, resolved
