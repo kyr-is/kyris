@@ -367,19 +367,6 @@ pub fn merge_toml_string_entries(
     changed
 }
 
-pub fn find_upwards(relative_path: &str) -> Option<PathBuf> {
-    let mut current = std::env::current_dir().ok()?;
-    loop {
-        let candidate = current.join(relative_path);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
-}
-
 pub fn home_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").map_err(|_| "HOME is not set".to_string())?;
     Ok(PathBuf::from(home))

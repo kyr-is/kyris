@@ -92,14 +92,16 @@ fn promote_surface<M>(
     Ok(true)
 }
 
-fn file_contains_marker(path: &Path, markers: &[&str]) -> bool {
+fn file_contains_marker(path: &Path, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
     }
     let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
     };
-    markers.iter().any(|marker| contents.contains(marker))
+    markers
+        .iter()
+        .any(|marker| contents.contains(marker.as_str()))
 }
 
 pub type ReconcileResult = Result<Vec<(Box<dyn AgentDescriptor>, AgentProfile)>, String>;
@@ -281,7 +283,7 @@ fn reconcile_agent(
             break;
         }
         let current_hash = super::probe::sha256_file(path).unwrap_or_default();
-        if current_hash != existing_fp.content_hash && !file_contains_marker(path, markers) {
+        if current_hash != existing_fp.content_hash && !file_contains_marker(path, &markers) {
             needs_repair = true;
             break;
         }
@@ -419,8 +421,14 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let path = temp.path().join("test.json");
         std::fs::write(&path, r#"{"hooks": "agentpact_pretooluse"}"#).expect("write");
-        assert!(file_contains_marker(&path, &["agentpact_pretooluse"]));
-        assert!(!file_contains_marker(&path, &["nonexistent_marker"]));
+        assert!(file_contains_marker(
+            &path,
+            &["agentpact_pretooluse".to_string()]
+        ));
+        assert!(!file_contains_marker(
+            &path,
+            &["nonexistent_marker".to_string()]
+        ));
     }
 
     #[test]

@@ -52,22 +52,6 @@ pub(super) fn kyrisd_base_url() -> Option<String> {
     crate::state::load_config().ok().map(|c| c.base_url())
 }
 
-pub(super) fn probe_config_rewrite_burn_control(
-    config_path: Option<&std::path::Path>,
-    base_url_check: impl FnOnce(&serde_json::Value) -> bool,
-    agent_id: &str,
-    env_var: &str,
-) -> SurfaceState<BurnControlMechanism> {
-    let has_base_url =
-        config_path.is_some_and(|p| read_json_value(p).is_ok_and(|v| base_url_check(&v)));
-    let has_env_proxy = env_routes_to_kyrisd(agent_id, env_var);
-    if has_base_url || has_env_proxy {
-        SurfaceState::adapted(BurnControlMechanism::ConfigRewrite)
-    } else {
-        SurfaceState::none()
-    }
-}
-
 fn json_servers_at<'v>(
     value: &'v serde_json::Value,
     servers_path: &[String],

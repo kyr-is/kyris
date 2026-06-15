@@ -775,44 +775,47 @@ impl AgentDescriptor for CodexCli {
             managed_files,
         }
     }
-    fn kyris_content_markers(&self) -> &'static [&'static str] {
-        &[
+    fn kyris_content_markers(&self) -> Vec<String> {
+        [
             "kyris-mcp",
             "kyris_pretooluse",
             "KYRIS_GOVERNED_SUBPROCESS",
             "model_provider = \"kyris\"",
             "[model_providers.kyris]",
         ]
+        .into_iter()
+        .map(String::from)
+        .collect()
     }
     fn integration_plan(&self) -> AgentIntegrationPlan {
-        super::capabilities::apply_declared_capabilities(
-            self.canonical_id(),
-            AgentIntegrationPlan {
-                execution: SurfaceIntegration::adapted(&[
-                    ExecutionMechanism::LiveHookAdapter,
-                    ExecutionMechanism::CompiledPolicy,
-                ]),
-                tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
-                burn_control: SurfaceIntegration::adapted(&[
-                    BurnControlMechanism::KyrisdModelProvider,
-                ]),
-                attribution: &[
-                    // The PATH shim is load-bearing beyond attribution: it puts
-                    // KYRIS_GOVERNED_SUBPROCESS in codex's OWN env, so codex's
-                    // HOOK children inherit the governed-agent marker.
-                    // ShellEnvironmentPolicy covers only exec-tool children —
-                    // without the shim, the kyris hook spawn itself
-                    // (`bash kyris_pretooluse.sh`) reached the shell gate
-                    // unmarked and was prompted on the agent's own TTY (the
-                    // codex composer-garbage bug).
-                    AttributionMechanism::KyrisPathShim,
-                    AttributionMechanism::ShellEnvironmentPolicy,
-                    AttributionMechanism::NativeHookPayload,
-                    AttributionMechanism::PeerProcessObserved,
-                ],
-                agentpact_native_attribution: false,
-            },
-        )
+        // Raw declared plan — the native overlay is applied by the generic engine
+        // (GenericAgent) from the document's `native` flags / a live `agentpact`
+        // response, not from the retired capabilities.json file reader.
+        AgentIntegrationPlan {
+            execution: SurfaceIntegration::adapted(vec![
+                ExecutionMechanism::LiveHookAdapter,
+                ExecutionMechanism::CompiledPolicy,
+            ]),
+            tool: SurfaceIntegration::adapted(vec![ToolMechanism::McpWrapping]),
+            burn_control: SurfaceIntegration::adapted(vec![
+                BurnControlMechanism::KyrisdModelProvider,
+            ]),
+            attribution: vec![
+                // The PATH shim is load-bearing beyond attribution: it puts
+                // KYRIS_GOVERNED_SUBPROCESS in codex's OWN env, so codex's
+                // HOOK children inherit the governed-agent marker.
+                // ShellEnvironmentPolicy covers only exec-tool children —
+                // without the shim, the kyris hook spawn itself
+                // (`bash kyris_pretooluse.sh`) reached the shell gate
+                // unmarked and was prompted on the agent's own TTY (the
+                // codex composer-garbage bug).
+                AttributionMechanism::KyrisPathShim,
+                AttributionMechanism::ShellEnvironmentPolicy,
+                AttributionMechanism::NativeHookPayload,
+                AttributionMechanism::PeerProcessObserved,
+            ],
+            agentpact_native_attribution: false,
+        }
     }
     // Configuration for Codex CLI is a linear sequence of TOML edits (live
     // hook adapter + rules dir + permissions table + default_permissions +
@@ -1158,7 +1161,7 @@ impl AgentDescriptor for CodexCli {
             .map(|path| McpConfigLocation {
                 path,
                 format: McpConfigFormat::Toml {
-                    servers_key: "mcp_servers",
+                    servers_key: "mcp_servers".to_string(),
                 },
             })
             .into_iter()
@@ -1167,10 +1170,10 @@ impl AgentDescriptor for CodexCli {
     fn burn_control_config_paths(&self) -> Vec<PathBuf> {
         codex_config_path().into_iter().collect()
     }
-    fn supported_settings(&self) -> &'static [(&'static str, &'static str)] {
-        &[(
-            super::registry::APPROVAL_PROMPT_SETTING,
-            super::registry::APPROVAL_PROMPT_SETTING_DESC,
+    fn supported_settings(&self) -> Vec<(String, String)> {
+        vec![(
+            super::registry::APPROVAL_PROMPT_SETTING.to_string(),
+            super::registry::APPROVAL_PROMPT_SETTING_DESC.to_string(),
         )]
     }
     fn hook_protocol(&self) -> Option<HookProtocol> {

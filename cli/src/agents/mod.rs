@@ -1,20 +1,24 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+pub mod adaptation;
 pub mod capabilities;
-pub mod claude_code;
-pub mod cline;
+// codex's irreducible governance realization is kept (delegated by its document
+// via `GenericAgent`); the other four agents are now their JSON documents only.
 pub mod codex_cli;
 pub mod codex_cli_schema;
 pub mod configure;
 pub mod display;
-pub mod gemini_cli;
-pub mod opencode;
+pub mod documents;
+pub mod engine;
+pub mod generic;
+pub mod manifest;
 pub mod prestage;
 pub mod probe;
 pub mod profile;
 pub mod reconcile;
 pub mod registry;
 pub mod shim;
+pub mod templates;
 pub mod undo;
 
 use clap::{Args, Subcommand};

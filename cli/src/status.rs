@@ -134,13 +134,13 @@ fn check_native_integrations() {
         let exec = format!(
             "{}/{}",
             surface_cell(&probe.execution),
-            plan_label(plan.execution)
+            plan_label(&plan.execution)
         );
-        let tool = format!("{}/{}", surface_cell(&probe.tool), plan_label(plan.tool));
+        let tool = format!("{}/{}", surface_cell(&probe.tool), plan_label(&plan.tool));
         let burn = format!(
             "{}/{}",
             surface_cell(&probe.burn_control),
-            plan_label(plan.burn_control)
+            plan_label(&plan.burn_control)
         );
         println!(
             "  [{marker}] {:<14} cmd:{:<13} mcp:{:<13} burn:{}",

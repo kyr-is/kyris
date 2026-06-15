@@ -2277,11 +2277,15 @@ mod tests {
         use crate::agents::registry;
         // Claude Code's payload cwd is mutable → must use CLAUDE_PROJECT_DIR.
         assert_eq!(
-            registry::agent_by_id("claude-code").and_then(|a| a.launch_dir_env()),
+            registry::agent_by_id("claude-code")
+                .and_then(|a| a.launch_dir_env())
+                .as_deref(),
             Some("CLAUDE_PROJECT_DIR")
         );
         assert_eq!(
-            registry::agent_by_id("gemini-cli").and_then(|a| a.launch_dir_env()),
+            registry::agent_by_id("gemini-cli")
+                .and_then(|a| a.launch_dir_env())
+                .as_deref(),
             Some("GEMINI_PROJECT_DIR")
         );
         // Codex's payload cwd is already the fixed session dir → no env needed.
