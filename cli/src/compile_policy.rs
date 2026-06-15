@@ -159,19 +159,14 @@ fn load_merged_policy(policy_dir: Option<&Path>) -> Result<PolicyLevel, String> 
         if files.is_empty() {
             return Err(format!("No policy files found in {}", dir.display()));
         }
-        return parse_policy_level(&files, Some(30));
+        return parse_policy_level(&files);
     }
 
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot determine working directory: {e}"))?;
 
     let user_policy_dir = agentpact::config::default_user_policy_dir(&home);
-    let levels = resolve_walk_up(
-        Some(cwd.to_str().unwrap_or(".")),
-        &home,
-        &user_policy_dir,
-        Some(30),
-    )?;
+    let levels = resolve_walk_up(Some(cwd.to_str().unwrap_or(".")), &home, &user_policy_dir)?;
 
     if levels.is_empty() {
         return Err(format!(
@@ -807,7 +802,7 @@ mod tests {
             &policy_dir,
             "commands.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: commands
 spec:
@@ -850,13 +845,15 @@ spec:
 "#,
         );
 
+        // A second authored file that sorts AFTER pact.yaml — last-writer-wins
+        // in the policy dir relaxes git·push ask → auto.
         writeTempYaml(
             &policy_dir,
-            "commands.local.yaml",
+            "zz-overrides.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
-  name: local-overrides
+  name: overrides
 spec:
   commands:
     "git·push": auto
@@ -868,7 +865,7 @@ spec:
         let deny = output["deny"].as_array().unwrap();
         assert!(
             allow.contains(&serde_json::json!("git push")),
-            "local override should relax ask → auto"
+            "later authored file should relax ask → auto"
         );
         assert!(deny.contains(&serde_json::json!("rm -rf")));
     }
@@ -927,7 +924,7 @@ spec:
             &policy_dir,
             "commands.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: commands
 spec:
@@ -957,7 +954,7 @@ spec:
             &policy_dir,
             "full.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: full
 spec:
@@ -1000,7 +997,7 @@ spec:
             &policy_dir,
             "commands_only.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: commands-only
 spec:
@@ -1025,7 +1022,7 @@ spec:
             &policy_dir,
             "commands.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: commands
 spec:
@@ -1065,7 +1062,7 @@ spec:
             &policy_dir,
             "mcp.yaml",
             r"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: mcp-overrides
 spec:
@@ -1130,7 +1127,7 @@ spec:
             &policy_dir,
             "commands.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: commands
 spec:
@@ -1181,7 +1178,7 @@ spec:
             &policy_dir,
             "mcp.yaml",
             r"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: mcp
 spec:
@@ -1219,7 +1216,7 @@ spec:
             &policy_dir,
             "paths.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: paths
 spec:
@@ -1460,7 +1457,7 @@ priority = 10
             &policy_dir,
             "paths.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: paths
 spec:
@@ -1506,7 +1503,7 @@ spec:
             &policy_dir,
             "domains.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: domains
 spec:
@@ -1532,7 +1529,7 @@ spec:
             &policy_dir,
             "policy.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: asks
 spec:
@@ -1563,7 +1560,7 @@ spec:
             &policy_dir,
             "policy.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: mixed
 spec:
@@ -1593,7 +1590,7 @@ spec:
             &policy_dir,
             "policy.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: url-paths
 spec:
@@ -1629,7 +1626,7 @@ spec:
             &policy_dir,
             "policy.yaml",
             r#"apiVersion: agentpact/v1
-kind: PolicyOverride
+kind: Pact
 metadata:
   name: asks
 spec:
