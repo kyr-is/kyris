@@ -42,9 +42,10 @@ pub const CLINE: &str = r#"{
       "config_paths": ["hook", "providers"]
     },
     "config_files": {
-      "mcp":       { "discovery": { "static": { "path": "~/.cline/data/settings/cline_mcp_settings.json" } }, "format": "json" },
-      "providers": { "discovery": { "static": { "path": "~/.cline/data/settings/providers.json" } }, "format": "json" },
-      "hook":      { "discovery": { "static": { "path": "~/.cline/hooks/PreToolUse.cjs" } }, "format": "json" }
+      "mcp":          { "discovery": { "static": { "path": "~/.cline/data/settings/cline_mcp_settings.json" } }, "format": "json" },
+      "providers":    { "discovery": { "static": { "path": "~/.cline/data/settings/providers.json" } }, "format": "json" },
+      "hook":         { "discovery": { "static": { "path": "~/.cline/hooks/PreToolUse.cjs" } }, "format": "json" },
+      "global_state": { "discovery": { "static": { "path": "~/.cline/data/globalState.json" } }, "format": "json" }
     },
     "surfaces": {
       "execution": {
@@ -181,9 +182,9 @@ pub const OPENCODE: &str = r#"{
           { "set_key": { "file": "config", "path": ["provider", "google", "options", "baseURL"], "value": "{base_url}/v1beta" } },
           { "set_key": { "file": "config", "path": ["provider", "google", "options", "headers", "x-kyris-inbound"], "value": "{inbound_key}" } },
           { "set_key": { "file": "config", "path": ["provider", "google", "options", "headers", "x-kyris-agent-id"], "value": "{agent_id}" } },
-          { "strip_key_if_equals_inbound": { "file": "config", "path": ["provider", "anthropic", "options", "apiKey"] } },
-          { "strip_key_if_equals_inbound": { "file": "config", "path": ["provider", "openai", "options", "apiKey"] } },
-          { "strip_key_if_equals_inbound": { "file": "config", "path": ["provider", "google", "options", "apiKey"] } }
+          { "strip_kyris_apikey": { "file": "config", "path": ["provider", "anthropic", "options", "apiKey"] } },
+          { "strip_kyris_apikey": { "file": "config", "path": ["provider", "openai", "options", "apiKey"] } },
+          { "strip_kyris_apikey": { "file": "config", "path": ["provider", "google", "options", "apiKey"] } }
         ],
         "probe": [
           { "key_equals_kyrisd": { "file": "config", "path": ["provider", "anthropic", "options", "baseURL"], "suffix": "/v1" } },

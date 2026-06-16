@@ -1058,6 +1058,8 @@ uninstall_all() {
       info "  State:  $STATE_DIR (logs, crash dumps)"
       info "Run with --reset-data to wipe them too."
     fi
+    # The brew uninstall above runs the cask's uninstall_postflight, which prints
+    # the restart-agents notice — don't duplicate it here.
     return 0
   fi
 
@@ -1155,6 +1157,19 @@ uninstall_all() {
   # --reset-data, so they never regenerate (no daemon/hook drift). Note it so
   # it isn't a surprise on reinstall.
   info "Auth keys preserved at $DATA_DIR/$SECRET_SUBDIR."
+
+  print_restart_agents_notice
+}
+
+# Already-running coding agents and shells loaded the kyris hooks at startup and
+# keep them in memory until they exit — an orphaned hook that now points at a
+# removed kyris would error on every tool call. The on-disk integration is gone;
+# restarting picks up the clean state. Printed at the end of every uninstall.
+print_restart_agents_notice() {
+  echo ""
+  info "Restart your coding agents (Claude Code, Codex, Gemini, opencode, cline)"
+  info "and any open terminal shells to finish — sessions started before this"
+  info "uninstall still have the kyris hooks loaded until they restart."
 }
 
 # Wipe the XDG dirs that uninstall_all preserves by default. Only invoked when

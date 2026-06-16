@@ -67,7 +67,21 @@ impl CircuitBreaker {
         }
         entry.max_tokens = max_tokens;
         entry.last_activity = Instant::now();
-        entry.idle_output_tokens >= entry.max_tokens
+        let tripped = entry.idle_output_tokens >= entry.max_tokens;
+        // The single chokepoint for the breaker decision — every input that
+        // determines a trip is here. At `debug` so `kyris debug trace-on`
+        // surfaces exactly why a session gated (e.g. a misconfigured
+        // `max_tokens` cap), without noise at the default `info` level.
+        tracing::debug!(
+            session_id,
+            output_tokens,
+            had_tool_call,
+            idle_output_tokens = entry.idle_output_tokens,
+            max_tokens = entry.max_tokens,
+            tripped,
+            "circuit_breaker record"
+        );
+        tripped
     }
 
     /// Add no-action output tokens to a session (a response with no tool call).

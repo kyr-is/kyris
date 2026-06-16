@@ -318,6 +318,16 @@ pub async fn await_token_gate(
     token_count: i64,
 ) -> GateDecision {
     let (mut rx, first) = state.gate.subscribe(&session_id);
+    // User-facing event: this request is HELD on a human continue/stop decision
+    // because the session crossed its no-tool token cap. At `info` so it shows in
+    // the default log — the answer to "why did my call hang/429?".
+    tracing::info!(
+        session_id,
+        token_count,
+        max_tokens = state.config.load().circuit_breaker.max_tokens,
+        shared = !first,
+        "circuit_breaker gating request on human decision"
+    );
     if first {
         let agent_label = agent.unwrap_or_else(|| "An agent".to_string());
         crate::notify::token_gate_toast(&agent_label, token_count);

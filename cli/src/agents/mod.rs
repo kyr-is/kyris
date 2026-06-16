@@ -17,6 +17,7 @@ pub mod probe;
 pub mod profile;
 pub mod reconcile;
 pub mod registry;
+pub mod scrub;
 pub mod shim;
 pub mod templates;
 pub mod undo;

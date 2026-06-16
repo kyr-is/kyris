@@ -15,8 +15,8 @@ use super::adaptation::{AdaptationProfile, Discovery, FileFormat};
 use super::capabilities::NativeCapabilityDeclaration;
 use crate::config_writer::{NoopValidator, WellFormedJsonValidator};
 use crate::integration::{
-    read_json_value, remove_json_string_if_equals, set_json_string_path, set_json_value_path,
-    write_json_value,
+    is_kyris_key, read_json_value, remove_json_string_if, set_json_string_path,
+    set_json_value_path, write_json_value,
 };
 use crate::state::{restore_manifest_entry_component, write_managed_file};
 
@@ -290,13 +290,19 @@ pub fn set_governed_permissions(
     Ok(Vec::new())
 }
 
-/// `strip_key_if_equals_inbound` op: remove a key whose value is a stale inbound
-/// credential from an older install.
-pub fn strip_key_if_equals(
+/// `strip_kyris_apikey` op: remove an upstream `apiKey` slot whose value is a
+/// kyris-issued key. This covers the current inbound key AND any stale one a
+/// prior enrollment left behind: such a value is never a usable provider
+/// credential, so the agent must fall back to its own key (env / native auth).
+///
+/// `inbound` is the current inbound key — matched explicitly so a non-prefixed
+/// legacy value is still caught — but the primary signal is the `sk-kyris-`
+/// prefix ([`is_kyris_key`]), which survives key rotation.
+pub fn strip_kyris_apikey(
     path: &Path,
     format: FileFormat,
     key_path: &[String],
-    value: &str,
+    inbound: &str,
     component: &str,
 ) -> Result<Vec<String>, String> {
     if !path.exists() {
@@ -304,10 +310,10 @@ pub fn strip_key_if_equals(
     }
     let mut config = read_config(path, format)?;
     let refs: Vec<&str> = key_path.iter().map(String::as_str).collect();
-    if remove_json_string_if_equals(&mut config, &refs, value) {
+    if remove_json_string_if(&mut config, &refs, |v| v == inbound || is_kyris_key(v)) {
         write_json_value(path, &config, component, &WellFormedJsonValidator)?;
         return Ok(vec![format!(
-            "removed stale credential in {}",
+            "removed stale kyris credential in {}",
             path.display()
         )]);
     }
@@ -689,6 +695,67 @@ mod tests {
         assert_eq!(
             env_rooted_path(Some("/custom/codex"), "config.toml", "/fb").unwrap(),
             PathBuf::from("/custom/codex/config.toml")
+        );
+    }
+
+    #[test]
+    fn testStripKyrisApikeyHandlesRotatedStaleKey() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("opencode.json");
+        // The config holds a STALE inbound key (from a prior enrollment) while
+        // the CURRENT inbound key has since rotated to a different value — the
+        // exact shape that left opencode forwarding `sk-kyris-…` upstream.
+        std::fs::write(
+            &cfg,
+            r#"{"provider":{"anthropic":{"options":{"apiKey":"sk-kyris-STALE-OLD","baseURL":"x"}}}}"#,
+        )
+        .unwrap();
+        let path = vec![
+            "provider".to_string(),
+            "anthropic".to_string(),
+            "options".to_string(),
+            "apiKey".to_string(),
+        ];
+        let changes = strip_kyris_apikey(
+            &cfg,
+            FileFormat::Json,
+            &path,
+            "sk-kyris-CURRENT-NEW", // current inbound ≠ the stale value
+            "test",
+        )
+        .unwrap();
+        assert_eq!(changes.len(), 1, "stale kyris key should be stripped");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        let opts = &v["provider"]["anthropic"]["options"];
+        assert!(opts.get("apiKey").is_none(), "apiKey must be removed");
+        assert_eq!(opts["baseURL"], "x", "siblings untouched");
+    }
+
+    #[test]
+    fn testStripKyrisApikeyLeavesRealProviderKey() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("opencode.json");
+        // A genuine upstream key must NOT be stripped.
+        std::fs::write(
+            &cfg,
+            r#"{"provider":{"anthropic":{"options":{"apiKey":"sk-ant-REAL"}}}}"#,
+        )
+        .unwrap();
+        let path = vec![
+            "provider".to_string(),
+            "anthropic".to_string(),
+            "options".to_string(),
+            "apiKey".to_string(),
+        ];
+        let changes =
+            strip_kyris_apikey(&cfg, FileFormat::Json, &path, "sk-kyris-CURRENT", "test").unwrap();
+        assert!(changes.is_empty(), "real provider key must be preserved");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            v["provider"]["anthropic"]["options"]["apiKey"],
+            "sk-ant-REAL"
         );
     }
 

@@ -272,7 +272,23 @@ pub fn set_json_value_path(root: &mut Value, path: &[&str], value: Value) -> boo
 /// Remove the string leaf at `path` iff it currently equals `expected`. Returns
 /// whether anything was removed. Used to migrate away a kyris-owned value (e.g. an
 /// `apiKey` wrongly set to the gate key) without disturbing a user's real value.
-pub fn remove_json_string_if_equals(root: &mut Value, path: &[&str], expected: &str) -> bool {
+/// The prefix every kyris-issued auth key carries (inbound, operator, and any
+/// rotated/stale predecessor). A value with this prefix sitting in an upstream
+/// credential slot is never a usable provider key — it is always kyris residue.
+pub const KYRIS_KEY_PREFIX: &str = "sk-kyris-";
+
+/// True when `s` is a kyris-issued key (current, operator, or a stale one left
+/// by a prior enrollment whose inbound key has since rotated).
+#[must_use]
+pub fn is_kyris_key(s: &str) -> bool {
+    s.starts_with(KYRIS_KEY_PREFIX)
+}
+
+/// Remove the string at `path` when `pred` accepts its current value. Returns
+/// `true` if a value was removed. Callers match by signature (e.g. any
+/// `sk-kyris-` key via [`is_kyris_key`]) rather than an exact value, so a
+/// rotated/stale kyris key still matches.
+pub fn remove_json_string_if(root: &mut Value, path: &[&str], pred: impl Fn(&str) -> bool) -> bool {
     if path.is_empty() {
         return false;
     }
@@ -287,7 +303,7 @@ pub fn remove_json_string_if_equals(root: &mut Value, path: &[&str], expected: &
         return false;
     };
     let leaf = path[path.len() - 1];
-    if object.get(leaf).and_then(Value::as_str) == Some(expected) {
+    if object.get(leaf).and_then(Value::as_str).is_some_and(&pred) {
         object.remove(leaf);
         return true;
     }

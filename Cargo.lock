@@ -32,6 +32,8 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tracing",
+ "tracing-journald",
+ "tracing-oslog",
  "tracing-subscriber",
  "windows-sys 0.61.2",
 ]

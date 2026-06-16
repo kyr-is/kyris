@@ -138,6 +138,15 @@ pub trait AgentDescriptor {
     fn undo_burn_control_surface(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Manifest-INDEPENDENT removal of any kyris residue left in this agent's
+    /// config files (stale credentials, kyris headers/baseURL, plugin/hook
+    /// registrations, kyris-installed script files). Runs after the surface
+    /// undos as a backstop so `uninstall`/`disconnect` leave nothing behind even
+    /// when the manifest is stale or never recorded an edit. Returns the
+    /// human-readable changes made. Best-effort; default is a no-op.
+    fn scrub_residue(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
     fn hook_protocol(&self) -> Option<HookProtocol> {
         None
     }

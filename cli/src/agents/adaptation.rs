@@ -278,9 +278,11 @@ pub enum ConfigureOp {
     /// Apply opencode's scoped governed-tool permissions (`bash`/`edit`/`write`
     /// = allow, dropping a blunt allow-all, preserving the user's other rules).
     SetGovernedPermissions { file: String },
-    /// Remove the key at `path` in `file` when its value equals the inbound key
-    /// (stale-credential cleanup from older installs).
-    StripKeyIfEqualsInbound { file: String, path: Vec<String> },
+    /// Remove the upstream `apiKey` at `path` in `file` when its value is a
+    /// kyris-issued key — the current inbound key OR a stale one left by a prior
+    /// enrollment (matched by the `sk-kyris-` prefix, so it survives rotation).
+    /// Such a value is never a usable provider credential.
+    StripKyrisApikey { file: String, path: Vec<String> },
     /// Install a live-hook adapter: write the agent's hook launcher script to
     /// `script` and register `events` in the `register_in` config (Claude's
     /// `PreToolUse`). `register_settings` toggles writing the settings entry.

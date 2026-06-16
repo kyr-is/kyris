@@ -204,7 +204,14 @@ pub fn show_approval_alert(
         let cols = (text_col_w / BODY_CHAR_W).max(1.0);
         let visual_lines: f64 = body
             .lines()
-            .map(|line| (line.chars().count() as f64 / cols).ceil().max(1.0))
+            .map(|line| {
+                // A notification line is at most a few hundred chars — far below
+                // f64's 52-bit mantissa — so this cast loses no precision for a
+                // visual wrap estimate.
+                #[allow(clippy::cast_precision_loss)]
+                let chars = line.chars().count() as f64;
+                (chars / cols).ceil().max(1.0)
+            })
             .sum();
         visual_lines * BODY_H
     } else {

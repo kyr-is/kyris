@@ -27,6 +27,21 @@ pub fn undo_agent(agent_id: &str) -> Result<(), String> {
     }
     undo_env_agent(agent_id)?;
 
+    // Manifest-independent backstop: the surface undos above restore the user's
+    // prior VALUES via the manifest, but silently leave residue when the
+    // manifest is stale or never recorded an edit (e.g. a strip op that was a
+    // no-op at setup). Scrub any remaining kyris signatures so disconnect and
+    // uninstall leave nothing pointing at a now-removed kyris. Best-effort: a
+    // scrub failure must not abort the rest of the cleanup.
+    match agent.scrub_residue() {
+        Ok(changes) => {
+            for change in changes {
+                println!("{change}");
+            }
+        }
+        Err(e) => eprintln!("Warning: residue scrub for {agent_id} failed: {e}"),
+    }
+
     let mut profile = load_agent_profile(agent_id)?
         .unwrap_or_else(|| super::profile::AgentProfile::new_empty(agent_id));
     profile.execution = super::profile::SurfaceState::none();

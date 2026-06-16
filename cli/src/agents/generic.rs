@@ -20,7 +20,7 @@ use super::registry::{
     AgentDescriptor, AgentIntegrationPlan, HookProtocol, McpConfigFormat, McpConfigLocation,
     ProviderRouting, SurfaceIntegration, ToolMechanism, canonical_agent_id,
 };
-use super::{documents, engine};
+use super::{documents, engine, scrub};
 use crate::config_writer::WellFormedJsonValidator;
 use crate::integration::{read_json_value, write_json_value};
 
@@ -94,6 +94,31 @@ impl GenericAgent {
             .config_files
             .get(name)
             .map_or(FileFormat::Json, |cf| cf.format)
+    }
+
+    /// Resolve a named config file to its GLOBAL (user-level) path, ignoring the
+    /// current working directory. Uninstall/disconnect must scrub the user-level
+    /// config — not whatever project-level `walk_up` file happens to sit above
+    /// the cwd — so walk-up discovery resolves straight to `global_dir`.
+    /// `walk_up_optional` (project-only, no global) yields `None`.
+    fn global_config_path(&self, name: &str) -> Result<PathBuf, String> {
+        let cf = self
+            .profile()
+            .config_files
+            .get(name)
+            .ok_or_else(|| format!("{}: unknown config file '{name}'", self.id))?;
+        if let Discovery::SiblingOf {
+            file,
+            name: sibling,
+        } = &cf.discovery
+        {
+            let base = self.global_config_path(file)?;
+            let parent = base.parent().ok_or_else(|| {
+                format!("{}: cannot resolve parent of {}", self.id, base.display())
+            })?;
+            return Ok(parent.join(sibling));
+        }
+        engine::resolve_config_path(&cf.discovery, None)
     }
 
     /// The daemon-side realization handler for an agent whose probe/configure/undo
@@ -196,9 +221,9 @@ impl GenericAgent {
                         component,
                     )?);
                 }
-                ConfigureOp::StripKeyIfEqualsInbound { file, path } => {
+                ConfigureOp::StripKyrisApikey { file, path } => {
                     let p = self.config_path(file)?;
-                    changes.extend(engine::strip_key_if_equals(
+                    changes.extend(engine::strip_kyris_apikey(
                         &p,
                         self.config_format(file),
                         path,
@@ -813,6 +838,78 @@ impl AgentDescriptor for GenericAgent {
             Some(s) => self.run_undo(&s.undo),
             None => Ok(()),
         }
+    }
+
+    fn scrub_residue(&self) -> Result<Vec<String>, String> {
+        // Codex's realization is delegated; its residue scrub is bespoke (TOML
+        // provider table + hooks.json + rules file), so defer to it wholesale.
+        if self.native_delegate().is_some() {
+            return super::codex_cli::scrub_codex_residue();
+        }
+
+        let profile = self.profile();
+
+        // File roles kyris OWNS (the hook/plugin/policy scripts it installs) are
+        // deleted outright; every other config_file is the agent's own config
+        // and is scrubbed in place for kyris signatures.
+        let mut owned_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if let Some(exec) = profile.surfaces.execution.as_ref() {
+            for op in &exec.configure {
+                match op {
+                    ConfigureOp::InstallFile { dest, .. }
+                    | ConfigureOp::InstallPlugin { dest, .. }
+                    | ConfigureOp::WriteCompiledPolicy { dest } => {
+                        owned_files.insert(dest.as_str());
+                    }
+                    ConfigureOp::InstallHook { script, .. } => {
+                        owned_files.insert(script.as_str());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // The live kyrisd authority (host:port) so the scrub matches whatever
+        // address kyrisd is configured on — read from config, never hardcoded.
+        let kyrisd_url = super::probe::kyrisd_base_url();
+        let kyrisd_authority = kyrisd_url.as_deref().and_then(scrub::authority_of);
+
+        let mut changes = Vec::new();
+        for (name, cf) in &profile.config_files {
+            let Ok(path) = self.global_config_path(name) else {
+                continue; // project-only (walk_up_optional) or unresolvable — skip
+            };
+            if !path.exists() {
+                continue;
+            }
+            if owned_files.contains(name.as_str()) {
+                // A kyris-owned script: delete it, but only when it actually
+                // carries a kyris marker (never a same-named foreign file).
+                if scrub::file_has_kyris_marker(&path) {
+                    std::fs::remove_file(&path)
+                        .map_err(|e| format!("remove {}: {e}", path.display()))?;
+                    changes.push(format!("removed kyris file {}", path.display()));
+                }
+                continue;
+            }
+            if matches!(cf.format, FileFormat::Json | FileFormat::Jsonc) {
+                // Unparseable config → leave it for manifest/manual handling
+                // rather than risk corrupting the user's file.
+                let Ok(mut config) = engine::read_config(&path, cf.format) else {
+                    continue;
+                };
+                if scrub::scrub_kyris_json(&mut config, kyrisd_authority) {
+                    write_json_value(
+                        &path,
+                        &config,
+                        &self.component("scrub"),
+                        &WellFormedJsonValidator,
+                    )?;
+                    changes.push(format!("scrubbed kyris residue from {}", path.display()));
+                }
+            }
+        }
+        Ok(changes)
     }
 }
 

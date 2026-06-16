@@ -98,45 +98,16 @@ impl std::fmt::Display for Metering {
     }
 }
 
-/// Cost-coverage class for a gateway record. Orthogonal to [`Metering`] (which
-/// only says whether the usage block was parseable): `plan_status` says whether
-/// the parsed usage is plan-covered or billable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum PlanStatus {
-    /// Routed on the agent's own subscription/monthly plan (burn-only) — the
-    /// computed cost is shown for visibility but is covered by the plan.
-    Included,
-    /// Routed pay-per-token on an API key — the computed cost is real billing.
-    Overage,
-    /// Auth mode could not be determined.
-    #[default]
-    #[serde(other)]
-    Unknown,
-}
-
-impl std::fmt::Display for PlanStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Included => f.write_str("included"),
-            Self::Overage => f.write_str("overage"),
-            Self::Unknown => f.write_str("unknown"),
-        }
-    }
-}
-
-impl std::str::FromStr for PlanStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "included" => Ok(Self::Included),
-            "overage" => Ok(Self::Overage),
-            _ => Ok(Self::Unknown),
-        }
-    }
-}
+// PlanStatus lives in `agentpact-types` (the canonical home for wire value
+// types defined by agentpact). It was briefly duplicated here; consolidating
+// there makes the wire form single-source. Re-exported so kyris consumers keep
+// importing `kyris_types::record::PlanStatus`. The `Display` + `FromStr` impls
+// and the `JsonSchema` derive (gated by agentpact-types' `schema` feature,
+// which kyris-types' own `schema` feature forwards to) ship with the canonical
+// definition. Orthogonal to [`Metering`] (which only says whether the usage
+// block was parseable): `plan_status` says whether the parsed usage is
+// plan-covered or billable.
+pub use agentpact_types::PlanStatus;
 
 pub const CREATE_GATEWAY_RECORDS: &str = "\
 CREATE TABLE IF NOT EXISTS gateway_records (
@@ -212,26 +183,9 @@ mod tests {
         assert_eq!(Metering::default(), Metering::Available);
     }
 
-    #[test]
-    fn testPlanStatusRoundTrip() {
-        assert_eq!(PlanStatus::default(), PlanStatus::Unknown);
-        assert_eq!(
-            serde_json::to_string(&PlanStatus::Included).unwrap(),
-            r#""included""#
-        );
-        assert_eq!(
-            serde_json::to_string(&PlanStatus::Overage).unwrap(),
-            r#""overage""#
-        );
-        assert_eq!(
-            serde_json::from_str::<PlanStatus>(r#""subscription""#).unwrap(),
-            PlanStatus::Unknown
-        );
-        assert_eq!(
-            "included".parse::<PlanStatus>().unwrap(),
-            PlanStatus::Included
-        );
-    }
+    // PlanStatus is re-exported from `agentpact-types`; its round-trip /
+    // FromStr / default tests live in that crate's canonical definition.
+    // Don't duplicate them here.
 
     #[test]
     fn testGatewayRecordRoundTrip() {

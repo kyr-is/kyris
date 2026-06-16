@@ -403,44 +403,51 @@ fn clean_checks() -> Vec<Check> {
         });
     }
 
-    // Agent JSON / TOML config files — must not contain any kyris markers.
-    // These are the files kyris surgically modifies (hooks, MCP servers,
-    // base URLs).  If they still contain kyris content, uninstall was
-    // incomplete.
-    let kyris_markers = [
-        "kyris-mcp",
-        "kyris-hook",
-        "kyris_pretooluse",
-        "agentpact_pretooluse",
-        "agentpact_beforetool",
-        "KYRIS_GOVERNED_SUBPROCESS",
-        "model_provider = \"kyris\"",
-        "[model_providers.kyris]",
-        "[permissions.kyris]",
-        "default_permissions = \"kyris\"",
-        "/.kyris/",
-    ];
+    // Agent JSON / TOML config files — must not contain any kyris signature.
+    // These are the files kyris surgically modifies (hooks, MCP servers, base
+    // URLs, credentials). We scan for kyris's own namespaced tokens (host- and
+    // port-INDEPENDENT — `sk-kyris`, `x-kyris-`, …) PLUS the LIVE kyrisd
+    // authority resolved from config — never a hardcoded `127.0.0.1:4710`, which
+    // is only the dev default — so a kyrisd base URL left on ANY address is
+    // caught. If a file still matches, uninstall was incomplete.
+    let kyrisd_authority: Option<String> = crate::state::load_config()
+        .ok()
+        .map(|c| c.base_url())
+        .and_then(|u| crate::agents::scrub::authority_of(&u).map(str::to_string));
+    let mut needles: Vec<String> = crate::agents::scrub::RESIDUE_SCAN_MARKERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    if let Some(authority) = &kyrisd_authority {
+        needles.push(authority.clone());
+    }
+    let has_residue = |path: &std::path::Path| needles.iter().any(|n| file_contains(path, n));
 
-    // Relative-to-HOME paths for agents with stable dot-directory configs.
+    // Relative-to-HOME paths for agents with stable dot-directory configs —
+    // every file kyris may write into, across all five agents.
     let agent_configs: &[(&str, &str)] = &[
         (".claude/settings.json", "claude-code"),
+        (".claude.json", "claude-code (mcp)"),
         (".codex/hooks.json", "codex-cli"),
         (".codex/config.toml", "codex-cli config"),
         (".gemini/settings.json", "gemini-cli"),
-        (".cline/data/globalState.json", "cline (global state)"),
         (".config/opencode/opencode.json", "opencode"),
+        (".config/opencode/opencode.jsonc", "opencode (jsonc)"),
+        (".cline/data/settings/providers.json", "cline (providers)"),
+        (".cline/data/settings/cline_mcp_settings.json", "cline (mcp)"),
+        (".cline/data/globalState.json", "cline (global state)"),
     ];
     for (rel, label) in agent_configs {
         let path = PathBuf::from(&home).join(rel);
         if !path.exists() {
             continue; // absent is clean
         }
-        let has_residue = kyris_markers.iter().any(|m| file_contains(&path, m));
+        let residue = has_residue(&path);
         checks.push(Check {
             name: label,
             component: "agent-configs",
-            passed: !has_residue,
-            detail: if has_residue {
+            passed: !residue,
+            detail: if residue {
                 format!("kyris entries remain in {}", path.display())
             } else {
                 "clean".into()
@@ -450,12 +457,12 @@ fn clean_checks() -> Vec<Check> {
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         let path = PathBuf::from(codex_home).join("config.toml");
         if path != PathBuf::from(&home).join(".codex").join("config.toml") && path.exists() {
-            let has_residue = kyris_markers.iter().any(|m| file_contains(&path, m));
+            let residue = has_residue(&path);
             checks.push(Check {
                 name: "codex-cli config (CODEX_HOME)",
                 component: "agent-configs",
-                passed: !has_residue,
-                detail: if has_residue {
+                passed: !residue,
+                detail: if residue {
                     format!("kyris entries remain in {}", path.display())
                 } else {
                     "clean".into()
@@ -475,12 +482,12 @@ fn clean_checks() -> Vec<Check> {
         .join("saoudrizwan.claude-dev")
         .join("cline_mcp_settings.json");
     if cline_mcp.exists() {
-        let has_residue = kyris_markers.iter().any(|m| file_contains(&cline_mcp, m));
+        let residue = has_residue(&cline_mcp);
         checks.push(Check {
             name: "cline (MCP settings)",
             component: "agent-configs",
-            passed: !has_residue,
-            detail: if has_residue {
+            passed: !residue,
+            detail: if residue {
                 format!("kyris entries remain in {}", cline_mcp.display())
             } else {
                 "clean".into()
