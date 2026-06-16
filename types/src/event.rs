@@ -62,6 +62,29 @@ pub struct Event {
     /// omitted for the (today universal) un-sandboxed path.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sandbox_applied: bool,
+    /// OS-sandbox backend confining the requester at decision time
+    /// (`macos_seatbelt` today; future `linux_landlock` / `windows_appcontainer`).
+    /// OS-neutral structural audit evidence alongside `sandbox_applied`. `None`
+    /// (omitted) when un-sandboxed or for events that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_backend: Option<String>,
+    /// Prompt-reduction telemetry: the distinct effect kinds the command
+    /// performs (`["write","network"]`), stamped by agentpact's `facts` module
+    /// from the same extraction that drove the decision. Empty (omitted) for an
+    /// effect-free command or a non-execute event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_classes: Vec<String>,
+    /// Prompt-reduction telemetry: the most-salient resource class the command
+    /// touches (`workspace`, `scratch`, `outside_workspace`, `sensitive:secret`,
+    /// `network:unknown`, `remote`, `privilege`, `dynamic`, …). `None` when the
+    /// command touches no notable resource or the field was not stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_class: Option<String>,
+    /// Prompt-reduction telemetry: whether answering "Always" would record a
+    /// session grant (vs a non-grantable remote-destroy / dynamic-exec effect
+    /// that re-prompts). `None` for events that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantable: Option<bool>,
     /// Per-segment breakdown for a compound `execute` command the agent issued
     /// as one line (e.g. `cmd1 && cmd2`). The event represents the whole line
     /// (`detail`), with each split segment's own decision/coverage here. Empty
@@ -349,6 +372,10 @@ mod tests {
             mode: String::new(),
             event_kind: String::new(),
             sandbox_applied: false,
+            sandbox_backend: None,
+            effect_classes: Vec::new(),
+            resource_class: None,
+            grantable: None,
             segments: Vec::new(),
         };
         let json = serde_json::to_string(&event).unwrap();

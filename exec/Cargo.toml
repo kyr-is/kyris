@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dependencies]
 agentpact-sandbox = { workspace = true }
 agentpact-hardening = { workspace = true }
+# Typed, OS-neutral SandboxCapability sent at session.register.
+agentpact-types = { workspace = true }
 # The single sanctioned path to agentpactd (BOUNDARY.md): kyris-exec registers
 # its jailed session through this client rather than hand-building wire frames.
 kyris-agentpact-client = { workspace = true }

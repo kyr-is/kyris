@@ -37,6 +37,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::exit;
 
+use agentpact_sandbox::NetworkPolicy;
+use agentpact_sandbox::ReadAccess;
 use agentpact_sandbox::SandboxSpec;
 use agentpact_sandbox::create_seatbelt_command_args;
 
@@ -217,15 +219,57 @@ fn exec_sandboxed(
     );
 }
 
+/// Project the resolved [`SandboxSpec`] into the typed, OS-neutral
+/// [`agentpact_types::SandboxCapability`] the daemon stores and reasons against.
+/// `registration_roots` is the already-resolved writable-root path list (see
+/// [`profile::registration_roots`]); the read/network scope and protected
+/// metadata names come from the spec.
+fn capability_from_spec(
+    spec: &SandboxSpec,
+    registration_roots: &[String],
+) -> agentpact_types::SandboxCapability {
+    use std::collections::BTreeSet;
+    let readable = match &spec.read_access {
+        ReadAccess::FullDisk => agentpact_types::SandboxReads::FullDisk,
+        ReadAccess::Roots(paths) => agentpact_types::SandboxReads::Roots(
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        ),
+    };
+    let network = match spec.network {
+        NetworkPolicy::Full => agentpact_types::SandboxNetwork::Full,
+        NetworkPolicy::Off => agentpact_types::SandboxNetwork::Off,
+    };
+    // Union of the protected metadata names across all writable roots (the
+    // workspace root carries the defaults; scratch roots none) — deterministic.
+    let protected_names: Vec<String> = spec
+        .writable_roots
+        .iter()
+        .flat_map(|w| w.protected_metadata_names.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    agentpact_types::SandboxCapability {
+        backend: agentpact_types::SandboxBackend::MacosSeatbelt,
+        writable_roots: registration_roots.to_vec(),
+        readable,
+        protected_names,
+        network,
+    }
+}
+
 /// Announce this jailed session to agentpactd over its UDS (best-effort).
 /// Short timeout so a slow/absent daemon never delays the agent launch.
 fn register_session(spec: &SandboxSpec, registration_roots: &[String]) {
     let socket = kyris_agentpact_client::default_socket_path();
     let summary = profile::summary(spec);
+    let capability = capability_from_spec(spec, registration_roots);
     let ok = kyris_agentpact_client::register_jailed_session(
         &socket.to_string_lossy(),
         &summary,
-        registration_roots,
+        &capability,
         Some(std::time::Duration::from_millis(250)),
     );
     if !ok {
