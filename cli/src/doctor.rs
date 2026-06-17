@@ -81,7 +81,7 @@ fn check_directory_effective_mode(cwd: &std::path::Path) -> CheckResult {
     use agentpact::policy::resolution::{
         ModeSource, SYSTEM_POLICY_DIR, resolve_mode_at, resolve_mode_for,
     };
-    use agentpact::protocol::types::Mode;
+    use kyris_core::agentpact::Mode;
 
     let Some(here) = resolve_mode_at(cwd) else {
         return CheckResult {

@@ -434,7 +434,10 @@ fn clean_checks() -> Vec<Check> {
         (".config/opencode/opencode.json", "opencode"),
         (".config/opencode/opencode.jsonc", "opencode (jsonc)"),
         (".cline/data/settings/providers.json", "cline (providers)"),
-        (".cline/data/settings/cline_mcp_settings.json", "cline (mcp)"),
+        (
+            ".cline/data/settings/cline_mcp_settings.json",
+            "cline (mcp)",
+        ),
         (".cline/data/globalState.json", "cline (global state)"),
     ];
     for (rel, label) in agent_configs {

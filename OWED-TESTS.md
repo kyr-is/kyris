@@ -48,23 +48,42 @@ against a real daemon:
   `[50,100,250]ms` then restarts agentpactd. The restart branch is untested.
 - **oversized-command ceiling** — already unit-tested; no e2e owed.
 
-## Prereq-gated e2e cases left as `--setup` stubs
+## Prereq-gated e2e cases — the pre-release gate
 
-These live in the e2e but skip without `--setup`/keys; the real implementations
-belong as `--setup` integration tests:
+These seams need a real environment GitHub Actions can't provide (installed
+launchd daemons, real agent CLIs, live provider keys), so they're not in normal
+CI. They are tagged `@pytest.mark.pre_release` in `kyris-internal` and run as one
+named gate before a release:
 
-- **`kyris agents setup <agent>` config acceptance** (per agent) — after setup,
-  the real agent CLI starts with the written config (exit 0); `undo` reverses it;
-  setting up one agent doesn't arm another's hooks. Mutates `~/.claude` etc. →
-  snapshot/restore. (e2e: `tests/seams/test_agent_cli_setup.py`, read-only env-file
-  assertions are already implemented + green.)
-- **install / uninstall / reinstall lifecycle** — plist written, idempotent,
-  XDG-preserving across uninstall→reinstall. Mutates the real install → `--setup`.
-  (e2e: `tests/seams/test_install_lifecycle.py`.)
+```
+kyris-internal/scripts/pre-release-gate.sh        # full agent matrix
+```
+
+The runner pre-flights the prerequisites and, via `KYRIS_CI_TIER=pre-release`,
+**fails** (never silently skips) if a required agent is missing — so the gate
+can't pass while omitting a seam. The tests (now in the dir-based `tests/A`
+layout, not the old `tests/seams/`):
+
+- **`kyris agent setup <agent>` config acceptance** (per agent) — after setup,
+  the real agent CLI starts with the written config (exit 0); setting up one
+  agent doesn't arm another's hooks. Snapshot/restores real agent config.
+  → `tests/A/test_04_agent_cli_setup.py::test_real_agent_cli_accepts_written_config`
+  (the read-only env-file assertions in the same file are unmarked — they run in
+  the normal lane). Codex setup↔disconnect round-trip:
+  `tests/A/test_10_codex_setup_roundtrip.py::test_codex_setup_undo_restores_config`.
 - **kyrisd → provider, API-key mode** (anthropic/openai/google non-streaming +
-  streaming + upstream-error relay) — needs a real provider key AND a configured
-  `providers:` entry (kyrisd ships `providers: 0`). Subscription-passthrough →
-  `included` is already covered + green. (e2e: `tests/seams/test_kyrisd_to_provider.py`.)
-- **circuit breaker** — token-cap → 429 / SSE error → reset. Needs a lowered
-  `circuit_breaker.max_tokens` (config → `--setup`) and real provider calls.
-  (e2e: `tests/scenarios/test_circuit_breaker.py`.)
+  streaming + upstream-error relay) — needs a real provider key. Subscription
+  passthrough → `included` is also here (marked `subscription_only`).
+  → `tests/A/test_03_kyrisd_to_provider.py`.
+- **circuit breaker with real provider calls** — tool-call reset + the human
+  continue/stop gate (token-cap → 429 / SSE error → reset). Lowers
+  `circuit_breaker.max_tokens` via a fixture that edits + restores installed
+  config. → `tests/A/test_07_circuit_breaker.py`.
+
+**Still owed (not yet covered by any test):**
+
+- **install / uninstall / reinstall lifecycle** — plist written, idempotent,
+  XDG-preserving across uninstall→reinstall. No e2e test exists yet (it mutates
+  the real install, which the suite avoids); the pre-release gate notes this and
+  it must be verified by hand until a `--setup`-style test lands. When added,
+  tag it `pre_release` so the gate picks it up.

@@ -503,6 +503,82 @@ pub fn parse_response_segments(response: &serde_json::Value) -> Option<Vec<Strin
         .collect()
 }
 
+/// Human-facing classification of a command for `kyris policy check`.
+///
+/// Carries the raw fields the CLI surfaces to a person — the decision verb
+/// (`auto`/`inform`/`ask`/`deny`/…), the matched rule id (catalog form; the
+/// caller renders it via `id_to_shell`), and a reason. These are deliberately
+/// richer than [`McpPermissionDecision`], which collapses the decision verb to
+/// `Allow`/`Ask`/`Deny` and drops the matched rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCheck {
+    /// Raw decision verb as agentpactd reported it (`unknown` if absent).
+    pub decision: String,
+    /// Matched rule id (catalog form), if the daemon reported one.
+    pub matched_rule: Option<String>,
+    /// Human-readable reason / error string, if the daemon reported one.
+    pub reason: Option<String>,
+}
+
+/// Previews how agentpactd would classify an `execute` of `command` in
+/// `working_dir`, without minting a token or storing a pending entry
+/// (`preview: true`). Drives `kyris policy check`.
+///
+/// A single attempt — no retry and no daemon restart — matching the read-only
+/// intent of a `check`: an unreachable daemon should surface as an error, not
+/// bounce the user's running `agentpactd`.
+///
+/// # Errors
+///
+/// Returns an error when `agentpactd` is unreachable or returns a malformed
+/// response.
+pub fn check_command(
+    socket_path: &str,
+    command: &str,
+    working_dir: Option<&str>,
+    socket_timeout: Duration,
+) -> Result<CommandCheck, String> {
+    let mut request = build_hook_permission_request(
+        "kyris-check",
+        "execute",
+        command,
+        working_dir,
+        None,
+        None,
+        None,
+        None,
+    );
+    request["preview"] = serde_json::json!(true);
+    let response = send_daemon_request_to_socket(socket_path, &request, Some(socket_timeout))?;
+    Ok(parse_command_check(&response))
+}
+
+/// Pulls the human-facing decision / matched-rule / reason out of a
+/// `permission.request` response, with the same field fallbacks the daemon may
+/// use (`matched_rule` → `rule_id`, `reason` → `error`).
+fn parse_command_check(response: &serde_json::Value) -> CommandCheck {
+    let decision = response
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let matched_rule = response
+        .get("matched_rule")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("rule_id").and_then(|v| v.as_str()))
+        .map(str::to_owned);
+    let reason = response
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("error").and_then(|v| v.as_str()))
+        .map(str::to_owned);
+    CommandCheck {
+        decision,
+        matched_rule,
+        reason,
+    }
+}
+
 /// Sends a `trace.attach` request to `agentpactd`, binding a `trace_token`
 /// (from `usage.report`) to a `trace_id` (from kyrisd's gateway record).
 ///
@@ -1458,6 +1534,67 @@ mod tests {
     fn testParseResponseSegmentsAbsent() {
         let response = serde_json::json!({"code": "PACT_OK"});
         assert_eq!(parse_response_segments(&response), None);
+    }
+
+    #[test]
+    fn testParseCommandCheckFull() {
+        let response = serde_json::json!({
+            "decision": "auto",
+            "matched_rule": "allow-all",
+            "reason": "default policy"
+        });
+        assert_eq!(
+            parse_command_check(&response),
+            CommandCheck {
+                decision: "auto".to_string(),
+                matched_rule: Some("allow-all".to_string()),
+                reason: Some("default policy".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn testParseCommandCheckMinimal() {
+        let response = serde_json::json!({"decision": "deny"});
+        assert_eq!(
+            parse_command_check(&response),
+            CommandCheck {
+                decision: "deny".to_string(),
+                matched_rule: None,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn testParseCommandCheckFallsBackToRuleId() {
+        let response = serde_json::json!({
+            "decision": "auto",
+            "rule_id": "cmd:git\u{b7}status"
+        });
+        let check = parse_command_check(&response);
+        assert_eq!(check.matched_rule.as_deref(), Some("cmd:git\u{b7}status"));
+        assert_eq!(check.reason, None);
+    }
+
+    #[test]
+    fn testParseCommandCheckFallsBackToError() {
+        let response = serde_json::json!({
+            "code": "PACT_POLICY_ERROR",
+            "error": "working_dir not allowed"
+        });
+        let check = parse_command_check(&response);
+        assert_eq!(check.decision, "unknown");
+        assert_eq!(check.matched_rule, None);
+        assert_eq!(check.reason.as_deref(), Some("working_dir not allowed"));
+    }
+
+    #[test]
+    fn testParseCommandCheckMissing() {
+        let check = parse_command_check(&serde_json::json!({}));
+        assert_eq!(check.decision, "unknown");
+        assert_eq!(check.matched_rule, None);
+        assert_eq!(check.reason, None);
     }
 
     #[test]

@@ -35,7 +35,7 @@ use std::time::Duration;
 use agentpact::policy::resolution::{
     ModeResolution, ModeSource, SYSTEM_POLICY_DIR, resolve_mode_at, resolve_mode_for,
 };
-use agentpact::protocol::types::Mode;
+use kyris_core::agentpact::Mode;
 
 /// Render the headline string for the current working directory.
 ///

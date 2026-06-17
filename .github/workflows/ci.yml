@@ -114,6 +114,26 @@ jobs:
       # no hand-maintained table. GitHub-hosted runners have network, so no setup
       # is needed here; do NOT "fix" a fetch failure with --offline, a cached
       # snapshot, or a fallback source — a failed fetch is meant to fail the build.
+      # BOUNDARY enforcement (BOUNDARY.md §Enforcement): no kyris crate other
+      # than kyris-agentpact-client may import `agentpact::protocol`. cargo-deny
+      # governs the dependency GRAPH (which crates link), not module imports, so
+      # this module-path rule is a source grep. The only allowlisted hit is the
+      # wire contract test, which deliberately pins wire spellings against the
+      # upstream protocol types. A new hit here means wire construction/parsing
+      # is leaking out of the single audited client crate — route it through
+      # kyris-agentpact-client instead. Runs before the toolchain steps because
+      # it needs nothing but the checked-out source.
+      - name: Boundary check (agentpact::protocol)
+        run: |
+          hits=$(grep -rn 'agentpact::protocol' --include='*.rs' \
+                   cli daemon mcp hooks core \
+                 | grep -v '^daemon/tests/wire_contract.rs:' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::BOUNDARY.md violation — agentpact::protocol used outside kyris-agentpact-client:"
+            echo "$hits"
+            exit 1
+          fi
+
       - name: Format check
         run: cargo fmt --check
 

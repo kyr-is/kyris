@@ -139,7 +139,10 @@ pub fn scrub_kyris_json(v: &mut Value, kyrisd_authority: Option<&str>) -> bool {
             // (`baseURL`, `anthropicBaseUrl`, …) without a hardcoded host.
             let kyris_valued: Vec<String> = map
                 .iter()
-                .filter(|(_, val)| val.as_str().is_some_and(|s| is_kyris_value(s, kyrisd_authority)))
+                .filter(|(_, val)| {
+                    val.as_str()
+                        .is_some_and(|s| is_kyris_value(s, kyrisd_authority))
+                })
                 .map(|(k, _)| k.clone())
                 .collect();
             for k in kyris_valued {
@@ -216,8 +219,14 @@ mod tests {
 
     #[test]
     fn testAuthorityOfStripsSchemeAndPath() {
-        assert_eq!(authority_of("http://127.0.0.1:4710/v1"), Some("127.0.0.1:4710"));
-        assert_eq!(authority_of("https://kyrisd.example.com:8443"), Some("kyrisd.example.com:8443"));
+        assert_eq!(
+            authority_of("http://127.0.0.1:4710/v1"),
+            Some("127.0.0.1:4710")
+        );
+        assert_eq!(
+            authority_of("https://kyrisd.example.com:8443"),
+            Some("kyrisd.example.com:8443")
+        );
         assert_eq!(authority_of(""), None);
     }
 
@@ -234,7 +243,10 @@ mod tests {
         let opts = &v["provider"]["anthropic"]["options"];
         assert!(opts.get("apiKey").is_none(), "stale kyris apiKey removed");
         assert!(opts.get("baseURL").is_none(), "kyrisd baseURL removed");
-        assert!(opts.get("headers").is_none(), "emptied kyris headers pruned");
+        assert!(
+            opts.get("headers").is_none(),
+            "emptied kyris headers pruned"
+        );
         assert_eq!(opts["model"], "claude-haiku-4-5", "user field survives");
     }
 
@@ -259,8 +271,14 @@ mod tests {
         )
         .unwrap();
         scrub_kyris_json(&mut v, None);
-        assert!(v["settings"].get("baseUrl").is_none(), "sibling baseUrl removed");
-        assert!(v["settings"].get("headers").is_none(), "emptied headers pruned");
+        assert!(
+            v["settings"].get("baseUrl").is_none(),
+            "sibling baseUrl removed"
+        );
+        assert!(
+            v["settings"].get("headers").is_none(),
+            "emptied headers pruned"
+        );
     }
 
     #[test]
@@ -275,8 +293,14 @@ mod tests {
                 }
             }"#,
         );
-        assert!(v.get("provider").is_none(), "all-kyris provider block collapses");
-        assert_eq!(v["permission"]["bash"]["ls"], "allow", "user config survives");
+        assert!(
+            v.get("provider").is_none(),
+            "all-kyris provider block collapses"
+        );
+        assert_eq!(
+            v["permission"]["bash"]["ls"], "allow",
+            "user config survives"
+        );
     }
 
     #[test]
@@ -333,6 +357,9 @@ mod tests {
     #[test]
     fn testNoKyrisContentIsNoOp() {
         let mut v: Value = serde_json::from_str(r#"{"a":{"b":[1,2,3]},"c":"d"}"#).unwrap();
-        assert!(!scrub_kyris_json(&mut v, AUTH), "no change when nothing kyris");
+        assert!(
+            !scrub_kyris_json(&mut v, AUTH),
+            "no change when nothing kyris"
+        );
     }
 }
