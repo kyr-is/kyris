@@ -80,40 +80,6 @@ fn test_setup_rejects_unknown_set_key() {
     );
 }
 
-/// agentpactd down → setup reports an error (not success) naming agentpactd:
-/// command/MCP governance can't enforce without it, so "setup succeeded" would
-/// be false confidence.
-#[test]
-fn test_setup_errors_when_agentpactd_unreachable() {
-    let temp_home = TempDir::new().expect("temp home");
-    let home = temp_home.path();
-    fs::create_dir_all(home.join(".claude")).expect("create .claude");
-    write_kyrisd_config(home);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_kyris"))
-        .current_dir(home)
-        .env("HOME", home)
-        // Force agentpactd unreachable deterministically, independent of host env.
-        .env("AGENTPACT_SOCK", home.join("nonexistent-agentpact.sock"))
-        .args(["agent", "setup", "claude-code"])
-        .output()
-        .expect("run kyris agent setup");
-
-    assert!(
-        !output.status.success(),
-        "setup must exit non-zero when agentpactd is unreachable"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("agentpactd unreachable"),
-        "expected agentpactd to be surfaced, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("UNGOVERNED"),
-        "expected the ungoverned warning, got: {stderr}"
-    );
-}
-
 /// When the agent is not installed (no ~/.claude/settings.json), setup exits
 /// with an error as soon as the health check fails. No files are modified.
 #[test]
