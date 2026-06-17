@@ -4,6 +4,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KyrisdConfig {
+    /// Config-format version. Authoring tools validate against
+    /// `kyr-is.github.io/kyris/v1/config.json`; the daemon requires `kyris/v1`
+    /// (see [`KyrisdConfig::validate_api_version`]). Optional in the type so
+    /// in-memory test configs (`from_str("{}")`) still build; the real on-disk
+    /// loaders enforce that it is present and current.
+    #[serde(
+        rename = "apiVersion",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_version: Option<String>,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -30,6 +41,31 @@ pub struct KyrisdConfig {
     pub spend: SpendConfig,
     #[serde(default)]
     pub log: LogConfig,
+}
+
+/// The only config-format version this build understands.
+pub const EXPECTED_API_VERSION: &str = "kyris/v1";
+
+impl KyrisdConfig {
+    /// Enforce that a config loaded from disk declares the supported
+    /// `apiVersion`. Fail-fast (no guessing) on a missing or mismatched
+    /// version, mirroring the agentpact policy `apiVersion` contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if `apiVersion` is missing or does not match
+    /// [`EXPECTED_API_VERSION`].
+    pub fn validate_api_version(&self) -> Result<(), String> {
+        match self.api_version.as_deref() {
+            Some(EXPECTED_API_VERSION) => Ok(()),
+            Some(other) => Err(format!(
+                "unsupported config apiVersion '{other}' (expected '{EXPECTED_API_VERSION}')"
+            )),
+            None => Err(format!(
+                "config is missing required 'apiVersion: {EXPECTED_API_VERSION}'"
+            )),
+        }
+    }
 }
 
 /// Operational logging configuration. `filter` is the baseline
@@ -220,10 +256,23 @@ pub struct McpServerConfig {
 pub struct CircuitBreakerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Cap on model output tokens burned **without any tool/shell/MCP call**
+    /// since the last one. A response that takes an action resets the count to
+    /// zero, so a working agent never approaches it; only a no-action runaway
+    /// does. Crossing it gates the next request on a human "continue or stop?"
+    /// — it does not auto-kill the agent. (This used to be a cumulative
+    /// input+output cap, which N-counted re-sent context and falsely tripped.)
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
     #[serde(default = "default_session_idle_minutes")]
     pub session_idle_minutes: u64,
+    /// How long the runaway "continue or stop?" prompt holds the agent's
+    /// request waiting for a human, before defaulting to stop. Deliberately
+    /// long (7 days) — the agent should wait for a person rather than receive a
+    /// confusing automatic 429; the timeout is only a backstop so an
+    /// unattended, never-answered prompt cannot pin a connection indefinitely.
+    #[serde(default = "default_decision_timeout_seconds")]
+    pub decision_timeout_seconds: u64,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -232,6 +281,7 @@ impl Default for CircuitBreakerConfig {
             enabled: true,
             max_tokens: default_max_tokens(),
             session_idle_minutes: default_session_idle_minutes(),
+            decision_timeout_seconds: default_decision_timeout_seconds(),
         }
     }
 }
@@ -390,6 +440,11 @@ fn default_max_tokens() -> u64 {
 fn default_session_idle_minutes() -> u64 {
     30
 }
+fn default_decision_timeout_seconds() -> u64 {
+    // 7 days. The agent waits for a human; this is only a never-answered
+    // backstop, not a cadence anyone should hit in practice.
+    604_800
+}
 fn default_fetch_interval_hours() -> u64 {
     6
 }
@@ -409,6 +464,38 @@ fn default_channel_capacity() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn testValidateApiVersionAcceptsExpected() {
+        let config: KyrisdConfig = serde_saphyr::from_str("apiVersion: kyris/v1").unwrap();
+        assert_eq!(config.validate_api_version(), Ok(()));
+    }
+
+    #[test]
+    fn testValidateApiVersionRejectsMissingAndWrong() {
+        let missing: KyrisdConfig = serde_saphyr::from_str("{}").unwrap();
+        assert!(missing.validate_api_version().is_err());
+        let wrong: KyrisdConfig = serde_saphyr::from_str("apiVersion: kyris/v2").unwrap();
+        assert!(wrong.validate_api_version().is_err());
+    }
+
+    #[test]
+    fn testShippedConfigsDeclareCurrentApiVersion() {
+        // default.yaml is the real config the daemon writes and loads: it must
+        // fully parse and carry the current version.
+        let default: KyrisdConfig =
+            serde_saphyr::from_str(include_str!("../../config/default.yaml")).unwrap();
+        assert_eq!(default.validate_api_version(), Ok(()));
+
+        // example.yaml is a documentation file (it shows illustrative provider
+        // blocks that intentionally omit required fields, so it does not fully
+        // deserialize) — assert textually that it declares the current version.
+        let example = include_str!("../../config/example.yaml");
+        assert!(
+            example.contains("apiVersion: kyris/v1"),
+            "example.yaml must declare apiVersion: kyris/v1"
+        );
+    }
 
     #[test]
     fn testServerConfigDefaults() {

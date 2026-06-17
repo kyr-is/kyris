@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright 2026 Kyris
+# SPDX-License-Identifier: Apache-2.0
+name: Publish schema
+
+# Publishes the kyris config JSON Schema to GitHub Pages so the
+# `# yaml-language-server: $schema=https://kyr-is.github.io/kyris/v1/config.json`
+# header in config files resolves to the current schema.
+#
+#   v1/config.json   generated from the daemon — single source of truth is
+#                    kyris-core `schema::generate()` (`kyrisd schema`).
+#
+# Versioning: the URL is versioned by schema major (`v1`). The config schema
+# evolves additively within a major, so overwriting v1/ on every main push is
+# safe; a breaking change publishes to v2/ and freezes v1.
+#
+# The current schema is NOT committed to the repo — it is generated here on
+# every push to main so the published copy can never drift from the code.
+#
+# One-time setup: repo Settings -> Pages -> Source = "GitHub Actions".
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One Pages deployment at a time; let an in-flight deploy finish rather than
+# cancelling it (a half-deployed site is worse than a slightly stale one).
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Match CI's runner so the daemon builds the same way.
+    runs-on: macos-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Generate schema site
+        run: |
+          set -euo pipefail
+          # Versioned by schema major; see header comment for the v2 freeze plan.
+          mkdir -p site/v1
+          # Single source of truth — emit the live config schema from the daemon.
+          cargo run -p kyrisd --quiet -- schema > site/v1/config.json
+          # Refuse to publish anything that is not valid JSON.
+          python3 -m json.tool site/v1/config.json > /dev/null
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

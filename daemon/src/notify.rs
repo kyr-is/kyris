@@ -49,14 +49,14 @@ pub enum ApprovalOutcome {
 /// On macOS with the tray feature this dispatches to the main thread via
 /// the tao event loop. On other platforms there is no approval UI yet, so it
 /// returns [`ApprovalOutcome::CouldNotShow`] — the request stays pending for
-/// `kyris pending` / the menu-bar path. It must NOT return `Yes`: a permission
+/// the tray / app to resolve. It must NOT return `Yes`: a permission
 /// gate that auto-approves when it cannot ask is not a gate.
 ///
 /// `code`, when `Some`, is rendered in the popup's accessoryView as
 /// monospaced text — the right surface for shell commands and file paths
 /// (whose readability suffers in the standard `informativeText` font).
 /// When `None`, the popup uses `body` alone.
-/// `allow_always` controls whether the "Always" button is offered; `false`
+/// `allow_always` controls whether the "For session" button is offered; `false`
 /// greys it out (e.g. privilege escalation, which agentpactd never persists).
 #[cfg(feature = "tray")]
 pub async fn ask_approval(
@@ -73,7 +73,7 @@ pub async fn ask_approval(
     {
         let _ = (title, body, code, allow_always);
         // No desktop approval UI on non-macOS yet. Fail safe: leave the
-        // request pending (resolvable via `kyris pending`) rather than
+        // request pending (resolvable via the tray / app) rather than
         // silently approving it.
         ApprovalOutcome::CouldNotShow
     }
@@ -106,33 +106,37 @@ pub fn send_toast(title: &str, body: &str) {
     {}
 }
 
-pub fn circuit_breaker_toast(token_count: i64) {
+/// Fallback notification for the runaway "continue or stop?" prompt — shown
+/// alongside the modal dialog so the ask is still discoverable if the dialog
+/// can't be presented (fullscreen app, headless). The dialog is the primary
+/// surface; the tray and the Kyris app resolve the same gate.
+pub fn token_gate_toast(agent_label: &str, token_count: i64) {
     send_toast(
-        "Kyris: Circuit Breaker",
-        &format!("Circuit breaker: {token_count} tokens. Run `kyris continue` to resume."),
+        "Kyris: agent burning tokens",
+        &format!(
+            "{agent_label} burned {token_count} tokens without a tool call. Approve to continue, or stop, in the Kyris dialog, tray, or app."
+        ),
     );
 }
 
 pub fn mcp_pending_toast(tool: &str) {
     send_toast(
         "Kyris: MCP Approval Required",
-        &format!("Agent wants to run {tool}. Run `kyris pending` to review."),
+        &format!("Agent wants to run {tool}. Review in the Kyris desktop prompt, tray, or app."),
     );
 }
 
 pub fn daemon_recovery_toast(duration: &str) {
     send_toast(
         "Kyris Was Offline",
-        &format!(
-            "kyrisd was unreachable during {duration}. Run `kyris daemon status` to investigate."
-        ),
+        &format!("kyrisd was unreachable during {duration}. Run `kyris doctor` to investigate."),
     );
 }
 
 pub fn agentpactd_unreachable_toast() {
     send_toast(
         "AgentPact Governance Was Offline",
-        "agentpactd was unreachable. Run `kyris daemon status` to investigate.",
+        "agentpactd was unreachable. Run `kyris doctor` to investigate.",
     );
 }
 
@@ -154,7 +158,7 @@ pub fn spend_warning_toast(total_usd: f64, threshold_usd: f64, window_hours: u64
         "Kyris: Spend Warning",
         &format!(
             "${total_usd:.2} spent in the last {window_hours}h \
-             (threshold: ${threshold_usd:.2}). Run `kyris stats` for details."
+             (threshold: ${threshold_usd:.2}). Run `kyris activity stats` for details."
         ),
     );
 }

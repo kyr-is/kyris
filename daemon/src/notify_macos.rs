@@ -190,9 +190,35 @@ pub fn show_approval_alert(
     let code_min_w = code_w + PADDING * 2.0;
     let content_w = code_min_w.max(header_min_w).max(MIN_W);
 
+    // Text column geometry (also used by the title + body labels below).
+    let text_col_x = PADDING + ICON_SIZE + HEADER_GAP;
+    let text_col_w = content_w - text_col_x - PADDING;
+
     let has_body = !body.is_empty();
+    // The body is the daemon's structured "why" (warnings + what "For session"
+    // remembers) and can run several lines. It wraps within `text_col_w`, so
+    // size the label for its estimated *visual* (wrapped) line count — the old
+    // fixed single-line `BODY_H` clipped a multi-line body to its first line.
+    let body_h = if has_body {
+        const BODY_CHAR_W: f64 = 6.6; // ~12pt system-font advance, empirical
+        let cols = (text_col_w / BODY_CHAR_W).max(1.0);
+        let visual_lines: f64 = body
+            .lines()
+            .map(|line| {
+                // A notification line is at most a few hundred chars — far below
+                // f64's 52-bit mantissa — so this cast loses no precision for a
+                // visual wrap estimate.
+                #[allow(clippy::cast_precision_loss)]
+                let chars = line.chars().count() as f64;
+                (chars / cols).ceil().max(1.0)
+            })
+            .sum();
+        visual_lines * BODY_H
+    } else {
+        0.0
+    };
     let text_block_h = if has_body {
-        TITLE_H + TITLE_BODY_GAP + BODY_H
+        TITLE_H + TITLE_BODY_GAP + body_h
     } else {
         TITLE_H
     };
@@ -280,8 +306,6 @@ pub fn show_approval_alert(
     }
 
     // --- Title label ---
-    let text_col_x = PADDING + ICON_SIZE + HEADER_GAP;
-    let text_col_w = content_w - text_col_x - PADDING;
     let title_y = content_h - PADDING - TITLE_H;
     let title_rect = NSRect {
         origin: NSPoint {
@@ -300,7 +324,7 @@ pub fn show_approval_alert(
 
     // --- Body label (skipped when caller passes an empty string) ---
     if has_body {
-        let body_y = title_y - TITLE_BODY_GAP - BODY_H;
+        let body_y = title_y - TITLE_BODY_GAP - body_h;
         let body_rect = NSRect {
             origin: NSPoint {
                 x: text_col_x,
@@ -308,12 +332,15 @@ pub fn show_approval_alert(
             },
             size: NSSize {
                 width: text_col_w,
-                height: BODY_H,
+                height: body_h,
             },
         };
         let body_label = NSTextField::labelWithString(&NSString::from_str(body), mtm);
         body_label.setFrame(body_rect);
         body_label.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+        // Render every line: a label clips to one line unless multi-line is
+        // allowed and the frame (above) is tall enough.
+        body_label.setMaximumNumberOfLines(0);
         content_view.addSubview(&body_label);
     }
 
@@ -369,7 +396,7 @@ pub fn show_approval_alert(
         content_view.addSubview(&scroll);
     }
 
-    // --- Buttons: [Always]   [No] [Yes]  (Yes is default, rightmost) ---
+    // --- Buttons: [For session]   [No] [Yes]  (Yes is default, rightmost) ---
     let handler = ApprovalAction::new(mtm);
     let target: &AnyObject = &handler;
 
@@ -405,9 +432,9 @@ pub fn show_approval_alert(
     // Tag = MODAL_CODE_*; ApprovalAction calls stopModalWithCode:tag.
     let yes_btn = make_button("Yes", yes_x, MODAL_CODE_YES, "\r"); // Return: default
     let no_btn = make_button("No", no_x, MODAL_CODE_NO, "\u{1b}"); // Escape: cancel
-    let always_btn = make_button("Always", always_x, MODAL_CODE_ALWAYS, "");
+    let always_btn = make_button("For session", always_x, MODAL_CODE_ALWAYS, "");
     // Privilege escalations (and anything agentpactd won't persist) can't be
-    // "Always"-remembered — grey the button out. The server-side guard in
+    // granted "For session" — grey the button out. The server-side guard in
     // `should_persist_override` is authoritative regardless; this is UX.
     if !allow_always {
         always_btn.setEnabled(false);

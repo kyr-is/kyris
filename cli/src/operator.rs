@@ -26,8 +26,9 @@ impl OperatorError {
     pub fn report(&self) -> ! {
         match self {
             Self::NotRunning => eprintln!(
-                "kyrisd is not running — start it with `kyris daemon start`. \
-                 Timeline and stats are served by the daemon (it owns the records)."
+                "kyrisd is not running — it is managed by launchd. Run `kyris doctor` \
+                 to diagnose, or reinstall with `kyris install`. Activity and stats \
+                 are served by the daemon (it owns the records)."
             ),
             Self::Request(e) => eprintln!("kyrisd query failed: {e}"),
         }

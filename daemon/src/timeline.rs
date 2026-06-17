@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use kyris_core::event::{Event, Segment};
 use kyris_core::record::GatewayRecord;
 use kyris_core::timeline::{
-    AgentActivity, CoverageCount, DecisionCount, ModelStat, ProviderSpend, TimelineEntry,
-    TimelineStats, TokenTotals,
+    AgentActivity, CoverageCount, DecisionCount, ModelStat, PromptBucket, ProviderSpend,
+    TimelineEntry, TimelineStats, TokenTotals,
 };
 
 use crate::storage::DuckDbWriter;
@@ -79,6 +79,8 @@ pub struct TimelineEventRow {
     pub mode: Option<String>,
     pub rule_kind: Option<String>,
     pub rule_id: Option<String>,
+    pub resource_class: Option<String>,
+    pub grantable: Option<bool>,
     pub trace_id: Option<String>,
     /// Per-segment breakdown for a compound command; empty otherwise.
     pub segments: Vec<Segment>,
@@ -103,6 +105,8 @@ impl From<&Event> for TimelineEventRow {
             mode: opt(&e.mode),
             rule_kind: e.rule_kind.clone(),
             rule_id: e.rule_id.clone(),
+            resource_class: e.resource_class.clone(),
+            grantable: e.grantable,
             trace_id: e.trace_id.clone(),
             segments: e.segments.clone(),
         }
@@ -237,6 +241,8 @@ pub fn entry_from_event(
         mode: row.mode.clone(),
         rule_kind: row.rule_kind.clone(),
         rule_id: row.rule_id.clone(),
+        resource_class: row.resource_class.clone(),
+        grantable: row.grantable,
         sync_state,
         hostname: None,
         provider: rec.map(|r| r.provider.clone()),
@@ -278,6 +284,8 @@ pub fn entry_from_orphan_record(rec: &GatewayRecord) -> TimelineEntry {
         mode: None,
         rule_kind: None,
         rule_id: None,
+        resource_class: None,
+        grantable: None,
         sync_state: Some(record_sync_state(rec)),
         hostname: None,
         provider: Some(rec.provider.clone()),
@@ -370,6 +378,8 @@ pub fn compute_stats(entries: &[TimelineEntry]) -> TimelineStats {
     let mut models: HashMap<String, ModelStat> = HashMap::new();
     let mut metering_available = 0u64;
     let mut metering_unavailable = 0u64;
+    // resource_class -> (ask count, grantable-ask count)
+    let mut prompts: HashMap<String, (u64, u64)> = HashMap::new();
 
     for e in entries {
         if let Some(d) = &e.decision {
@@ -387,6 +397,19 @@ pub fn compute_stats(entries: &[TimelineEntry]) -> TimelineStats {
                 "ask" => a.ask += 1,
                 "deny" => a.denied += 1,
                 _ => {}
+            }
+            // Prompt-reduction bucketing: every `ask` grouped by resource class,
+            // tracking how many could have been remembered ("Always" sticks).
+            if d == "ask" {
+                let rc = e
+                    .resource_class
+                    .clone()
+                    .unwrap_or_else(|| "unclassified".to_string());
+                let bucket = prompts.entry(rc).or_insert((0, 0));
+                bucket.0 += 1;
+                if e.grantable == Some(true) {
+                    bucket.1 += 1;
+                }
             }
         }
         *coverage.entry(e.coverage_state.clone()).or_default() += 1;
@@ -449,6 +472,16 @@ pub fn compute_stats(entries: &[TimelineEntry]) -> TimelineStats {
     let mut models: Vec<ModelStat> = models.into_values().collect();
     models.sort_by_key(|m| std::cmp::Reverse(m.calls));
 
+    let mut prompts_by_resource: Vec<PromptBucket> = prompts
+        .into_iter()
+        .map(|(resource_class, (count, grantable))| PromptBucket {
+            resource_class,
+            count,
+            grantable,
+        })
+        .collect();
+    prompts_by_resource.sort_by_key(|p| std::cmp::Reverse(p.count));
+
     TimelineStats {
         actions_by_decision,
         agents,
@@ -459,6 +492,7 @@ pub fn compute_stats(entries: &[TimelineEntry]) -> TimelineStats {
         models,
         metering_available,
         metering_unavailable,
+        prompts_by_resource,
     }
 }
 
@@ -473,6 +507,7 @@ const EVENT_COLUMNS: &str = "{\
     detail: 'VARCHAR', decision: 'VARCHAR', working_dir: 'VARCHAR', trace_id: 'VARCHAR', \
     git_remote_origin: 'VARCHAR', session: 'VARCHAR', mode: 'VARCHAR', \
     rule_kind: 'VARCHAR', rule_id: 'VARCHAR', attribution_method: 'VARCHAR', \
+    resource_class: 'VARCHAR', grantable: 'BOOLEAN', \
     segments: 'JSON'\
 }";
 
@@ -515,7 +550,7 @@ fn read_event_rows(
     let mut sql = format!(
         "SELECT id, timestamp, agent, action, detail, decision, working_dir, trace_id, \
                 git_remote_origin, session, mode, rule_kind, rule_id, {coverage} AS coverage_state, \
-                CAST(segments AS VARCHAR) AS segments \
+                CAST(segments AS VARCHAR) AS segments, resource_class, grantable \
          FROM read_json({sources}, columns = {EVENT_COLUMNS}, \
                         format = 'newline_delimited', ignore_errors = true) \
          WHERE 1 = 1"
@@ -578,6 +613,8 @@ fn read_event_rows(
                     .get::<_, Option<String>>(14)?
                     .and_then(|s| serde_json::from_str::<Vec<Segment>>(&s).ok())
                     .unwrap_or_default(),
+                resource_class: row.get(15)?,
+                grantable: row.get(16)?,
             })
         })?;
         rows.collect()
@@ -647,6 +684,8 @@ mod tests {
             mode: Some("enforce".to_string()),
             rule_kind: None,
             rule_id: None,
+            resource_class: None,
+            grantable: None,
             trace_id: trace.map(str::to_string),
             segments: Vec::new(),
         }
@@ -773,6 +812,42 @@ mod tests {
     }
 
     #[test]
+    fn testComputeStatsPromptBuckets() {
+        // Asks bucket by resource_class with a grantable tally; auto events do
+        // not count as prompts; buckets sort by count descending.
+        let scope = SyncScope::default();
+        let ask = |id: &str, rc: &str, grantable: bool| {
+            let mut e = ev(id, "execute", None);
+            e.decision = Some("ask".to_string());
+            e.resource_class = Some(rc.to_string());
+            e.grantable = Some(grantable);
+            e
+        };
+        let entries = join(
+            vec![
+                ask("a", "workspace", true),
+                ask("b", "sensitive:secret", false),
+                ask("c", "workspace", true),
+                ev("d", "execute", None), // auto — not a prompt
+            ],
+            vec![],
+            &scope,
+        );
+        let stats = compute_stats(&entries);
+
+        assert_eq!(stats.prompts_by_resource[0].resource_class, "workspace");
+        assert_eq!(stats.prompts_by_resource[0].count, 2);
+        assert_eq!(stats.prompts_by_resource[0].grantable, 2);
+        let secret = stats
+            .prompts_by_resource
+            .iter()
+            .find(|p| p.resource_class == "sensitive:secret")
+            .expect("secret bucket");
+        assert_eq!(secret.count, 1);
+        assert_eq!(secret.grantable, 0);
+    }
+
+    #[test]
     fn testEventLogSourcesNoneWhenEmpty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(event_log_sources(dir.path()).is_none());
@@ -799,7 +874,7 @@ mod tests {
         assert_eq!(row.decision.as_deref(), Some("auto"));
     }
     // NOTE: the read-time join over a *real* DuckDB + *real* `events.jsonl` (via
-    // `read_json`) is exercised by the live e2e (`kyris timeline` reads `execute`
+    // `read_json`) is exercised by the live e2e (`kyris activity` reads `execute`
     // events from the log through this path) rather than a unit test: `read_json`
     // is unreliable when ~30 DuckDB-using tests run concurrently in one process
     // (a duckdb-rs limitation, not a kyrisd-runtime one — production kyrisd uses a

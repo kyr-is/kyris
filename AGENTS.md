@@ -54,14 +54,14 @@ Cargo workspace with nine crates producing four installable binaries (plus a bui
 | `kyris-types` | `types/` | Shared types: events, pricing tiers, records, config schema, sync protocol. Pure schema — no I/O. |
 | `kyris-core` | `core/` | Shared logic: AgentPact wire helpers, config loading, coverage derivation, fail-open log, pending-approval client (feature-gated). Re-exports `kyris-types`. |
 | `kyris-agentpact-client` | `agentpact-client/` | UDS client for `agentpactd`: permission requests, trace attachment, approval responses, with retry + graceful degradation. |
-| `kyris-peer-cwd` | `peer-cwd/` | Resolve the CWD of the process owning a localhost TCP connection. Used by `kyrisd` for non-conformant-agent attribution (per `design/kyris.md` §5.14). |
+| `kyris-peer-cwd` | `peer-cwd/` | Resolve the CWD of the process owning a localhost TCP connection. Used by `kyrisd` for non-conformant-agent attribution. |
 
 ### Binaries
 
 | Crate | Binary | Purpose |
 |-------|--------|---------|
 | `kyrisd` | `kyrisd` | Local LLM routing proxy. Intercepts agent-to-model traffic, enforces policy, meters usage, writes events to DuckDB. Runs as a `launchd` daemon. |
-| `kyris` (cli) | `kyris` | CLI for queries (`timeline`, `replay`, `stats`, `history`), setup (`install`, `enroll`, `agents setup`), policy compilation, lifecycle management, agent hook delegation (`hook check`), always-allow management (`always`), post-install verification (`verify`). |
+| `kyris` (cli) | `kyris` | CLI for activity inspection (`activity` + `stats`/`replay`/`trace`/`approvals`), setup (`install`, `enroll`, `agent setup`), policy (`policy check`/`compile`/`enable`/`disable`), lifecycle management, agent hook delegation (`hook check`), diagnostics (`debug verify`/`audit`/`trace-*`). |
 | `kyris-mcp` | `kyris-mcp` | MCP server wrapper. Wraps an MCP server command, routing tool calls through `agentpactd` for permission checks. |
 | `kyris-hook` | `kyris-hook` | Shell hook helper (`hooks/helper/`). Lightweight stdlib-only binary invoked by shell preexec hooks to check/respond to `agentpactd` permission requests. |
 
@@ -77,10 +77,10 @@ Cargo workspace with nine crates producing four installable binaries (plus a bui
 |------|----------|
 | `config/` | Default config template (`default.yaml`), example config, pricing tiers. |
 | `service/` | `launchd` plist for `kyrisd` and the `Info.plist.template` used by `scripts/build-app-bundle.sh`. |
-| `integrations/` | Compiled-policy templates. `compiled-policy/cline/template.json` is the only static template — adapters for OpenCode, Codex CLI, and Gemini CLI are generated at runtime by `kyris compile-policy`. Live hook adapters (Claude Code, Codex CLI, Gemini CLI) are generated at agent-setup time by `cli/src/agents/configure.rs`. |
+| `integrations/` | Compiled-policy templates. `compiled-policy/cline/template.json` is the only static template — adapters for OpenCode, Codex CLI, and Gemini CLI are generated at runtime by `kyris policy compile`. Live hook adapters (Claude Code, Codex CLI, Gemini CLI) are generated at agent-setup time by `cli/src/agents/configure.rs`. |
 | `hooks/` | Shell preexec hooks (`zsh_hook.sh`, `zshenv_hook.sh`, `bash_hook.sh`, `bash_env.sh`) and the `kyris-hook` helper crate (`hooks/helper/`). |
 | `scripts/` | Local release helpers: `release-local.sh`, `build-app-bundle.sh`, `build-tar.sh`, `sign-and-notarize.sh`. |
-| `install.sh` | Standalone bash installer (the brew-detecting front door — see `forest/design/kyris.md` §6.5). |
+| `install.sh` | Standalone bash installer (the brew-detecting front door). |
 
 ## Conventions
 
@@ -117,4 +117,4 @@ single source of truth; honors `KYRIS_HOME`, `XDG_CONFIG_HOME`,
 
 ## Dependencies
 
-Kyris depends on the `agentpact` crate (pinned git dependency at `v0.1.2`) for catalog lookups, policy loading, and protocol types. The `kyris-agentpact-client` crate provides the UDS client for communicating with `agentpactd`; `kyris-peer-cwd` provides OS-level process-CWD resolution for non-conformant-agent attribution. See `forest/design/kyris.md` §3.2 for the full per-crate dependency table.
+Kyris depends on the `agentpact` crate (pinned git dependency at `v0.1.2`) for catalog lookups, policy loading, and protocol types. The `kyris-agentpact-client` crate provides the UDS client for communicating with `agentpactd`; `kyris-peer-cwd` provides OS-level process-CWD resolution for non-conformant-agent attribution.

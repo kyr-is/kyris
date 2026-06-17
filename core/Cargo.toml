@@ -21,7 +21,7 @@ agentpact-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-# Explicitly authorized GA exception per forest/03-architecture.md §0.4 #1.
+# Explicitly authorized GA exception (per internal architecture policy).
 # serde-saphyr is still 0.0.x; no GA alternative provides the same YAML+serde
 # integration. Used for kyrisd.yaml config parsing in the shared I/O layer.
 serde-saphyr = { workspace = true }

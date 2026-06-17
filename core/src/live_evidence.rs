@@ -8,7 +8,7 @@
 //! `kyris hook check` (execution — a decision round-tripped agentpactd),
 //! `kyris-mcp wrap` / kyrisd's `/mcp/` routing (tool — a `tools/call` was
 //! mediated), and kyrisd's provider adapters (burn-control — a request arrived
-//! carrying `x-kyris-agent-id`). Probes and `kyris agents status` read these to
+//! carrying `x-kyris-agent-id`). Probes and `kyris agent status` read these to
 //! distinguish "configured (unverified)" from "verified live" — see the
 //! agent-interface review's fourth gap (probes over-claiming on artifact
 //! existence).

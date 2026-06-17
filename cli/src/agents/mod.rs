@@ -1,73 +1,72 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
+pub mod adaptation;
 pub mod capabilities;
-pub mod claude_code;
-pub mod cline;
+// codex's irreducible governance realization is kept (delegated by its document
+// via `GenericAgent`); the other four agents are now their JSON documents only.
 pub mod codex_cli;
 pub mod codex_cli_schema;
 pub mod configure;
 pub mod display;
-pub mod gemini_cli;
-pub mod opencode;
+pub mod documents;
+pub mod engine;
+pub mod generic;
+pub mod manifest;
 pub mod prestage;
 pub mod probe;
 pub mod profile;
 pub mod reconcile;
 pub mod registry;
+pub mod scrub;
 pub mod shim;
+pub mod templates;
 pub mod undo;
 
 use clap::{Args, Subcommand};
 
 #[derive(Args)]
-pub struct AgentsArgs {
+pub struct AgentArgs {
     #[command(subcommand)]
-    pub command: Option<AgentsCommand>,
+    pub command: Option<AgentCommand>,
 
-    /// Show detail for a specific agent (shorthand for `kyris agents status <agent>`)
+    /// Show detail for a specific agent (shorthand for `kyris agent status <agent>`)
     pub agent: Option<String>,
 }
 
 #[derive(Subcommand)]
-pub enum AgentsCommand {
-    /// Show agent status (default when no subcommand given)
+pub enum AgentCommand {
+    /// List supported agents and their integration status (default)
+    List,
+    /// Show agent status
     Status { agent: Option<String> },
-    /// Reconcile agent integrations (detect reinstalls, repair config)
-    Reconcile {
-        agent: Option<String>,
-        #[arg(long)]
-        auto: bool,
-    },
-    /// Configure an agent to route through Kyris
+    /// Configure an agent to route through Kyris. Idempotent: re-running
+    /// repairs drift and re-integrates a disconnected agent. With `--all`,
+    /// configures every detected agent (skipping disconnected ones).
     Setup {
         agent: Option<String>,
         #[arg(long)]
-        auto: bool,
+        all: bool,
         /// Agent-specific settings as key=value pairs (e.g. --set max-budget-usd=50)
         #[arg(long = "set", value_name = "KEY=VALUE")]
         settings: Vec<String>,
     },
-    /// Remove all Kyris integrations for an agent
-    Undo { agent: String },
+    /// Remove Kyris's integration from an agent (the agent itself stays
+    /// installed; it just stops being governed until you `setup` it again).
+    Disconnect { agent: String },
 }
 
-pub fn run(args: AgentsArgs) {
+pub fn run(args: AgentArgs) {
     let result = match args.command {
-        Some(AgentsCommand::Status { agent }) => run_status(agent),
-        Some(AgentsCommand::Reconcile { agent, auto }) => run_reconcile(agent, auto),
-        Some(AgentsCommand::Setup {
+        Some(AgentCommand::List) | None if args.agent.is_none() => run_status(None),
+        None => run_status(args.agent),
+        Some(AgentCommand::List) => run_status(None),
+        Some(AgentCommand::Status { agent }) => run_status(agent),
+        Some(AgentCommand::Setup {
             agent,
-            auto,
+            all,
             settings,
-        }) => run_setup(agent, auto, settings),
-        Some(AgentsCommand::Undo { agent }) => run_undo(&agent),
-        None => {
-            if let Some(agent) = args.agent {
-                run_status(Some(agent))
-            } else {
-                run_status(None)
-            }
-        }
+        }) => run_setup(agent, all, settings),
+        Some(AgentCommand::Disconnect { agent }) => run_disconnect(&agent),
     };
 
     if let Err(error) = result {
@@ -79,7 +78,7 @@ pub fn run(args: AgentsArgs) {
 fn run_status(agent: Option<String>) -> Result<(), String> {
     // Status is read-only: snapshot persisted profile + live probe, never
     // configure/repair/persist. Mutating reconcile is the daemon's job (plus
-    // explicit `kyris agents setup` / `reconcile`). See `status_snapshot_all`.
+    // explicit `kyris agent setup` / `reconcile`). See `status_snapshot_all`.
     let results = reconcile::status_snapshot_all()?;
 
     if let Some(agent_id) = agent {
@@ -102,29 +101,6 @@ fn run_status(agent: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn run_reconcile(agent: Option<String>, auto: bool) -> Result<(), String> {
-    if let Some(agent_id) = agent {
-        let profile = reconcile::reconcile_one(&agent_id)?;
-        let descriptor =
-            registry::agent_by_id(&agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
-        display::print_detail(descriptor.as_ref(), &profile);
-    } else {
-        let results = reconcile::reconcile_all(auto, None)?;
-        if !auto {
-            let refs: Vec<_> = results
-                .iter()
-                .map(|(d, p)| {
-                    let boxed: Box<dyn registry::AgentDescriptor> =
-                        registry::agent_by_id(d.id()).expect("known agent");
-                    (boxed, p.clone())
-                })
-                .collect();
-            display::print_summary(&refs);
-        }
-    }
-    Ok(())
-}
-
 fn parse_settings(raw: Vec<String>) -> Result<std::collections::HashMap<String, String>, String> {
     let mut map = std::collections::HashMap::new();
     for entry in raw {
@@ -139,34 +115,33 @@ fn parse_settings(raw: Vec<String>) -> Result<std::collections::HashMap<String, 
     Ok(map)
 }
 
-fn run_setup(agent: Option<String>, auto: bool, settings: Vec<String>) -> Result<(), String> {
+fn run_setup(agent: Option<String>, all: bool, settings: Vec<String>) -> Result<(), String> {
     let agent_specific = parse_settings(settings)?;
-    if auto {
+    if all {
         if !agent_specific.is_empty() {
-            return Err("--set cannot be used with --auto".to_string());
+            return Err("--set cannot be used with --all".to_string());
         }
+        // Configure + repair + promote every detected agent in one pass. This is
+        // the full evidence-based reconcile (auto-configure new agents, repair
+        // drift, promote adapted→native), which skips agents the user
+        // disconnected (`reconcile_agent` honors `profile.disconnected`). It's also
+        // the entry point the reconcile watcher drives, so bulk setup and the
+        // watcher share one code path.
         prestage::prestage_all(None)?;
-        for agent in registry::all_agents() {
-            if agent.is_installed()
-                && let Err(e) = configure::configure_agent(
-                    agent.id(),
-                    &std::collections::HashMap::new(),
-                    false,
-                    None,
-                )
-            {
-                eprintln!("{e}");
-            }
-        }
-        Ok(())
+        reconcile::reconcile_all(false, None).map(|_| ())
     } else if let Some(agent_id) = agent {
-        configure::setup_agent(&agent_id, &agent_specific)
+        // setup_agent applies settings + (re)configures surfaces; reconcile_one
+        // then runs the evidence-based pass (native promotion + drift repair) so
+        // a single `setup` fully subsumes the old `reconcile` verb. The second
+        // pass is silent when there's nothing to promote/repair.
+        configure::setup_agent(&agent_id, &agent_specific)?;
+        reconcile::reconcile_one(&agent_id).map(|_| ())
     } else {
-        Err("Usage: kyris agents setup <agent> or kyris agents setup --auto".to_string())
+        Err("Usage: kyris agent setup <agent> or kyris agent setup --all".to_string())
     }
 }
 
-fn run_undo(agent_id: &str) -> Result<(), String> {
+fn run_disconnect(agent_id: &str) -> Result<(), String> {
     undo::undo_agent(agent_id)
 }
 

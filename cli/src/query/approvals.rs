@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
-//! `kyris approvals` — recall view over the popup-resolved approvals log
-//! (`~/.local/state/kyris/approvals.jsonl`).
+//! `kyris activity approvals` — recall view over the popup-resolved approvals
+//! log (`~/.local/state/kyris/approvals.jsonl`).
 //!
 //! Reads the JSONL file written by `kyrisd::approvals_log::record` and
 //! emits a human or machine-readable view. Intentionally narrow: this is
 //! the recall surface ("what did I approve last week?"), separate from
 //! the `AgentPact` `events.jsonl` cryptographic record served by
-//! `kyris timeline` / `kyris history`.
+//! `kyris activity`.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};

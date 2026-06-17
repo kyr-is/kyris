@@ -9,7 +9,7 @@ Kyris → AgentPact   (Kyris depends on AgentPact)
 AgentPact ↛ Kyris   (AgentPact MUST NOT depend on Kyris)
 ```
 
-Source: `README.md §3.1` ("The main architectural boundary is one-way dependency"), `forest/03-architecture.md:93`.
+Source: `README.md §3.1` ("The main architectural boundary is one-way dependency").
 
 Concretely:
 
@@ -48,6 +48,8 @@ These cases look like they cross the line but are intentional. Don't "fix" them 
 
 3. **`kyrisd` records spend in DuckDB.** Until agents emit native AgentPact `usage.report` events for all model traffic, kyrisd's gateway records are the primary spend signal. Long-term these become a convenience cache cross-referenced against the agentpact event log.
 
+4. **`kyris-hook` (`hooks/helper`) builds its `permission.request` / `permission.respond` JSON by hand instead of going through `kyris-agentpact-client`.** This is intentional and load-bearing: the helper sits on the synchronous hot path of *every* governed shell command, so it is deliberately `std`-only — its `Cargo.toml` declares no dependency on `agentpact`, `kyris-agentpact-client`, or `kyris-core` (see the comment at `hooks/helper/src/main.rs` on `MAX_COMMAND_LENGTH_CEILING`). Pulling the client crate (and its transitive `kyris-core`/`agentpact-types`/`uuid` graph) into this binary to satisfy the "only the client builds wire messages" rule would regress hook binary size and startup latency on the per-command hot path — the wrong trade. The duplicated wire shapes are kept from drifting by a real-binary contract test, not by sharing code: `hooks/helper/tests/shell_hook_contract.rs` runs the actual `kyris-hook` binary against a fake agentpactd socket and pins the emitted `permission.request` (method/action/detail/working_dir/exec_token/ppid_chain) and `permission.respond` (method/response/approval_token) shapes; `kyris-hook`'s runtime `check_protocol_version` guards version drift. If you change the wire shape on either side, that contract test is the tripwire. **This is the sole sanctioned exception to the "route through `kyris-agentpact-client`" rule; widening it requires a reviewer sign-off and a new entry here.**
+
 ## Rules for contributors
 
 When adding code, ask in order:
@@ -59,15 +61,19 @@ When adding code, ask in order:
 5. **Is this evidence / inspection UX?** (Timeline, replay, stats, scan, popup.) → kyris.
 6. **Is this configuration drift / install state?** → kyris.
 
-If you find yourself building a JSON request that goes over the agentpactd socket from anywhere other than `kyris-agentpact-client`, stop and route it through `kyris-agentpact-client` instead.
+If you find yourself building a JSON request that goes over the agentpactd socket from anywhere other than `kyris-agentpact-client`, stop and route it through `kyris-agentpact-client` instead. The single sanctioned exception is `kyris-hook` (`hooks/helper`), for the stdlib-only hot-path reason documented under "Deliberate specialization" above — and even there the wire shapes are pinned by a real-binary contract test.
 
 ## Enforcement
 
-- `cargo deny` ban list: `kyris-agentpact-client` may import `agentpact::protocol::*`; no other kyris crate may. Other kyris crates may use `agentpact::policy::*` and `agentpact::catalog::*` (read-only types) and `agentpact::attribution::signatures::SignatureTable` (read-only signature data).
-- CI grep: `rg --type rust 'agentpact::protocol' kyris/{cli,daemon,mcp,hooks,core}` must be empty.
-- New kyris crates default to: agentpact dep allowed, agentpact::protocol disallowed. Override only with reviewer sign-off and a note here.
+The one-way rule is enforced by two complementary checks in `.github/workflows/ci.yml`:
+
+- **Module-import rule (the source grep).** `cargo deny` governs the dependency *graph* — which crates may link — but cannot express "only `kyris-agentpact-client` may import the `agentpact::protocol` *module*", because that is a source-path rule, not a graph edge. So the CI job `Boundary check (agentpact::protocol)` greps the source: `grep -rn 'agentpact::protocol' --include='*.rs' cli daemon mcp hooks core` must be empty except for the single allowlisted file below. It runs before the toolchain steps (it needs only the checkout) and fails the build on any new hit. Other kyris crates may still use `agentpact::policy::*` and `agentpact::catalog::*` (read-only types) and `agentpact::attribution::signatures::SignatureTable` (read-only signature data) — those are not `agentpact::protocol`.
+  - **Allowlisted exception:** `daemon/tests/wire_contract.rs` imports `agentpact::protocol::types` on purpose, to pin kyris's wire spellings against the upstream protocol types. It is a contract test, not traffic. The grep excludes exactly this path; widening the allowlist requires a reviewer sign-off and a note here.
+- **Dependency graph (`cargo deny check`).** `deny.toml` pins the allowed git source for `agentpact` (`allow-git`) and bans duplicate/yanked crates, keeping the linked graph honest. This is the graph-level half of the boundary.
+- New kyris crates default to: agentpact dep allowed, `agentpact::protocol` disallowed (the grep covers them once their directory is added to the scan list). Override only with reviewer sign-off and a note here.
 
 ## Known gaps tracked elsewhere
 
-- `kyris/cli/src/hook_cmd.rs::discover_agent_pid` walks process ancestors using `agentpact::attribution::signatures::SignatureTable` inside kyris. The long-term home for this loop is agentpactd (kyris sends its own PID via `seed_boundary_pid` and the daemon does the walk). Tracked in the audit plan (P1.1/P1.2).
-- Wire-message builders in `kyris/core/src/agentpact.rs` should move into `kyris-agentpact-client`. Today they live in `kyris-core` and are re-exported by the client; this is a vestigial split that breaks the "only the client builds wire messages" rule on technicalities. Tracked in the audit plan (P1.5).
+- `kyris/cli/src/hook_cmd/hold.rs::discover_agent_pid` walks process ancestors using `agentpact::attribution::signatures::SignatureTable` inside kyris. The long-term home for this loop is agentpactd (kyris sends its own PID via `seed_boundary_pid` and the daemon does the walk). Tracked in the audit plan (P1.1/P1.2).
+
+`core/src/agentpact.rs` no longer holds wire-message builders or a parser — those live in `kyris-agentpact-client`. What remains there is read-only value types (`Mode` re-export, `McpPermissionDecision`, `ApprovalResponse`, `McpContext`), approval-popup presentation (`format_ask_context`, kyris owns the UX), and the `default_socket_path` helper — none of which construct or interpret wire messages. The earlier "vestigial split" gap is closed.

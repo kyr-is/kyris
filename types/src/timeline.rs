@@ -60,6 +60,17 @@ pub struct TimelineEntry {
     pub mode: Option<String>,
     pub rule_kind: Option<String>,
     pub rule_id: Option<String>,
+    /// Prompt-reduction telemetry carried from the governance event: the
+    /// command's most-salient resource class (`workspace`, `sensitive:secret`,
+    /// `network:unknown`, `remote`, …). `None` for model-only rows or events
+    /// that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_class: Option<String>,
+    /// Prompt-reduction telemetry: whether answering "Always" would have stuck
+    /// (session-grantable). Lets `stats` show how many prompts could have been
+    /// remembered. `None` for model-only rows or pre-field events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantable: Option<bool>,
     /// kyrisd-stamped sync state: `synced` | `pending` | `local`. kyrisd is the
     /// one process that holds both the rows and the sync cursor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,6 +145,26 @@ pub struct TimelineStats {
     /// Count of model calls whose upstream usage block parsed vs. did not.
     pub metering_available: u64,
     pub metering_unavailable: u64,
+    /// Prompt-reduction breakdown: `ask` decisions grouped by resource class,
+    /// with how many were session-grantable (could have been remembered with
+    /// "Always"). The empirical "what is prompting, and could it stick?" view.
+    #[serde(default)]
+    pub prompts_by_resource: Vec<PromptBucket>,
+}
+
+/// One resource-class bucket of approval prompts, with how many were
+/// session-grantable. Sorted by `count` descending in [`TimelineStats`].
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct PromptBucket {
+    /// The command's most-salient resource class (`unclassified` when the event
+    /// carried none).
+    pub resource_class: String,
+    /// Number of `ask` decisions in this bucket.
+    pub count: u64,
+    /// How many of those were session-grantable (answering "Always" would stick).
+    pub grantable: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -211,6 +242,8 @@ mod tests {
             mode: Some("enforce".to_string()),
             rule_kind: None,
             rule_id: None,
+            resource_class: None,
+            grantable: None,
             sync_state: Some("local".to_string()),
             hostname: None,
             provider: Some("anthropic".to_string()),

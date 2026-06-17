@@ -22,9 +22,11 @@
 //!   note where network tightening will land).
 //!
 //! KNOWN-INCOMPLETE (intentional, v1): the per-agent carveout list is
-//! best-effort and unverified against a live agent. That is exactly why the
-//! shim's sandbox wiring ships GATED OFF — these gaps cannot break a user
-//! until the gate is flipped and the list is tuned (plan Phase 4, test 15).
+//! best-effort and not exhaustively verified against every live agent. The
+//! sandbox is on by default wherever a backend exists (macOS Seatbelt today;
+//! see `cli/src/agents/shim.rs`), so a missing carveout surfaces as an
+//! over-tight jail to tune here — not a silent gate. `kyris status` reports
+//! the jail as active.
 
 use std::path::Path;
 use std::path::PathBuf;

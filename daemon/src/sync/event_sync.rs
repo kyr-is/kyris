@@ -913,6 +913,8 @@ mod tests {
             mode: Some("enforce".to_string()),
             rule_kind: None,
             rule_id: None,
+            resource_class: None,
+            grantable: None,
             sync_state: None,
             hostname: None,
             provider: None,

@@ -19,22 +19,14 @@ pub trait AgentDescriptor {
     /// governance events instead of appearing as a second, differently-named
     /// agent. Keep this match in sync with agentpact's `agents.yaml`.
     fn canonical_id(&self) -> &'static str {
-        match self.id() {
-            "claude-code" => "anthropic/claude-code",
-            "codex-cli" => "openai/codex-cli",
-            "gemini-cli" => "google/gemini-cli",
-            "opencode" => "opencode/opencode",
-            "cline" => "cline/cline",
-            other => other,
-        }
+        canonical_agent_id(self.id())
     }
-    fn display_name(&self) -> &'static str;
     fn is_installed(&self) -> bool;
     fn probe(&self) -> ProbeResult;
     fn native_evidence(&self) -> NativeEvidence {
         NativeEvidence::default()
     }
-    fn kyris_content_markers(&self) -> &'static [&'static str];
+    fn kyris_content_markers(&self) -> Vec<String>;
     /// Declares how an env-routed (`EnvVarProxy`) agent is pointed at kyrisd:
     /// which provider base-URL env vars to repoint, any auth-skip flags, and the
     /// provider CLI's custom-headers env var (+ multi-header separator) that
@@ -60,16 +52,16 @@ pub trait AgentDescriptor {
         let mut exports: Vec<(String, String)> = routing
             .base_url_vars
             .iter()
-            .map(|var| ((*var).to_string(), base_url.to_string()))
+            .map(|var| (var.clone(), base_url.to_string()))
             .collect();
         exports.extend(
             routing
                 .auth_skip_flags
                 .iter()
-                .map(|(var, val)| ((*var).to_string(), (*val).to_string())),
+                .map(|(var, val)| (var.clone(), val.clone())),
         );
         exports.push((
-            routing.custom_headers_var.to_string(),
+            routing.custom_headers_var.clone(),
             format!(
                 "x-kyris-inbound: {inbound_key}{}x-kyris-agent-id: {}",
                 routing.header_separator,
@@ -90,7 +82,7 @@ pub trait AgentDescriptor {
     /// not define the workspace boundary. `None` → fall back to the payload
     /// `cwd` (already fixed at session start for agents like Codex and Gemini).
     /// See `crate::hook_cmd::derive_session_cwd`.
-    fn launch_dir_env(&self) -> Option<&'static str> {
+    fn launch_dir_env(&self) -> Option<String> {
         None
     }
     /// Per-surface design ceiling (exec, tool, burn). `Some(Compiled)` means
@@ -146,6 +138,15 @@ pub trait AgentDescriptor {
     fn undo_burn_control_surface(&self) -> Result<(), String> {
         Ok(())
     }
+    /// Manifest-INDEPENDENT removal of any kyris residue left in this agent's
+    /// config files (stale credentials, kyris headers/baseURL, plugin/hook
+    /// registrations, kyris-installed script files). Runs after the surface
+    /// undos as a backstop so `uninstall`/`disconnect` leave nothing behind even
+    /// when the manifest is stale or never recorded an edit. Returns the
+    /// human-readable changes made. Best-effort; default is a no-op.
+    fn scrub_residue(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
     fn hook_protocol(&self) -> Option<HookProtocol> {
         None
     }
@@ -161,20 +162,24 @@ pub trait AgentDescriptor {
     fn burn_control_config_paths(&self) -> Vec<PathBuf> {
         Vec::new()
     }
-    /// Keys accepted by `kyris agents setup <agent> --set KEY=VALUE`, each with a
+    /// Keys accepted by `kyris agent setup <agent> --set KEY=VALUE`, each with a
     /// short description. Any `--set` key not listed here is rejected fail-fast
     /// rather than silently stored and ignored. Default: none.
-    fn supported_settings(&self) -> &'static [(&'static str, &'static str)] {
-        &[]
+    fn supported_settings(&self) -> Vec<(String, String)> {
+        Vec::new()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Owned, not `Copy`: the plan can be built from a parsed JSON document (an agent
+// `adaptation` profile) at runtime, so the mechanism/attribution lists are owned
+// `Vec`s rather than `&'static` slices baked into the binary. Clone, not Copy,
+// for the same reason (a `Vec` owns heap memory).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentIntegrationPlan {
     pub execution: SurfaceIntegration<ExecutionMechanism>,
     pub tool: SurfaceIntegration<ToolMechanism>,
     pub burn_control: SurfaceIntegration<BurnControlMechanism>,
-    pub attribution: &'static [AttributionMechanism],
+    pub attribution: Vec<AttributionMechanism>,
     pub agentpact_native_attribution: bool,
 }
 
@@ -237,19 +242,19 @@ impl AgentIntegrationPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
-pub enum SurfaceIntegration<M: 'static> {
+pub enum SurfaceIntegration<M> {
     None,
     AgentPactNative,
     Adapted {
-        mechanisms: &'static [M],
+        mechanisms: Vec<M>,
         ceiling: Option<CoverageCeiling>,
     },
 }
 
-impl<M: 'static> SurfaceIntegration<M> {
-    pub fn adapted(mechanisms: &'static [M]) -> Self {
+impl<M> SurfaceIntegration<M> {
+    pub fn adapted(mechanisms: Vec<M>) -> Self {
         Self::Adapted {
             mechanisms,
             ceiling: None,
@@ -294,7 +299,7 @@ pub trait MechanismLabel {
 /// mechanisms' short labels joined by "+". Shared by every renderer so the plan
 /// side and the observed side (which also uses `MechanismLabel::short`) cannot
 /// drift apart.
-pub fn plan_label<M: MechanismLabel>(plan: SurfaceIntegration<M>) -> String {
+pub fn plan_label<M: MechanismLabel>(plan: &SurfaceIntegration<M>) -> String {
     match plan {
         SurfaceIntegration::None => "none".to_string(),
         SurfaceIntegration::AgentPactNative => "native".to_string(),
@@ -405,7 +410,8 @@ impl MechanismLabel for BurnControlMechanism {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum AttributionMechanism {
     AgentPactNative,
@@ -421,11 +427,10 @@ pub enum AttributionMechanism {
 pub enum McpConfigFormat {
     /// Owned segments, not `&'static str`: Claude Code's local-scope path is
     /// `projects.<absolute project dir>.mcpServers` — a runtime value.
-    Json {
-        servers_path: Vec<String>,
-    },
+    Json { servers_path: Vec<String> },
     Toml {
-        servers_key: &'static str,
+        // Owned (not `&'static`) so it can come from a parsed JSON document.
+        servers_key: String,
     },
 }
 
@@ -693,7 +698,7 @@ pub enum ApprovalMode {
     KyrisPopup,
 }
 
-/// `kyris agents setup <agent> --set approval_prompt=native|kyris` — selects the
+/// `kyris agent setup <agent> --set approval_prompt=native|kyris` — selects the
 /// approval UX for an `ask`. Stored in the agent profile's `agent_specific`.
 pub const APPROVAL_PROMPT_SETTING: &str = "approval_prompt";
 
@@ -708,7 +713,7 @@ pub const APPROVAL_PROMPT_SETTING_DESC: &str = "Approval UX for an `ask`: `kyris
 /// cross-device resolution. Native mode hands the ask to the agent's own
 /// prompt and never learns the outcome (and on codex its safe-command list
 /// can skip the prompt entirely), so it is opt-in:
-/// `kyris agents setup <agent> --set approval_prompt=native`, honored only
+/// `kyris agent setup <agent> --set approval_prompt=native`, honored only
 /// for agents that declare a `native_ask` channel. The native machinery
 /// stays in place — dormant, not removed.
 #[must_use]
@@ -717,7 +722,7 @@ pub fn resolve_approval_mode(agent_id: &str, native_capable: bool) -> ApprovalMo
         return ApprovalMode::KyrisPopup;
     }
     // Single source of truth: the persisted `approval_prompt` agent-profile
-    // setting (`kyris agents setup <agent> --set approval_prompt=native|kyris`).
+    // setting (`kyris agent setup <agent> --set approval_prompt=native|kyris`).
     let setting = crate::state::load_agent_profile(agent_id)
         .ok()
         .flatten()
@@ -736,44 +741,69 @@ pub fn resolve_approval_mode(agent_id: &str, native_capable: bool) -> ApprovalMo
 /// is one [`AgentDescriptor::provider_routing`] declaration with no construction
 /// code. The agent's own provider credential is never part of this — it flows
 /// through to the provider untouched (see `env_exports`).
+// Owned (not `&'static`) so it can be built from a parsed JSON `model_routing`
+// surface as well as from a source literal.
 pub struct ProviderRouting {
     /// Provider base-URL env vars to repoint at kyrisd (each set to `base_url`).
-    pub base_url_vars: &'static [&'static str],
+    pub base_url_vars: Vec<String>,
     /// Provider auth-skip flags set verbatim (e.g. `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1`).
-    pub auth_skip_flags: &'static [(&'static str, &'static str)],
+    pub auth_skip_flags: Vec<(String, String)>,
     /// The provider CLI's custom-headers env var carrying the gate secret +
     /// agent-id (Claude Code: `ANTHROPIC_CUSTOM_HEADERS`; Gemini CLI:
     /// `GEMINI_CLI_CUSTOM_HEADERS`).
-    pub custom_headers_var: &'static str,
+    pub custom_headers_var: String,
     /// Separator the CLI's parser expects between multiple headers in that var
     /// (Claude Code: `"\n"`; Gemini CLI: `", "`).
-    pub header_separator: &'static str,
+    pub header_separator: String,
+}
+
+/// Map a bare kyris registry handle (`claude-code`) to the canonical
+/// `vendor/product` id agentpact attribution emits. Unknown ids pass through
+/// unchanged. Single source for both `AgentDescriptor::canonical_id` and the
+/// generic engine's document validation. Keep in sync with agentpact `agents.yaml`.
+#[must_use]
+pub fn canonical_agent_id(id: &'static str) -> &'static str {
+    match id {
+        "claude-code" => "anthropic/claude-code",
+        "codex-cli" => "openai/codex-cli",
+        "gemini-cli" => "google/gemini-cli",
+        "opencode" => "opencode/opencode",
+        "cline" => "cline/cline",
+        other => other,
+    }
 }
 
 pub fn which_exists(cmd: &str) -> bool {
     crate::state::find_in_path(cmd).is_some()
 }
 
-macro_rules! agent_registry {
-    ($($id:literal => $mod:ident::$ty:ident),* $(,)?) => {
-        pub fn all_agents() -> Vec<Box<dyn AgentDescriptor>> {
-            vec![$(Box::new(super::$mod::$ty)),*]
-        }
-        pub fn agent_by_id(id: &str) -> Option<Box<dyn AgentDescriptor>> {
-            match id {
-                $($id => Some(Box::new(super::$mod::$ty)),)*
-                _ => None,
-            }
-        }
-    };
+/// The five supported agents, by bare registry id.
+const AGENT_IDS: [&str; 5] = [
+    "claude-code",
+    "codex-cli",
+    "gemini-cli",
+    "cline",
+    "opencode",
+];
+
+/// Build a descriptor. Every supported agent is now defined by its in-code
+/// `AgentCapabilities` document and run through the generic engine
+/// (`GenericAgent`); codex's irreducible realization is delegated from its
+/// document to the `codex-cli` handler inside `GenericAgent`.
+fn descriptor_for(id: &'static str) -> Box<dyn AgentDescriptor> {
+    assert!(
+        super::documents::for_agent(id).is_some(),
+        "no in-code AgentCapabilities document for agent {id}"
+    );
+    Box::new(super::generic::GenericAgent::new(id))
 }
 
-agent_registry! {
-    "claude-code"  => claude_code::ClaudeCode,
-    "codex-cli"    => codex_cli::CodexCli,
-    "gemini-cli"   => gemini_cli::GeminiCli,
-    "cline"        => cline::Cline,
-    "opencode"     => opencode::OpenCode,
+pub fn all_agents() -> Vec<Box<dyn AgentDescriptor>> {
+    AGENT_IDS.into_iter().map(descriptor_for).collect()
+}
+
+pub fn agent_by_id(id: &str) -> Option<Box<dyn AgentDescriptor>> {
+    AGENT_IDS.into_iter().find(|&x| x == id).map(descriptor_for)
 }
 
 #[cfg(test)]
@@ -835,14 +865,14 @@ mod tests {
         // configure method: EnvVarProxy burn-control is delivered by prestage via
         // `env_exports`, so claude/gemini intentionally leave
         // `configure_burn_control_surface` as the default. Behavioral proof that a
-        // configure body actually enforces lives in kyris-internal e2e
+        // configure body actually enforces lives in the cross-repo e2e suite
         // (run-agent + assert-event-log); this is the cheap structural guard.
         for agent in all_agents() {
             let plan = agent.integration_plan();
             let id = agent.id();
 
             if let SurfaceIntegration::Adapted { mechanisms, .. } = plan.execution {
-                for &m in mechanisms {
+                for m in mechanisms {
                     match m {
                         ExecutionMechanism::LiveHookAdapter => assert!(
                             agent.hook_protocol().is_some(),
@@ -858,7 +888,7 @@ mod tests {
             }
 
             if let SurfaceIntegration::Adapted { mechanisms, .. } = plan.tool {
-                for &m in mechanisms {
+                for m in mechanisms {
                     match m {
                         ToolMechanism::McpWrapping => assert!(
                             !agent.mcp_configs().is_empty(),
@@ -874,7 +904,7 @@ mod tests {
             }
 
             if let SurfaceIntegration::Adapted { mechanisms, .. } = plan.burn_control {
-                for &m in mechanisms {
+                for m in mechanisms {
                     match m {
                         BurnControlMechanism::EnvVarProxy => assert!(
                             !agent
@@ -1232,7 +1262,7 @@ mod tests {
             let advertises = agent
                 .supported_settings()
                 .iter()
-                .any(|(k, _)| *k == APPROVAL_PROMPT_SETTING);
+                .any(|(k, _)| k.as_str() == APPROVAL_PROMPT_SETTING);
             assert_eq!(
                 native,
                 advertises,
@@ -1293,7 +1323,7 @@ mod tests {
             execution: SurfaceIntegration::AgentPactNative,
             tool: SurfaceIntegration::AgentPactNative,
             burn_control: SurfaceIntegration::AgentPactNative,
-            attribution: &[AttributionMechanism::AgentPactNative],
+            attribution: vec![AttributionMechanism::AgentPactNative],
             agentpact_native_attribution: true,
         };
 
@@ -1309,9 +1339,11 @@ mod tests {
     fn testPartialNativePlanOnlyAdaptsRemainingSurfaces() {
         let plan = AgentIntegrationPlan {
             execution: SurfaceIntegration::AgentPactNative,
-            tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
-            burn_control: SurfaceIntegration::adapted(&[BurnControlMechanism::KyrisdModelProvider]),
-            attribution: &[AttributionMechanism::AgentPactNative],
+            tool: SurfaceIntegration::adapted(vec![ToolMechanism::McpWrapping]),
+            burn_control: SurfaceIntegration::adapted(vec![
+                BurnControlMechanism::KyrisdModelProvider,
+            ]),
+            attribution: vec![AttributionMechanism::AgentPactNative],
             agentpact_native_attribution: true,
         };
 
@@ -1325,10 +1357,10 @@ mod tests {
     #[test]
     fn testNativeCapabilityDeclarationOverlaysOnlyDeclaredSurfaces() {
         let plan = AgentIntegrationPlan {
-            execution: SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
-            tool: SurfaceIntegration::adapted(&[ToolMechanism::McpWrapping]),
-            burn_control: SurfaceIntegration::adapted(&[BurnControlMechanism::EnvVarProxy]),
-            attribution: &[AttributionMechanism::KyrisPathShim],
+            execution: SurfaceIntegration::adapted(vec![ExecutionMechanism::LiveHookAdapter]),
+            tool: SurfaceIntegration::adapted(vec![ToolMechanism::McpWrapping]),
+            burn_control: SurfaceIntegration::adapted(vec![BurnControlMechanism::EnvVarProxy]),
+            attribution: vec![AttributionMechanism::KyrisPathShim],
             agentpact_native_attribution: false,
         }
         .with_native_capabilities(NativeCapabilityDeclaration {

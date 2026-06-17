@@ -60,6 +60,17 @@ pub fn print_stats(s: &TimelineStats) {
         println!("  {:<10} {}", d.decision, d.count);
     }
 
+    println!("\nPrompts (asks by resource class — grantable = answering \"Always\" would stick):");
+    if s.prompts_by_resource.is_empty() {
+        println!("  (none)");
+    }
+    for p in &s.prompts_by_resource {
+        println!(
+            "  {:<22} {:<6} (grantable: {})",
+            p.resource_class, p.count, p.grantable
+        );
+    }
+
     println!("\nAgents:");
     if s.agents.is_empty() {
         println!("  (none)");

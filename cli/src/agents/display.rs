@@ -25,7 +25,7 @@ fn format_surface_with_plan<M: MechanismLabel>(
     state: &SurfaceState<M>,
     plan: SurfaceIntegration<M>,
 ) -> String {
-    format!("{}/{}", format_surface_short(state), plan_label(plan))
+    format!("{}/{}", format_surface_short(state), plan_label(&plan))
 }
 
 fn is_compiled_degradation<M>(state: &SurfaceState<M>, design: Option<CoverageCeiling>) -> bool {
@@ -183,7 +183,7 @@ fn format_control_line<M: MechanismLabel>(
     plan: SurfaceIntegration<M>,
     live: Option<chrono::DateTime<Utc>>,
 ) -> String {
-    let planned = plan_label(plan);
+    let planned = plan_label(&plan);
     if state.not_applicable {
         return format!("n/a (nothing to mediate; plan: {planned})");
     }
@@ -243,7 +243,7 @@ mod tests {
         // filesystem claim, not proof the surface works (fourth-gap honesty).
         let line = format_control_line(
             &SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter),
-            SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+            SurfaceIntegration::adapted(vec![ExecutionMechanism::LiveHookAdapter]),
             None,
         );
 
@@ -254,7 +254,7 @@ mod tests {
     fn testFormatControlLineShowsLiveEvidenceAge() {
         let line = format_control_line(
             &SurfaceState::adapted(ExecutionMechanism::LiveHookAdapter),
-            SurfaceIntegration::adapted(&[ExecutionMechanism::LiveHookAdapter]),
+            SurfaceIntegration::adapted(vec![ExecutionMechanism::LiveHookAdapter]),
             Some(Utc::now() - chrono::Duration::minutes(5)),
         );
 
@@ -272,7 +272,7 @@ mod tests {
         // which is why the old label-alignment test is gone.
         let line = format_surface_with_plan(
             &SurfaceState::adapted(ExecutionMechanism::CompiledPolicy),
-            SurfaceIntegration::adapted(&[
+            SurfaceIntegration::adapted(vec![
                 ExecutionMechanism::LiveHookAdapter,
                 ExecutionMechanism::CompiledPolicy,
             ]),

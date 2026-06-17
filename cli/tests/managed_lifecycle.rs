@@ -167,8 +167,8 @@ fn test_install_skips_local_kyrisd_when_homebrew_managed() {
 }
 
 // `kyris daemon start` / `kyris daemon stop` were removed when the
-// sentinel mechanism was retired. Mode toggling now lives in top-
-// level `kyris disable` / `kyris enable`, which edit
+// sentinel mechanism was retired. Mode toggling now lives under
+// `kyris policy disable` / `kyris policy enable`, which edit
 // `~/.config/agentpact/policy/pact.yaml` and don't require a
 // launchctl-aware fixture. Coverage for the new commands is the
 // `rewrite_mode_line` / `write_mode_in_place` unit tests in

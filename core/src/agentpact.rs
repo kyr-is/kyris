@@ -48,13 +48,170 @@ pub enum McpPermissionDecision {
     Ask {
         approval_id: String,
         approval_token: String,
-        /// Authoritative server signal: whether answering "Always" would
-        /// actually persist a standing override. UX surfaces offer "Always"
-        /// only when this is `true`. Defaults to `false` when the daemon omits
+        /// Authoritative server signal: whether answering "For session" would
+        /// actually persist a session-scoped grant. UX surfaces offer the
+        /// "For session" choice (field name stays `allow_always` for wire
+        /// stability) only when this is `true`. Defaults to `false` when the daemon omits
         /// it (older daemon / malformed response) — conservative: a missing
         /// signal means don't advertise a grant that may not stick.
         allow_always: bool,
+        /// Pre-formatted "why this needs approval" body for the approval popup,
+        /// rendered by the wire interpreter from the daemon's structured
+        /// [`agentpact_types::AskContext`] (see [`format_ask_context`]). `None`
+        /// when the daemon sent no ask-context (older daemon / non-popup path).
+        detail: Option<String>,
     },
+}
+
+/// Render the daemon's structured ask-context into a human popup body — one
+/// line per effect (`action resource — note`), then unresolved heads, sandbox
+/// bounds, and what "For session" does. Presentation lives here (kyris owns the UX);
+/// the daemon emits facts.
+#[must_use]
+pub fn format_ask_context(ctx: &agentpact_types::AskContext) -> String {
+    use agentpact_types::RememberInfo;
+    let mut lines: Vec<String> = Vec::new();
+    for effect in &ctx.effects {
+        // Surface an effect only when it carries a notable classification — a
+        // real warning worth weighing before approving (secret material,
+        // recursive delete, elevated privileges, external host, a remote
+        // change, …). Unremarkable effects (a plain `exec` / `read` / in-
+        // workspace write) are log-tier: the command itself is shown in the
+        // dialog and the classification is in the event log, so repeating it
+        // here is noise.
+        let Some(note) = &effect.note else {
+            continue;
+        };
+        let line = match &effect.resource {
+            Some(resource) => format!("• {} {resource} — {note}", effect.action),
+            None => format!("• {} — {note}", effect.action),
+        };
+        lines.push(line);
+    }
+    if !ctx.unresolved.is_empty() {
+        lines.push(format!("• unresolved: {}", ctx.unresolved.join(", ")));
+    }
+    if let Some(sandbox) = &ctx.sandbox {
+        lines.push(format_sandbox(sandbox));
+    }
+    match &ctx.remember {
+        Some(RememberInfo::Session { scope }) => {
+            lines.push(format!(
+                "\u{201c}For session\u{201d} remembers {scope} for the rest of the session."
+            ));
+        }
+        Some(RememberInfo::NotRemembered { reason }) => {
+            lines.push(format!("Won\u{2019}t be remembered: {reason}"));
+        }
+        None => {}
+    }
+    lines.join("\n")
+}
+
+/// One line describing the OS jail: backend + verified status, the writable
+/// bounds (when known), and the network scope — so the prompt states *why* a
+/// command is physically contained, not just "sandboxed".
+fn format_sandbox(sandbox: &agentpact_types::SandboxFact) -> String {
+    use agentpact_types::{SandboxBackend, SandboxNetwork};
+    let backend = match sandbox.capability.backend {
+        SandboxBackend::MacosSeatbelt => "macOS Seatbelt",
+        SandboxBackend::None => "OS jail",
+    };
+    let status = if sandbox.verified {
+        "verified"
+    } else {
+        "unverified — protection not confirmed"
+    };
+    let mut line = format!("Sandboxed ({backend}, {status})");
+    if !sandbox.capability.writable_roots.is_empty() {
+        line.push_str(" — writes bounded to ");
+        line.push_str(&sandbox.capability.writable_roots.join(", "));
+    }
+    match &sandbox.capability.network {
+        SandboxNetwork::Full => {}
+        SandboxNetwork::Off => line.push_str("; network off"),
+        SandboxNetwork::Allowlisted(_) => line.push_str("; network allowlisted"),
+    }
+    line
+}
+
+#[cfg(test)]
+mod ask_context_tests {
+    use super::format_ask_context;
+    use agentpact_types::{
+        AskContext, EffectFact, RememberInfo, SandboxBackend, SandboxCapability, SandboxFact,
+    };
+
+    #[test]
+    fn testFormatRendersEffectsSandboxAndRemember() {
+        let ctx = AskContext {
+            effects: vec![
+                // Notable → shown.
+                EffectFact {
+                    action: "write".to_string(),
+                    resource: Some(".git/hooks/pre-commit".to_string()),
+                    note: Some("repo control metadata".to_string()),
+                },
+                // Unremarkable (no note) → suppressed (log-tier, not a warning).
+                EffectFact {
+                    action: "exec".to_string(),
+                    resource: None,
+                    note: None,
+                },
+            ],
+            unresolved: vec!["mystery_tool".to_string()],
+            sandbox: Some(SandboxFact {
+                capability: SandboxCapability {
+                    backend: SandboxBackend::MacosSeatbelt,
+                    writable_roots: vec!["/repo".to_string(), "/tmp".to_string()],
+                    ..Default::default()
+                },
+                verified: true,
+            }),
+            remember: Some(RememberInfo::Session {
+                scope: "this command".to_string(),
+            }),
+        };
+        let body = format_ask_context(&ctx);
+        assert!(
+            body.contains("write .git/hooks/pre-commit — repo control metadata"),
+            "{body}"
+        );
+        // The noteless `exec` effect is suppressed — it's not a warning.
+        assert!(!body.contains("• exec"), "{body}");
+        assert!(body.contains("unresolved: mystery_tool"), "{body}");
+        assert!(
+            body.contains("Sandboxed (macOS Seatbelt, verified) — writes bounded to /repo, /tmp"),
+            "{body}"
+        );
+        assert!(body.contains("\u{201c}For session\u{201d}"), "{body}");
+        assert!(body.contains("rest of the session"), "{body}");
+    }
+
+    #[test]
+    fn testFormatNotRememberedReason() {
+        let ctx = AskContext {
+            effects: vec![EffectFact {
+                action: "remote_delete".to_string(),
+                resource: Some("eks/prod".to_string()),
+                note: Some("destroys cloud resources".to_string()),
+            }],
+            unresolved: Vec::new(),
+            sandbox: None,
+            remember: Some(RememberInfo::NotRemembered {
+                reason: "remote-destroy".to_string(),
+            }),
+        };
+        let body = format_ask_context(&ctx);
+        assert!(
+            body.contains("remote_delete eks/prod — destroys cloud resources"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Won\u{2019}t be remembered: remote-destroy"),
+            "{body}"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default)]

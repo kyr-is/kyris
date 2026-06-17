@@ -178,8 +178,7 @@ pub async fn run_sync_loop(state: Arc<AppState>) {
         .map_or_else(|| Duration::from_mins(1), Duration::from_secs);
     let orphan_grace = orphan_grace();
 
-    // Sync state machine (see module-level behavior, and the design in
-    // `forest/design/kyris.md`). On any non-success the cursor is NOT advanced
+    // Sync state machine (see module-level behavior). On any non-success the cursor is NOT advanced
     // and records are NOT marked synced, so local data always keeps accumulating
     // and flushes once sync recovers.
     let mut consecutive_failures: u32 = 0;

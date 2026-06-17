@@ -33,7 +33,8 @@ fn no_tty_deny() -> PactDecision {
         code: DenyCode::PolicyDenied,
         reason: "tool requires approval but no terminal is available".to_string(),
         hint: Some(
-            "Use 'kyris pending' to approve, adjust policy to 'auto', or run from a terminal"
+            "Approve via the Kyris desktop prompt or app, adjust policy to 'auto', \
+             or run from a terminal"
                 .to_string(),
         ),
     }
@@ -107,9 +108,9 @@ fn prompt_user_tty(server_name: &str, tool_name: &str, allow_always: bool) -> Us
         return UserApprovalResponse::Denied;
     };
 
-    // Offer "always" only when the daemon says a grant would actually persist.
+    // Offer "session" only when the daemon says a grant would actually persist.
     let choices = if allow_always {
-        "[y/n/always]"
+        "[y/n/session]"
     } else {
         "[y/n]"
     };
@@ -129,9 +130,10 @@ fn prompt_user_tty(server_name: &str, tool_name: &str, allow_always: bool) -> Us
     let trimmed = input.trim().to_lowercase();
     match trimmed.as_str() {
         "y" | "yes" => UserApprovalResponse::Approved,
-        // "always" is honored only when persistable; otherwise the daemon
-        // would refuse it anyway, so treat it as a one-time approval.
-        "a" | "always" => {
+        // "session" is honored only when persistable; otherwise the daemon
+        // would refuse it anyway, so treat it as a one-time approval. The
+        // variant stays `Always` (wire/code stable).
+        "session" => {
             if allow_always {
                 UserApprovalResponse::Always
             } else {
@@ -233,6 +235,7 @@ pub async fn check_permission_with_socket(
             approval_id,
             approval_token,
             allow_always,
+            detail,
         }) => {
             if tty {
                 resolve_ask_via_tty(
@@ -251,6 +254,7 @@ pub async fn check_permission_with_socket(
                     server_name,
                     tool_name,
                     allow_always,
+                    detail.as_deref(),
                     sock_path,
                     socket_timeout,
                 )
@@ -314,12 +318,14 @@ async fn resolve_ask_via_tty(
     decision.unwrap_or_else(|_| daemon_unavailable_deny())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_ask_via_kyrisd(
     approval_id: &str,
     approval_token: &str,
     server_name: &str,
     tool_name: &str,
     allow_always: bool,
+    detail: Option<&str>,
     sock_path: &str,
     socket_timeout: std::time::Duration,
 ) -> PactDecision {
@@ -333,7 +339,8 @@ async fn resolve_ask_via_kyrisd(
     let client = reqwest::Client::new();
 
     eprintln!(
-        "[kyris-mcp] {server_name}/{tool_name} held for approval — resolve with 'kyris pending'"
+        "[kyris-mcp] {server_name}/{tool_name} held for approval — \
+         resolve via the Kyris desktop prompt, tray, or app"
     );
 
     let resolution = kyris_core::pending::hold_poll_resolve(
@@ -349,9 +356,11 @@ async fn resolve_ask_via_kyrisd(
             // the serialized args is a follow-up.
             code: None,
             agent: "kyris-mcp",
-            // Authoritative server signal: only offer "Always" when the daemon
+            // Authoritative server signal: only offer "For session" when the daemon
             // would actually persist the grant (e.g. not a non-cacheable call).
             allow_always,
+            // Structured "why" body the daemon attached to this ask.
+            detail,
         },
     )
     .await;
@@ -481,6 +490,7 @@ mod tests {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
                 allow_always: false,
+                detail: None,
             }
         );
     }

@@ -62,6 +62,29 @@ pub struct Event {
     /// omitted for the (today universal) un-sandboxed path.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sandbox_applied: bool,
+    /// OS-sandbox backend confining the requester at decision time
+    /// (`macos_seatbelt` today; future `linux_landlock` / `windows_appcontainer`).
+    /// OS-neutral structural audit evidence alongside `sandbox_applied`. `None`
+    /// (omitted) when un-sandboxed or for events that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_backend: Option<String>,
+    /// Prompt-reduction telemetry: the distinct effect kinds the command
+    /// performs (`["write","network"]`), stamped by agentpact's `facts` module
+    /// from the same extraction that drove the decision. Empty (omitted) for an
+    /// effect-free command or a non-execute event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_classes: Vec<String>,
+    /// Prompt-reduction telemetry: the most-salient resource class the command
+    /// touches (`workspace`, `scratch`, `outside_workspace`, `sensitive:secret`,
+    /// `network:unknown`, `remote`, `privilege`, `dynamic`, …). `None` when the
+    /// command touches no notable resource or the field was not stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_class: Option<String>,
+    /// Prompt-reduction telemetry: whether answering "Always" would record a
+    /// session grant (vs a non-grantable remote-destroy / dynamic-exec effect
+    /// that re-prompts). `None` for events that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grantable: Option<bool>,
     /// Per-segment breakdown for a compound `execute` command the agent issued
     /// as one line (e.g. `cmd1 && cmd2`). The event represents the whole line
     /// (`detail`), with each split segment's own decision/coverage here. Empty
@@ -99,7 +122,6 @@ pub use agentpact_types::Action;
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Auto,
-    Inform,
     Ask,
     Deny,
     #[serde(other)]
@@ -110,7 +132,6 @@ impl std::fmt::Display for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => f.write_str("auto"),
-            Self::Inform => f.write_str("inform"),
             Self::Ask => f.write_str("ask"),
             Self::Deny => f.write_str("deny"),
             Self::Unknown => f.write_str("unknown"),
@@ -287,7 +308,6 @@ mod tests {
     #[test]
     fn testDecisionDisplayAll() {
         assert_eq!(Decision::Auto.to_string(), "auto");
-        assert_eq!(Decision::Inform.to_string(), "inform");
         assert_eq!(Decision::Ask.to_string(), "ask");
         assert_eq!(Decision::Deny.to_string(), "deny");
     }
@@ -349,6 +369,10 @@ mod tests {
             mode: String::new(),
             event_kind: String::new(),
             sandbox_applied: false,
+            sandbox_backend: None,
+            effect_classes: Vec::new(),
+            resource_class: None,
+            grantable: None,
             segments: Vec::new(),
         };
         let json = serde_json::to_string(&event).unwrap();

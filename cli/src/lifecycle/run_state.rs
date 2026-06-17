@@ -42,8 +42,8 @@ pub struct DisableArgs {}
 ///
 /// Edits `pact.yaml` so the user policy's `spec.mode` is `enforce`.
 /// Catalog-classified commands auto-allow; unclassified commands
-/// route to the menu-bar approval popup (or `kyris pending` when the
-/// agent runs without a TTY). Tray icon clears the log-mode overlay.
+/// route to the menu-bar approval popup (the tray or app resolve it
+/// when no desktop dialog is available). Tray icon clears the log-mode overlay.
 #[derive(Args)]
 pub struct EnableArgs {}
 

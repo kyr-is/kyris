@@ -18,7 +18,7 @@ fn write_kyrisd_config(home: &Path, listen: &str) {
     // doesn't read them, so the config only needs `listen`.
     fs::write(
         config_dir.join("kyrisd.yaml"),
-        format!("server:\n  listen: \"{listen}\"\n"),
+        format!("apiVersion: kyris/v1\nserver:\n  listen: \"{listen}\"\n"),
     )
     .expect("write kyrisd config");
 }

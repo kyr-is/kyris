@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Kyris
 // SPDX-License-Identifier: Apache-2.0
 //
-// `kyris agents status` must be read-only. Inspecting a detected-but-unconfigured
+// `kyris agent status` must be read-only. Inspecting a detected-but-unconfigured
 // agent must not configure it, install a PATH shim, or otherwise mutate the
-// user's agent config. Mutating reconcile belongs to `kyris agents setup` /
-// `kyris agents reconcile` and the daemon's reconcile watcher.
+// user's agent config. Mutating (re)configuration belongs to `kyris agent setup`
+// (idempotent — it also repairs drift) and the daemon's reconcile watcher.
 
 use std::path::Path;
 use std::process::Command;
@@ -15,9 +15,9 @@ fn run_agents_status(home: &Path) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kyris"))
         .current_dir(home)
         .env("HOME", home)
-        .args(["agents", "status"])
+        .args(["agent", "status"])
         .output()
-        .expect("run kyris agents status")
+        .expect("run kyris agent status")
 }
 
 #[test]

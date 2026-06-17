@@ -105,7 +105,7 @@ fn forward_request_headers(
         if is_hop_by_hop(name)
             || name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("x-working-dir")
-            // kyris-internal attribution (tool-surface live evidence) — must
+            // Internal Kyris attribution (tool-surface live evidence) — must
             // not leak to the external upstream MCP server.
             || name.eq_ignore_ascii_case("x-kyris-agent-id")
         {
@@ -320,6 +320,7 @@ async fn forward_mcp_post(
             approval_id,
             approval_token,
             allow_always,
+            detail,
         } => {
             let pending_timeout = config.mcp.pending_timeout_seconds;
             let tool_display = tool_name.as_deref().unwrap_or("unknown tool");
@@ -334,6 +335,7 @@ async fn forward_mcp_post(
                 None,
                 "kyris-mcp".to_string(),
                 allow_always,
+                detail,
             );
 
             let pending = state.pending.clone();
@@ -789,6 +791,7 @@ mod tests {
         Arc::new(AppState {
             config: Arc::new(ArcSwap::from_pointee(config)),
             circuit_breaker: Arc::new(CircuitBreaker::new()),
+            gate: Arc::new(crate::gate::GateRegistry::new()),
             cost_calculator: CostCalculator::new(),
             stats_tx,
             db: Arc::new(DuckDbWriter::open(&temp_root.join("kyrisd.duckdb"))),

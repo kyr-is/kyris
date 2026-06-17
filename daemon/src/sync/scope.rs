@@ -51,8 +51,8 @@ impl SyncScope {
     /// Whether a record/event from `working_dir` should sync to the relay.
     ///
     /// Sync is **default-on for governed directories**: every call routed
-    /// through kyris carries the governed session's launch dir as `working_dir`
-    /// (see `forest/design/kyris.md` §5.8). We sync it unless:
+    /// through kyris carries the governed session's launch dir as `working_dir`.
+    /// We sync it unless:
     /// - there is no `working_dir` — no governed context, and "Kyris does not
     ///   guess"; or
     /// - the directory is conventionally **private** ([`Self::is_private`]) —

@@ -153,6 +153,10 @@ pub fn load_or_init_config() -> Result<KyrisdConfig, String> {
 }
 
 pub fn load_config() -> Result<KyrisdConfig, String> {
+    // The CLI is a reader (it wants the connection URL / settings), so it does
+    // NOT enforce the config `apiVersion` — that contract is enforced where it
+    // matters, at the daemon's authoritative load (kyrisd `daemon/src/config`).
+    // A CLI command must still work against a minimal/legacy config file.
     let path = config_path()?;
     let contents = std::fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;

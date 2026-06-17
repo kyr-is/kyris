@@ -10,8 +10,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentpact"
-version = "0.1.6"
-source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.6#4d321c610794c75742f2ef93cb2c19035222e5ac"
+version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "agentpact-hardening",
  "agentpact-types",
@@ -33,22 +33,24 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tracing",
+ "tracing-journald",
+ "tracing-oslog",
  "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "agentpact-hardening"
-version = "0.1.6"
-source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.6#4d321c610794c75742f2ef93cb2c19035222e5ac"
+version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "agentpact-sandbox"
-version = "0.1.6"
-source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.6#4d321c610794c75742f2ef93cb2c19035222e5ac"
+version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "regex-lite",
  "serde",
@@ -56,8 +58,8 @@ dependencies = [
 
 [[package]]
 name = "agentpact-types"
-version = "0.1.6"
-source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.6#4d321c610794c75742f2ef93cb2c19035222e5ac"
+version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "schemars",
  "serde",
@@ -1959,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "kyris"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentpact",
  "aws-lc-rs",
@@ -1986,7 +1988,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-agentpact-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentpact-types",
  "kyris-core",
@@ -1997,7 +1999,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentpact-types",
  "aws-lc-rs",
@@ -2015,10 +2017,11 @@ dependencies = [
 
 [[package]]
 name = "kyris-exec"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentpact-hardening",
  "agentpact-sandbox",
+ "agentpact-types",
  "kyris-agentpact-client",
  "serde_json",
  "tempfile",
@@ -2026,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-hook"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
  "serde",
@@ -2036,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "kyris-mcp"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "kyris-agentpact-client",
  "kyris-core",
@@ -2050,14 +2053,14 @@ dependencies = [
 
 [[package]]
 name = "kyris-peer-cwd"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libproc",
 ]
 
 [[package]]
 name = "kyris-types"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentpact-types",
  "chrono",
@@ -2073,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "kyrisd"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agentpact",
  "agentpact-hardening",
@@ -5287,7 +5290,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "kyris-types",
  "schemars",

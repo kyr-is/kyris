@@ -206,7 +206,7 @@ pub fn fail_open_path() -> PathBuf {
 
 /// `~/.local/state/kyris/approvals.jsonl` — append-only record of every
 /// popup-resolved approval (yes / no / always). Source of truth for the
-/// `kyris approvals` CLI; not signed (the `AgentPact` `events.jsonl`
+/// `kyris activity approvals` CLI; not signed (the `AgentPact` `events.jsonl`
 /// remains the cryptographic record).
 #[must_use]
 pub fn approvals_log_path() -> PathBuf {

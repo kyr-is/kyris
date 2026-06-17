@@ -57,12 +57,73 @@ jobs:
           toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
+      # --- Compilation cache (mirrors ci.yml) ----------------------------------
+      # Without this, every release rebuilds bundled-duckdb (libduckdb-sys C++) +
+      # all deps from cold. We cache the cargo registry (dep sources) + the
+      # sccache per-invocation store, and SHARE ci.yml's exact sccache cache key
+      # on purpose: releases are infrequent, so an isolated release cache would
+      # hit GitHub's 7-day idle eviction and be cold every time — whereas main's
+      # store is kept warm by CI on every push, and a tag run can restore the
+      # default branch's caches. sccache is content-hashed, so sharing is safe
+      # (no wrong hits). Note the realistic reuse is the duckdb C++ objects: the
+      # Rust crate compiles differ from CI (release profile lto/opt + explicit
+      # --target both change the content hash), so those re-run + re-cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+          cache-all-crates: "true"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: sccache
+
+      - name: Configure sccache
+        id: sccache
+        run: |
+          {
+            echo "RUSTC_WRAPPER=sccache"
+            echo "CC=sccache cc"
+            echo "CXX=sccache c++"
+            echo "SCCACHE_LOG=warn"
+            # sccache can't cache `-C incremental` (UnhandledCompile); release
+            # disables it by default, but set it explicitly to be safe.
+            echo "CARGO_INCREMENTAL=0"
+            echo "SCCACHE_BASEDIR=${{ github.workspace }}"
+            echo "SCCACHE_DIR=${{ github.workspace }}/.sccache"
+          } >> "$GITHUB_ENV"
+          # libduckdb-sys version drives the cache key — a code change never
+          # evicts the compiled-duckdb black box; a version bump rotates it.
+          ver=$(awk '/^name = "libduckdb-sys"/{getline; gsub(/[" ]/,"",$3); print $3; exit}' Cargo.lock)
+          echo "duckdb_ver=$ver" >> "$GITHUB_OUTPUT"
+
+      # SAME key prefix as ci.yml's "Persist the sccache store" step, so a tagged
+      # release restores main's warm store (default-branch cache access). The
+      # unique run_id suffix + duckdb-version restore-key is ci.yml's pattern.
+      - uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ runner.os }}-duckdb${{ steps.sccache.outputs.duckdb_ver }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-duckdb${{ steps.sccache.outputs.duckdb_ver }}-
+
+      - name: Start sccache server
+        run: |
+          sccache --stop-server || true
+          sccache --start-server
+
       # Requires outbound network: kyris-types' build.rs fetches the live LiteLLM
       # pricing feed at build time (PricingTable::bundled) and FAILS BY DESIGN if
       # it's unreachable — no fallback. So a release is cut against the pricing
       # table current as of build time.
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
+
+      # Read this on the first real release: cumulative cache requests vs hits.
+      # If the store is bloating without hitting (duckdb objects miss across the
+      # release-profile/--target boundary), split release onto its own cache key.
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
       - name: Pre-bundle prep
         run: |

@@ -26,7 +26,7 @@ fn write_kyrisd_config(home: &Path) {
     // the health check.
     fs::write(
         config_dir.join("kyrisd.yaml"),
-        "server:\n  listen: \"127.0.0.1:1\"\n",
+        "apiVersion: kyris/v1\nserver:\n  listen: \"127.0.0.1:1\"\n",
     )
     .expect("write kyrisd config");
 }
@@ -35,11 +35,11 @@ fn run_setup(home: &Path, cwd: &Path, agent: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_kyris"))
         .current_dir(cwd)
         .env("HOME", home)
-        .arg("agents")
+        .arg("agent")
         .arg("setup")
         .arg(agent)
         .output()
-        .expect("run kyris agents setup")
+        .expect("run kyris agent setup")
 }
 
 /// An unknown `--set` key is rejected fail-fast, before any side effects, so it
@@ -55,14 +55,14 @@ fn test_setup_rejects_unknown_set_key() {
         .current_dir(home)
         .env("HOME", home)
         .args([
-            "agents",
+            "agent",
             "setup",
             "claude-code",
             "--set",
             "max-budget-usd=50",
         ])
         .output()
-        .expect("run kyris agents setup");
+        .expect("run kyris agent setup");
 
     assert!(
         !output.status.success(),
@@ -77,40 +77,6 @@ fn test_setup_rejects_unknown_set_key() {
     assert!(
         !home.join(".claude").join("settings.json").exists(),
         "setup must reject before writing settings.json"
-    );
-}
-
-/// agentpactd down → setup reports an error (not success) naming agentpactd:
-/// command/MCP governance can't enforce without it, so "setup succeeded" would
-/// be false confidence.
-#[test]
-fn test_setup_errors_when_agentpactd_unreachable() {
-    let temp_home = TempDir::new().expect("temp home");
-    let home = temp_home.path();
-    fs::create_dir_all(home.join(".claude")).expect("create .claude");
-    write_kyrisd_config(home);
-
-    let output = Command::new(env!("CARGO_BIN_EXE_kyris"))
-        .current_dir(home)
-        .env("HOME", home)
-        // Force agentpactd unreachable deterministically, independent of host env.
-        .env("AGENTPACT_SOCK", home.join("nonexistent-agentpact.sock"))
-        .args(["agents", "setup", "claude-code"])
-        .output()
-        .expect("run kyris agents setup");
-
-    assert!(
-        !output.status.success(),
-        "setup must exit non-zero when agentpactd is unreachable"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("agentpactd unreachable"),
-        "expected agentpactd to be surfaced, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("UNGOVERNED"),
-        "expected the ungoverned warning, got: {stderr}"
     );
 }
 

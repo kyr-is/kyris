@@ -92,14 +92,16 @@ fn promote_surface<M>(
     Ok(true)
 }
 
-fn file_contains_marker(path: &Path, markers: &[&str]) -> bool {
+fn file_contains_marker(path: &Path, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
     }
     let Ok(contents) = std::fs::read_to_string(path) else {
         return false;
     };
-    markers.iter().any(|marker| contents.contains(marker))
+    markers
+        .iter()
+        .any(|marker| contents.contains(marker.as_str()))
 }
 
 pub type ReconcileResult = Result<Vec<(Box<dyn AgentDescriptor>, AgentProfile)>, String>;
@@ -128,6 +130,12 @@ pub fn reconcile_all(auto: bool, log: Option<&InstallLog>) -> ReconcileResult {
     Ok(results)
 }
 
+/// Evidence-based configure / repair / native-promotion pass for one agent.
+/// `kyris agent setup <id>` runs this after writing settings so an explicit
+/// setup repairs drift and promotes adapted→native exactly like the reconcile
+/// watcher — there is no separate `reconcile` command. Idempotent and quiet
+/// when there's nothing to do (already configured, no drift, no native
+/// evidence yet).
 pub fn reconcile_one(agent_id: &str) -> Result<AgentProfile, String> {
     let agent =
         registry::agent_by_id(agent_id).ok_or_else(|| format!("Unknown agent: {agent_id}"))?;
@@ -140,12 +148,12 @@ pub fn reconcile_one(agent_id: &str) -> Result<AgentProfile, String> {
 /// merge it with a fresh probe of the current on-disk state, WITHOUT
 /// configuring, repairing, promoting, or persisting anything.
 ///
-/// `kyris agents status` uses this so an inspection command never mutates the
+/// `kyris agent status` uses this so an inspection command never mutates the
 /// user's agent configs, never installs a shim, never runs `load_or_init_config`
 /// (which would create `kyrisd.yaml`), and never resets `last_reconciled` —
 /// which would mask a stopped reconcile daemon. Ongoing reconcile is the job of
 /// the daemon's reconcile watcher (`daemon/src/reconcile_watcher.rs`) plus the
-/// explicit `kyris agents setup` / `kyris agents reconcile` / `kyris install`.
+/// explicit `kyris agent setup` (idempotent — it also repairs) / `kyris install`.
 pub fn status_snapshot_all() -> ReconcileResult {
     let mut results = Vec::new();
     for agent in registry::all_agents() {
@@ -206,6 +214,18 @@ fn reconcile_agent(
 
     profile.detected = true;
 
+    // The user explicitly disconnected this agent (`kyris agent disconnect`):
+    // it's still present, but do NOT configure, repair, or promote it. Disconnect
+    // is a STABLE opt-out — only an explicit `kyris agent setup <id>` (which
+    // clears `disconnected` before this pass runs) re-governs it. This guard keeps
+    // bulk `setup --all` AND the reconcile watcher from silently re-governing an
+    // opt-out (auto-configure, drift repair, and native promotion all skipped).
+    if profile.disconnected {
+        profile.last_reconciled = Some(Utc::now());
+        save_agent_profile(&profile)?;
+        return Ok(profile);
+    }
+
     // Migrate legacy single-field native evidence to per-surface, then collect
     // current runtime evidence before any auto-configure/repair step so proven
     // native surfaces are not reinstalled as adapted.
@@ -222,8 +242,8 @@ fn reconcile_agent(
         || profile.native_evidence.burn_control.is_some();
 
     // Auto-configure: agent is present but has never been configured.
-    // Skip if the user explicitly disabled this agent via `kyris agents undo`.
-    if !was_configured(agent.id()) && !profile.disabled {
+    // Skip if the user explicitly disconnected this agent via `kyris agent disconnect`.
+    if !was_configured(agent.id()) && !profile.disconnected {
         match super::configure::configure_agent_surfaces(
             agent.id(),
             &profile.agent_specific,
@@ -263,7 +283,7 @@ fn reconcile_agent(
             break;
         }
         let current_hash = super::probe::sha256_file(path).unwrap_or_default();
-        if current_hash != existing_fp.content_hash && !file_contains_marker(path, markers) {
+        if current_hash != existing_fp.content_hash && !file_contains_marker(path, &markers) {
             needs_repair = true;
             break;
         }
@@ -401,8 +421,14 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let path = temp.path().join("test.json");
         std::fs::write(&path, r#"{"hooks": "agentpact_pretooluse"}"#).expect("write");
-        assert!(file_contains_marker(&path, &["agentpact_pretooluse"]));
-        assert!(!file_contains_marker(&path, &["nonexistent_marker"]));
+        assert!(file_contains_marker(
+            &path,
+            &["agentpact_pretooluse".to_string()]
+        ));
+        assert!(!file_contains_marker(
+            &path,
+            &["nonexistent_marker".to_string()]
+        ));
     }
 
     #[test]

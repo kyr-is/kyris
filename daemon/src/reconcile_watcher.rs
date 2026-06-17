@@ -42,8 +42,11 @@ fn watch_paths() -> Vec<PathBuf> {
 }
 
 fn run_reconcile() -> bool {
+    // `kyris agent setup --all` runs the full reconcile pass (auto-configure /
+    // repair drift / promote adapted→native) across detected agents, skipping
+    // any the user disconnected — the same pass an explicit bulk setup runs.
     let output = std::process::Command::new(kyris_binary())
-        .args(["agents", "reconcile"])
+        .args(["agent", "setup", "--all"])
         .output();
     match output {
         Ok(out) => {
@@ -55,7 +58,7 @@ fn run_reconcile() -> bool {
             repaired
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to run kyris agents reconcile");
+            tracing::warn!(error = %e, "failed to run kyris agent setup --all");
             false
         }
     }

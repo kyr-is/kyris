@@ -148,6 +148,17 @@ pub fn build_permission_respond_request(
 /// `PACT_ASK` → `Ask{id, token}`, `PACT_POLICY_ERROR`/`PACT_PROTOCOL_ERROR`
 /// → `Deny{PolicyError}` (surfacing recovery hint when present),
 /// `PACT_CAP_EXCEEDED` → `Deny{CapExceeded}`, anything else → `Deny{PolicyError}`.
+/// Parse the daemon's structured `ask_context` off a `PACT_ASK` response and
+/// render it into the approval-popup body (see
+/// [`kyris_core::agentpact::format_ask_context`]). `None` when the field is
+/// absent (older daemon) or unparseable — the popup then falls back to its
+/// terse default.
+fn parse_ask_context_detail(response: &serde_json::Value) -> Option<String> {
+    let ctx: agentpact_types::AskContext =
+        serde_json::from_value(response.get("ask_context")?.clone()).ok()?;
+    Some(kyris_core::agentpact::format_ask_context(&ctx))
+}
+
 #[must_use]
 pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermissionDecision {
     match response.get("code").and_then(|code| code.as_str()) {
@@ -203,6 +214,7 @@ pub fn parse_mcp_permission_response(response: &serde_json::Value) -> McpPermiss
                         .get("allow_always")
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false),
+                    detail: parse_ask_context_detail(response),
                 }
             }
         }
@@ -466,6 +478,9 @@ pub fn request_hook_permission_preview(
                     .get("allow_always")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                // Preview asks are never shown to the user (no token); skip the
+                // popup body.
+                detail: None,
             },
             _ => parse_mcp_permission_response(&response),
         };
@@ -486,6 +501,82 @@ pub fn parse_response_segments(response: &serde_json::Value) -> Option<Vec<Strin
         .iter()
         .map(|v| v.as_str().map(str::to_owned))
         .collect()
+}
+
+/// Human-facing classification of a command for `kyris policy check`.
+///
+/// Carries the raw fields the CLI surfaces to a person — the decision verb
+/// (`auto`/`ask`/`deny`/…), the matched rule id (catalog form; the
+/// caller renders it via `id_to_shell`), and a reason. These are deliberately
+/// richer than [`McpPermissionDecision`], which collapses the decision verb to
+/// `Allow`/`Ask`/`Deny` and drops the matched rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandCheck {
+    /// Raw decision verb as agentpactd reported it (`unknown` if absent).
+    pub decision: String,
+    /// Matched rule id (catalog form), if the daemon reported one.
+    pub matched_rule: Option<String>,
+    /// Human-readable reason / error string, if the daemon reported one.
+    pub reason: Option<String>,
+}
+
+/// Previews how agentpactd would classify an `execute` of `command` in
+/// `working_dir`, without minting a token or storing a pending entry
+/// (`preview: true`). Drives `kyris policy check`.
+///
+/// A single attempt — no retry and no daemon restart — matching the read-only
+/// intent of a `check`: an unreachable daemon should surface as an error, not
+/// bounce the user's running `agentpactd`.
+///
+/// # Errors
+///
+/// Returns an error when `agentpactd` is unreachable or returns a malformed
+/// response.
+pub fn check_command(
+    socket_path: &str,
+    command: &str,
+    working_dir: Option<&str>,
+    socket_timeout: Duration,
+) -> Result<CommandCheck, String> {
+    let mut request = build_hook_permission_request(
+        "kyris-check",
+        "execute",
+        command,
+        working_dir,
+        None,
+        None,
+        None,
+        None,
+    );
+    request["preview"] = serde_json::json!(true);
+    let response = send_daemon_request_to_socket(socket_path, &request, Some(socket_timeout))?;
+    Ok(parse_command_check(&response))
+}
+
+/// Pulls the human-facing decision / matched-rule / reason out of a
+/// `permission.request` response, with the same field fallbacks the daemon may
+/// use (`matched_rule` → `rule_id`, `reason` → `error`).
+fn parse_command_check(response: &serde_json::Value) -> CommandCheck {
+    let decision = response
+        .get("decision")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let matched_rule = response
+        .get("matched_rule")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("rule_id").and_then(|v| v.as_str()))
+        .map(str::to_owned);
+    let reason = response
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| response.get("error").and_then(|v| v.as_str()))
+        .map(str::to_owned);
+    CommandCheck {
+        decision,
+        matched_rule,
+        reason,
+    }
 }
 
 /// Sends a `trace.attach` request to `agentpactd`, binding a `trace_token`
@@ -565,7 +656,8 @@ pub fn resolve_agent(
 /// session with `agentpactd`. Sent by `kyris-exec` immediately before it execs
 /// the sandboxed agent in place, so the caller's PID (which the daemon reads
 /// from the socket peer credentials, NOT from this message) becomes the jail
-/// root. `profile_summary` is an audit-only description of the active sandbox.
+/// root. `profile_summary` is an audit-only description; `capability` is the
+/// typed, OS-neutral capability the daemon stores and reasons against.
 ///
 /// Returns `true` only on an explicit `PACT_OK`. Best-effort by contract: a
 /// `false` (daemon down, error) means the jail still applies but the daemon
@@ -575,14 +667,14 @@ pub fn resolve_agent(
 pub fn register_jailed_session(
     socket_path: &str,
     profile_summary: &str,
-    writable_roots: &[String],
+    capability: &agentpact_types::SandboxCapability,
     socket_timeout: Option<Duration>,
 ) -> bool {
     let request = serde_json::json!({
         "id": format!("kyris-exec-{}", uuid::Uuid::now_v7()),
         "method": "session.register",
         "profile_summary": profile_summary,
-        "writable_roots": writable_roots,
+        "capability": capability,
     });
     match send_daemon_request_to_socket(socket_path, &request, socket_timeout) {
         Ok(response) => response.get("code").and_then(|c| c.as_str()) == Some("PACT_OK"),
@@ -1369,6 +1461,7 @@ mod tests {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
                 allow_always: false,
+                detail: None,
             }
         );
     }
@@ -1387,6 +1480,7 @@ mod tests {
                 approval_id: "req-42".to_string(),
                 approval_token: "apt_123".to_string(),
                 allow_always: true,
+                detail: None,
             }
         );
     }
@@ -1440,6 +1534,67 @@ mod tests {
     fn testParseResponseSegmentsAbsent() {
         let response = serde_json::json!({"code": "PACT_OK"});
         assert_eq!(parse_response_segments(&response), None);
+    }
+
+    #[test]
+    fn testParseCommandCheckFull() {
+        let response = serde_json::json!({
+            "decision": "auto",
+            "matched_rule": "allow-all",
+            "reason": "default policy"
+        });
+        assert_eq!(
+            parse_command_check(&response),
+            CommandCheck {
+                decision: "auto".to_string(),
+                matched_rule: Some("allow-all".to_string()),
+                reason: Some("default policy".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn testParseCommandCheckMinimal() {
+        let response = serde_json::json!({"decision": "deny"});
+        assert_eq!(
+            parse_command_check(&response),
+            CommandCheck {
+                decision: "deny".to_string(),
+                matched_rule: None,
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn testParseCommandCheckFallsBackToRuleId() {
+        let response = serde_json::json!({
+            "decision": "auto",
+            "rule_id": "cmd:git\u{b7}status"
+        });
+        let check = parse_command_check(&response);
+        assert_eq!(check.matched_rule.as_deref(), Some("cmd:git\u{b7}status"));
+        assert_eq!(check.reason, None);
+    }
+
+    #[test]
+    fn testParseCommandCheckFallsBackToError() {
+        let response = serde_json::json!({
+            "code": "PACT_POLICY_ERROR",
+            "error": "working_dir not allowed"
+        });
+        let check = parse_command_check(&response);
+        assert_eq!(check.decision, "unknown");
+        assert_eq!(check.matched_rule, None);
+        assert_eq!(check.reason.as_deref(), Some("working_dir not allowed"));
+    }
+
+    #[test]
+    fn testParseCommandCheckMissing() {
+        let check = parse_command_check(&serde_json::json!({}));
+        assert_eq!(check.decision, "unknown");
+        assert_eq!(check.matched_rule, None);
+        assert_eq!(check.reason, None);
     }
 
     #[test]

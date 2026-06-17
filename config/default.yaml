@@ -4,6 +4,8 @@
 # on first run (default $HOME/.config/kyris/kyrisd.yaml). See
 # kyris-core/src/paths.rs for the full XDG-aware layout.
 
+apiVersion: kyris/v1
+
 server:
   listen: "127.0.0.1:4710"
   # The inbound/operator auth keys are NOT stored here. They live as 0600 files
@@ -35,10 +37,17 @@ mcp:
   #     upstream: "http://localhost:8080"
   #     working_dir: "/path/to/project"
 
+# Runaway guard. `max_tokens` caps the model OUTPUT tokens generated without any
+# tool/shell/MCP call (a tool call resets the counter, so a working agent never
+# trips). Crossing it doesn't kill the agent — it holds the next request and
+# prompts a human "continue or stop?"; `decision_timeout_seconds` is how long
+# that prompt waits for an answer before defaulting to stop (7 days, so the
+# agent waits for a person rather than getting a surprise 429).
 circuit_breaker:
   enabled: true
   max_tokens: 200000
   session_idle_minutes: 30
+  decision_timeout_seconds: 604800
 
 # The relay this install talks to. Two uses, neither requiring enrollment:
 #   - pricing: `kyris install` and the daemon fetch the live price table from
@@ -63,7 +72,7 @@ github:
 # owner-only (0700) dirs, and the macOS personal folders (~/Documents,
 # ~/Downloads, ~/Pictures, ~/Music, ~/Movies, ~/Desktop, ~/Library, …).
 # An empty `scope` syncs every other governed dir; set it to NARROW further,
-# e.g. `["~/work", "~/src/myrepo"]`. See forest/design/kyris.md §5.8.
+# e.g. `["~/work", "~/src/myrepo"]`.
 sync:
   scope: []
 

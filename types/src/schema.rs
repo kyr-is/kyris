@@ -6,12 +6,14 @@ use serde_json::{Map, Value, json};
 pub fn generate() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://kyr-is.github.io/kyris/config.json",
+        "$id": "https://kyr-is.github.io/kyris/v1/config.json",
         "title": "kyrisd configuration",
         "description": "Schema for kyrisd.yaml configuration",
         "type": "object",
         "additionalProperties": false,
+        "required": ["apiVersion"],
         "properties": {
+            "apiVersion": { "const": "kyris/v1" },
             "server": { "$ref": "#/$defs/ServerConfig" },
             "tls": { "$ref": "#/$defs/TlsConfig" },
             "providers": {
@@ -199,13 +201,19 @@ fn circuit_breaker_config() -> Value {
                 "type": "integer",
                 "minimum": 0,
                 "default": 200_000,
-                "description": "Maximum tokens per session before the circuit breaker trips"
+                "description": "Max output tokens generated without a tool/shell/MCP call before the runaway prompt fires (a tool call resets the counter)"
             },
             "session_idle_minutes": {
                 "type": "integer",
                 "minimum": 0,
                 "default": 30,
                 "description": "Minutes of idle time before a session's token counter resets"
+            },
+            "decision_timeout_seconds": {
+                "type": "integer",
+                "minimum": 0,
+                "default": 604_800,
+                "description": "How long the runaway 'continue or stop?' prompt holds the request waiting for a human before defaulting to stop (7 days)"
             }
         }
     })
@@ -218,7 +226,7 @@ fn relay_config() -> Value {
         "properties": {
             "url": {
                 "type": "string",
-                "description": "Base URL of the kyris-relay this install talks to (pricing fetch and `kyris enroll`). Read at enroll time and at runtime by the daemon; not part of credentials.json."
+                "description": "Base URL of the Kyris relay this install talks to (pricing fetch and `kyris enroll`). Read at enroll time and at runtime by the daemon; not part of credentials.json."
             }
         }
     })
@@ -352,6 +360,23 @@ mod tests {
             schema["$schema"],
             "https://json-schema.org/draft/2020-12/schema"
         );
+    }
+
+    #[test]
+    fn testSchemaIdIsVersionedAndRequiresApiVersion() {
+        let schema = generate();
+        // The published URL is versioned by schema major.
+        assert_eq!(
+            schema["$id"],
+            "https://kyr-is.github.io/kyris/v1/config.json"
+        );
+        // A config document must declare its version, pinned to this major.
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "apiVersion"),
+            "apiVersion must be required"
+        );
+        assert_eq!(schema["properties"]["apiVersion"]["const"], "kyris/v1");
     }
 
     #[test]

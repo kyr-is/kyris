@@ -19,6 +19,7 @@ fn bench_hold(c: &mut Criterion) {
                 None,
                 "test-agent".into(),
                 true,
+                None,
             );
             i += 1;
         });
@@ -39,6 +40,7 @@ fn bench_claim_complete(c: &mut Criterion) {
                 None,
                 "test-agent".into(),
                 true,
+                None,
             );
             let claim = store.claim(black_box(&id)).unwrap();
             store.complete_claim(claim, true);
@@ -63,6 +65,7 @@ fn bench_prune(c: &mut Criterion) {
                         None,
                         "test-agent".into(),
                         true,
+                        None,
                     );
                     let claim = store.claim(&id).unwrap();
                     store.complete_claim(claim, true);
@@ -88,6 +91,7 @@ fn bench_list_held(c: &mut Criterion) {
             None,
             "test-agent".into(),
             true,
+            None,
         );
         receivers.push(rx);
     }
@@ -101,6 +105,7 @@ fn bench_list_held(c: &mut Criterion) {
             None,
             "test-agent".into(),
             true,
+            None,
         );
         let claim = store.claim(&id).unwrap();
         store.complete_claim(claim, true);
