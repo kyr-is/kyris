@@ -26,7 +26,7 @@ fn write_kyrisd_config(home: &Path) {
     // the health check.
     fs::write(
         config_dir.join("kyrisd.yaml"),
-        "server:\n  listen: \"127.0.0.1:1\"\n",
+        "apiVersion: kyris/v1\nserver:\n  listen: \"127.0.0.1:1\"\n",
     )
     .expect("write kyrisd config");
 }

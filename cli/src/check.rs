@@ -53,7 +53,7 @@ pub fn run(args: CheckArgs) {
 
 fn decision_to_exit_code(decision: &str) -> i32 {
     match decision {
-        "auto" | "inform" => 0,
+        "auto" => 0,
         "ask" => 2,
         _ => 1,
     }
@@ -66,7 +66,6 @@ mod tests {
     #[test]
     fn testDecisionToExitCodeAuto() {
         assert_eq!(decision_to_exit_code("auto"), 0);
-        assert_eq!(decision_to_exit_code("inform"), 0);
     }
 
     #[test]

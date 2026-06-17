@@ -17,6 +17,8 @@ pub fn try_load_config() -> Result<KyrisdConfig, String> {
     let mut config: KyrisdConfig =
         serde_saphyr::from_str(&contents).map_err(|e| format!("failed to parse config: {e}"))?;
 
+    config.validate_api_version()?;
+
     validate_permissions(&config_path)?;
 
     if config.providers.is_empty() {
@@ -49,6 +51,11 @@ pub fn load_config_from(config_path: &Path) -> KyrisdConfig {
 
     let mut config: KyrisdConfig = serde_saphyr::from_str(&contents).unwrap_or_else(|e| {
         tracing::error!(path = %config_path.display(), error = %e, "failed to parse config");
+        std::process::exit(1);
+    });
+
+    config.validate_api_version().unwrap_or_else(|e| {
+        tracing::error!(path = %config_path.display(), error = %e, "invalid config apiVersion");
         std::process::exit(1);
     });
 

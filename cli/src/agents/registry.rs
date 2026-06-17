@@ -865,7 +865,7 @@ mod tests {
         // configure method: EnvVarProxy burn-control is delivered by prestage via
         // `env_exports`, so claude/gemini intentionally leave
         // `configure_burn_control_surface` as the default. Behavioral proof that a
-        // configure body actually enforces lives in kyris-internal e2e
+        // configure body actually enforces lives in the cross-repo e2e suite
         // (run-agent + assert-event-log); this is the cheap structural guard.
         for agent in all_agents() {
             let plan = agent.integration_plan();

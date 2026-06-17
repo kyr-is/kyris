@@ -923,7 +923,7 @@ mod tests {
     /// byte-for-byte faithfulness of each document to its former hand-written
     /// descriptor was proven by the equivalence tests during the migration; the
     /// documents are now the source of truth, validated here + by the registry
-    /// invariants + the kyris-internal e2e suite.
+    /// invariants + the cross-repo e2e suite.
     #[test]
     fn testAllAgentDocumentsLoad() {
         for id in [

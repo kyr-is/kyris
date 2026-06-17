@@ -122,7 +122,6 @@ pub use agentpact_types::Action;
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
     Auto,
-    Inform,
     Ask,
     Deny,
     #[serde(other)]
@@ -133,7 +132,6 @@ impl std::fmt::Display for Decision {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => f.write_str("auto"),
-            Self::Inform => f.write_str("inform"),
             Self::Ask => f.write_str("ask"),
             Self::Deny => f.write_str("deny"),
             Self::Unknown => f.write_str("unknown"),
@@ -310,7 +308,6 @@ mod tests {
     #[test]
     fn testDecisionDisplayAll() {
         assert_eq!(Decision::Auto.to_string(), "auto");
-        assert_eq!(Decision::Inform.to_string(), "inform");
         assert_eq!(Decision::Ask.to_string(), "ask");
         assert_eq!(Decision::Deny.to_string(), "deny");
     }

@@ -105,7 +105,7 @@ fn forward_request_headers(
         if is_hop_by_hop(name)
             || name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("x-working-dir")
-            // kyris-internal attribution (tool-surface live evidence) — must
+            // Internal Kyris attribution (tool-surface live evidence) — must
             // not leak to the external upstream MCP server.
             || name.eq_ignore_ascii_case("x-kyris-agent-id")
         {

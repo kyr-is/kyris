@@ -145,7 +145,7 @@ pub fn compile_cline_permissions(
     for (command_id, perm) in &level.commands {
         let shell_cmd = id_to_shell(command_id);
         match perm {
-            Permission::Auto | Permission::Inform => allow_rules.push(shell_cmd),
+            Permission::Auto => allow_rules.push(shell_cmd),
             Permission::Deny => deny_rules.push(shell_cmd),
             Permission::Ask => ask_dropped_names.push(shell_cmd),
         }
@@ -179,7 +179,7 @@ pub fn compile_opencode_permissions(
 
     let perm_str = |perm: &Permission| -> &'static str {
         match perm {
-            Permission::Auto | Permission::Inform => "allow",
+            Permission::Auto => "allow",
             Permission::Deny => "deny",
             Permission::Ask => "ask",
         }
@@ -405,19 +405,6 @@ spec:
 
         let result = compile_cline_permissions(Some(dir.path()));
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn testCompileClineInformMapsToAllow() {
-        let dir = tempfile::tempdir().unwrap();
-        writeTempYaml(
-            dir.path(),
-            "pact.yaml",
-            "apiVersion: agentpact/v1\nkind: Pact\nmetadata:\n  name: test\nspec:\n  commands:\n    \"git·status\": inform\n",
-        );
-
-        let (output, _) = compile_cline_permissions(Some(dir.path())).unwrap();
-        assert_eq!(output["allow"], serde_json::json!(["git status"]));
     }
 
     #[test]
@@ -1196,14 +1183,9 @@ spec:
 
     #[test]
     fn testPermissionToFileMode() {
-        // Auto and Inform both grant write — the "inform" log component is
-        // the live hook's responsibility, not the compiled sandbox config.
+        // Auto grants write at the compiled sandbox layer.
         assert_eq!(
             permission_to_file_mode(Permission::Auto),
-            FileAccessMode::Write
-        );
-        assert_eq!(
-            permission_to_file_mode(Permission::Inform),
             FileAccessMode::Write
         );
         // Ask fails closed at the sandbox layer (no prompt path).
@@ -1221,10 +1203,6 @@ spec:
     fn testPermissionToNetworkAccess() {
         assert_eq!(
             permission_to_network_access(Permission::Auto),
-            NetworkAccess::Allow
-        );
-        assert_eq!(
-            permission_to_network_access(Permission::Inform),
             NetworkAccess::Allow
         );
         assert_eq!(

@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: Copyright 2026 Kyris
 # SPDX-License-Identifier: Apache-2.0
-# yaml-language-server: $schema=https://kyr-is.github.io/kyris/config.json
+# yaml-language-server: $schema=https://kyr-is.github.io/kyris/v1/config.json
 # Example kyrisd.yaml with all configuration options documented.
+
+apiVersion: kyris/v1
 
 server:
   listen: "127.0.0.1:4710"

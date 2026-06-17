@@ -12,7 +12,7 @@
 //!   `configure`/`probe`/`undo` lists per surface. A bounded, frozen op
 //!   vocabulary the engine maps to the existing shared write/probe/restore
 //!   helpers. The vocabulary grows only by a deliberate engine change, never by
-//!   new JSON control constructs (see `forest/design/agent-integration.md`).
+//!   new JSON control constructs.
 //!
 //! The type set is grown agent-by-agent against proven need; cline is the first.
 

@@ -1,648 +1,410 @@
-# Kyris — Local LLM Governance for AI Agents
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- DRAFT restructure of README.md — for review, not yet in place. -->
+
+# Kyris
 
 [![CI](https://github.com/kyr-is/kyris/actions/workflows/ci.yml/badge.svg)](https://github.com/kyr-is/kyris/actions/workflows/ci.yml) [![coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/vinkaga/2a8a7c5f533e65aa92dc3c0478aac964/raw/coverage.json)](https://gist.github.com/vinkaga/2a8a7c5f533e65aa92dc3c0478aac964) [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE) [![MSRV](https://img.shields.io/badge/MSRV-1.95-orange.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.95.0.html) [![status](https://img.shields.io/badge/status-pre--release-yellow.svg)](https://github.com/kyr-is/kyris)
 
-Kyris is the local runtime that puts agent governance on the paths you can actually reach today: shell execution, MCP tool calls, and model traffic that you explicitly route through a local gateway. It is built for developers who want more autonomy from coding agents without giving up their machine, their budget, or their ability to understand what happened after the fact.
+AI coding agents are at their best when they can run builds, edit files, chase down errors, and keep moving. That same autonomy is a control problem: one agent rewrites your git history, another quietly calls a tool you didn't expect, a third burns through your model budget overnight — and every agent has its own permission model, its own audit trail (or none).
 
-[AgentPact](https://github.com/kyr-is/agentpact) defines the open contract: policy, protocol, event schema, attribution, and conformance. Kyris is the deployable layer around that contract: the CLI, hooks, adapters, `kyrisd`, and MCP wrapper that make the standard useful on real machines.
+Kyris is a local runtime that gives you **one operating model across them**:
 
-Today the practical target is macOS, with Apple Silicon as the primary supported path. Current support focuses on Claude Code, Gemini CLI, Codex CLI, OpenCode, and Cline through the strongest honest surface each one exposes.
+- **Govern shell commands** before they run — stop a destructive delete or a history rewrite at the point of execution, not after.
+- **Govern MCP tool calls** that never touch a shell, whether the server is stdio or HTTP.
+- **Prompt you with one consistent approval** when an action needs a decision — approve once, remember for the session, or deny — instead of learning each agent's own permission UI.
+- **Pause a runaway model loop** for your continue-or-stop call, on traffic routed through the local gateway.
+- **Meter and cap model spend** on gateway traffic, with per-agent and per-model accounting.
+- **Keep one local record** of what happened and what it cost — governance decisions and model usage joined into a single timeline you can replay, trace, and total.
+- **Stay honest about coverage** — Kyris reports what it actually governed, per path, and never claims control it didn't have.
 
-## 1. Install
+All of this works **locally, with no account and no network**. Enroll when you want to sync that record to a web dashboard across your machines.
 
-### 1.1 What's Included
+Kyris is built on [AgentPact](https://github.com/kyr-is/agentpact), the open governance contract — policy, protocol, event schema, attribution, conformance. AgentPact defines the standard; Kyris is the deployable local layer (CLI, hooks, adapters, `kyrisd`, MCP wrapper) that gets it onto real developer machines.
 
-- `kyris` CLI for install, agent setup, status, activity inspection, policy control, and diagnostics
-- `kyrisd` local daemon binary for LLM routing, HTTP MCP routing, and local operator workflows
-- `kyris-mcp` stdio MCP wrapper binary
-- `kyris-hook` helper binary for shell and native hook integrations
-- `launchd` service template for `kyrisd` on macOS
+## Contents
 
-### 1.2 Install (user mode — currently the only shipping mode)
+**Guide** — install and operate Kyris
 
-**Homebrew (recommended):**
+1. [What Kyris Installs](#1-what-kyris-installs)
+2. [Today's Scope (Phase 1)](#2-todays-scope-phase-1)
+3. [Installing, Upgrading, and Uninstalling](#3-installing-upgrading-and-uninstalling)
+4. [Operating Kyris](#4-operating-kyris)
+   - [4.1 Governing Shell Commands](#41-governing-shell-commands)
+   - [4.2 Governing MCP Tools](#42-governing-mcp-tools)
+   - [4.3 Approvals](#43-approvals)
+   - [4.4 Stopping Runaway Loops](#44-stopping-runaway-loops)
+   - [4.5 Tracking and Controlling Model Spend](#45-tracking-and-controlling-model-spend)
+   - [4.6 Seeing What Happened](#46-seeing-what-happened)
+   - [4.7 Tuning Policy](#47-tuning-policy)
+   - [4.8 Syncing to a Dashboard](#48-syncing-to-a-dashboard)
+5. [Agent Support](#5-agent-support)
+6. [Command Reference](#6-command-reference)
+
+**Design** — how Kyris works, and how to build on it
+
+7. [How Kyris Works](#7-how-kyris-works)
+8. [Architecture and Extension](#8-architecture-and-extension)
+
+---
+
+# Guide
+
+*Install and operate Kyris.*
+
+## 1. What Kyris Installs
+
+Kyris installs five local binaries:
+
+| Binary | Purpose |
+| --- | --- |
+| `kyris` | CLI for install, agent setup, status, activity inspection, policy control, diagnostics, and lifecycle tasks. |
+| `kyrisd` | Local daemon for model routing, HTTP MCP routing, local storage, approvals, notifications, and sync. |
+| `kyris-mcp` | Stdio MCP wrapper that checks tool calls against policy. |
+| `kyris-hook` | Lightweight helper used by shell hooks. |
+| `kyris-exec` | Sandbox launcher used for OS-backed workspace confinement. |
+
+It also installs shell hook assets, agent integration assets, default config, and a macOS `launchd` service template for `kyrisd`.
+
+## 2. Today's Scope (Phase 1)
+
+Kyris runs on macOS (Apple Silicon) today — a Phase 1 scope, not where Kyris stops. It is designed as a cross-platform local runtime, with the platform-specific pieces (service management, shell mediation, process inspection) kept behind clear seams so Windows and Linux can follow. We are going deep on one platform first rather than shallow on three.
+
+A few details are platform-specific today:
+
+- macOS uses `launchd` for the local daemon.
+- Shell mediation depends on your shell and the agent's execution path.
+- Windows and Linux would integrate through their own native service, process, and shell points.
+
+Phase 1 governs five agents — Claude Code, Cline, OpenCode, Codex CLI, and Gemini CLI — each through the strongest honest surface it exposes. The supported set grows as agents expose governable surfaces; new agents land as that work is done, not as a roadmap promise.
+
+## 3. Installing, Upgrading, and Uninstalling
+
+### 3.1 Homebrew (Recommended)
 
 ```sh
-brew install --cask kyr-is/tap/kyris   # auto-installs agentpact via depends_on
+brew install --cask kyr-is/tap/kyris
 brew services start kyris
-kyris install                          # configure shell hooks and agent integrations
-```
-
-**Install script:**
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash
-kyris install                          # configure shell hooks and agent integrations
-```
-
-Both paths install the same four binaries (`kyris`, `kyrisd`, `kyris-mcp`, `kyris-hook`) and the same hardened `launchd` plist. The script auto-installs agentpact if it's missing (chained `curl ... | bash` of agentpact's install.sh) and auto-detects `brew` to delegate when present; pass `--no-brew` to force the script path or `--no-agentpact` to skip the dependency check. No `sudo` required. The daemon runs as the developer; state lives under `~/.kyris/`.
-
-**Uninstall** — three levels, pick the one that matches how clean a slate you want. All three work regardless of install channel.
-
-Run the cached installer (`~/.kyris/installer.sh`) rather than `curl … | bash` against `main`. Install cached a version-matched copy of `install.sh` exactly so uninstall uses the same code that placed the files; pulling `main` can drift if the on-disk layout has changed since you installed.
-
-| Level | Command | What gets removed | What stays |
-| --- | --- | --- | --- |
-| **1. Integrations only** | `kyris uninstall` | Shell hooks (`~/.zshrc`/`~/.bashrc` edits), per-agent config edits (Claude Code `settings.json`, etc.), `~/.kyris/` runtime scaffolding | Binaries, `launchd` plist (`kyrisd` keeps running until you stop it), config (`~/.config/kyris/`), data (`~/.local/share/kyris/`), state/logs (`~/.local/state/kyris/`) |
-| **2. Default uninstall** (preserves user data) | `~/.kyris/installer.sh --uninstall`<br>or `brew uninstall --cask kyr-is/tap/kyris` | Everything in Level 1 plus binaries (`kyris`, `kyrisd`, `kyris-mcp`, `kyris-hook`), `launchd` plist, `~/.kyris/`, package receipt | Config (`~/.config/kyris/kyrisd.yaml`), data (`~/.local/share/kyris/credentials.json`, `kyrisd.duckdb`), state (`~/.local/state/kyris/log/`, `fail-open.jsonl`, `approvals.jsonl`) — so a reinstall picks up where you left off |
-| **3. Full wipe** (clean slate) | `~/.kyris/installer.sh --uninstall --reset-data`<br>or `brew uninstall --cask --zap kyr-is/tap/kyris` | Everything in Level 2 plus the three XDG dirs (`~/.config/kyris/`, `~/.local/share/kyris/`, `~/.local/state/kyris/`) | Nothing kyris-related |
-
-How the script chooses: `~/.kyris/installer.sh --uninstall` runs `kyris uninstall` first (Level 1 cleanup), then either delegates to `brew uninstall --cask` if it detects a brew-managed install (adding `--zap` when `--reset-data` is passed), or removes the binaries / plist / `~/.kyris/` itself. `--reset-data` adds the XDG-dir wipe in either path. Pass `--no-brew` to force the script path when both are available.
-
-**If `~/.kyris/installer.sh` is missing** (e.g. the runtime dir was deleted manually), fall back to:
-```sh
-curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash -s -- --uninstall [--reset-data]
-```
-The network fallback works in practice but isn't version-matched.
-
-**Agentpact cascade.** All three levels also remove agentpact when kyris was its last dependent. The check reads `~/.local/share/kyr-packages/*.json` — if any other manifest declares `depends_on: ["agentpact"]`, agentpact is preserved with a `leaving agentpact installed: still required by …` log line. Pass `--no-agentpact` to keep agentpact regardless. `--reset-data` / `--zap` propagates: script-installed agentpact gets `--reset-data`, brew-installed agentpact gets `--zap`, so a full kyris wipe is a full agentpact wipe too. The cascade chose this direction because new kyris versions reconcile the agentpact version on install — there's no reason to leave a stale agentpact behind.
-
-**Mixing channels is unsupported.** If you install kyris via brew but agentpact via the script (or vice versa), dependency tracking is incomplete — brew won't refuse to uninstall a script-installed agentpact while kyris still needs it. Pick one channel per machine and stick with it.
-
-### 1.3 Enterprise mode (planned, phase 2)
-
-Enterprise mode will install `kyrisd` as a root `LaunchDaemon` with tamper-proof local audit logs, signed event entries, root-owned config at `/etc/kyris/`, and a shared socket at `/var/run/kyrisd.sock` — for regulated environments and MDM-managed fleets where the audit trail must survive an adversarial operator. The current `install.sh` rejects `--enterprise` with a "not yet available" message.
-
-### 1.4 Quick Start
-
-```sh
 kyris install
 kyris agent setup --all
 kyris status
 ```
 
-<hr>
+The cask installs the Kyris binaries and the service definition; `kyris install` configures shell hooks and detected agent integrations, and `kyris agent setup --all` wires up every detected agent. A healthy `kyris status` reports the local daemon, AgentPact connection, shell hooks, and configured agent surfaces — and everything works from here with no account (enrollment is optional, covered in [§4.8](#48-syncing-to-a-dashboard)).
 
-## 2. For Users
-Current agent tooling still forces a bad tradeoff. If you let the agent run with broad autonomy, you risk destructive commands, silent tool use, and runaway spend. If you keep every built-in prompt turned on, you spend the whole session babysitting. Kyris tries to remove that tradeoff by getting onto the paths where control is technically real and by being explicit about where it is not.
-
-### 2.1 The Problem Kyris Solves
-There are four recurring problems Kyris is designed to solve.
-
-- **Unsafe autonomy.** Developers want to let agents edit files, run builds, and keep moving, but not `rm -rf`, rewrite git history, or run destructive commands without a real stop.
-- **Weak vendor-specific controls.** Prompt text and agent-native permissions are inconsistent across tools and are not a portable answer for mixed-agent environments.
-- **Poor forensic visibility.** When something breaks, the developer usually has to reconstruct the session from chat logs, terminal output, and git state.
-- **Runaway burn.** Cost visibility and hard spend controls are only honest when Kyris is actually on the request path.
-
-The goal is not "all-seeing governance." The goal is a local runtime that makes the reachable surfaces safer, clearer, and more useful than the status quo.
-
-### 2.2 The Three Control Surfaces
-Kyris uses three surfaces as its organizing model.
-
-| Surface | What it governs | How Kyris gets in | What the user gets |
-| --- | --- | --- | --- |
-| **Execution surface** | Shell commands and environment-changing actions | Shell hooks and live agent hook adapters talk to the AgentPact daemon | Preventive allow / ask / deny before risky local actions run |
-| **Tool surface** | MCP tool calls | `kyris-mcp` for stdio MCP or `kyrisd` for HTTP MCP | Policy checks and auditable tool use on reachable MCP paths |
-| **Burn-control surface** | LLM usage, routing, and token breaker behavior | The agent points its provider base URL at `kyrisd` | Metered usage, local cost records, and token circuit breaking on routed traffic |
-
-```mermaid
-flowchart LR
-  agent[Agent]
-
-  subgraph executionSurface [Execution Surface]
-    shellHooks[Shell hooks]
-    liveHooks[Live hook adapters]
-    agentpactdExec[agentpactd]
-  end
-
-  subgraph toolSurface [Tool Surface]
-    kyrisMcp[kyris-mcp]
-    kyrisdMcp[kyrisd HTTP MCP routing]
-    mcpServer[MCP server]
-  end
-
-  subgraph burnSurface [Burn-Control Surface]
-    kyrisdLlm[kyrisd LLM proxy]
-    llmProvider[LLM provider]
-  end
-
-  agent -->|"shell commands"| shellHooks --> agentpactdExec
-  agent -->|"native hook callbacks"| liveHooks --> agentpactdExec
-  agent -->|"stdio tools/call"| kyrisMcp --> mcpServer
-  kyrisMcp -->|"permission check"| agentpactdExec
-  agent -->|"HTTP MCP"| kyrisdMcp --> mcpServer
-  kyrisdMcp -->|"permission check"| agentpactdExec
-  agent -->|"LLM requests"| kyrisdLlm --> llmProvider
-```
-
-### 2.3 How Kyris Fits Into The Local Stack
-Kyris is not one binary pretending to solve everything. The local stack has two layers: the AgentPact daemon, which comes from the `agentpact` project, and the Kyris-owned components in this repo that sit on top of it. Those Kyris components do not all have the same long-term role: some are enduring product surfaces, while others are explicit bridges for today's non-native agents.
-
-| Component | What it does | Problem it solves | Long-term role in an AgentPact-native world |
-| --- | --- | --- | --- |
-| **AgentPact daemon (`agentpactd`)** | Evaluates policy, issues decisions, writes the standard event log, and defines the open permission protocol | Gives every governed action a portable policy and audit model | **Foundational.** A compliant agent still needs an AgentPact runtime or equivalent daemon behavior |
-| **Shell hooks** | Put the AgentPact decision path in front of shell commands | Stops destructive shell actions before they run | **Long-term complementary layer.** The architecture docs are explicit that native integrations do not replace shell hooks; they remain defense in depth for anything that reaches the shell |
-| **Live native hook adapters** | Bridge an agent's native hook system to the AgentPact daemon on each action | Covers agent-specific actions that never touch the shell | **Bridge for today's agent surfaces.** Less central when an agent exposes native AgentPact mediation directly, but still useful until that path is real |
-| **Compiled policy adapters** | Render a bounded slice of AgentPact policy into agent-native permission config | Gives some protection for agents that expose static config but no live hook | **Compatibility bridge, not the destination.** The architecture treats these as degraded defense in depth, not a substitute for live daemon mediation |
-| **`kyrisd`** | Kyris daemon for LLM routing, HTTP MCP routing, local storage, and sync | Gets Kyris onto the burn-control and HTTP MCP paths | **Long-term product daemon.** Right now its spend records are the primary local spend signal because most agents do not yet emit native AgentPact usage events; in an AgentPact-native future the daemon log becomes primary and `kyrisd` becomes routing plus convenience cache / cross-reference rather than the primary source of spend truth |
-| **`kyris-mcp`** | Wraps stdio MCP servers and checks `tools/call` against policy | Governs stdio MCP where launch-command interception is the reachable surface | **Long-term tool-surface component for stdio MCP.** It remains the Kyris path for local stdio MCP governance wherever wrapping the server command is still the real interception point |
-| **`kyris` CLI** | Install, setup, status, timeline, history, replay, stats, scan, daemon control | Makes the system deployable and explainable to an actual developer | **Long-term product surface.** Local evidence queries, timeline, scan, install, and enroll stay in Kyris even when the open contract lives in AgentPact |
-
-The distinction is straightforward. Compiled adapters are compatibility bridges for agents that do not expose a better live path yet, and `kyrisd`'s current spend records are a temporary bridge until agents emit native AgentPact usage events. Shell hooks, `kyrisd` as a product daemon, `kyris-mcp`, and the `kyris` CLI are the longer-lived Kyris surfaces that sit above the AgentPact contract rather than trying to replace it.
-
-### 2.4 How You Actually Use Kyris
-The normal workflow is simple. Exact output depends on what is installed and what the agent just did, but it should look roughly like this.
-
-1. Install the binaries with Homebrew or the install script.
-
-   Example response from the install script:
-
-   ```text
-   [kyris] kyris installer
-   [kyris] Fetching latest release...
-   [kyris] Downloading kyris v0.1.0 for aarch64-apple-darwin...
-   [kyris] Installed binaries to /Users/alex/.local/bin
-   [kyris] Installation complete!
-   ```
-
-2. Run `kyris install` to set up shell hooks, binaries, and agent integrations.
-
-   Example response:
-
-   ```text
-   Kyris Installer
-   ===============
-   Installed hooks:
-     - updated ~/.zshrc
-     - updated ~/.bashrc
-   Installed claude-code:
-     - wrote /Users/alex/.claude/hooks/agentpact_pretooluse.sh
-
-   Component status:
-   Missing components:
-     agentpactd - Install separately via AgentPact's own installer.
-   ```
-
-3. Run `kyris agent setup <agent>` for the agents you use, or `kyris agent` to see what Kyris detected.
-
-   Example response:
-
-   ```text
-   $ kyris agent
-   Agent         Execution        Tool             Burn-Control     Status
-   claude-code   adapted(hook)    adapted(hook)    none             ok
-   codex-cli     none             none             none             ok
-   cline         none             none             none             ok
-
-   $ kyris agent setup claude-code
-   Applied setup for claude-code:
-     wrote /Users/alex/.kyris/env/load.sh
-     wrote /Users/alex/.kyris/env/claude-code.sh
-     updated ~/.zshrc
-   ```
-
-4. Point supported LLM traffic at `kyrisd` if you want real burn control on that path.
-
-   Example result for routed agents:
-
-   ```sh
-   # ~/.kyris/env/claude-code.sh
-   export ANTHROPIC_BASE_URL=http://127.0.0.1:4710
-   export ANTHROPIC_API_KEY=sk-kyris-inbound
-
-   # ~/.kyris/env/codex-cli.sh
-   export OPENAI_BASE_URL=http://127.0.0.1:4710/v1
-   export OPENAI_API_KEY=sk-kyris-inbound
-   ```
-
-5. Work normally, then use the query commands when you want to inspect what happened.
-
-   Example response:
-
-   ```text
-   2026-04-25T15:03:11Z  claude-code     execute    denied   [enforced] git push --force origin main
-   2026-04-25T15:03:17Z  anthropic       think      ok       [observed] claude-4-sonnet-20250301  [1820→412]  $0.0214  [local]
-   2026-04-25T15:03:22Z  claude-code     write      auto     [enforced] kyris/README.md
-   ```
-
-The most useful commands for day-to-day use are:
-
-- `kyris status`
-
-  Example response:
-
-  ```text
-  Kyris Status
-  ============
-    [+] agentpactd (/Users/alex/.agentpact/agentpact.sock)
-    [+] kyrisd (launchd, http://127.0.0.1:4710/healthz)
-    [+] shell hooks
-    [+] claude-code live hook
-    [-] codex-cli live hook
-    [-] gemini-cli live hook
-    [-] cline compiled policy
-    [-] enrolled
-    [+] component versions aligned (kyris=0.1.0, kyrisd=0.1.0, agentpactd=0.1.0)
-  ```
-
-- `kyris activity`
-
-  Example response:
-
-  ```text
-  2026-04-25T15:03:11Z  claude-code     execute    denied   [enforced] git push --force origin main
-  2026-04-25T15:03:17Z  anthropic       think      ok       [observed] claude-4-sonnet-20250301  [1820→412]  $0.0214  [local]
-  2026-04-25T15:03:22Z  claude-code     write      auto     [enforced] kyris/README.md
-  ```
-
-- `kyris activity stats`
-
-  Example response:
-
-  ```text
-  Actions by decision:
-    execute    denied   1
-    write      auto     7
-
-  Coverage breakdown:
-    enforced         8
-    observed         3
-
-  Token usage:
-    anthropic        3 requests        5420 in         980 out
-
-  Spend:
-    anthropic    claude-4-sonnet-20250301      $  0.2143  (3 requests)
-  ```
-
-- `kyris activity` (filtered)
-
-  Example response:
-
-  ```text
-  2026-04-25T15:03:22Z  claude-code     write      auto     kyris/README.md
-  2026-04-25T15:03:11Z  claude-code     execute    denied   git push --force origin main
-  ```
-
-- `kyris activity replay <session>`
-
-  Example response:
-
-  ```text
-  2026-04-25T15:03:05Z  claude-code     execute    approved [enforced] cargo test  mode=ask
-  2026-04-25T15:03:11Z  claude-code     execute    denied   [enforced] git push --force origin main  mode=deny
-
-  Gateway records:
-    2026-04-25T15:03:17Z  anthropic    claude-4-sonnet-20250301    ok        842ms  [1820→412]  $0.0214
-
-  3 events replayed.
-  ```
-
-Two points are worth being explicit about.
-
-- **Everything is independently installable.** You can use Kyris just for shell governance, just for routed LLM traffic, just for MCP wrapping, or as a combined local stack.
-- **Kyris only claims control on paths it actually owns.** If your agent bypasses `kyrisd`, you do not get a Kyris token breaker on that path. If an MCP call never passes through `kyris-mcp` or `kyrisd`, Kyris does not pretend it governed it.
-
-### 2.5 Burn Control, Timeline, And Reports
-Kyris is meant to replace a messy reconstruction workflow. Without it, you piece the story together from chat history, terminal scrollback, vendor dashboards, and guesswork. With it, you use one local interface to answer the two questions people ask after every serious agent run: "What happened?" and "What did it cost?"
-
-- `kyris activity` is the fast answer when you want the full picture: commands, approvals, tool calls, model usage, and coverage in one human-readable stream.
-- `kyris activity stats` is the burn-control view: where tokens went, which models were active, how decisions broke down, and what Kyris could actually see.
-- `kyris activity --agent X --since T` (any filter) is the searchable view when you want to narrow by agent, action, decision, or time range.
-- `kyris activity replay <session>` is the forensic view when you want one session reconstructed in order.
-
-If you enroll the machine, in-scope records can also sync to the hosted Kyris product. The local CLI still works without enrollment, and the open-source value proposition should stand on its own even if you never sync anything.
-
-### 2.6 Coverage Honesty
-Coverage terms describe what Kyris actually saw and controlled. If Kyris does not own the path, it does not claim to control the path.
-
-| Coverage state | What it means | Typical example |
-| --- | --- | --- |
-| **`enforced`** | Kyris intercepted the action and applied policy before execution | Shell command stopped by hooks, MCP call checked before execution |
-| **`observed`** | Kyris saw the action or its direct side effects, but not as a guaranteed preventive gate | Routed LLM request recorded by `kyrisd` without a stronger pre-execution claim on downstream effects |
-| **`vendor_reported`** | Kyris learned about the action from a vendor feed rather than a local preventive path | Vendor audit or analytics feed |
-| **`unknown`** | Kyris had no trustworthy visibility into the path | Ungoverned traffic that bypassed Kyris entirely |
-
-```mermaid
-flowchart TD
-  agentAction[Agent action]
-  governedPath[Path Kyris controls before execution]
-  seenLater[Path Kyris can observe later]
-  vendorFeed[Vendor feed or audit export]
-  blindPath[Path outside Kyris visibility]
-
-  enforced[enforced]
-  observed[observed]
-  vendorReported[vendor_reported]
-  unknown[unknown]
-
-  agentAction --> governedPath --> enforced
-  agentAction --> seenLater --> observed
-  agentAction --> vendorFeed --> vendorReported
-  agentAction --> blindPath --> unknown
-```
-
-That honesty matters because it keeps the tool trustworthy. Kyris is strongest when it is boringly clear about what it really intercepted, what it only observed, and what it never saw at all.
-
-### 2.7 Why Kyris Enforces The Workspace
-
-Kyris treats the directory an agent is launched from as that session's permitted domain: inside it, the agent should work freely; outside it, nothing changes without an explicit decision. That boundary is not a constraint to apologize for — it is the mechanism that makes agent autonomy safe to grant. Four reasons:
-
-- **A boundary you can enforce beats judgment you have to trust.** Allow/ask/deny decisions are made from what a command *declares* it will do. Declarations can be incomplete, and a command's behavior can diverge from its classification. "Does this write stay inside the workspace?" is a question with a checkable answer, independent of how well the command was understood.
-- **The boundary is what makes fewer prompts possible.** Every prompt buys confidence about one command. A workspace boundary buys the same confidence wholesale: if nothing outside the workspace can be touched, routine workspace edits no longer need per-command confirmation — the boundary absorbs the risk the prompts were covering. Autonomy inside, control at the edge.
-- **Mistakes become breakage, not damage.** Kyris guards against agent mistakes, not malicious agents. With an enforced boundary, a misclassified or surprising command fails at the edge instead of quietly modifying something outside the project — the failure is visible and recoverable rather than discovered later.
-- **One boundary covers everything.** Kyris launches every supported agent through a small wrapper, and a boundary imposed at launch is inherited by every process the agent ever spawns — every shell, every command, every helper — including paths no hook sees. It is the only control that is both agent-agnostic and total.
-
-By default the workspace boundary is enforced on the decision path: writes and deletes outside the workspace ask or deny, and writes inside it follow the `workspace_writes` policy (default ask).
-
-Kernel enforcement is also a core part of this, **on by default** wherever an OS sandbox backend exists (macOS Seatbelt today; Linux planned). Each newly launched agent runs inside an OS sandbox whose writable root is its launch directory — the whole agent process tree, jailed at the kernel. There is no switch to flip and no marker file; `kyris status` reports whether the jail is active on this host. Inside a verified jail, workspace writes stop prompting entirely (they auto-allow), because a misclassified or surprising write can no longer escape the boundary: it fails at the kernel, not at our judgement. Each governed action records whether it ran sandboxed, so the audit trail never conflates a kernel-confined run with an advisory one. On a platform with no backend the jail is simply inactive (the agent launches normally); the boundary is still enforced on the decision path. Coverage claims stay honest per §2.6 regardless: an action is only reported as kernel-enforced when it actually ran inside a verified jail.
-
-<hr>
-
-## 3. For Developers
-This repo contains the open deployable tools in the Kyris stack. It does not contain the AgentPact standard itself, and it does not contain Kyris's hosted services. The code here exists to get onto reachable local surfaces, make the AgentPact daemon useful, and turn local events plus routed model traffic into something a developer can actually inspect.
-
-### 3.1 Architecture At A Glance
-The architecture is intentionally split into three buckets.
-
-| Bucket | What it owns | Why the split exists |
-| --- | --- | --- |
-| **AgentPact** | The open standard, daemon semantics, policy format, protocol, event schema, and conformance model | Keeps governance portable and not tied to one product implementation |
-| **Kyris OSS** | The local runtime and developer tooling in this repo | Gets onto reachable surfaces, produces local value, and makes the standard deployable |
-| **Kyris Proprietary** | Hosted governance system, evidence graph, and organization-level operations | Covers live ops, sync, approvals, and enterprise workflows that do not belong in a repo-local standard |
-
-The main architectural boundary is one-way dependency: Kyris depends on AgentPact; AgentPact must not depend on Kyris.
-
-That is why a machine can legitimately run two daemons: `agentpactd` as the standard daemon and `kyrisd` as the Kyris product daemon.
-
-```mermaid
-flowchart LR
-  agent[Agent]
-  shellHooks[Shell hooks]
-  liveHooks[Live hook adapters]
-  compiledPolicy[Compiled policy adapter]
-  agentpactd[agentpactd]
-  kyrisd[kyrisd]
-  kyrisMcp[kyris-mcp]
-  stdioServer[stdio MCP server]
-  httpServer[HTTP MCP server]
-  llmProvider[LLM provider]
-  eventLog[AgentPact event log]
-  duckdb[kyrisd.duckdb]
-  kyrisCli[kyris CLI]
-  kyrisApp[Kyris App optional]
-
-  agent -->|"shell actions"| shellHooks --> agentpactd
-  agent -->|"native hook callbacks"| liveHooks --> agentpactd
-  compiledPolicy -.renders static permissions into.-> agent
-
-  agent -->|"stdio MCP"| kyrisMcp --> stdioServer
-  kyrisMcp -->|"permission check"| agentpactd
-
-  agent -->|"LLM and HTTP MCP"| kyrisd
-  kyrisd -->|"provider traffic"| llmProvider
-  kyrisd -->|"HTTP MCP routing"| httpServer
-  kyrisd -->|"permission and trace calls"| agentpactd
-
-  agentpactd --> eventLog
-  kyrisd --> duckdb
-  kyrisCli --> eventLog
-  kyrisCli --> duckdb
-  kyrisd -.optional sync.-> kyrisApp
-```
-
-### 3.2 Repo Layout
-This repo is deliberately kept small. It separates pure types, shared local logic, binaries, and install-time assets so contributors can reason about boundaries quickly.
-
-| Path | Purpose | Notes |
-| --- | --- | --- |
-| `types/` | `kyris-types`: pure schema and serialization types | No I/O, no DuckDB, no sockets, no runtime concerns |
-| `core/` | `kyris-core`: shared local helpers | Re-exports `kyris-types` and adds config loading plus AgentPact wire helpers |
-| `agentpact-client/` | UDS client for `agentpactd` | Keeps daemon communication logic out of the binaries |
-| `daemon/` | `kyrisd` | LLM routing, HTTP MCP routing, local storage, sync, tray, notifications |
-| `cli/` | `kyris` | Installer, setup, query commands, scan, status, lifecycle commands |
-| `mcp/` | `kyris-mcp` | Minimal stdio MCP wrapper for governed `tools/call` paths |
-| `hooks/helper/` | `kyris-hook` | Tiny helper binary for the shell-hook protocol boundary (check, respond, send). Native agent hooks use `kyris hook check` instead. |
-| `hooks/` | Zsh and Bash hook scripts | Transport glue only; shell scripts do not own JSON protocol logic |
-| `integrations/` | Agent-specific integration assets | Legacy compiled-policy assets. Live hook scripts, bridges, and plugins are generated at runtime by shared code in `cli/src/agents/configure.rs`. |
-| `config/` | Runtime defaults and examples | Includes `default.yaml`, `example.yaml`, and pricing data |
-| `service/` | Service definitions | Currently the `launchd` plist for `kyrisd` |
-
-```mermaid
-flowchart TD
-  kyrisTypes[kyris-types]
-  kyrisCore[kyris-core]
-  agentpactClient[kyris-agentpact-client]
-  kyrisd[kyrisd]
-  kyrisCli[kyris CLI]
-  kyrisMcp[kyris-mcp]
-  kyrisHook[kyris-hook]
-  assets[hooks integrations config service]
-  agentpactRuntime[agentpact and agentpactd]
-
-  kyrisTypes --> kyrisCore
-  kyrisCore --> agentpactClient
-  kyrisCore --> kyrisd
-  kyrisCore --> kyrisCli
-  kyrisCore --> kyrisMcp
-  kyrisCore --> kyrisHook
-  assets --> kyrisd
-  assets --> kyrisCli
-  assets --> kyrisHook
-  agentpactRuntime -.protocol and policy boundary.-> agentpactClient
-```
-
-### 3.3 Runtime Flows
-The runtime has three main flows, one per reachable surface.
-
-- **Execution flow.** Shell hooks pass actions to `kyris-hook` (fast, synchronous). Live native hook adapters use `kyris hook check` (full CLI binary with hold-poll-resolve for `PACT_ASK`). Both talk to `agentpactd` and return allow / deny results in the format the caller expects.
-- **Tool flow.** `kyris-mcp` interposes on stdio MCP `tools/call`; `kyrisd` interposes on HTTP MCP. Both use AgentPact policy decisions rather than inventing a second policy model.
-- **Burn-control flow.** `kyrisd` accepts provider-native requests, forwards them upstream in the same provider format, meters the result, enriches it with local cost data, and stores it in DuckDB.
-
-The local evidence loop is the key product shape: preventive decisions go into the AgentPact event log, routed gateway records go into DuckDB, and the CLI reads both.
-
-```mermaid
-flowchart TD
-  agent[Agent]
-  routeChoice[Chosen path]
-  shellHooks[Shell hooks]
-  kyrisHook[kyris-hook]
-  agentpactd[agentpactd]
-  kyrisMcp[kyris-mcp]
-  kyrisd[kyrisd]
-  mcpServer[MCP server]
-  llmProvider[LLM provider]
-  eventLog[events.jsonl]
-  duckdb[kyrisd.duckdb]
-  kyrisCli[kyris CLI]
-
-  agent --> routeChoice
-  routeChoice -->|"Execution"| shellHooks --> kyrisHook --> agentpactd --> eventLog
-  routeChoice -->|"stdio MCP"| kyrisMcp --> mcpServer
-  kyrisMcp -->|"permission check"| agentpactd
-  routeChoice -->|"LLM or HTTP MCP"| kyrisd
-  kyrisd --> llmProvider
-  kyrisd --> duckdb
-  agentpactd --> eventLog
-  eventLog --> kyrisCli
-  duckdb --> kyrisCli
-```
-
-**Native hook response contract.** `kyris hook check` is the shared decision engine behind every live agent adapter. The installed hook, bridge, or plugin translates the agent's native payload into Kyris's normalized action model, calls `agentpactd`, then emits the response shape that that agent expects. The hook response shape and its real effect are intentionally modeled separately because agents differ: an exit-0 JSON allow suppresses Claude Code's native prompt, Gemini CLI parses an allow-shaped response but still applies its own confirmation path, and Codex CLI needs a separate `PermissionRequest` hook to suppress the native approval prompt.
-
-| Hook response | Agent reaction |
-| --- | --- |
-| Exit 2 + stderr message | Block. Tool is denied; the message surfaces to the LLM. No prompt. |
-| Exit 0 + empty stdout | No decision. Backstopped agents fall back to their built-in permission rules. Agents without a native backstop must not silently defer in enforce mode, so Kyris denies unmapped or daemon-unavailable actions instead. |
-| Exit 0 + JSON body in the agent's expected shape | Agent-specific allow / ask response. Whether it suppresses the native prompt is declared on the agent's `HookRuntime`, not inferred from JSON alone. |
-
-Per-agent response shape lives on `HookProtocol::allow_response`, prompt behavior lives on `HookRuntime::allow_suppresses_agent_prompt`, and native ask behavior lives on `HookProtocol::native_ask` in `cli/src/agents/registry.rs`. Codex CLI additionally declares `permission_request_allow`, which lets Kyris answer Codex's native `PermissionRequest` hook after AgentPact or a recent Kyris approval already allowed the action.
-
-### 3.4 Interface To Agents
-Agent support is implemented as a small descriptor plus shared delivery code, not as a separate installer for each agent. The central contract is `AgentDescriptor` in `cli/src/agents/registry.rs`; each supported agent implements it in `cli/src/agents/<agent>.rs`.
-
-The descriptor has four jobs.
-
-1. **Declare the plan.** `integration_plan()` states the intended coverage for execution, tool, and burn-control surfaces. A surface can be `None`, `AgentPactNative`, or `Adapted` with typed mechanisms. Execution mechanisms include `LiveHookAdapter`, `ShellHook`, and `CompiledPolicy`; tool mechanisms include `LiveHookAdapter` and `McpWrapping`; burn-control mechanisms include `EnvVarProxy`, `ConfigRewrite`, `KyrisdModelProvider`, and `AgentPactUsageReport`.
-2. **Describe native hook semantics.** `hook_protocol()` declares payload fields, governed tool mappings, safe pass-through tools, agent-owned tools, allow / ask response shapes, MCP tool naming, and the `HookRuntime`. `HookRuntime` records the agent hook timeout, timeout posture, whether native permissions still backstop an empty response, and whether the allow response actually suppresses the agent prompt.
-3. **Expose config locations.** `mcp_configs()`, `burn_control_config_paths()`, `provider_routing()`, `env_exports()`, and the configure / undo methods tell the shared machinery where to rewrite MCP servers, where to route provider traffic, and how to restore user files.
-4. **Report evidence.** `probe()` reports installed state, managed files, and per-surface status. Reconcile also reads `.live-seen` breadcrumbs written by live execution hooks, `kyris-mcp`, and `kyrisd` so `kyris agent <id>` can distinguish "configured" from "observed working live."
-
-The current Phase 1 descriptors are:
-
-| Agent | Canonical id | Execution | Tool | Burn control | Notes |
-| --- | --- | --- | --- | --- | --- |
-| Claude Code | `anthropic/claude-code` | live hook | MCP wrapping | env proxy | Multi-scope MCP config; Claude's JSON allow suppresses the native prompt. |
-| Codex CLI | `openai/codex-cli` | live hook + compiled policy | MCP wrapping | kyrisd model provider | Uses both `PreToolUse` and `PermissionRequest`; the latter completes the allow path without double prompting. |
-| Gemini CLI | `google/gemini-cli` | live hook + compiled policy | MCP wrapping | env proxy | Compiled policy is used for native prompt suppression; JSON hook allow alone does not suppress Gemini's prompt. |
-| Cline | `cline/cline` | live hook bridge | MCP wrapping | config rewrite | No native backstop in CLI mode, so Kyris denies instead of silently deferring when it cannot classify a live-hook action. |
-| OpenCode | `opencode/opencode` | live hook plugin | MCP wrapping | config rewrite | No native backstop after Kyris installs permissive native permissions, so the plugin is the gate. |
-
-For live execution hooks, the shared flow is:
-
-```text
-agent native hook payload
-  -> installed shell script / JS bridge / plugin
-  -> kyris hook check --agent <id>
-  -> HookProtocol maps native tool name and detail into AgentPact action
-  -> agentpactd returns allow / ask / deny
-  -> kyris emits the agent-specific hook response
-```
-
-`tool_mappings` are for side-effecting actions that AgentPact can govern, such as shell execution, file reads, writes, deletes, and MCP tool calls. `pass_through_tools` are known no-side-effect coordination primitives that Kyris intentionally allows without contacting `agentpactd`. `agent_owned_tools` are known tools whose native agent control should stay in charge, such as agent-native web domain prompts or session-control operations. Unknown tools defer only when `HookRuntime.native_backstop` is true; otherwise they deny in enforce mode because empty stdout would be a silent allow.
-
-For MCP, the descriptor returns every config location that can launch MCP servers. The shared rewrite registers the original upstream in `kyrisd.yaml`, then rewrites stdio servers through `kyris-mcp wrap --agent <canonical-id>` and HTTP servers through `kyrisd`'s `/mcp/<server>/` route with `x-kyris-agent-id` attribution. Undo is manifest-driven so it can restore files even when the current working directory no longer matches the setup-time project.
-
-For burn control, the interface supports two broad delivery styles. Env-routed agents declare `ProviderRouting`, and the shared `env_exports()` points provider base URLs at `kyrisd` while carrying `x-kyris-inbound` and `x-kyris-agent-id` in the agent's custom header mechanism. Config-routed agents implement `configure_burn_control_surface()` to write the agent's provider config directly. Kyris only claims burn-control coverage when the probe can verify that the effective provider path really points at `kyrisd`.
-
-Native AgentPact adoption is modeled as promotion, not as a separate agent implementation. `capabilities.json` declarations can promote individual surfaces to `AgentPactNative`; reconcile then removes the adapted bridge for that surface and reports native coverage while keeping other adapted surfaces in place. This lets an agent adopt AgentPact one surface at a time without breaking the existing Kyris descriptor.
-
-When adding or changing an agent, keep the descriptor declarative and put reusable delivery in shared code. Add or update registry invariants when a new mechanism requires a companion artifact, when timeout or backstop semantics change, or when a new native approval path is introduced. The high-risk tables are tool names and config locations; stale entries should fail tests or show degraded status rather than quietly expanding the ungoverned path.
-
-### 3.5 Design Decisions That Matter
-Several decisions are intentional enough that contributors should treat them as constraints, not suggestions.
-
-- **No per-project Kyris config.** Project-specific policy belongs in AgentPact's directory walk-up tree. `kyrisd.yaml` is machine-wide.
-- **No provider normalization layer.** `kyrisd` uses native-format passthrough for provider adapters. Shared infra is metering, circuit breaking, auth, and storage, not request translation.
-- **Shell scripts stay thin.** `kyris-hook` owns the shell-to-daemon protocol boundary so the scripts remain transport glue. Native agent hooks use `kyris hook check` in the full CLI binary for the hold-poll-resolve pattern that `PACT_ASK` requires.
-- **Coverage claims are path-based.** If Kyris is not on the path, the right answer is `observed`, `vendor_reported`, or `unknown`, not wishful thinking.
-- **`kyris-types` is a stability boundary.** Pure shared types stay separate so local crates and future hosted systems can share a contract without dragging in runtime dependencies.
-- **`kyris-mcp` stays intentionally minimal.** Stdout is reserved for JSON-RPC, so the wrapper avoids database, web stack, and heavy observability dependencies on purpose.
-
-### 3.6 Current Scope And Extension Points
-Kyris is deliberately narrow today: macOS-first developer tooling, not a universal governance platform pretending to be finished.
-
-The current extension points line up with that scope.
-
-| Area | Current shape | Where you extend it |
-| --- | --- | --- |
-| Provider routing | Anthropic, OpenAI, and Google passthrough adapters in `kyrisd` | `daemon/src/adapter/` |
-| Agent descriptors | Claude Code, Codex CLI, Gemini CLI, Cline, OpenCode | `cli/src/agents/registry.rs` plus `cli/src/agents/<agent>.rs` |
-| Live agent hooks | Claude Code, Codex CLI, Gemini CLI, Cline, OpenCode | `cli/src/agents/configure.rs` for shared hook delivery and `cli/src/hook_cmd.rs` for the shared decision engine |
-| Compiled policy | Codex CLI and Gemini CLI permission rendering | `cli/src/compile_policy.rs` |
-| Query and reporting UX | Timeline, history, replay, stats, scan, status | `cli/src/` |
-| Local runtime packaging | Config templates, service definitions, install flow | `config/`, `service/`, `install.sh` |
-
-What should not happen in a contribution here is just as important.
-
-- Do not add a second project-scoped configuration system.
-- Do not smuggle in a provider translation layer under the name of an adapter.
-- Do not make blanket burn-control claims for traffic Kyris does not own.
-- Do not turn AgentPact policy into a Kyris-only policy dialect.
-
-### 3.7 Testing And Further Reading
-Tests live with the crates they exercise rather than under one monolithic top-level test directory. If you are changing behavior, start with the crate that owns that surface.
-
-The standard local checks are:
+### 3.2 Install Script
 
 ```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo deny check
-cargo bench -p kyrisd -- --test
+curl -fsSL https://raw.githubusercontent.com/kyr-is/kyris/main/install.sh | bash
+kyris install
 ```
 
-If you need more implementation context, read these next.
+Useful when Homebrew is unavailable. It installs the same binaries and prepares the same local runtime layout. Pick one channel and stay on it — mixing Homebrew and script installs on one machine is unsupported, because dependency tracking and uninstall differ.
 
-1. [AgentPact README](https://github.com/kyr-is/agentpact/blob/main/README.md) for the open standard boundary.
-2. [`AGENTS.md`](AGENTS.md) for build, test, workspace, and runtime-path conventions in this repo.
-3. [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution workflow and project expectations.
+### 3.3 Upgrading
 
-The short version is simple: AgentPact defines the contract, Kyris gets onto the path, and the code in this repo should stay honest about the difference.
+Use the channel you installed with — `brew upgrade --cask kyr-is/tap/kyris`, or rerun the install script.
 
-<hr>
+### 3.4 Uninstalling
 
-## Appendix: CLI Reference
+```sh
+kyris uninstall                                  # remove agent + shell integration only
+~/.kyris/installer.sh --uninstall                # normal uninstall, preserves your data
+~/.kyris/installer.sh --uninstall --reset-data   # clean slate, removes data too
+```
 
-### Setup
+(Homebrew equivalents: `brew uninstall --cask kyr-is/tap/kyris`, and `--zap` for the clean slate.) A normal uninstall preserves config, credentials, logs, and the local event store under the XDG directories so a reinstall picks up where you left off; the reset/zap path removes them.
+
+## 4. Operating Kyris
+
+Kyris is modular — use one surface or the whole local stack. Each capability below is what it does, how you use it, and a line on how it works.
+
+### 4.1 Governing Shell Commands
+
+`kyris install` adds a Kyris hook to your shell startup (zsh and bash) so an agent's commands are checked against AgentPact policy **before they run** — the most direct way to stop a destructive delete or a history rewrite. Kyris analyzes the actual command, not a prefix, so it sees through compound commands (`a && b`) and wrappers, and decides per segment.
+
+It governs **the agent's commands, not your own typing.** The hook activates only when the shell is inside a governed agent's process tree (detected from the agent's markers or a short parent-process walk) and skips the shell's own startup files, so your interactive terminal is untouched. When a command is checked:
+
+- **allow** → it runs (and is recorded).
+- **ask** → you're prompted — on the terminal if the agent left one free, otherwise via the desktop popup ([§4.3](#43-approvals)).
+- **deny** → it's blocked, with a reason.
+
+If the daemon is ever unreachable, the behavior is explicit and visible — Kyris records the command to a fail-open spool and either allows or blocks per your `on_daemon_unavailable` setting, never a silent pass ([§7.3](#73-graceful-degradation)).
+
+Test a decision without running anything:
+
+```sh
+kyris policy check 'git push --force origin main'
+```
+
+### 4.2 Governing MCP Tools
+
+MCP tool calls often never touch a shell, so Kyris governs them on two paths.
+
+**Stdio servers** — wrap the launch command with `kyris-mcp` in your MCP client's config:
+
+```jsonc
+// before:  "command": "my-mcp-server", "args": ["--arg", "value"]
+"command": "kyris-mcp",
+"args": ["wrap", "--server", "my-server", "--", "my-mcp-server", "--arg", "value"]
+```
+
+`kyris agent setup` rewrites supported agents' MCP configs this way for you.
+
+**HTTP servers** — route through `kyrisd` by enabling MCP routing and registering the upstream in `kyrisd.yaml`:
+
+```yaml
+mcp:
+  enabled: true
+  servers:
+    - name: my-server
+      upstream: https://my-mcp-host/mcp
+```
+
+Either way, Kyris checks each reachable `tools/call` against policy — a `delete_file` or `drop_table` tool can be `ask` or `deny` — and records it.
+
+### 4.3 Approvals
+
+When a governed action resolves to **ask**, Kyris surfaces the approval itself — a desktop prompt (plus tray and app) where you **approve once**, **approve for the rest of the session**, or **deny** — and routes your answer back to the pending action. You get the same approval experience across every agent, instead of each agent's own permission model.
+
+"Approve for the session" is remembered only for **that agent's session** and cleared when the session ends or policy changes — it doesn't silently persist or carry across agents. And for an agent with its own native prompt, Kyris can hand the decision back to it if Kyris's own path is unavailable, so a down daemon never silently lets an action through.
+
+```sh
+kyris activity approvals   # review recent approval decisions
+```
+
+### 4.4 Stopping Runaway Loops
+
+When an agent's model traffic runs through `kyrisd`, Kyris meters the model's **output tokens since its last action**. A tool, shell, or MCP call resets that meter to zero — a working agent never approaches the cap; only a no-action generation loop does. When the count crosses the cap, `kyrisd` **gates the next request and asks you: continue or stop?** It does not auto-kill the agent — you answer on the terminal, or from the desktop popup when the agent owns it, and either answer resets the meter. Streaming responses get a stop event so the agent unwinds cleanly. This applies only to traffic routed through the gateway.
+
+Defaults, in `kyrisd.yaml`:
+
+```yaml
+circuit_breaker:
+  enabled: true
+  max_tokens: 200000                # no-action output tokens before gating
+  decision_timeout_seconds: 604800  # hold up to 7 days for a human, then stop
+```
+
+The hold is deliberately long: the agent should wait for a person, not receive a confusing automatic error — the timeout is only a backstop so a never-answered prompt can't pin a connection forever.
+
+### 4.5 Tracking and Controlling Model Spend
+
+Spend tracking and the runaway gate both need an agent's provider traffic to pass through `kyrisd`. `kyris agent setup` wires that up — pointing the agent's provider base URL (or provider config) at the local gateway (`127.0.0.1:4710`), which forwards to the real provider **with your own credential** (Kyris stores no provider key of its own). The exact mechanism per agent is in [§5](#5-agent-support).
+
+On that path Kyris meters each request, computes spend from a pricing table it fetches from the relay (no enrollment needed), attaches a trace id, and attributes usage per agent and model — distinguishing **plan-included** from **billable overage** so the numbers reflect what you actually pay.
+
+Set thresholds to be warned before a surprise — a desktop alert fires when the rolling total crosses each:
+
+```yaml
+spend:
+  warn_thresholds_usd: [10, 50, 100]
+  window_hours: 24   # rolling window (default 24h)
+```
+
+Kyris only claims burn-control for traffic that passes through `kyrisd`. If an agent talks directly to a provider, Kyris does not pretend it governed that traffic.
+
+<!-- Embedded into kyris-app /docs/install via ReadmeSection — keep this heading text stable. -->
+### 4.6 Seeing What Happened
+
+Kyris keeps **two local evidence streams** — AgentPact governance events (commands, decisions, attribution, coverage) and `kyrisd` gateway records (provider, model, tokens, cost) — in a local store at `~/.local/share/kyris/kyrisd.duckdb`, and joins them, exactly once, into a single **timeline** correlated by **session** and model-call **trace id**. (Default retention is 7 days; tune `stats.retention_days`.)
+
+```sh
+kyris status                      # posture + component health
+kyris activity                    # the unified event stream
+kyris activity stats              # token, spend, and decision summaries
+kyris activity replay <session>   # reconstruct a session in order
+kyris activity trace <trace_id>   # records sharing one model-call trace
+```
+
+Each `activity` row shows the agent, the command or model call, the decision and coverage, and — for model calls — tokens and cost; `stats` totals spend by provider and model and breaks decisions down by agent. One coherent record across governance *and* spend, all on your machine — no chat-transcript archaeology.
+
+### 4.7 Tuning Policy
+
+Kyris uses **AgentPact policy** rather than inventing a Kyris-only language — `allow` / `ask` / `deny` are AgentPact decisions, and Kyris presents the operator UX around them.
+
+- **Check** a command before trusting it: `kyris policy check '<command>'` — shows the decision and the rule behind it.
+- **Enable / disable** enforcement: `kyris policy enable` enforces; `kyris policy disable` keeps recording but stops prompting or denying (log-only).
+- **What the decisions mean**: `allow` runs silently (still recorded); `ask` pauses for your approval; `deny` blocks with a reason.
+- **Where policy lives**: nearest wins, walked up from your working directory — project `./.agentpact/policy/*.yaml`, then user `~/.config/agentpact/policy/*.yaml`, then bundled defaults.
+
+A policy file is small AgentPact YAML — for example, always confirm a force-push:
+
+```yaml
+apiVersion: agentpact/v1
+kind: PolicyOverride
+metadata:
+  name: project-overrides
+spec:
+  commands:
+    "git·push·--force": ask
+```
+
+See the [AgentPact policy reference](https://github.com/kyr-is/agentpact) for the full format. `kyris policy compile --agent <agent>` renders a bounded slice into an agent's native config when that improves coverage.
+
+### 4.8 Syncing to a Dashboard
+
+By default Kyris is **fully standalone** — governance, prompting, the runaway gate, activity, pricing, and spend all work with **no account and no network**. `kyris enroll` connects the runtime to the hosted Kyris relay (a GitHub sign-in mints a per-machine token) and turns on **event sync**, so you can see your activity and spend in a **web dashboard** and aggregate it across your machines.
+
+```sh
+kyris enroll
+```
+
+**Which directories' activity leaves your machine.** Sync covers the **governed directories you actually worked in**, and deliberately excludes ones that are conventionally private: hidden / dot-prefixed directories, owner-only (`0700`) directories, and the macOS personal folders are **always** excluded. With the default empty `sync.scope`, every other governed directory syncs; set `sync.scope` to a list of roots to **narrow** it to just those:
+
+```yaml
+sync:
+  scope:
+    - ~/work/acme       # sync activity only under these roots
+    - ~/work/widgets
+```
+
+**What syncs from those directories** is a bounded summary, not raw content: per row, the agent, action type and a short detail (command line / model / path / tool name), the decision and coverage, the **working directory and git remote**, session/trace ids, and — for model calls — provider, model, token counts, cost, and status. It does **not** include your prompts, tool-call argument payloads, file contents, or any API keys (those stay in the local secret store; `kyrisd` forwards your credential and stores none). Sync goes over HTTPS, authenticated by the per-machine token. The relay stores those rows under your account **and reads them** to render your dashboard — it is the hosted service, not a zero-knowledge store, so treat anything you sync as visible to Kyris (only the machine token itself is encrypted at rest; the timeline rows are not). Kyris is one-user-per-org today — no team-sharing surface. Enrollment is opt-in and additive: unenrolled, you lose nothing locally.
+
+## 5. Agent Support
+
+Each agent exposes different control points, so Kyris reports coverage per surface and stays honest about the gaps.
+
+| Agent | Execution Surface | MCP / Tool Surface | Model Routing / Burn Control | Setup Command | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | Native live hook (gates pre-exec) | Stdio wrap | Gateway via env | `kyris agent setup claude-code` | Strongest surface; decision before the command runs. |
+| Cline | Live hook bridge | Stdio wrap | Provider-config rewrite → `kyrisd` | `kyris agent setup cline` | Burn control via rewritten provider config. |
+| OpenCode | Hook plugin | Stdio wrap | Provider-config rewrite → `kyrisd` | `kyris agent setup opencode` | Plugin-based live mediation. |
+| Codex CLI | Live hook + compiled policy | Stdio wrap | `kyrisd` as model provider | `kyris agent setup codex-cli` | Compiled policy complements the live hook. |
+| Gemini CLI | Live hook + compiled policy | Stdio wrap | Gateway via env (**API-key mode only**) | `kyris agent setup gemini-cli` | OAuth / Code-Assist traffic can't be proxied — an honest gap. |
+
+```sh
+kyris agent                 # supported agents + integration status
+kyris agent status <agent>  # detail for one agent
+kyris agent setup --all     # configure every detected agent
+kyris agent disconnect <agent>   # remove Kyris integration cleanly
+```
+
+Setup is **reversible**: Kyris records the structural edits it makes and `disconnect` restores your agent config semantically, so trying Kyris never traps you.
+
+<!-- Embedded into kyris-app /docs/install via ReadmeSection — keep this heading text stable. -->
+## 6. Command Reference
+
+Run `kyris --help` (or `kyris <command> --help`) for the full surface; this is the common set.
 
 | Command | Description |
-|---------|-------------|
-| `kyris install` | Install shell hooks, binaries, and configure detected agents |
-| `kyris uninstall [--reset-data]` | Remove all Kyris modifications (restores agent configs) |
-| `kyris update [--check]` | Update Kyris binaries. `--check` prints available update without applying |
-| `kyris enroll [--force] [--relay-url URL]` | Enroll machine with Kyris hosted service via GitHub device flow. `--force` re-authenticates |
-| `kyris version` | Print version |
+| --- | --- |
+| `kyris install` / `kyris uninstall [--reset-data]` | Configure or remove Kyris-managed local integration. |
+| `kyris update [--check]` | Update or check for updates. |
+| `kyris enroll [--force] [--relay-url URL]` | Enroll with the hosted Kyris service to enable sync. |
+| `kyris agent` / `kyris agent status [agent]` | Show supported agents and integration status. |
+| `kyris agent setup <agent> \| --all` / `kyris agent disconnect <agent>` | Configure or cleanly remove an integration. |
+| `kyris status` | Posture and component health. |
+| `kyris activity [stats \| replay <session> \| trace <id> \| approvals]` | Inspect the unified local record. |
+| `kyris policy check <command>` / `enable` / `disable` / `compile --agent <agent>` | Test and control policy. |
+| `kyris doctor` / `kyris logs` / `kyris debug <verify \| audit \| trace-on \| trace-off>` | Diagnostics. |
 
-### Agent Management
+Hook-internal commands (`kyris hook check`, `kyris mcp wrap`) are invoked by installed hooks, not by hand.
 
-| Command | Description |
-|---------|-------------|
-| `kyris agent` / `kyris agent list` | Summary of all agents and their integration status |
-| `kyris agent <agent>` | Detail view for one agent (shorthand for `kyris agent status <agent>`) |
-| `kyris agent status [agent]` | Show agent integration status |
-| `kyris agent setup <agent> [--set KEY=VALUE...]` | Configure one agent. Idempotent: re-running repairs drift and re-integrates a disconnected agent. `--set` passes agent-specific settings (e.g. `--set maxSessionTurns=100`); a bare re-run preserves previously-set settings |
-| `kyris agent setup --all` | Detect installed agents and configure each (skips agents you disconnected) |
-| `kyris agent disconnect <agent>` | Remove Kyris's integration from an agent. The agent itself stays installed — it just stops being governed until you `setup` it again |
+---
 
-### Activity & Inspection
+# Design
 
-| Command | Description |
-|---------|-------------|
-| `kyris status` | Show effective posture and component health: daemons, sandbox, hooks, agents, enrollment |
-| `kyris activity [--agent X] [--action X] [--decision X] [--since T] [--until T] [--dir D] [--sync-state S] [--last N]` | Unified event stream — recent rows by default, filtered when any filter is given |
-| `kyris activity stats [--since DURATION]` | Burn-control summary: tokens, spend, decisions (default 7d) |
-| `kyris activity replay <session>` | Reconstruct one session in order |
-| `kyris activity trace <trace_id>` | Every row sharing a model-call trace id |
-| `kyris activity approvals [--decision D] [--json] [--last N]` | Recall view over popup-resolved approval decisions |
+*How Kyris works, and how to build on it.*
 
-### Policy
+<!-- Embedded into kyris-app /docs/install via ReadmeSection — keep this heading text stable. -->
+## 7. How Kyris Works
 
-| Command | Description |
-|---------|-------------|
-| `kyris policy check <command>` | Test a command against current policy (returns allow/deny) |
-| `kyris policy enable` | Switch the user policy (`~/.config/agentpact/policy/pact.yaml`) to `mode: enforce`: catalog-classified commands auto-allow, unclassified commands route to the desktop approval popup. Errors if agentpactd is unreachable |
-| `kyris policy disable` | Flip the same policy file to `mode: log` so agentpactd records commands but does not prompt or deny. Tray icon shows a red bar across the kyris glyph. Daemons stay running. Errors if agentpactd is unreachable |
-| `kyris policy compile --agent <agent> [--policy PATH]` | Render AgentPact policy into agent-native permission format |
+Kyris is organized around three control surfaces, all evaluated against AgentPact policy and recorded as local evidence.
 
-The current enforce/log mode is shown by `kyris status`.
+| Surface | What It Governs | How Kyris Gets In |
+| --- | --- | --- |
+| Execution | Shell commands and environment-changing actions | Shell hooks and live agent hook adapters talk to AgentPact. |
+| Tool | MCP tool calls | `kyris-mcp` wraps stdio MCP; `kyrisd` routes HTTP MCP. |
+| Model | LLM usage, routing, token accounting, spend, and the runaway gate | Agents point provider base URLs or provider config at `kyrisd`. |
 
-### Support
+```mermaid
+flowchart LR
+  agent[Agent]
+  shell[Shell hooks and live hooks]
+  mcp[kyris-mcp / kyrisd MCP routing]
+  proxy[kyrisd LLM proxy]
+  pact[agentpactd]
+  provider[LLM provider]
+  tools[MCP server]
+  events[Local evidence]
 
-| Command | Description |
-|---------|-------------|
-| `kyris doctor` | Probe each subsystem (agentpactd socket, kyrisd `/healthz`, pending approvals) and print `[✓]`/`[!]` per check with a fix suggestion. First line is the headline (`Kyris — enforcing` / `Kyris — enforcement disabled — log only` / `Kyris — errors encountered — may not enforce correctly`). Exits non-zero on any failure |
-| `kyris logs` | List log file paths (kyris, kyrisd-launchd, agentpactd, shell fail-open) with size and last-modified time |
-| `kyris debug trace-on [--filter F] [--duration-secs N]` / `trace-off` / `trace-status` | Control kyrisd's runtime log filter for a bounded window |
-| `kyris debug verify [--post-install] [--post-uninstall] [--json]` | Verify installation state |
-| `kyris debug audit [--format terminal\|json\|html] [-o FILE]` | Forensic: detect LLM traffic bypassing Kyris governance (a diagnostics tool, not for daily use) |
+  agent --> shell --> pact --> events
+  agent --> mcp --> tools
+  mcp --> pact
+  agent --> proxy --> provider
+  proxy --> events
+```
 
-Daemon lifecycle is not kyris's responsibility — the launchd plists keep `kyrisd` and `agentpactd` up. Use `kyris policy disable` / `kyris policy enable` to toggle whether agentpactd actually enforces (without touching daemon lifecycle), or `kyris uninstall` for a real teardown. Held approval requests are resolved at the desktop popup, the tray, or the Kyris app — there is no CLI approval command.
+**The decision lifecycle.** When an agent runs a shell command, the shell hook hands it to `kyris-hook`, which asks `agentpactd` over a local socket. `agentpactd` attributes the caller, resolves policy from the directory tree, extracts the command's effects, and returns `allow` / `ask` / `deny`; the hook enforces that answer — running, prompting you, or blocking — and `agentpactd` writes the event. A **model call** follows the model path instead: the request reaches `kyrisd`, which meters tokens, applies the runaway gate, forwards to the provider with your credential, and records the call. The CLI later joins those governance events and gateway records into the timeline you read. Nothing is re-evaluated at read time — the decision happened once, on the path.
 
-### Internal (used by hooks, not user-facing)
+### 7.1 Coverage Is Path-Based
 
-| Command | Description |
-|---------|-------------|
-| `kyris hook check --agent <agent>` | Native agent hook adapter — reads hook payload from stdin, round-trips to agentpactd |
-| `kyris mcp wrap [--server NAME] <cmd> [args...]` | Wrap a stdio MCP server with policy enforcement |
+If Kyris is on the path **before** execution, the action can be `enforced`. If Kyris only sees a record **after** the fact, it is `observed` or `vendor_reported`. If Kyris never sees the path, coverage is `unknown`. Kyris never reports preventive control it didn't have — that honesty is the point.
+
+### 7.2 Attribution
+
+Per-agent policy and audit are only useful if events name the right agent. AgentPact attributes each action from validated local peer credentials and process lineage — not from self-reported environment variables an agent could spoof — falling back to `unknown` when it genuinely can't tell.
+
+### 7.3 Graceful Degradation
+
+When the decision path is unavailable, Kyris does not silently fail open. A shell hook spools to `~/.local/state/kyris/fail-open.jsonl` and surfaces a degraded posture; a backstopped agent defers to its own native prompt. The invariant is visibility — you always know when governance was partial.
+
+### 7.4 Workspace Boundary and Sandbox
+
+Kyris treats the directory an agent is launched from as that session's permitted work domain. Inside it the agent moves quickly; outside it, writes and destructive actions require an explicit decision or are denied. That boundary is what makes *fewer* prompts possible — routine edits can be allowed with confidence when surprising writes can't escape the project. On platforms with an OS sandbox backend (macOS Seatbelt today), Kyris can additionally confine the agent process tree at the kernel boundary.
+
+### 7.5 Component Map
+
+| Component | Role |
+| --- | --- |
+| `agentpactd` | Evaluates policy, issues decisions, writes standard governance events. From the AgentPact project. |
+| Shell hooks | Put local command execution on the AgentPact decision path. |
+| Live hook adapters | Bridge each agent's native hook system into AgentPact. |
+| Compiled policy adapters | Render a bounded slice of AgentPact policy into agent-native config when useful. |
+| `kyrisd` | Local daemon: provider routing, HTTP MCP routing, local storage, approvals, notifications, sync, and the runaway gate. |
+| `kyris-mcp` | Minimal stdio MCP wrapper for governed MCP calls. |
+| `kyris` CLI | The operator surface for setup, status, activity, policy, diagnostics, and lifecycle. |
+
+AgentPact is the contract; Kyris is the local runtime that gets that contract onto real paths.
+
+## 8. Architecture and Extension
+
+This repo contains the open, deployable local tools in the Kyris stack — not the AgentPact standard itself, and not the hosted Kyris services.
+
+### 8.1 Workspace Layout
+
+`kyris-types` (shared types), `kyris-core` (config, paths, coverage, AgentPact helpers), `kyris-agentpact-client` (UDS client), `kyrisd` (daemon), `kyris` (CLI), `kyris-mcp` (stdio wrapper), `kyris-hook` (shell helper), plus `hooks/`, `integrations/`, `config/`, `service/`, and `xtask/`. The authoritative crate-by-crate map and runtime paths live in [AGENTS.md](AGENTS.md).
+
+### 8.2 Key Flows
+
+- **Install / setup**: `install.sh` or Homebrew place binaries; `kyris install` and `kyris agent setup` configure hooks and agent files.
+- **Execution mediation**: shell hooks call `kyris-hook`; native agent hooks call `kyris hook check`; both route decisions through AgentPact.
+- **MCP mediation**: stdio via `kyris-mcp`; HTTP via `kyrisd`.
+- **Model routing**: provider-native traffic passes through `kyrisd` to the provider, metered and gated on the way.
+- **Evidence**: `kyrisd` joins AgentPact events and gateway records into the timeline the CLI renders.
+- **Sync**: `kyrisd` ships joined timeline rows to the relay when enrolled.
+
+### 8.3 Extension Points
+
+| Area | Where to Work |
+| --- | --- |
+| Agent support | `cli/src/agents/registry.rs`, `cli/src/agents/<agent>.rs` |
+| Live hook behavior | `cli/src/hook_cmd.rs`, `cli/src/agents/` |
+| Compiled policy | `cli/src/compile_policy.rs` |
+| Provider routing and the gate | `daemon/src/` adapter, metering, gate, server modules |
+| MCP wrapping | `mcp/src/`, `daemon/src/` HTTP MCP routing |
+| Activity and status UX | `cli/src/activity.rs`, `cli/src/status.rs` |
+| Config schema | `types/src/config.rs`, `core/src/config.rs`, `config/` |
+
+### 8.4 Sources of Truth
+
+This README is a guide, not a spec. For deeper context, see [AgentPact](https://github.com/kyr-is/agentpact) (the open governance contract Kyris builds on), [AGENTS.md](AGENTS.md) (engineering rules plus crate and path facts), and [CONTRIBUTING.md](CONTRIBUTING.md) (contribution mechanics). When docs lag code, treat the current code and tests as the source of truth.
+
+---
+
+## Further Reading
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development workflow and contribution mechanics.
+- [AGENTS.md](AGENTS.md) — repository rules, crate descriptions, runtime paths.
+- [SECURITY.md](SECURITY.md) — reporting security issues.
+- [AgentPact](https://github.com/kyr-is/agentpact) — the open governance contract.

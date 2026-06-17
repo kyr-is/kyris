@@ -27,7 +27,7 @@ pub fn compile_gemini_permissions(
     let mut ask_dropped: u32 = 0;
     let mut decision_for = |perm: &Permission| -> Option<(&'static str, u32)> {
         match perm {
-            Permission::Auto | Permission::Inform => Some(("allow", GEMINI_ALLOW_PRIORITY)),
+            Permission::Auto => Some(("allow", GEMINI_ALLOW_PRIORITY)),
             Permission::Deny => Some(("deny", GEMINI_DENY_PRIORITY)),
             Permission::Ask => {
                 ask_dropped += 1;

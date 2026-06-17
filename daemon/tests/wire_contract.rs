@@ -27,12 +27,11 @@ use kyris_core::event::Decision as KyrisDecision;
 
 #[test]
 fn decision_shared_variants_serialize_identically() {
-    // The four real verdicts agentpact produces must serialize to the exact
+    // The three real verdicts agentpact produces must serialize to the exact
     // strings kyris reads back. kyris's extra `Unknown` is a forward-compat
     // reader concern, not a shared variant, so it is not part of the contract.
     let cases = [
         (PactDecision::Auto, KyrisDecision::Auto),
-        (PactDecision::Inform, KyrisDecision::Inform),
         (PactDecision::Ask, KyrisDecision::Ask),
         (PactDecision::Deny, KyrisDecision::Deny),
     ];

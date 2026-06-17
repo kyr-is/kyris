@@ -6,12 +6,14 @@ use serde_json::{Map, Value, json};
 pub fn generate() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://kyr-is.github.io/kyris/config.json",
+        "$id": "https://kyr-is.github.io/kyris/v1/config.json",
         "title": "kyrisd configuration",
         "description": "Schema for kyrisd.yaml configuration",
         "type": "object",
         "additionalProperties": false,
+        "required": ["apiVersion"],
         "properties": {
+            "apiVersion": { "const": "kyris/v1" },
             "server": { "$ref": "#/$defs/ServerConfig" },
             "tls": { "$ref": "#/$defs/TlsConfig" },
             "providers": {
@@ -224,7 +226,7 @@ fn relay_config() -> Value {
         "properties": {
             "url": {
                 "type": "string",
-                "description": "Base URL of the kyris-relay this install talks to (pricing fetch and `kyris enroll`). Read at enroll time and at runtime by the daemon; not part of credentials.json."
+                "description": "Base URL of the Kyris relay this install talks to (pricing fetch and `kyris enroll`). Read at enroll time and at runtime by the daemon; not part of credentials.json."
             }
         }
     })
@@ -358,6 +360,23 @@ mod tests {
             schema["$schema"],
             "https://json-schema.org/draft/2020-12/schema"
         );
+    }
+
+    #[test]
+    fn testSchemaIdIsVersionedAndRequiresApiVersion() {
+        let schema = generate();
+        // The published URL is versioned by schema major.
+        assert_eq!(
+            schema["$id"],
+            "https://kyr-is.github.io/kyris/v1/config.json"
+        );
+        // A config document must declare its version, pinned to this major.
+        let required = schema["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "apiVersion"),
+            "apiVersion must be required"
+        );
+        assert_eq!(schema["properties"]["apiVersion"]["const"], "kyris/v1");
     }
 
     #[test]

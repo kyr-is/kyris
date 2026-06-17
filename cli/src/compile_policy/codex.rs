@@ -15,7 +15,7 @@ pub fn compile_codex_permissions(
     for (command_id, perm) in &level.commands {
         let shell_cmd = id_to_shell(command_id);
         let permission = match perm {
-            Permission::Auto | Permission::Inform => "Allow",
+            Permission::Auto => "Allow",
             Permission::Deny => "Forbidden",
             Permission::Ask => "Prompt",
         };

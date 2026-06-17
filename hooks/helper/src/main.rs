@@ -26,9 +26,7 @@ use std::process::ExitCode;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CheckResponse {
-    Allow {
-        inform_reason: Option<String>,
-    },
+    Allow,
     Deny {
         reason: Option<String>,
     },
@@ -132,12 +130,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         .map_or_else(|| request_id.clone(), str::to_string);
 
     match parse_check_response(&response) {
-        CheckResponse::Allow { inform_reason } => {
-            if let Some(reason) = inform_reason {
-                eprintln!("[agentpact] {reason}");
-            }
-            ExitCode::from(0)
-        }
+        CheckResponse::Allow => ExitCode::from(0),
         CheckResponse::Deny { reason } => {
             log_error(&format!(
                 "denied (agentpactd id={traced_id}): {}",
@@ -180,18 +173,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
 fn parse_check_response(response: &serde_json::Value) -> CheckResponse {
     match response.get("code").and_then(|value| value.as_str()) {
-        Some("PACT_OK") => CheckResponse::Allow {
-            inform_reason: if response.get("decision").and_then(|value| value.as_str())
-                == Some("inform")
-            {
-                response
-                    .get("reason")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-            } else {
-                None
-            },
-        },
+        Some("PACT_OK") => CheckResponse::Allow,
         Some("PACT_DENIED") => CheckResponse::Deny {
             reason: response
                 .get("reason")
@@ -568,18 +550,12 @@ mod tests {
     }
 
     #[test]
-    fn testParseCheckResponseAllowsInform() {
+    fn testParseCheckResponseAllow() {
         let response = serde_json::json!({
             "code": "PACT_OK",
-            "decision": "inform",
-            "reason": "heads up"
+            "decision": "auto"
         });
-        assert_eq!(
-            parse_check_response(&response),
-            CheckResponse::Allow {
-                inform_reason: Some("heads up".to_string()),
-            }
-        );
+        assert_eq!(parse_check_response(&response), CheckResponse::Allow);
     }
 
     #[test]

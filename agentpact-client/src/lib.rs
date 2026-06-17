@@ -506,7 +506,7 @@ pub fn parse_response_segments(response: &serde_json::Value) -> Option<Vec<Strin
 /// Human-facing classification of a command for `kyris policy check`.
 ///
 /// Carries the raw fields the CLI surfaces to a person — the decision verb
-/// (`auto`/`inform`/`ask`/`deny`/…), the matched rule id (catalog form; the
+/// (`auto`/`ask`/`deny`/…), the matched rule id (catalog form; the
 /// caller renders it via `id_to_shell`), and a reason. These are deliberately
 /// richer than [`McpPermissionDecision`], which collapses the decision verb to
 /// `Allow`/`Ask`/`Deny` and drops the matched rule.

@@ -9,7 +9,7 @@ Kyris → AgentPact   (Kyris depends on AgentPact)
 AgentPact ↛ Kyris   (AgentPact MUST NOT depend on Kyris)
 ```
 
-Source: `README.md §3.1` ("The main architectural boundary is one-way dependency"), `forest/03-architecture.md:93`.
+Source: `README.md §3.1` ("The main architectural boundary is one-way dependency").
 
 Concretely:
 

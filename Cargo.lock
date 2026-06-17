@@ -11,6 +11,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 [[package]]
 name = "agentpact"
 version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "agentpact-hardening",
  "agentpact-types",
@@ -41,6 +42,7 @@ dependencies = [
 [[package]]
 name = "agentpact-hardening"
 version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "libc",
 ]
@@ -48,6 +50,7 @@ dependencies = [
 [[package]]
 name = "agentpact-sandbox"
 version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "regex-lite",
  "serde",
@@ -56,6 +59,7 @@ dependencies = [
 [[package]]
 name = "agentpact-types"
 version = "0.1.7"
+source = "git+https://github.com/kyr-is/agentpact.git?tag=v0.1.7#ca46e5c4a0e41be98bb9a07f20e110988653c034"
 dependencies = [
  "schemars",
  "serde",

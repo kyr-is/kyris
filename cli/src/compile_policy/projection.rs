@@ -64,7 +64,7 @@ impl NetworkAccess {
 #[must_use]
 pub fn permission_to_file_mode(perm: Permission) -> FileAccessMode {
     match perm {
-        Permission::Auto | Permission::Inform => FileAccessMode::Write,
+        Permission::Auto => FileAccessMode::Write,
         Permission::Ask | Permission::Deny => FileAccessMode::None,
     }
 }
@@ -74,7 +74,7 @@ pub fn permission_to_file_mode(perm: Permission) -> FileAccessMode {
 #[must_use]
 pub fn permission_to_network_access(perm: Permission) -> NetworkAccess {
     match perm {
-        Permission::Auto | Permission::Inform => NetworkAccess::Allow,
+        Permission::Auto => NetworkAccess::Allow,
         Permission::Ask | Permission::Deny => NetworkAccess::Deny,
     }
 }

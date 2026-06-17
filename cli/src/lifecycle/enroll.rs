@@ -243,12 +243,12 @@ async fn enroll_with_relay(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Failed to enroll with kyris-relay: {e}"))?
+        .map_err(|e| format!("Failed to enroll with the Kyris relay: {e}"))?
         .error_for_status()
-        .map_err(|e| format!("kyris-relay enrollment failed: {e}"))?
+        .map_err(|e| format!("Kyris relay enrollment failed: {e}"))?
         .json::<EnrollmentResponse>()
         .await
-        .map_err(|e| format!("Failed to parse kyris-relay enrollment response: {e}"))
+        .map_err(|e| format!("Failed to parse Kyris relay enrollment response: {e}"))
 }
 
 fn machine_metadata() -> EnrollmentRequest {
